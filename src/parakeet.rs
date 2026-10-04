@@ -474,10 +474,23 @@ fn run_processor_worker(
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .recv();
-        let Ok(job) = job else { break };
+        let Ok(mut job) = job else { break };
         if job.control.is_cancelled() {
             let _ = output.send(OutputJob::Cancelled { job_id: job.job_id });
             continue;
+        }
+        // Fork: optional OpenRouter cleanup ahead of Modes; history keeps the raw text.
+        let mut raw = None;
+        if !matches!(job.target, TranscriptionTarget::VoiceAction)
+            && let Some(cleaned) =
+                crate::openrouter::cleanup::clean(&job.text, &job.control.cancelled, || {
+                    let _ = events.send(WorkerEvent::Stage {
+                        job_id: job.job_id,
+                        stage: DictationJobStage::Processing,
+                    });
+                })
+        {
+            raw = Some(std::mem::replace(&mut job.text, cleaned));
         }
         let mut processed = process_job_text(
             &job,
@@ -544,7 +557,7 @@ fn run_processor_worker(
                 target: job.target,
                 result: Box::new(Ok(CompletedTranscript {
                     text: processed.text,
-                    raw: job.text,
+                    raw: raw.unwrap_or(job.text),
                     application: job.context.application,
                     timings: job.timings,
                     processing: processed.observation,

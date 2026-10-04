@@ -591,7 +591,8 @@ fn transcription_action(
         crate::transcription_models::ModelRuntime::Gguf(_) => {
             crate::transcription_models::is_verified(model)
         }
-        crate::transcription_models::ModelRuntime::AppleSpeech => {
+        crate::transcription_models::ModelRuntime::AppleSpeech
+        | crate::transcription_models::ModelRuntime::OpenRouter => {
             crate::transcription_models::is_installed(model, &selection.language)
         }
     };

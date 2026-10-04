@@ -3,6 +3,7 @@ use serde::Deserialize;
 
 use crate::apple_speech::AppleSpeech;
 use crate::dictation::DictationProtocol;
+use crate::openrouter::transcribe::OpenRouterTranscriber;
 use crate::parakeet::Parakeet;
 use crate::transcription_models::{
     ModelRuntime, TranscriptionModelId, TranscriptionSelection, validate,
@@ -13,6 +14,7 @@ const UNIFIED_ENGLISH_TRAILING_SILENCE_SAMPLES: usize = 3_200;
 pub enum Transcriber {
     Gguf(Box<Parakeet>),
     AppleSpeech(AppleSpeech),
+    OpenRouter(OpenRouterTranscriber),
 }
 
 #[derive(Default)]
@@ -47,6 +49,9 @@ impl Transcriber {
                 .map(Box::new)
                 .map(Self::Gguf),
             ModelRuntime::AppleSpeech => AppleSpeech::load(selection).map(Self::AppleSpeech),
+            ModelRuntime::OpenRouter => {
+                OpenRouterTranscriber::load(selection).map(Self::OpenRouter)
+            }
         }
     }
 
@@ -54,6 +59,7 @@ impl Transcriber {
         match self {
             Self::Gguf(model) => model.matches_selection(selection),
             Self::AppleSpeech(model) => model.matches_selection(selection),
+            Self::OpenRouter(model) => model.matches_selection(selection),
         }
     }
 
@@ -85,6 +91,8 @@ impl Transcriber {
                 }
             }
             Self::AppleSpeech(model) => model.transcribe(&samples).map(|result| result.text),
+            // Voice-control protocol words are stripped downstream as for any model.
+            Self::OpenRouter(model) => model.transcribe(&samples),
         }
     }
 
@@ -110,6 +118,10 @@ impl Transcriber {
                     })
             }
             Self::AppleSpeech(model) => model.transcribe(&samples),
+            Self::OpenRouter(model) => model.transcribe(&samples).map(|text| Transcript {
+                segments: Vec::new(),
+                text,
+            }),
         }
     }
 }

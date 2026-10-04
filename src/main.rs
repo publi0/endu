@@ -97,6 +97,8 @@ mod moonshine;
 mod moonshine_lab;
 #[cfg(target_os = "macos")]
 mod onboarding;
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+mod openrouter;
 #[cfg(target_os = "macos")]
 mod parakeet;
 #[cfg(target_os = "macos")]

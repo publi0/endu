@@ -12,7 +12,7 @@ pub fn support_dir() -> Result<PathBuf> {
     }
     Ok(dirs::data_dir()
         .ok_or_else(|| eyre!("application data directory is unavailable"))?
-        .join("voice-control"))
+        .join(crate::openrouter::SUPPORT_DIR_NAME.unwrap_or("voice-control")))
 }
 
 pub fn logs_dir() -> Result<PathBuf> {

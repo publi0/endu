@@ -25,6 +25,9 @@ pub enum TranscriptionModelId {
     SenseVoiceSmall,
     CohereTranscribe,
     AppleSpeech,
+    /// Fork: cloud transcription through OpenRouter (`crate::openrouter`).
+    #[serde(rename = "openrouter")]
+    OpenRouter,
 }
 
 impl TranscriptionModelId {
@@ -38,6 +41,7 @@ impl TranscriptionModelId {
             Self::SenseVoiceSmall => "sense_voice_small",
             Self::CohereTranscribe => "cohere_transcribe",
             Self::AppleSpeech => "apple_speech",
+            Self::OpenRouter => "openrouter",
         }
     }
 }
@@ -55,6 +59,7 @@ impl FromStr for TranscriptionModelId {
             "sense_voice_small" => Ok(Self::SenseVoiceSmall),
             "cohere_transcribe" => Ok(Self::CohereTranscribe),
             "apple_speech" => Ok(Self::AppleSpeech),
+            "openrouter" => Ok(Self::OpenRouter),
             _ => Err(eyre!("unknown transcription model: {value}")),
         }
     }
@@ -100,6 +105,13 @@ pub struct TranscriptionSelection {
 
 impl Default for TranscriptionSelection {
     fn default() -> Self {
+        if crate::openrouter::ENABLED {
+            return Self {
+                model: TranscriptionModelId::OpenRouter,
+                language: AUTO_LANGUAGE.into(),
+                recognition_hints: String::new(),
+            };
+        }
         Self {
             model: TranscriptionModelId::default(),
             language: "en".into(),
@@ -153,6 +165,8 @@ pub struct ModelDefinition {
 pub enum ModelRuntime {
     Gguf(&'static GgufArtifact),
     AppleSpeech,
+    /// Fork: remote inference; nothing to download or verify locally.
+    OpenRouter,
 }
 
 pub struct GgufArtifact {
@@ -167,7 +181,11 @@ pub struct GgufArtifact {
 
 impl ModelDefinition {
     pub const fn available(&self) -> bool {
-        !matches!(self.runtime, ModelRuntime::AppleSpeech)
+        match self.runtime {
+            ModelRuntime::AppleSpeech => false,
+            ModelRuntime::OpenRouter => crate::openrouter::ENABLED,
+            ModelRuntime::Gguf(_) => true,
+        }
     }
 
     fn download_url(&self) -> Result<String> {
@@ -212,6 +230,7 @@ impl ModelDefinition {
     pub fn size_label(&self) -> String {
         match self.runtime {
             ModelRuntime::AppleSpeech => "Managed".into(),
+            ModelRuntime::OpenRouter => "Cloud".into(),
             ModelRuntime::Gguf(artifact) if artifact.bytes >= 1_000_000_000 => {
                 format!("{:.1} GB", artifact.bytes as f64 / 1_000_000_000.0)
             }
@@ -222,7 +241,7 @@ impl ModelDefinition {
     pub const fn download_bytes(&self) -> Option<u64> {
         match self.runtime {
             ModelRuntime::Gguf(artifact) => Some(artifact.bytes),
-            ModelRuntime::AppleSpeech => None,
+            ModelRuntime::AppleSpeech | ModelRuntime::OpenRouter => None,
         }
     }
 }
@@ -425,6 +444,21 @@ pub const MODELS: &[ModelDefinition] = &[
         supports_language_detection: false,
         supports_recognition_hints: false,
     },
+    ModelDefinition {
+        id: TranscriptionModelId::OpenRouter,
+        name: "OpenRouter",
+        realtime: "Cloud",
+        realtime_context: "network bound",
+        quality: "Fallback",
+        quality_context: "configurable model chain",
+        coverage: "Multilingual",
+        timestamps: "No timestamps",
+        runtime: ModelRuntime::OpenRouter,
+        languages: &["*"],
+        accepts_language_hint: true,
+        supports_language_detection: true,
+        supports_recognition_hints: false,
+    },
 ];
 
 pub const AUTO_LANGUAGE: &str = "auto";
@@ -491,7 +525,7 @@ pub(crate) fn choices_for_runtime(language: &str) -> Vec<ModelChoice> {
         model: definition(id),
         recommendation,
     };
-    match language {
+    let mut choices = match language {
         AUTO_LANGUAGE => vec![
             choice(
                 TranscriptionModelId::WhisperLargeV3Turbo,
@@ -558,7 +592,18 @@ pub(crate) fn choices_for_runtime(language: &str) -> Vec<ModelChoice> {
             TranscriptionModelId::WhisperLargeV3Turbo,
             Recommendation::Recommended,
         )],
+    };
+    if crate::openrouter::ENABLED {
+        // Fork: offer OpenRouter first, ahead of the local models.
+        choices.insert(
+            0,
+            choice(
+                TranscriptionModelId::OpenRouter,
+                Recommendation::Recommended,
+            ),
+        );
     }
+    choices
 }
 
 pub fn validate(selection: &TranscriptionSelection) -> Result<&'static ModelDefinition> {
@@ -621,6 +666,7 @@ pub fn is_installed(model: &ModelDefinition, language: &str) -> bool {
         ModelRuntime::AppleSpeech => crate::apple_speech::AppleSpeech::is_ready(language),
         #[cfg(not(target_os = "macos"))]
         ModelRuntime::AppleSpeech => false,
+        ModelRuntime::OpenRouter => crate::openrouter::is_configured(),
     }
 }
 
