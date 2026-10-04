@@ -267,14 +267,6 @@ impl TextInput {
         Self::with_mode(cx, placeholder, initial.as_ref(), false, true)
     }
 
-    pub fn multiline(
-        cx: &mut Context<Self>,
-        placeholder: impl Into<SharedString>,
-        initial: impl AsRef<str>,
-    ) -> Self {
-        Self::with_mode(cx, placeholder, initial.as_ref(), true, false)
-    }
-
     fn with_mode(
         cx: &mut Context<Self>,
         placeholder: impl Into<SharedString>,
@@ -326,10 +318,6 @@ impl TextInput {
         self.preferred_x = None;
         self.history = EditHistory::default();
         cx.notify();
-    }
-
-    pub fn is_focused(&self, window: &Window) -> bool {
-        self.focus_handle.is_focused(window)
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {

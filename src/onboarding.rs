@@ -8,8 +8,6 @@ use objc2::msg_send;
 use objc2::runtime::{AnyClass, Bool};
 use objc2_foundation::NSString;
 
-use crate::transcription_models::TranscriptionSelection;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PermissionState {
     Ready,
@@ -43,7 +41,7 @@ pub struct SetupStatus {
     pub microphone: PermissionState,
     pub input_monitoring: PermissionState,
     pub accessibility: PermissionState,
-    pub transcription_model: bool,
+    pub api_key: bool,
 }
 
 impl SetupStatus {
@@ -51,7 +49,7 @@ impl SetupStatus {
         self.microphone == PermissionState::Ready
             && self.input_monitoring == PermissionState::Ready
             && self.accessibility == PermissionState::Ready
-            && self.transcription_model
+            && self.api_key
     }
 }
 
@@ -140,18 +138,18 @@ pub(crate) fn record_completion_at(directory: &Path) -> color_eyre::Result<()> {
     Ok(())
 }
 
-pub fn status(selection: &TranscriptionSelection) -> SetupStatus {
-    let transcription_model = crate::transcription_models::validate(selection)
-        .is_ok_and(|model| crate::transcription_models::is_installed(model, &selection.language));
-    status_with_transcription_model(transcription_model)
+/// Permission health plus whether an OpenRouter key is available. The key
+/// lookup may touch the Keychain, so callers poll this off the hot path.
+pub fn status() -> SetupStatus {
+    status_with_api_key(crate::openrouter::is_configured())
 }
 
-pub fn status_with_transcription_model(transcription_model: bool) -> SetupStatus {
+pub fn status_with_api_key(api_key: bool) -> SetupStatus {
     SetupStatus {
         microphone: microphone_state(),
         input_monitoring: settings(CGPreflightListenEventAccess()),
         accessibility: settings(CGPreflightPostEventAccess()),
-        transcription_model,
+        api_key,
     }
 }
 
@@ -233,17 +231,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_commands_model_does_not_block_dictation_setup() {
+    fn dictation_setup_needs_every_permission_and_a_key() {
         let mut status = SetupStatus {
             microphone: PermissionState::Ready,
             input_monitoring: PermissionState::Ready,
             accessibility: PermissionState::Ready,
-            transcription_model: true,
+            api_key: true,
         };
         assert!(status.ready());
-        status.transcription_model = false;
+        status.api_key = false;
         assert!(!status.ready());
-        status.transcription_model = true;
+        status.api_key = true;
         status.microphone = PermissionState::NeedsRequest;
         assert!(!status.ready());
         status.microphone = PermissionState::Ready;
@@ -345,7 +343,7 @@ mod tests {
             microphone: PermissionState::Ready,
             input_monitoring: PermissionState::Ready,
             accessibility: PermissionState::Ready,
-            transcription_model: true,
+            api_key: true,
         }
     }
 }

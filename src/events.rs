@@ -1,14 +1,10 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::io::{self, BufWriter, Write};
+use std::path::Path;
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
@@ -23,81 +19,21 @@ pub enum VoiceEvent {
         state: VoiceState,
         device: String,
     },
-    Transcript {
-        timestamp_ms: u64,
-        phase: TranscriptPhase,
-        latency_ms: u32,
-        text: String,
-    },
-    Command {
-        timestamp_ms: u64,
-        heard: String,
-        command: Option<String>,
-        outcome: CommandOutcome,
-        #[serde(default)]
-        context: String,
-    },
     Dictation {
         timestamp_ms: u64,
         phase: DictationPhase,
         #[serde(default)]
         text: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        processing: Option<DictationProcessing>,
     },
     Context {
         timestamp_ms: u64,
         application: Option<String>,
-        browser_url: Option<String>,
     },
-    ApiServerStarted {
-        timestamp_ms: u64,
-        port: u16,
-    },
-    ApiServerStopped {
-        timestamp_ms: u64,
-    },
-    ApiAuthFailed {
-        timestamp_ms: u64,
-        method: String,
-        path: String,
-    },
-}
-
-impl VoiceEvent {
-    pub fn timestamp_ms(&self) -> u64 {
-        match self {
-            Self::SessionStarted { timestamp_ms }
-            | Self::State { timestamp_ms, .. }
-            | Self::Transcript { timestamp_ms, .. }
-            | Self::Command { timestamp_ms, .. }
-            | Self::Dictation { timestamp_ms, .. }
-            | Self::Context { timestamp_ms, .. }
-            | Self::ApiServerStarted { timestamp_ms, .. }
-            | Self::ApiServerStopped { timestamp_ms }
-            | Self::ApiAuthFailed { timestamp_ms, .. } => *timestamp_ms,
-        }
-    }
-
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::SessionStarted { .. } => "session_started",
-            Self::State { .. } => "state",
-            Self::Transcript { .. } => "transcript",
-            Self::Command { .. } => "command",
-            Self::Dictation { .. } => "dictation",
-            Self::Context { .. } => "context",
-            Self::ApiServerStarted { .. } => "api_server_started",
-            Self::ApiServerStopped { .. } => "api_server_stopped",
-            Self::ApiAuthFailed { .. } => "api_auth_failed",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VoiceState {
-    Sleeping,
     Listening,
     Dictating,
     Transcribing,
@@ -112,51 +48,8 @@ pub enum DictationPhase {
     Cancelled,
     Transcribing,
     Pasted,
-    Edited,
-    VoiceAction,
-    // Retained so activity readers can decode records written by older releases.
-    Logged,
     Repasted,
-    MeetingPasted,
     Failed(String),
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct DictationProcessing {
-    pub profile: String,
-    pub latency_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback: Option<String>,
-}
-
-#[cfg(target_os = "macos")]
-impl From<crate::dictation_processor::ProcessingObservation> for DictationProcessing {
-    fn from(observation: crate::dictation_processor::ProcessingObservation) -> Self {
-        Self {
-            profile: observation.profile,
-            latency_ms: observation.latency_ms,
-            fallback: observation.fallback,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CommandOutcome {
-    Ignored,
-    Woke,
-    Slept,
-    Submitted,
-    Executed,
-    Failed(String),
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TranscriptPhase {
-    Started,
-    Updated,
-    Completed,
 }
 
 #[derive(Clone)]
@@ -175,22 +68,7 @@ enum WriterMessage {
     Flush(mpsc::SyncSender<Option<(io::ErrorKind, String)>>),
 }
 
-pub struct EventReader {
-    path: PathBuf,
-    offset: u64,
-    pending: Vec<u8>,
-    discarding_record: bool,
-    events: VecDeque<VoiceEvent>,
-    current_context: Option<(Option<String>, Option<String>)>,
-    #[cfg(unix)]
-    file_id: Option<(u64, u64)>,
-}
-
-const EVENT_RETENTION: usize = 1_024;
 const EVENT_WRITER_CAPACITY: usize = 1_024;
-const EVENT_READ_BUFFER_BYTES: usize = 16 * 1024;
-// This is an observation-reader limit, not a limit on capture or persisted output.
-const MAX_EVENT_RECORD_BYTES: usize = 1024 * 1024;
 
 impl EventLog {
     pub fn create(path: &Path) -> io::Result<Self> {
@@ -271,34 +149,13 @@ impl EventLog {
             timestamp_ms: now_ms(),
             phase,
             text: text.into(),
-            processing: None,
-        })
-    }
-
-    pub fn processed_dictation(
-        &self,
-        phase: DictationPhase,
-        text: impl Into<String>,
-        processing: Option<DictationProcessing>,
-    ) -> io::Result<()> {
-        self.emit(&VoiceEvent::Dictation {
-            timestamp_ms: now_ms(),
-            phase,
-            text: text.into(),
-            processing,
         })
     }
 }
 
 impl VoiceEvent {
     fn is_replaceable(&self) -> bool {
-        matches!(
-            self,
-            Self::Transcript {
-                phase: TranscriptPhase::Started | TranscriptPhase::Updated,
-                ..
-            } | Self::Context { .. }
-        )
+        matches!(self, Self::Context { .. })
     }
 }
 
@@ -349,135 +206,6 @@ fn run_event_writer(
     let _ = writer.flush();
 }
 
-impl EventReader {
-    pub fn open(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            offset: 0,
-            pending: Vec::new(),
-            discarding_record: false,
-            events: VecDeque::new(),
-            current_context: None,
-            #[cfg(unix)]
-            file_id: None,
-        }
-    }
-
-    pub fn refresh(&mut self) -> io::Result<()> {
-        let mut file = match File::open(&self.path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                self.reset();
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        let metadata = file.metadata()?;
-        if metadata.len() < self.offset {
-            self.reset();
-        }
-        #[cfg(unix)]
-        {
-            let file_id = (metadata.dev(), metadata.ino());
-            if self.file_id.is_some_and(|current| current != file_id) {
-                self.reset();
-            }
-            self.file_id = Some(file_id);
-        }
-        file.seek(SeekFrom::Start(self.offset))?;
-        // Read this snapshot only: a busy writer must not keep refresh chasing EOF.
-        let mut appended = file.take(metadata.len() - self.offset);
-        let mut buffer = [0; EVENT_READ_BUFFER_BYTES];
-        loop {
-            let count = match appended.read(&mut buffer) {
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                result => result?,
-            };
-            if count == 0 {
-                break;
-            }
-            self.offset += count as u64;
-            self.read_records(&buffer[..count]);
-        }
-        Ok(())
-    }
-
-    fn read_records(&mut self, bytes: &[u8]) {
-        for part in bytes.split_inclusive(|byte| *byte == b'\n') {
-            let complete = part.last() == Some(&b'\n');
-            let text = if complete {
-                &part[..part.len() - 1]
-            } else {
-                part
-            };
-            if !self.discarding_record {
-                if self.pending.len() + text.len() > MAX_EVENT_RECORD_BYTES {
-                    self.pending.clear();
-                    self.discarding_record = true;
-                } else {
-                    self.pending.extend_from_slice(text);
-                }
-            }
-            if complete {
-                if !self.discarding_record
-                    && let Ok(event) = serde_json::from_slice(&self.pending)
-                {
-                    self.push(event);
-                }
-                self.pending.clear();
-                self.discarding_record = false;
-            }
-        }
-    }
-
-    pub fn events(&self) -> &VecDeque<VoiceEvent> {
-        &self.events
-    }
-
-    pub fn recent(&self, limit: usize) -> Vec<VoiceEvent> {
-        self.events.iter().rev().take(limit).cloned().collect()
-    }
-
-    pub fn current_context(&self) -> Option<&(Option<String>, Option<String>)> {
-        self.current_context.as_ref()
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    fn push(&mut self, event: VoiceEvent) {
-        if matches!(event, VoiceEvent::SessionStarted { .. }) {
-            self.events.clear();
-            self.current_context = None;
-        }
-        if let VoiceEvent::Context {
-            application,
-            browser_url,
-            ..
-        } = &event
-        {
-            self.current_context = Some((application.clone(), browser_url.clone()));
-        }
-        self.events.push_back(event);
-        while self.events.len() > EVENT_RETENTION {
-            self.events.pop_front();
-        }
-    }
-
-    fn reset(&mut self) {
-        self.offset = 0;
-        self.pending.clear();
-        self.discarding_record = false;
-        self.events.clear();
-        self.current_context = None;
-        #[cfg(unix)]
-        {
-            self.file_id = None;
-        }
-    }
-}
-
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -494,19 +222,11 @@ mod tests {
         let fixtures = serde_json::json!([
             {"kind": "session_started", "timestamp_ms": 42},
             {"kind": "state", "timestamp_ms": 42, "state": "listening", "device": "Test"},
-            {"kind": "transcript", "timestamp_ms": 42, "phase": "completed", "latency_ms": 73, "text": "olá"},
-            {"kind": "transcript", "timestamp_ms": 42, "phase": "completed", "latency_ms": 73, "text": "other"},
-            {"kind": "command", "timestamp_ms": 42, "heard": "alpha", "command": null, "outcome": "ignored"},
-            {"kind": "command", "timestamp_ms": 42, "heard": "alpha", "command": "example", "outcome": {"failed": "é"}, "context": "Test"},
             {"kind": "dictation", "timestamp_ms": 42, "phase": "pasted", "text": "olá"},
-            {"kind": "dictation", "timestamp_ms": 42, "phase": "pasted", "text": "olá", "processing": {"profile": "example", "latency_ms": 321}},
-            {"kind": "dictation", "timestamp_ms": 42, "phase": "pasted", "text": "olá", "processing": {"profile": "example", "latency_ms": 321, "fallback": "timeout"}},
+            {"kind": "dictation", "timestamp_ms": 42, "phase": "pasted", "text": "other"},
             {"kind": "dictation", "timestamp_ms": 42, "phase": {"failed": "timeout"}},
-            {"kind": "context", "timestamp_ms": 42, "application": null, "browser_url": null},
-            {"kind": "context", "timestamp_ms": 42, "application": "Test", "browser_url": "https://example.com"},
-            {"kind": "api_server_started", "timestamp_ms": 42, "port": 12345},
-            {"kind": "api_server_stopped", "timestamp_ms": 42},
-            {"kind": "api_auth_failed", "timestamp_ms": 42, "method": "POST", "path": "/transcribe"}
+            {"kind": "context", "timestamp_ms": 42, "application": null},
+            {"kind": "context", "timestamp_ms": 42, "application": "Test"}
         ]);
         let events: Vec<VoiceEvent> = serde_json::from_value(fixtures).unwrap();
         for left in &events {
@@ -524,55 +244,24 @@ mod tests {
     }
 
     #[test]
-    fn events_round_trip_through_ndjson() {
-        let event = VoiceEvent::Transcript {
+    fn dictation_events_round_trip_through_ndjson() {
+        let event = VoiceEvent::Dictation {
             timestamp_ms: 42,
-            phase: TranscriptPhase::Completed,
-            latency_ms: 73,
-            text: "Open Zed".into(),
+            phase: DictationPhase::Failed("timeout".into()),
+            text: String::new(),
         };
-
         let json = serde_json::to_string(&event).unwrap();
-        let decoded: VoiceEvent = serde_json::from_str(&json).unwrap();
-
-        assert!(matches!(
-            decoded,
-            VoiceEvent::Transcript {
-                timestamp_ms: 42,
-                phase: TranscriptPhase::Completed,
-                latency_ms: 73,
-                ref text,
-            } if text == "Open Zed"
-        ));
+        assert_eq!(serde_json::from_str::<VoiceEvent>(&json).unwrap(), event);
     }
 
     #[test]
-    fn dictation_processing_observation_round_trips() {
-        let event = VoiceEvent::Dictation {
-            timestamp_ms: 42,
-            phase: DictationPhase::Pasted,
-            text: "Processed text".into(),
-            processing: Some(DictationProcessing {
-                profile: "slack".into(),
-                latency_ms: 321,
-                fallback: Some("deadline exceeded".into()),
-            }),
-        };
-
-        let decoded: VoiceEvent =
-            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
-
-        assert!(matches!(
-            decoded,
-            VoiceEvent::Dictation {
-                processing: Some(DictationProcessing {
-                    profile,
-                    latency_ms: 321,
-                    fallback: Some(fallback),
-                }),
-                ..
-            } if profile == "slack" && fallback == "deadline exceeded"
-        ));
+    fn records_from_removed_features_are_rejected_not_misread() {
+        assert!(
+            serde_json::from_str::<VoiceEvent>(
+                r#"{"kind":"command","timestamp_ms":1,"heard":"x","command":null,"outcome":"ignored"}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -591,157 +280,6 @@ mod tests {
         EventLog::create(&path).unwrap().emit(&event).unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 2);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn reader_tails_complete_records_and_resets_at_session_boundaries() {
-        let path = std::env::temp_dir().join(format!(
-            "voice-control-event-reader-{}-{}.ndjson",
-            std::process::id(),
-            now_ms()
-        ));
-        let mut reader = EventReader::open(&path);
-        fs::write(
-            &path,
-            concat!(
-                "{\"kind\":\"context\",\"timestamp_ms\":1,\"application\":\"Zed\",\"browser_url\":null}\n",
-                "{\"kind\":\"state\",\"timestamp_ms\":2,\"state\":\"listening\",\"device\":\"Test\"}"
-            ),
-        )
-        .unwrap();
-
-        reader.refresh().unwrap();
-        assert_eq!(reader.events().len(), 1);
-        assert_eq!(
-            reader.current_context().cloned(),
-            Some((Some("Zed".into()), None))
-        );
-
-        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        writeln!(file).unwrap();
-        writeln!(file, "{{\"kind\":\"session_started\",\"timestamp_ms\":3}}",).unwrap();
-        writeln!(
-            file,
-            "{{\"kind\":\"state\",\"timestamp_ms\":4,\"state\":\"dictating\",\"device\":\"Test\"}}"
-        )
-        .unwrap();
-
-        reader.refresh().unwrap();
-        assert_eq!(reader.events().len(), 2);
-        assert!(matches!(
-            reader.events().front(),
-            Some(VoiceEvent::SessionStarted { timestamp_ms: 3 })
-        ));
-        assert_eq!(reader.current_context(), None);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn reader_streams_large_logs_and_keeps_context_outside_the_retained_rows() {
-        let path = std::env::temp_dir().join(format!(
-            "hex-large-event-reader-{}-{}.ndjson",
-            std::process::id(),
-            now_ms()
-        ));
-        let log = EventLog::create(&path).unwrap();
-        log.emit(&VoiceEvent::Context {
-            timestamp_ms: 0,
-            application: Some("Fixture".into()),
-            browser_url: None,
-        })
-        .unwrap();
-        for timestamp_ms in 1..=2048 {
-            log.dictation(
-                DictationPhase::Pasted,
-                format!("{timestamp_ms}: {}", "é".repeat(100)),
-            )
-            .unwrap();
-        }
-        log.flush().unwrap();
-        let mut reader = EventReader::open(&path);
-        reader.refresh().unwrap();
-        assert_eq!(reader.offset, fs::metadata(&path).unwrap().len());
-        assert_eq!(reader.events().len(), EVENT_RETENTION);
-        assert_eq!(
-            reader.current_context(),
-            Some(&(Some("Fixture".into()), None))
-        );
-        assert!(
-            matches!(reader.events().back(), Some(VoiceEvent::Dictation { text, .. }) if text.starts_with("2048:"))
-        );
-        // Scratch space follows one record, never the size of the file.
-        assert!(reader.pending.capacity() <= EVENT_READ_BUFFER_BYTES);
-        drop(log);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn reader_skips_oversized_records_through_their_newline_and_recovers() {
-        let path = std::env::temp_dir().join(format!(
-            "hex-oversized-event-reader-{}-{}.ndjson",
-            std::process::id(),
-            now_ms()
-        ));
-        fs::write(&path, vec![b'x'; MAX_EVENT_RECORD_BYTES + 1]).unwrap();
-        let mut reader = EventReader::open(&path);
-        reader.refresh().unwrap();
-        assert!(reader.discarding_record);
-        assert!(reader.pending.is_empty());
-        assert!(reader.pending.capacity() <= MAX_EVENT_RECORD_BYTES);
-
-        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-        // A valid-looking suffix of the oversized line must not become an event.
-        writeln!(file, "{{\"kind\":\"session_started\",\"timestamp_ms\":1}}").unwrap();
-        write!(
-            file,
-            "{{\"kind\":\"context\",\"timestamp_ms\":2,\"application\":\"caf"
-        )
-        .unwrap();
-        file.write_all(&[0xc3]).unwrap();
-        reader.refresh().unwrap();
-        assert!(reader.events().is_empty());
-        assert!(!reader.discarding_record);
-        file.write_all(b"\xa9\",\"browser_url\":null}\r\n").unwrap();
-        reader.refresh().unwrap();
-        assert_eq!(reader.current_context(), Some(&(Some("café".into()), None)));
-        assert_eq!(reader.events().len(), 1);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn reader_resets_partial_record_state_on_truncation_and_replacement() {
-        let path = std::env::temp_dir().join(format!(
-            "hex-replaced-event-reader-{}-{}.ndjson",
-            std::process::id(),
-            now_ms()
-        ));
-        let mut reader = EventReader::open(&path);
-        fs::write(&path, vec![b'x'; MAX_EVENT_RECORD_BYTES + 1]).unwrap();
-        reader.refresh().unwrap();
-        fs::write(
-            &path,
-            b"{\"kind\":\"session_started\",\"timestamp_ms\":3}\n",
-        )
-        .unwrap();
-        reader.refresh().unwrap();
-        assert!(matches!(
-            reader.events().front(),
-            Some(VoiceEvent::SessionStarted { timestamp_ms: 3 })
-        ));
-
-        let replacement = path.with_extension("replacement");
-        fs::write(
-            &replacement,
-            b"{\"kind\":\"session_started\",\"timestamp_ms\":4}\n",
-        )
-        .unwrap();
-        fs::rename(replacement, &path).unwrap();
-        reader.refresh().unwrap();
-        assert!(matches!(
-            reader.events().front(),
-            Some(VoiceEvent::SessionStarted { timestamp_ms: 4 })
-        ));
         fs::remove_file(path).unwrap();
     }
 }

@@ -86,11 +86,12 @@ fn request(url: &str, api_key: &str, body: Option<&str>, timeout: Duration) -> R
 
 fn curl_config(url: &str, api_key: &str, body: Option<&str>) -> Result<Vec<u8>> {
     let authorization = format!("Authorization: Bearer {api_key}");
-    let mut options = vec![
-        ("url", url),
-        ("header", authorization.as_str()),
-        ("header", "X-Title: HEX (OpenRouter fork)"),
-    ];
+    let mut options = vec![("url", url)];
+    // Public endpoints such as the model catalog work without a key.
+    if !api_key.is_empty() {
+        options.push(("header", authorization.as_str()));
+    }
+    options.push(("header", "X-Title: HEX OpenRouter"));
     if let Some(body) = body {
         options.push(("request", "POST"));
         options.push(("header", "Content-Type: application/json"));

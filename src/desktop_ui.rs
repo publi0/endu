@@ -3,54 +3,23 @@ use gpui::{
     rgba,
 };
 
-#[cfg(target_os = "linux")]
-use gpui::{Image, ImageFormat, img};
-#[cfg(target_os = "linux")]
-use std::sync::Arc;
-
 #[derive(Clone, Copy)]
 pub(crate) enum NavigationIcon {
-    Activity,
-    Commands,
-    History,
-    HudLab,
-    Meetings,
-    Modes,
     Settings,
-    VoiceAction,
+    History,
+    Statistics,
 }
 
 impl NavigationIcon {
-    #[cfg(target_os = "macos")]
     fn sf_symbol(self) -> &'static str {
         match self {
             Self::Settings => "slider.horizontal.3",
-            Self::Modes => "square.grid.2x2.fill",
-            Self::VoiceAction => "sparkle",
-            Self::Commands => "command",
             Self::History => "clock.fill",
-            Self::Meetings => "calendar",
-            Self::Activity => "chart.bar",
-            Self::HudLab => "flask",
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn heroicon(self) -> &'static str {
-        match self {
-            Self::Settings => include_str!("../assets/icons/settings.svg"),
-            Self::Modes => include_str!("../assets/icons/modes.svg"),
-            Self::VoiceAction => include_str!("../assets/icons/voice-action.svg"),
-            Self::Commands => include_str!("../assets/icons/commands.svg"),
-            Self::History => include_str!("../assets/icons/history.svg"),
-            Self::Meetings => include_str!("../assets/icons/meetings.svg"),
-            Self::Activity => include_str!("../assets/icons/activity.svg"),
-            Self::HudLab => include_str!("../assets/icons/hud-lab.svg"),
+            Self::Statistics => "chart.bar.fill",
         }
     }
 }
 
-#[cfg(target_os = "macos")]
 fn navigation_icon(icon: NavigationIcon, selected: bool) -> AnyElement {
     gpui_symbols::Icon::new(icon.sf_symbol())
         .size(px(12.0))
@@ -60,7 +29,6 @@ fn navigation_icon(icon: NavigationIcon, selected: bool) -> AnyElement {
         .into_any_element()
 }
 
-#[cfg(target_os = "macos")]
 fn disclosure_chevron() -> AnyElement {
     gpui_symbols::Icon::new("chevron.down")
         .size(px(10.0))
@@ -68,52 +36,6 @@ fn disclosure_chevron() -> AnyElement {
         .weight(gpui_symbols::SymbolWeight::Medium)
         .rendering_mode(gpui_symbols::RenderingMode::Monochrome)
         .into_any_element()
-}
-
-#[cfg(target_os = "macos")]
-fn plus_icon() -> AnyElement {
-    gpui_symbols::Icon::new("plus")
-        .size(px(11.0))
-        .color(rgb(TEXT_SOFT))
-        .weight(gpui_symbols::SymbolWeight::Semibold)
-        .rendering_mode(gpui_symbols::RenderingMode::Monochrome)
-        .into_any_element()
-}
-
-#[cfg(target_os = "linux")]
-fn disclosure_chevron() -> AnyElement {
-    div()
-        .size(px(10.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_size(px(10.0))
-        .text_color(rgb(MUTED))
-        .child("⌄")
-        .into_any_element()
-}
-
-#[cfg(target_os = "linux")]
-fn plus_icon() -> AnyElement {
-    div()
-        .size(px(11.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_size(px(11.0))
-        .text_color(rgb(TEXT_SOFT))
-        .child("+")
-        .into_any_element()
-}
-
-#[cfg(target_os = "linux")]
-fn navigation_icon(icon: NavigationIcon, selected: bool) -> AnyElement {
-    let color = if selected { "#eeeeee" } else { "#858585" };
-    let image = Image::from_bytes(
-        ImageFormat::Svg,
-        icon.heroicon().replace("currentColor", color).into_bytes(),
-    );
-    img(Arc::new(image)).size(px(16.0)).into_any_element()
 }
 
 pub(crate) const SIDEBAR_WIDTH: f32 = 220.0;
@@ -137,7 +59,6 @@ pub(crate) const TEXT_INPUT_HEIGHT: f32 = 34.0;
 pub(crate) const MULTILINE_INPUT_HEIGHT: f32 = 76.0;
 pub(crate) const PANEL_RADIUS: f32 = 10.0;
 pub(crate) const COMPACT_PANEL_HEADER_HEIGHT: f32 = 38.0;
-pub(crate) const SECTION_GAP: f32 = 8.0;
 
 pub(crate) fn window_frame() -> Div {
     div()
@@ -211,26 +132,6 @@ pub(crate) fn pane_list(
         .when_some(error, |list, error| {
             list.child(error_message(error_title, error))
         })
-}
-
-const LIST_ROW_SELECTED: u32 = 0x292929;
-const LIST_ROW_SELECTED_HOVER: u32 = 0x303030;
-
-/// A rounded, selectable row inside a list column.
-pub(crate) fn list_row(selected: bool) -> Div {
-    div()
-        .w_full()
-        .px_3()
-        .py_2()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .rounded(px(6.0))
-        .when(selected, |row| {
-            row.bg(rgb(LIST_ROW_SELECTED))
-                .hover(|row| row.bg(rgb(LIST_ROW_SELECTED_HOVER)))
-        })
-        .when(!selected, |row| row.hover(|row| row.bg(rgb(SURFACE_HOVER))))
 }
 
 pub(crate) fn pane_header(title: &'static str) -> AnyElement {
@@ -316,42 +217,6 @@ pub(crate) fn section_label(label: &'static str) -> AnyElement {
         .text_color(rgb(FAINT))
         .child(label)
         .into_any_element()
-}
-
-pub(crate) fn listener_status(
-    status: impl IntoElement,
-    device: impl IntoElement,
-    active: bool,
-) -> Div {
-    div()
-        .flex()
-        .items_center()
-        .gap_2()
-        .child(
-            div()
-                .size(px(8.0))
-                .flex_none()
-                .rounded_full()
-                .bg(if active { rgb(0x69d89f) } else { rgb(FAINT) }),
-        )
-        .child(
-            div()
-                .min_w(px(0.0))
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(rgb(TEXT_SOFT))
-                        .child(status),
-                )
-                .child(
-                    div()
-                        .text_size(px(10.0))
-                        .text_color(rgb(FAINT))
-                        .child(device),
-                ),
-        )
 }
 
 pub(crate) fn hotkey_keycaps(parts: Vec<String>, opacity: f32) -> AnyElement {
@@ -475,17 +340,6 @@ pub(crate) fn compact_button(label: impl IntoElement) -> Div {
         .child(label)
 }
 
-pub(crate) fn compact_plus_button() -> Div {
-    compact_button(plus_icon())
-        .size(px(28.0))
-        .px_0()
-        .justify_center()
-}
-
-pub(crate) fn compact_header_plus_button() -> Div {
-    compact_plus_button().mr(px(-7.0))
-}
-
 pub(crate) fn compact_panel() -> Div {
     div()
         .w_full()
@@ -514,15 +368,6 @@ pub(crate) fn compact_panel_header(title: impl IntoElement, action: Option<AnyEl
                 .child(title),
         )
         .when_some(action, |header, action| header.child(action))
-}
-
-pub(crate) fn compact_section_label(label: impl IntoElement) -> Div {
-    div()
-        .px_1()
-        .text_size(px(10.0))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(FAINT))
-        .child(label)
 }
 
 pub(crate) fn disclosure_button(label: impl IntoElement) -> Div {
@@ -715,7 +560,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod layout_tests {
     use super::*;
     use gpui::{Context, Render, TestAppContext, Window, size};

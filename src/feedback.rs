@@ -1,5 +1,4 @@
 use std::io::Cursor;
-#[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -13,11 +12,6 @@ use rodio::{Decoder, DeviceSinkBuilder, Source};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Tone {
-    #[cfg(target_os = "macos")]
-    Wake,
-    #[cfg(target_os = "macos")]
-    Sleep,
-    #[cfg(target_os = "macos")]
     Error,
     DictationStart,
     DictationStop,
@@ -29,7 +23,6 @@ static LOADER_STARTED: AtomicBool = AtomicBool::new(false);
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static VOLUME: AtomicU32 = AtomicU32::new(0.5_f32.to_bits());
 
-#[cfg(target_os = "macos")]
 pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
 }
@@ -182,8 +175,7 @@ pub fn preload() -> Result<()> {
                 Tone::DictationStart => &start,
                 Tone::DictationStop => &stop,
                 Tone::Cancel => &cancel,
-                #[cfg(target_os = "macos")]
-                Tone::Wake | Tone::Sleep | Tone::Error => continue,
+                Tone::Error => continue,
             };
             if let Err(error) = output.open_for_tone(Instant::now(), open) {
                 tracing::warn!(%error, "recording audio output unavailable; retrying");
@@ -217,8 +209,7 @@ pub fn play(tone: Tone) {
         Tone::DictationStart | Tone::DictationStop | Tone::Cancel => {
             enqueue(DICTATION_PLAYER.get(), tone);
         }
-        #[cfg(target_os = "macos")]
-        Tone::Wake | Tone::Sleep | Tone::Error => play_system_sound(tone),
+        Tone::Error => play_system_sound(tone),
     }
 }
 
@@ -228,11 +219,8 @@ fn enqueue(player: Option<&SyncSender<Tone>>, tone: Tone) {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn play_system_sound(tone: Tone) {
     let sound = match tone {
-        Tone::Wake => "Pop",
-        Tone::Sleep => "Tink",
         Tone::Error => "Basso",
         Tone::DictationStart | Tone::DictationStop | Tone::Cancel => return,
     };

@@ -1,9 +1,9 @@
 //! Retained dictation history: an owner-only, bounded, crash-safe store of
-//! successful dictation and Voice Action results.
+//! successful dictations.
 //!
 //! History is a product record, deliberately separate from the diagnostic
-//! Activity event stream. Entries hold text and bounded metadata only; audio
-//! is never retained here. Every retention choice remains subject to hard
+//! event stream. Entries hold text and bounded metadata only; audio is never
+//! retained here. Every retention choice remains subject to hard
 //! entry and byte caps, writes are atomic, and files are owner-only.
 
 use std::fs;
@@ -19,7 +19,6 @@ const VERSION: u32 = 1;
 const MAX_ENTRIES: usize = 2_000;
 const MAX_TEXT_BYTES: usize = 16 * 1024;
 const MAX_LABEL_BYTES: usize = 256;
-const MAX_FALLBACK_BYTES: usize = 1_024;
 const MAX_TOTAL_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 pub const MAX_SEARCH_RESULTS: usize = 200;
@@ -64,99 +63,58 @@ impl HistoryRetention {
     }
 }
 
-/// Which successful output produced an entry.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HistoryKind {
-    Dictation,
-    Send,
-    VoiceAction,
-}
-
-impl HistoryKind {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Dictation => "Dictation",
-            Self::Send => "Send",
-            Self::VoiceAction => "Voice Action",
-        }
-    }
-}
-
-/// Bounded record of the post-processing that shaped the final text.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct HistoryProcessing {
-    pub profile: String,
-    pub latency_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback: Option<String>,
-}
-
-#[cfg(target_os = "macos")]
-impl From<crate::dictation_processor::ProcessingObservation> for HistoryProcessing {
-    fn from(observation: crate::dictation_processor::ProcessingObservation) -> Self {
-        Self {
-            profile: observation.profile,
-            latency_ms: observation.latency_ms,
-            fallback: observation.fallback,
-        }
-    }
-}
-
-/// One retained successful result.
+/// One retained successful dictation. Files from older builds load too:
+/// their extra fields are ignored and `final_text` becomes `text`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct HistoryEntry {
     pub id: u64,
     pub timestamp_ms: u64,
-    pub kind: HistoryKind,
-    /// Corrected local transcript before mode processing.
-    pub raw_text: String,
     /// Text that was actually inserted.
-    pub final_text: String,
+    #[serde(alias = "final_text")]
+    pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub application: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub processing: Option<HistoryProcessing>,
     #[serde(default)]
     pub audio_ms: u64,
     #[serde(default)]
     pub inference_ms: u64,
     #[serde(default)]
     pub total_ms: u64,
-    /// Fork: OpenRouter models and latencies.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub openrouter: Option<crate::openrouter::RunReport>,
+    /// The OpenRouter model, latency, fallbacks, and trimming.
+    #[serde(
+        default,
+        rename = "openrouter_transcription",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub transcription: Option<crate::openrouter::StepReport>,
 }
 
 impl HistoryEntry {
     fn text_bytes(&self) -> usize {
-        self.raw_text.len() + self.final_text.len()
+        self.text.len()
     }
 
     fn matches(&self, needle: &str) -> bool {
         let matches_field = |field: &str| field.to_lowercase().contains(needle);
-        matches_field(&self.raw_text)
-            || matches_field(&self.final_text)
+        matches_field(&self.text)
             || self.application.as_deref().is_some_and(matches_field)
             || self
-                .processing
+                .transcription
                 .as_ref()
-                .is_some_and(|processing| matches_field(&processing.profile))
+                .and_then(|report| report.model.as_deref())
+                .is_some_and(matches_field)
     }
 }
 
 /// A successful result awaiting a history identity.
 #[derive(Clone, Debug)]
 pub struct HistoryDraft {
-    pub kind: HistoryKind,
-    pub raw_text: String,
-    pub final_text: String,
+    pub text: String,
     pub application: Option<String>,
-    pub processing: Option<HistoryProcessing>,
     pub audio_ms: u64,
     pub inference_ms: u64,
     pub total_ms: u64,
-    pub openrouter: Option<crate::openrouter::RunReport>,
+    pub transcription: Option<crate::openrouter::StepReport>,
 }
 
 #[derive(Serialize)]
@@ -235,23 +193,16 @@ impl HistoryStore {
         self.entries.push(HistoryEntry {
             id,
             timestamp_ms: now_ms,
-            kind: draft.kind,
-            raw_text: truncated(&draft.raw_text, MAX_TEXT_BYTES),
-            final_text: truncated(&draft.final_text, MAX_TEXT_BYTES),
+            text: truncated(&draft.text, MAX_TEXT_BYTES),
             application: draft
                 .application
                 .map(|application| truncated(&application, MAX_LABEL_BYTES)),
-            processing: draft.processing.map(|processing| HistoryProcessing {
-                profile: truncated(&processing.profile, MAX_LABEL_BYTES),
-                latency_ms: processing.latency_ms,
-                fallback: processing
-                    .fallback
-                    .map(|fallback| truncated(&fallback, MAX_FALLBACK_BYTES)),
-            }),
             audio_ms: draft.audio_ms,
             inference_ms: draft.inference_ms,
             total_ms: draft.total_ms,
-            openrouter: draft.openrouter.map(crate::openrouter::RunReport::bounded),
+            transcription: draft
+                .transcription
+                .map(crate::openrouter::StepReport::bounded),
         });
         self.prune(now_ms);
         self.persist()?;
@@ -307,8 +258,8 @@ impl HistoryStore {
         self.entries.len()
     }
 
-    /// Case-insensitive substring search over text, application, and
-    /// processing profile. Newest first and bounded.
+    /// Case-insensitive substring search over text, application, and model.
+    /// Newest first and bounded.
     pub fn search(&self, query: &str, now_ms: u64) -> Vec<&HistoryEntry> {
         let needle = query.trim().to_lowercase();
         let cutoff = self
@@ -508,19 +459,16 @@ mod tests {
 
     fn draft(text: &str) -> HistoryDraft {
         HistoryDraft {
-            kind: HistoryKind::Dictation,
-            raw_text: format!("raw {text}"),
-            final_text: text.to_string(),
+            text: text.to_string(),
             application: Some("Zed".into()),
-            processing: Some(HistoryProcessing {
-                profile: "Messages".into(),
-                latency_ms: 120,
-                fallback: None,
-            }),
             audio_ms: 900,
             inference_ms: 80,
             total_ms: 1_100,
-            openrouter: None,
+            transcription: Some(crate::openrouter::StepReport {
+                model: Some("openai/whisper-large-v3-turbo".into()),
+                latency_ms: 120,
+                ..Default::default()
+            }),
         }
     }
 
@@ -539,7 +487,7 @@ mod tests {
         assert!(third > second, "deleted IDs are never reused");
         let texts: Vec<_> = reopened
             .entries()
-            .map(|entry| entry.final_text.as_str())
+            .map(|entry| entry.text.as_str())
             .collect();
         assert_eq!(texts, ["third", "first"]);
     }
@@ -554,16 +502,13 @@ mod tests {
 
         // A write one day later prunes the first entry exactly at the cutoff.
         store.record(draft("newest"), day_ms + 1_001).unwrap();
-        let texts: Vec<_> = store
-            .entries()
-            .map(|entry| entry.final_text.as_str())
-            .collect();
+        let texts: Vec<_> = store.entries().map(|entry| entry.text.as_str()).collect();
         assert_eq!(texts, ["newest", "fresh"]);
 
         let reopened = HistoryStore::open(path, HistoryRetention::Day, 2 * day_ms + 500);
         let texts: Vec<_> = reopened
             .entries()
-            .map(|entry| entry.final_text.as_str())
+            .map(|entry| entry.text.as_str())
             .collect();
         assert_eq!(texts, ["newest"]);
     }
@@ -584,7 +529,7 @@ mod tests {
         assert!(store.search("old", day_ms + 1_001).is_empty());
         let matches = store.search("", day_ms + 1_001);
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].final_text, "fresh");
+        assert_eq!(matches[0].text, "fresh");
         assert_eq!(
             store.len(),
             2,
@@ -627,7 +572,7 @@ mod tests {
         tick(day_ms + 1_001);
         let saved: LoadedHistory = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(saved.entries.len(), 1);
-        assert_eq!(saved.entries[0].final_text, "fresh");
+        assert_eq!(saved.entries[0].text, "fresh");
 
         tick(day_ms + 2_001);
         let saved: LoadedHistory = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -703,10 +648,7 @@ mod tests {
 
         store.set_retention(HistoryRetention::Week, now).unwrap();
 
-        let texts: Vec<_> = store
-            .entries()
-            .map(|entry| entry.final_text.as_str())
-            .collect();
+        let texts: Vec<_> = store.entries().map(|entry| entry.text.as_str()).collect();
         assert_eq!(texts, ["two days old"]);
     }
 
@@ -742,7 +684,7 @@ mod tests {
 
         let oversized = "x".repeat(MAX_TEXT_BYTES + 100);
         let id = store.record(draft(&oversized), 9_999_999).unwrap().unwrap();
-        assert_eq!(store.entry(id).unwrap().final_text.len(), MAX_TEXT_BYTES);
+        assert_eq!(store.entry(id).unwrap().text.len(), MAX_TEXT_BYTES);
     }
 
     #[test]
@@ -750,21 +692,18 @@ mod tests {
         let path = temp_path("total-bytes");
         let mut store = HistoryStore::open(path, HistoryRetention::Forever, 0);
         let big = "y".repeat(MAX_TEXT_BYTES - 10);
-        let per_entry = 2 * big.len() + 8;
+        let per_entry = big.len();
         let fits = MAX_TOTAL_TEXT_BYTES / per_entry;
         for index in 0..(fits + 3) {
             store.record(draft(&big), index as u64).unwrap();
         }
-        let total: usize = store
-            .entries()
-            .map(|entry| entry.raw_text.len() + entry.final_text.len())
-            .sum();
+        let total: usize = store.entries().map(|entry| entry.text.len()).sum();
         assert!(total <= MAX_TOTAL_TEXT_BYTES);
         assert!(store.len() < fits + 3);
     }
 
     #[test]
-    fn search_is_case_insensitive_across_text_application_and_profile() {
+    fn search_is_case_insensitive_across_text_application_and_model() {
         let path = temp_path("search");
         let mut store = HistoryStore::open(path, HistoryRetention::Week, 0);
         store.record(draft("Hello World"), 1_000).unwrap();
@@ -772,7 +711,7 @@ mod tests {
 
         assert_eq!(store.search("hello world", 2_000).len(), 1);
         assert_eq!(store.search("zed", 2_000).len(), 2);
-        assert_eq!(store.search("messages", 2_000).len(), 2);
+        assert_eq!(store.search("whisper", 2_000).len(), 2);
         assert_eq!(store.search("absent", 2_000).len(), 0);
         assert_eq!(
             store.search("  ", 2_000).len(),
@@ -817,6 +756,16 @@ mod tests {
 
         let mode = fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn entries_from_older_builds_load_and_keep_their_text() {
+        let entry: HistoryEntry = serde_json::from_str(
+            r#"{"id":1,"timestamp_ms":2,"kind":"voice_action","raw_text":"raw","final_text":"final","processing":{"profile":"Messages","latency_ms":3},"openrouter":{"transcription":{"model":"m","latency_ms":4}}}"#,
+        )
+        .unwrap();
+        assert_eq!(entry.text, "final");
+        assert!(entry.transcription.is_none());
     }
 
     #[test]

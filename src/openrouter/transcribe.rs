@@ -10,19 +10,20 @@ use color_eyre::eyre::{WrapErr, bail, eyre};
 use serde_json::{Value, json};
 
 use super::http::{self, Response};
+use super::stats::{self, ErrorKind, Failure, Sample};
 use super::vad::{self, Trimmed};
-use super::{AudioTrim, Config, StepReport, excerpt};
-use crate::transcription_models::{AUTO_LANGUAGE, TranscriptionSelection};
+use super::{AUTO_LANGUAGE, AudioTrim, Config, StepReport, excerpt};
 
-/// HEX hands transcribers normalized 16 kHz mono samples.
+/// HEX hands the transcriber normalized 16 kHz mono samples.
 pub const SAMPLE_RATE: u32 = 16_000;
 const QUIET_SEARCH_SECONDS: usize = 10;
 const QUIET_FRAME_SAMPLES: usize = SAMPLE_RATE as usize / 10;
 
-pub struct OpenRouterTranscriber {
-    selection: TranscriptionSelection,
-    /// What the last `transcribe` call did, for History.
-    last_report: Option<StepReport>,
+/// A finished transcription. `report` is `None` when nothing was sent
+/// because the clip was empty or had no speech.
+pub struct Transcription {
+    pub text: String,
+    pub report: Option<StepReport>,
 }
 
 /// One model's successful answer in a fallback chain.
@@ -30,104 +31,165 @@ pub struct OpenRouterTranscriber {
 pub(crate) struct Success {
     pub text: String,
     pub model: String,
-    /// Models that failed before `model`, in order.
-    pub failed: Vec<String>,
+    pub usage: Usage,
+    /// Attempts that failed before `model` answered, in order.
+    pub failures: Vec<Failure>,
 }
 
-impl OpenRouterTranscriber {
-    /// Validate that a request could be sent: readable config, at least one
-    /// model, and an API key. No network call is made.
-    pub fn load(selection: &TranscriptionSelection) -> Result<Self> {
-        let config = super::load_config()?;
-        if models(&config).next().is_none() {
-            bail!(
-                "No OpenRouter transcription models are configured in {}",
-                super::config_path()?.display()
-            );
+/// Every model in the chain failed.
+#[derive(Debug)]
+pub(crate) struct ChainFailure {
+    pub failures: Vec<Failure>,
+}
+
+impl std::fmt::Display for ChainFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.failures.is_empty() {
+            return formatter.write_str("No OpenRouter transcription models are configured");
         }
-        super::api_key(&config)?;
-        Ok(Self {
-            selection: selection.clone(),
-            last_report: None,
+        let failures: Vec<String> = self
+            .failures
+            .iter()
+            .map(|failure| failure.detail.clone())
+            .collect();
+        write!(
+            formatter,
+            "OpenRouter transcription failed on every model: {}",
+            failures.join("; ")
+        )
+    }
+}
+
+impl std::error::Error for ChainFailure {}
+
+/// Billing details OpenRouter returns with a transcription.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Usage {
+    pub tokens: u64,
+    pub cost_usd: f64,
+}
+
+/// Transcribe one dictation with the configuration on disk.
+pub fn transcribe(samples: &[f32]) -> Result<Transcription> {
+    let nothing = || {
+        Ok(Transcription {
+            text: String::new(),
+            report: None,
         })
+    };
+    if samples.is_empty() {
+        return nothing();
     }
-
-    pub fn matches_selection(&self, selection: &TranscriptionSelection) -> bool {
-        &self.selection == selection
+    let config = super::load_config()?;
+    if models(&config).next().is_none() {
+        bail!(
+            "No OpenRouter transcription models are configured in {}",
+            super::config_path()?.display()
+        );
     }
-
-    /// Report for the most recent `transcribe` call, once.
-    pub fn take_report(&mut self) -> Option<StepReport> {
-        self.last_report.take()
-    }
-
-    pub fn transcribe(&mut self, samples: &[f32]) -> Result<String> {
-        self.last_report = None;
-        if samples.is_empty() {
-            return Ok(String::new());
-        }
-        let config = super::load_config()?;
-        let recorded_ms = duration_ms(samples.len());
-        let trimmed;
-        let samples = if config.transcription.trim_silence {
-            match vad::trim(samples) {
-                Trimmed::Silent => {
-                    tracing::info!(recorded_ms, "no speech detected; skipped OpenRouter");
-                    return Ok(String::new());
-                }
-                Trimmed::Speech(speech) => {
-                    trimmed = speech;
-                    &trimmed[..]
-                }
+    let recorded_ms = duration_ms(samples.len());
+    let trimmed;
+    let samples = if config.transcription.trim_silence {
+        match vad::trim(samples) {
+            Trimmed::Silent => {
+                tracing::info!(recorded_ms, "no speech detected; skipped OpenRouter");
+                stats::record(&Sample {
+                    skipped_silent: true,
+                    recorded_ms,
+                    ..Sample::default()
+                });
+                return nothing();
             }
-        } else {
-            samples
+            Trimmed::Speech(speech) => {
+                trimmed = speech;
+                &trimmed[..]
+            }
+        }
+    } else {
+        samples
+    };
+    let started = Instant::now();
+    let api_key = super::api_key(&config)?;
+    let language = config.transcription.language.trim();
+    let language = (!language.is_empty() && language != AUTO_LANGUAGE).then_some(language);
+    let url = config.endpoint("audio/transcriptions");
+    // 200 s of 16 kHz 16-bit WAV is ~8.5 MB as base64, under the request cap.
+    let chunk_seconds = config.transcription.chunk_seconds.clamp(10, 200);
+    let chunk_samples = (chunk_seconds * u64::from(SAMPLE_RATE)) as usize;
+    let sent_ms = duration_ms(samples.len());
+    let mut texts = Vec::new();
+    let mut models_used: Vec<String> = Vec::new();
+    let mut failures: Vec<Failure> = Vec::new();
+    let mut usage = Usage::default();
+    for range in chunk_ranges(samples, chunk_samples) {
+        let chunk_started = Instant::now();
+        let audio = encode_base64(&encode_wav(&samples[range])?);
+        let success = match transcribe_with_fallback(
+            &config,
+            &audio,
+            language,
+            |body, timeout| http::post_json(&url, &api_key, body, timeout),
+            std::thread::sleep,
+        ) {
+            Ok(success) => success,
+            Err(failure) => {
+                failures.extend(failure.failures.iter().cloned());
+                stats::record(&Sample {
+                    words: None,
+                    recorded_ms,
+                    sent_ms,
+                    latency_ms: started.elapsed().as_millis() as u64,
+                    tokens: usage.tokens,
+                    cost_usd: usage.cost_usd,
+                    failures,
+                    ..Sample::default()
+                });
+                return Err(failure.into());
+            }
         };
-        let started = Instant::now();
-        let api_key = super::api_key(&config)?;
-        let language =
-            (self.selection.language != AUTO_LANGUAGE).then_some(self.selection.language.as_str());
-        let url = config.endpoint("audio/transcriptions");
-        // 200 s of 16 kHz 16-bit WAV is ~8.5 MB as base64, under the request cap.
-        let chunk_seconds = config.transcription.chunk_seconds.clamp(10, 200);
-        let chunk_samples = (chunk_seconds * u64::from(SAMPLE_RATE)) as usize;
-        let mut texts = Vec::new();
-        let mut models_used: Vec<String> = Vec::new();
-        let mut failed: Vec<String> = Vec::new();
-        for range in chunk_ranges(samples, chunk_samples) {
-            let chunk_started = Instant::now();
-            let audio = encode_base64(&encode_wav(&samples[range])?);
-            let success = transcribe_with_fallback(
-                &config,
-                &audio,
-                language,
-                |body, timeout| http::post_json(&url, &api_key, body, timeout),
-                std::thread::sleep,
-            )?;
-            tracing::info!(
-                model = success.model,
-                latency_ms = chunk_started.elapsed().as_millis(),
-                "OpenRouter transcribed audio chunk"
-            );
-            push_unique(&mut models_used, success.model);
-            for model in success.failed {
-                push_unique(&mut failed, model);
-            }
-            if !success.text.is_empty() {
-                texts.push(success.text);
-            }
+        tracing::info!(
+            model = success.model,
+            latency_ms = chunk_started.elapsed().as_millis(),
+            "OpenRouter transcribed audio chunk"
+        );
+        usage.tokens += success.usage.tokens;
+        usage.cost_usd += success.usage.cost_usd;
+        push_unique(&mut models_used, success.model);
+        failures.extend(success.failures);
+        if !success.text.is_empty() {
+            texts.push(success.text);
         }
-        self.last_report = Some(StepReport {
-            model: Some(models_used.join(", ")),
-            latency_ms: started.elapsed().as_millis() as u64,
+    }
+    let text = texts.join(" ");
+    let latency_ms = started.elapsed().as_millis() as u64;
+    let model = models_used.join(", ");
+    stats::record(&Sample {
+        words: Some(stats::word_count(&text)),
+        model: Some(model.clone()),
+        recorded_ms,
+        sent_ms,
+        latency_ms,
+        tokens: usage.tokens,
+        cost_usd: usage.cost_usd,
+        failures: failures.clone(),
+        skipped_silent: false,
+    });
+    let mut failed: Vec<String> = Vec::new();
+    for failure in failures {
+        push_unique(&mut failed, failure.model);
+    }
+    Ok(Transcription {
+        text,
+        report: Some(StepReport {
+            model: Some(model),
+            latency_ms,
             failed,
             audio: Some(AudioTrim {
                 recorded_ms,
-                sent_ms: duration_ms(samples.len()),
+                sent_ms,
             }),
-        });
-        Ok(texts.join(" "))
-    }
+        }),
+    })
 }
 
 fn duration_ms(samples: usize) -> u64 {
@@ -157,19 +219,22 @@ pub(crate) fn transcribe_with_fallback(
     language: Option<&str>,
     mut send: impl FnMut(&str, Duration) -> Result<Response>,
     mut sleep: impl FnMut(Duration),
-) -> Result<Success> {
+) -> std::result::Result<Success, ChainFailure> {
     let started = Instant::now();
     let total = config.total_timeout();
     let max_rate_limit_wait =
         Duration::from_millis(config.transcription.rate_limit_retry_max_wait_ms);
-    let mut failures = Vec::new();
-    let mut failed_models = Vec::new();
+    let mut failures: Vec<Failure> = Vec::new();
     for model in models(config) {
         let mut retried = false;
         loop {
             let remaining = total.saturating_sub(started.elapsed());
             if remaining.is_zero() {
-                failures.push(format!("{model}: not tried, chain deadline reached"));
+                failures.push(Failure {
+                    model: model.to_owned(),
+                    kind: ErrorKind::Timeout,
+                    detail: format!("{model}: not tried, chain deadline reached"),
+                });
                 break;
             }
             let body = request_body(
@@ -179,23 +244,24 @@ pub(crate) fn transcribe_with_fallback(
                 config.transcription.temperature,
             );
             let timeout = config.attempt_timeout().min(remaining);
-            let failure = match send(&body, timeout) {
+            let (kind, detail) = match send(&body, timeout) {
                 Ok(response) if response.is_success() => match parse_transcript(&response.body) {
-                    Ok(text) => {
+                    Ok((text, usage)) => {
                         if !failures.is_empty() {
                             tracing::warn!(
                                 model,
-                                failures = failures.join("; "),
+                                failed = failures.len(),
                                 "OpenRouter transcription succeeded on a fallback model"
                             );
                         }
                         return Ok(Success {
                             text,
                             model: model.to_owned(),
-                            failed: failed_models,
+                            usage,
+                            failures,
                         });
                     }
-                    Err(error) => format!("{model}: {error}"),
+                    Err(error) => (ErrorKind::InvalidResponse, format!("{model}: {error}")),
                 },
                 Ok(response) => {
                     if response.status == 401 {
@@ -214,27 +280,33 @@ pub(crate) fn transcribe_with_fallback(
                             continue;
                         }
                     }
-                    format!(
-                        "{model}: HTTP {}: {}",
-                        response.status,
-                        excerpt(&response.body)
+                    (
+                        ErrorKind::from_status(response.status),
+                        format!(
+                            "{model}: HTTP {}: {}",
+                            response.status,
+                            excerpt(&response.body)
+                        ),
                     )
                 }
-                Err(error) => format!("{model}: {error}"),
+                Err(error) => {
+                    let message = error.to_string();
+                    (
+                        ErrorKind::from_transport(&message),
+                        format!("{model}: {message}"),
+                    )
+                }
             };
-            tracing::warn!(failure, "OpenRouter transcription attempt failed");
-            failures.push(failure);
-            failed_models.push(model.to_owned());
+            tracing::warn!(failure = detail, "OpenRouter transcription attempt failed");
+            failures.push(Failure {
+                model: model.to_owned(),
+                kind,
+                detail,
+            });
             break;
         }
     }
-    if failures.is_empty() {
-        bail!("No OpenRouter transcription models are configured");
-    }
-    bail!(
-        "OpenRouter transcription failed on every model: {}",
-        failures.join("; ")
-    )
+    Err(ChainFailure { failures })
 }
 
 fn request_body(
@@ -256,7 +328,7 @@ fn request_body(
     body.to_string()
 }
 
-fn parse_transcript(body: &[u8]) -> Result<String> {
+fn parse_transcript(body: &[u8]) -> Result<(String, Usage)> {
     let value: Value = serde_json::from_slice(body)
         .wrap_err_with(|| format!("invalid JSON response: {}", excerpt(body)))?;
     if let Some(error) = value.get("error") {
@@ -267,11 +339,22 @@ fn parse_transcript(body: &[u8]) -> Result<String> {
             .unwrap_or_else(|| error.to_string());
         bail!("provider error: {message}");
     }
-    value
+    let text = value
         .get("text")
         .and_then(Value::as_str)
         .map(|text| text.trim().to_owned())
-        .ok_or_else(|| eyre!("response has no text: {}", excerpt(body)))
+        .ok_or_else(|| eyre!("response has no text: {}", excerpt(body)))?;
+    let usage = value.get("usage");
+    let number = |key: &str| usage.and_then(|usage| usage.get(key));
+    Ok((
+        text,
+        Usage {
+            tokens: number("total_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            cost_usd: number("cost").and_then(Value::as_f64).unwrap_or_default(),
+        },
+    ))
 }
 
 pub(crate) fn encode_wav(samples: &[f32]) -> Result<Vec<u8>> {
@@ -402,7 +485,7 @@ mod tests {
         .unwrap();
         assert_eq!(success.text, "olá mundo");
         assert_eq!(success.model, "a");
-        assert!(success.failed.is_empty());
+        assert!(success.failures.is_empty());
         assert_eq!(*calls.borrow(), ["a"]);
     }
 
@@ -437,9 +520,20 @@ mod tests {
         .unwrap();
         assert_eq!(success.text, "done");
         assert_eq!(success.model, "good");
+        let failed: Vec<(&str, ErrorKind)> = success
+            .failures
+            .iter()
+            .map(|failure| (failure.model.as_str(), failure.kind))
+            .collect();
         assert_eq!(
-            success.failed,
-            ["transport", "server", "garbage", "provider", "missing"]
+            failed,
+            [
+                ("transport", ErrorKind::Network),
+                ("server", ErrorKind::Server),
+                ("garbage", ErrorKind::InvalidResponse),
+                ("provider", ErrorKind::InvalidResponse),
+                ("missing", ErrorKind::InvalidResponse),
+            ]
         );
         assert_eq!(calls.borrow().len(), 6);
     }
@@ -466,7 +560,7 @@ mod tests {
         .unwrap();
         assert_eq!(success.text, "ok");
         assert_eq!(success.model, "a");
-        assert!(success.failed.is_empty(), "a retry is not a fallback");
+        assert!(success.failures.is_empty(), "a retry is not a fallback");
         assert_eq!(*calls.borrow(), ["a", "a"]);
         assert_eq!(*slept.borrow(), [Duration::from_secs(1)]);
     }
@@ -487,8 +581,14 @@ mod tests {
             },
             |_| {},
         )
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        assert!(
+            error
+                .failures
+                .iter()
+                .all(|failure| failure.kind == ErrorKind::RateLimited)
+        );
+        let error = error.to_string();
         assert_eq!(*calls.borrow(), ["slow", "twice", "twice"]);
         assert!(error.contains("slow: HTTP 429"), "{error}");
         assert!(error.contains("twice: HTTP 429"), "{error}");
@@ -508,6 +608,19 @@ mod tests {
         assert!(error.contains("a: HTTP 500"), "{error}");
         assert!(error.contains("b: HTTP 500"), "{error}");
         assert!(!error.contains(" : "), "blank models are skipped: {error}");
+    }
+
+    #[test]
+    fn usage_is_read_when_present() {
+        let (text, usage) = parse_transcript(
+            br#"{"text":" oi ","usage":{"seconds":3,"total_tokens":42,"cost":0.0012}}"#,
+        )
+        .unwrap();
+        assert_eq!(text, "oi");
+        assert_eq!(usage.tokens, 42);
+        assert!((usage.cost_usd - 0.0012).abs() < 1e-9);
+        let (_, usage) = parse_transcript(br#"{"text":"oi"}"#).unwrap();
+        assert_eq!(usage, Usage::default());
     }
 
     #[test]

@@ -8,26 +8,15 @@ use objc2::MainThreadMarker;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use serde::{Deserialize, Serialize};
 
-use crate::transcription_models::{TranscriptionModelId, TranscriptionSelection};
-
 static RECORDING_AUDIO_BEHAVIOR: AtomicU8 = AtomicU8::new(0);
 static DOUBLE_TAP_LOCK: AtomicBool = AtomicBool::new(true);
 static DOUBLE_TAP_ONLY: AtomicBool = AtomicBool::new(false);
-static MICROPHONE_POLICY: AtomicU8 = AtomicU8::new(0);
-static CUSTOM_TRANSFORMATIONS_ENABLED: AtomicBool = AtomicBool::new(false);
+static RELEASE_MICROPHONE_WHILE_IDLE: AtomicBool = AtomicBool::new(false);
 static HOTKEYS: OnceLock<RwLock<RuntimeHotkeys>> = OnceLock::new();
 static PASTE_KEY_CODE: OnceLock<u16> = OnceLock::new();
 static HOTKEY_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SETTINGS_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static TRANSCRIPTION_SELECTION: OnceLock<RwLock<RuntimeTranscriptionSelection>> = OnceLock::new();
 static MICROPHONE_SELECTION: OnceLock<RwLock<RuntimeMicrophoneSelection>> = OnceLock::new();
-static VOICE_ACTION_SETTINGS: OnceLock<RwLock<VoiceActionSettings>> = OnceLock::new();
-
-#[derive(Default)]
-struct RuntimeTranscriptionSelection {
-    revision: u64,
-    selection: TranscriptionSelection,
-}
 
 #[derive(Default)]
 struct RuntimeMicrophoneSelection {
@@ -103,16 +92,6 @@ impl HotkeyModifiers {
             control: None,
             shift: None,
             command: None,
-            function: false,
-        }
-    }
-
-    pub const fn option_command() -> Self {
-        Self {
-            option: Some(ModifierSide::Either),
-            command: Some(ModifierSide::Either),
-            control: None,
-            shift: None,
             function: false,
         }
     }
@@ -217,32 +196,11 @@ impl Default for HotkeyBinding {
 }
 
 impl HotkeyBinding {
-    pub fn edit_default() -> Self {
-        Self {
-            modifiers: HotkeyModifiers::option_command(),
-            key: None,
-        }
-    }
-
     pub fn paste_last_default() -> Self {
         Self {
             modifiers: HotkeyModifiers {
                 option: Some(ModifierSide::Either),
                 shift: Some(ModifierSide::Either),
-                ..Default::default()
-            },
-            key: Some(HotkeyKey {
-                code: paste_key_code(),
-                label: "V".into(),
-            }),
-        }
-    }
-
-    pub fn paste_meeting_default() -> Self {
-        Self {
-            modifiers: HotkeyModifiers {
-                option: Some(ModifierSide::Either),
-                control: Some(ModifierSide::Either),
                 ..Default::default()
             },
             key: Some(HotkeyKey {
@@ -275,13 +233,6 @@ impl HotkeyBinding {
             modifiers: self.modifiers,
             key_code: self.key.as_ref().map(|key| key.code),
         }
-    }
-
-    #[cfg(test)]
-    pub fn is_modifier_prefix_of(&self, other: &Self) -> bool {
-        self.key.is_none()
-            && other.modifiers.contains(self.modifiers)
-            && (self.modifiers != other.modifiers || other.key.is_some())
     }
 
     pub fn overlaps(&self, other: &Self) -> bool {
@@ -389,19 +340,14 @@ fn side_from_flags(flags: u64, general: u64, left: u64, right: u64) -> Option<Mo
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeHotkeys {
     pub dictation: RuntimeHotkey,
-    pub edit: Option<RuntimeHotkey>,
     pub paste_last: Option<RuntimeHotkey>,
-    pub paste_meeting: Option<RuntimeHotkey>,
 }
 
 impl Default for RuntimeHotkeys {
     fn default() -> Self {
         Self {
             dictation: HotkeyBinding::default().runtime(),
-            edit: None,
             paste_last: Some(HotkeyBinding::paste_last_default().runtime()),
-            paste_meeting: crate::DEVELOPER_FEATURES_ENABLED
-                .then(|| HotkeyBinding::paste_meeting_default().runtime()),
         }
     }
 }
@@ -413,85 +359,6 @@ pub enum RecordingAudioBehavior {
     PauseMedia,
     #[default]
     DoNothing,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default)]
-pub struct DictationProcessingSettings {
-    pub default_mode: DictationMode,
-    pub modes: Vec<DictationMode>,
-}
-
-impl Default for DictationProcessingSettings {
-    fn default() -> Self {
-        Self {
-            default_mode: DictationMode {
-                name: "Global".into(),
-                ..Default::default()
-            },
-            modes: Vec::new(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default)]
-pub struct DictationMode {
-    pub name: String,
-    pub applications: Vec<String>,
-    pub browser_hosts: Vec<String>,
-    pub replacements: Vec<TextReplacement>,
-    pub transformations: Vec<String>,
-    pub post_processing: DictationPostProcessing,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default)]
-pub struct DictationPostProcessing {
-    pub enabled: bool,
-    pub prompt: String,
-    pub model: Option<String>,
-    pub variant: Option<String>,
-    pub deadline_seconds: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(default)]
-pub struct VoiceActionSettings {
-    pub enabled: bool,
-    pub model: Option<String>,
-    pub variant: Option<String>,
-    pub deadline_seconds: u64,
-}
-
-impl Default for VoiceActionSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            model: None,
-            variant: None,
-            deadline_seconds: 60,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(default)]
-pub struct TextReplacement {
-    pub matched_phrase: String,
-    pub output: String,
-}
-
-impl Default for DictationPostProcessing {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            prompt: "Rewrite the transcript into clear, natural text while preserving the speaker's intended meaning.".into(),
-            model: None,
-            variant: None,
-            deadline_seconds: 30,
-        }
-    }
 }
 
 impl RecordingAudioBehavior {
@@ -525,7 +392,6 @@ impl RecordingAudioBehavior {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AppSettings {
-    pub commands_enabled: bool,
     pub release_microphone_while_idle: bool,
     pub sound_effects: bool,
     pub sound_effect_volume: f32,
@@ -534,34 +400,14 @@ pub struct AppSettings {
     pub double_tap_lock: bool,
     pub double_tap_only: bool,
     pub dictation_hotkey: HotkeyBinding,
-    #[serde(
-        default = "HotkeyBinding::edit_default",
-        deserialize_with = "deserialize_edit_hotkey"
-    )]
-    pub edit_hotkey: HotkeyBinding,
     pub paste_last_hotkey: Option<HotkeyBinding>,
     pub show_dock_icon: bool,
-    pub transcription: TranscriptionSelection,
-    pub transcription_recents: Vec<TranscriptionSelection>,
-    pub dictation_processing: DictationProcessingSettings,
-    pub voice_action: VoiceActionSettings,
     pub history_retention: crate::history::HistoryRetention,
-    #[serde(skip_serializing)]
-    pub text_replacements: Vec<TextReplacement>,
-}
-
-fn deserialize_edit_hotkey<'de, D>(deserializer: D) -> std::result::Result<HotkeyBinding, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(Option::<HotkeyBinding>::deserialize(deserializer)?
-        .unwrap_or_else(HotkeyBinding::edit_default))
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            commands_enabled: false,
             release_microphone_while_idle: false,
             sound_effects: true,
             sound_effect_volume: 0.5,
@@ -570,75 +416,14 @@ impl Default for AppSettings {
             double_tap_lock: true,
             double_tap_only: false,
             dictation_hotkey: HotkeyBinding::default(),
-            edit_hotkey: HotkeyBinding::edit_default(),
             paste_last_hotkey: Some(HotkeyBinding::paste_last_default()),
             show_dock_icon: true,
-            transcription: TranscriptionSelection::default(),
-            transcription_recents: Vec::new(),
-            dictation_processing: DictationProcessingSettings::default(),
-            voice_action: VoiceActionSettings::default(),
             history_retention: crate::history::HistoryRetention::default(),
-            text_replacements: Vec::new(),
         }
     }
 }
 
 impl AppSettings {
-    pub fn transcription_for_model(&self, id: TranscriptionModelId) -> TranscriptionSelection {
-        if self.transcription.model == id {
-            return self.transcription.clone();
-        }
-        if let Some(selection) = self.transcription_recents.iter().rev().find(|selection| {
-            selection.model == id && crate::transcription_models::validate(selection).is_ok()
-        }) {
-            return selection.clone();
-        }
-        let model = crate::transcription_models::definition(id);
-        let language = if model.supports_language(&self.transcription.language) {
-            self.transcription.language.clone()
-        } else if model.supports_language("en") {
-            "en".into()
-        } else {
-            model.languages[0].into()
-        };
-        TranscriptionSelection {
-            model: id,
-            language,
-            recognition_hints: String::new(),
-        }
-    }
-
-    pub fn remember_transcription(&mut self, selection: TranscriptionSelection) {
-        self.transcription_recents.push(self.transcription.clone());
-        self.transcription_recents.push(selection.clone());
-        self.normalize_transcription_recents();
-        self.transcription = selection;
-    }
-
-    fn normalize_transcription_recents(&mut self) {
-        let mut seen = std::collections::HashSet::new();
-        self.transcription_recents.reverse();
-        self.transcription_recents.retain(|selection| {
-            crate::transcription_models::validate(selection).is_ok() && seen.insert(selection.model)
-        });
-        self.transcription_recents.reverse();
-    }
-
-    pub fn save_transcription(&mut self, selection: TranscriptionSelection) -> Result<()> {
-        self.save_transcription_with(selection, Self::save)
-    }
-
-    fn save_transcription_with(
-        &mut self,
-        selection: TranscriptionSelection,
-        save: impl FnOnce(&Self) -> Result<()>,
-    ) -> Result<()> {
-        crate::transcription_models::validate(&selection)?;
-        let mut candidate = self.clone();
-        candidate.remember_transcription(selection);
-        self.commit_with(candidate, save)
-    }
-
     /// Persist the entire candidate before replacing the current editor value.
     /// The candidate may include unrelated debounced edits, which must survive
     /// both failed immediate changes and successful commits.
@@ -650,52 +435,6 @@ impl AppSettings {
         save(&candidate)?;
         *self = candidate;
         Ok(())
-    }
-
-    fn normalize_microphone_policy(&mut self) {
-        if self.commands_enabled && self.release_microphone_while_idle {
-            tracing::warn!("disabled voice commands because idle microphone release is enabled");
-            self.commands_enabled = false;
-        }
-    }
-
-    fn validate_microphone_policy(&self) -> Result<()> {
-        if self.commands_enabled && self.release_microphone_while_idle {
-            return Err(eyre!(
-                "voice commands require the microphone to remain ready"
-            ));
-        }
-        Ok(())
-    }
-
-    pub fn set_commands_enabled(&mut self, enabled: bool) -> Result<()> {
-        if enabled && self.release_microphone_while_idle {
-            return Err(eyre!(
-                "disable idle microphone release before enabling voice commands"
-            ));
-        }
-        self.commands_enabled = enabled;
-        Ok(())
-    }
-
-    pub fn set_release_microphone_while_idle(&mut self, enabled: bool) -> Result<()> {
-        if enabled && self.commands_enabled {
-            return Err(eyre!(
-                "disable voice commands before enabling idle microphone release"
-            ));
-        }
-        self.release_microphone_while_idle = enabled;
-        Ok(())
-    }
-
-    pub fn keep_microphone_ready_and_enable_commands(&mut self) {
-        self.release_microphone_while_idle = false;
-        self.commands_enabled = true;
-    }
-
-    pub fn disable_commands_and_release_microphone(&mut self) {
-        self.commands_enabled = false;
-        self.release_microphone_while_idle = true;
     }
 
     fn normalize_double_tap_settings(&mut self) {
@@ -715,15 +454,7 @@ impl AppSettings {
             Ok(data) => {
                 let mut settings: Self = serde_json::from_slice(&data)?;
                 let loaded = serde_json::to_value(&settings)?;
-                settings.normalize_microphone_policy();
-                settings.dictation_processing.default_mode.name = "Global".into();
                 settings.normalize_double_tap_settings();
-                settings.migrate_legacy_replacements();
-                settings.normalize_mode_application_names();
-                settings.migrate_disabled_transcription_model();
-                settings.normalize_transcription_recents();
-                crate::transcription_models::validate(&settings.transcription)?;
-                settings.repair_hotkey_conflict();
                 if serde_json::to_value(&settings)? != loaded
                     && let Err(error) = settings.write_to(path)
                 {
@@ -744,7 +475,6 @@ impl AppSettings {
     }
 
     fn write_to(&self, path: &std::path::Path) -> Result<()> {
-        self.validate_microphone_policy()?;
         let parent = path
             .parent()
             .ok_or_else(|| eyre!("settings path has no parent"))?;
@@ -760,22 +490,7 @@ impl AppSettings {
     }
 
     fn apply_runtime(&self) {
-        let policy =
-            u8::from(self.commands_enabled) | (u8::from(self.release_microphone_while_idle) << 1);
-        MICROPHONE_POLICY.store(policy, Ordering::Release);
-        CUSTOM_TRANSFORMATIONS_ENABLED.store(
-            !self
-                .dictation_processing
-                .default_mode
-                .transformations
-                .is_empty()
-                || self
-                    .dictation_processing
-                    .modes
-                    .iter()
-                    .any(|mode| !mode.transformations.is_empty()),
-            Ordering::Release,
-        );
+        RELEASE_MICROPHONE_WHILE_IDLE.store(self.release_microphone_while_idle, Ordering::Release);
         crate::feedback::set_enabled(self.sound_effects);
         crate::feedback::set_volume(self.sound_effect_volume.clamp(0.0, 1.0));
         RECORDING_AUDIO_BEHAVIOR.store(self.recording_audio_behavior.encoded(), Ordering::Relaxed);
@@ -788,114 +503,13 @@ impl AppSettings {
             .get_or_init(Default::default)
             .write()
             .unwrap_or_else(|error| error.into_inner()) = self.runtime_hotkeys();
-        set_transcription_selection(&self.transcription);
         set_microphone_selection(self.microphone.as_deref());
-        crate::config::update_dictation_profiles(&self.dictation_processing);
-        *VOICE_ACTION_SETTINGS
-            .get_or_init(Default::default)
-            .write()
-            .unwrap_or_else(|error| error.into_inner()) = self.voice_action.clone();
-    }
-
-    /// Mode activations saved while Finder showed filename extensions carry a
-    /// `.app` suffix that never matched the foreground application name.
-    fn normalize_mode_application_names(&mut self) {
-        let modes = std::iter::once(&mut self.dictation_processing.default_mode)
-            .chain(self.dictation_processing.modes.iter_mut());
-        for mode in modes {
-            let mut mode_migrated = false;
-            for application in &mut mode.applications {
-                let normalized = crate::context::strip_bundle_extension(application).to_owned();
-                if normalized != *application {
-                    *application = normalized;
-                    mode_migrated = true;
-                }
-            }
-            if mode_migrated {
-                mode.applications.sort_by_key(|name| name.to_lowercase());
-                mode.applications.dedup();
-            }
-        }
-    }
-
-    fn migrate_legacy_replacements(&mut self) {
-        if self.text_replacements.is_empty() {
-            return;
-        }
-        if self
-            .dictation_processing
-            .default_mode
-            .replacements
-            .is_empty()
-        {
-            self.dictation_processing.default_mode.replacements = self.text_replacements.clone();
-        }
-        for mode in &mut self.dictation_processing.modes {
-            if mode.replacements.is_empty() {
-                mode.replacements = self.text_replacements.clone();
-            }
-        }
-        self.text_replacements.clear();
-    }
-
-    fn migrate_disabled_transcription_model(&mut self) {
-        if crate::transcription_models::definition(self.transcription.model).available() {
-            return;
-        }
-        tracing::warn!(
-            model = self.transcription.model.as_str(),
-            "replaced a disabled transcription model"
-        );
-        self.transcription = TranscriptionSelection::default();
     }
 
     pub fn runtime_hotkeys(&self) -> RuntimeHotkeys {
         RuntimeHotkeys {
             dictation: self.dictation_hotkey.runtime(),
-            edit: self
-                .voice_action
-                .enabled
-                .then(|| self.edit_hotkey.runtime()),
             paste_last: self.paste_last_hotkey.as_ref().map(HotkeyBinding::runtime),
-            paste_meeting: crate::DEVELOPER_FEATURES_ENABLED
-                .then(|| HotkeyBinding::paste_meeting_default().runtime()),
-        }
-    }
-
-    fn repair_hotkey_conflict(&mut self) {
-        if !self.voice_action.enabled
-            || !hotkeys_conflict(&self.dictation_hotkey, &self.edit_hotkey)
-        {
-            return;
-        }
-        let edit_with_key = crate::keyboard::key_code_for('e')
-            .ok()
-            .map(|code| HotkeyBinding {
-                modifiers: HotkeyModifiers::option_command(),
-                key: Some(HotkeyKey {
-                    code,
-                    label: "E".into(),
-                }),
-            });
-        let control_command = HotkeyBinding {
-            modifiers: HotkeyModifiers {
-                control: Some(ModifierSide::Either),
-                command: Some(ModifierSide::Either),
-                ..Default::default()
-            },
-            key: None,
-        };
-        if let Some(binding) = [
-            Some(HotkeyBinding::edit_default()),
-            edit_with_key,
-            Some(control_command),
-        ]
-        .into_iter()
-        .flatten()
-        .find(|binding| !hotkeys_conflict(&self.dictation_hotkey, binding))
-        {
-            tracing::warn!("replaced a conflicting Voice Action shortcut");
-            self.edit_hotkey = binding;
         }
     }
 }
@@ -903,10 +517,6 @@ impl AppSettings {
 fn settings_temporary_path(path: &std::path::Path) -> PathBuf {
     let sequence = SETTINGS_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     path.with_extension(format!("json.{}.{}.tmp", std::process::id(), sequence))
-}
-
-pub fn hotkeys_conflict(dictation: &HotkeyBinding, edit: &HotkeyBinding) -> bool {
-    dictation.overlaps(edit)
 }
 
 pub fn hotkey_conflicts(
@@ -937,45 +547,12 @@ pub fn microphone_selection() -> (u64, Option<String>) {
     (state.revision, state.device.clone())
 }
 
-fn set_transcription_selection(selection: &TranscriptionSelection) {
-    let state = TRANSCRIPTION_SELECTION.get_or_init(Default::default);
-    let mut state = state.write().unwrap_or_else(|error| error.into_inner());
-    if state.selection != *selection {
-        state.revision = state.revision.wrapping_add(1);
-        state.selection = selection.clone();
-    }
-}
-
-pub fn transcription_selection() -> (u64, TranscriptionSelection) {
-    let state = TRANSCRIPTION_SELECTION.get_or_init(Default::default);
-    let state = state.read().unwrap_or_else(|error| error.into_inner());
-    (state.revision, state.selection.clone())
-}
-
 pub fn recording_audio_behavior() -> RecordingAudioBehavior {
     RecordingAudioBehavior::decode(RECORDING_AUDIO_BEHAVIOR.load(Ordering::Relaxed))
 }
 
-pub fn commands_enabled() -> bool {
-    microphone_policy().commands_enabled
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MicrophonePolicy {
-    pub commands_enabled: bool,
-    pub release_while_idle: bool,
-}
-
-pub fn microphone_policy() -> MicrophonePolicy {
-    let policy = MICROPHONE_POLICY.load(Ordering::Acquire);
-    MicrophonePolicy {
-        commands_enabled: policy & 1 != 0,
-        release_while_idle: policy & 2 != 0,
-    }
-}
-
-pub fn custom_transformations_enabled() -> bool {
-    CUSTOM_TRANSFORMATIONS_ENABLED.load(Ordering::Acquire)
+pub fn release_microphone_while_idle() -> bool {
+    RELEASE_MICROPHONE_WHILE_IDLE.load(Ordering::Acquire)
 }
 
 pub fn double_tap_lock() -> bool {
@@ -995,18 +572,6 @@ pub fn runtime_hotkeys() -> RuntimeHotkeys {
 
 pub fn dictation_hotkey() -> RuntimeHotkey {
     runtime_hotkeys().dictation
-}
-
-pub fn edit_hotkey() -> Option<RuntimeHotkey> {
-    runtime_hotkeys().edit
-}
-
-pub fn voice_action_settings() -> VoiceActionSettings {
-    VOICE_ACTION_SETTINGS
-        .get_or_init(Default::default)
-        .read()
-        .unwrap_or_else(|error| error.into_inner())
-        .clone()
 }
 
 pub fn hotkey_capture_active() -> bool {
@@ -1059,7 +624,6 @@ mod tests {
     #[test]
     fn missing_fields_receive_defaults() {
         let settings: AppSettings = serde_json::from_str("{}").unwrap();
-        assert!(!settings.commands_enabled);
         assert!(!settings.release_microphone_while_idle);
         assert!(settings.sound_effects);
         assert_eq!(settings.sound_effect_volume, 0.5);
@@ -1071,24 +635,20 @@ mod tests {
         assert!(settings.double_tap_lock);
         assert!(!settings.double_tap_only);
         assert_eq!(settings.dictation_hotkey, HotkeyBinding::default());
-        assert_eq!(settings.edit_hotkey, HotkeyBinding::edit_default());
         assert_eq!(
             settings.paste_last_hotkey,
             Some(HotkeyBinding::paste_last_default())
         );
         assert!(settings.show_dock_icon);
-        assert_eq!(settings.transcription, TranscriptionSelection::default());
-        assert!(
-            !settings
-                .dictation_processing
-                .default_mode
-                .post_processing
-                .enabled
-        );
-        assert!(settings.voice_action.model.is_none());
-        assert!(settings.voice_action.variant.is_none());
-        assert_eq!(settings.voice_action.deadline_seconds, 60);
-        assert!(settings.text_replacements.is_empty());
+    }
+
+    #[test]
+    fn settings_from_older_builds_still_load() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{"commands_enabled":true,"edit_hotkey":null,"transcription":{"model":"parakeet_v3"},"voice_action":{"enabled":true},"double_tap_lock":false}"#,
+        )
+        .unwrap();
+        assert!(!settings.double_tap_lock);
     }
 
     #[test]
@@ -1151,34 +711,6 @@ mod tests {
     }
 
     #[test]
-    fn loading_strips_finder_bundle_extensions_from_mode_applications() {
-        let directory = std::env::temp_dir().join(format!(
-            "hex-mode-applications-{}-{}",
-            std::process::id(),
-            SETTINGS_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed),
-        ));
-        fs::create_dir(&directory).unwrap();
-        let path = directory.join("settings.json");
-        fs::write(
-            &path,
-            br#"{"dictation_processing":{"modes":[{"name":"Code","applications":["Zed.app","Ghostty.app","Zed"]}]}}"#,
-        )
-        .unwrap();
-
-        let settings = AppSettings::load_from(&path).unwrap();
-        assert_eq!(
-            settings.dictation_processing.modes[0].applications,
-            vec!["Ghostty".to_string(), "Zed".to_string()]
-        );
-        let persisted: AppSettings = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(
-            persisted.dictation_processing.modes[0].applications,
-            vec!["Ghostty".to_string(), "Zed".to_string()]
-        );
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
     fn loading_persists_normalizations_only_when_they_change_settings() {
         let directory = std::env::temp_dir().join(format!(
             "hex-normalized-settings-{}-{}",
@@ -1189,23 +721,20 @@ mod tests {
         let path = directory.join("settings.json");
         fs::write(
             &path,
-            br#"{"text_replacements":[{"matched_phrase":"open code","output":"OpenCode"}]}"#,
+            br#"{"double_tap_lock":false,"double_tap_only":true,"voice_action":{"enabled":true}}"#,
         )
         .unwrap();
 
         let settings = AppSettings::load_from(&path).unwrap();
-        assert!(settings.text_replacements.is_empty());
+        assert!(!settings.double_tap_only);
         let persisted = fs::read_to_string(&path).unwrap();
-        assert!(!persisted.contains("text_replacements"));
-        assert!(persisted.contains("OpenCode"));
+        assert!(!persisted.contains("voice_action"));
+        assert!(persisted.contains("\"double_tap_only\": false"));
 
         let written = fs::metadata(&path).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         let reloaded = AppSettings::load_from(&path).unwrap();
-        assert_eq!(
-            reloaded.dictation_processing.default_mode.replacements,
-            settings.dictation_processing.default_mode.replacements
-        );
+        assert_eq!(reloaded.double_tap_only, settings.double_tap_only);
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), written);
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1252,266 +781,6 @@ mod tests {
         let serialized = serde_json::to_value(settings).unwrap();
 
         assert!(serialized.get("prevent_system_sleep").is_none());
-    }
-
-    #[test]
-    fn microphone_policy_requires_explicit_combined_transitions() {
-        let mut settings = AppSettings::default();
-        settings.set_release_microphone_while_idle(true).unwrap();
-        assert!(settings.set_commands_enabled(true).is_err());
-        assert!(!settings.commands_enabled);
-        assert!(settings.release_microphone_while_idle);
-
-        settings.keep_microphone_ready_and_enable_commands();
-        assert!(settings.commands_enabled);
-        assert!(!settings.release_microphone_while_idle);
-        assert!(settings.set_release_microphone_while_idle(true).is_err());
-
-        settings.disable_commands_and_release_microphone();
-        assert!(!settings.commands_enabled);
-        assert!(settings.release_microphone_while_idle);
-    }
-
-    #[test]
-    fn invalid_persisted_microphone_policy_prefers_idle_release() {
-        let mut settings: AppSettings = serde_json::from_str(
-            r#"{"commands_enabled":true,"release_microphone_while_idle":true}"#,
-        )
-        .unwrap();
-
-        settings.normalize_microphone_policy();
-        assert!(!settings.commands_enabled);
-        assert!(settings.release_microphone_while_idle);
-        assert!(settings.validate_microphone_policy().is_ok());
-    }
-
-    #[test]
-    fn legacy_disabled_edit_shortcut_migrates_to_the_new_default() {
-        let settings: AppSettings = serde_json::from_str(r#"{"edit_hotkey":null}"#).unwrap();
-
-        assert_eq!(settings.edit_hotkey, HotkeyBinding::edit_default());
-    }
-
-    #[test]
-    fn transcription_selection_round_trips() {
-        let settings = AppSettings {
-            transcription: TranscriptionSelection {
-                model: crate::transcription_models::TranscriptionModelId::WhisperLargeV3Turbo,
-                language: "zh".into(),
-                recognition_hints: "OpenCode, Effect".into(),
-            },
-            ..AppSettings::default()
-        };
-
-        let encoded = serde_json::to_string(&settings).unwrap();
-        let decoded: AppSettings = serde_json::from_str(&encoded).unwrap();
-
-        assert_eq!(decoded.transcription, settings.transcription);
-        assert!(crate::transcription_models::validate(&decoded.transcription).is_ok());
-    }
-
-    #[test]
-    fn model_switches_remember_language_and_hints_without_changing_other_settings() {
-        let french = TranscriptionSelection {
-            model: TranscriptionModelId::WhisperLargeV3Turbo,
-            language: "fr".into(),
-            recognition_hints: "Example project".into(),
-        };
-        let mut settings = AppSettings {
-            show_dock_icon: false,
-            microphone: Some("Test microphone".into()),
-            ..Default::default()
-        };
-        settings.remember_transcription(french.clone());
-        assert_eq!(
-            settings
-                .transcription_for_model(TranscriptionModelId::ParakeetV2)
-                .language,
-            "en"
-        );
-        assert_eq!(
-            settings
-                .transcription_for_model(TranscriptionModelId::CohereTranscribe)
-                .language,
-            "fr"
-        );
-        settings.remember_transcription(TranscriptionSelection::default());
-        let encoded = serde_json::to_vec(&settings).unwrap();
-        let mut decoded: AppSettings = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(
-            decoded.transcription_for_model(TranscriptionModelId::WhisperLargeV3Turbo),
-            french
-        );
-        for _ in 0..100 {
-            decoded.remember_transcription(french.clone());
-            decoded.remember_transcription(TranscriptionSelection::default());
-        }
-        assert_eq!(decoded.transcription_recents.len(), 2);
-        assert!(!decoded.show_dock_icon);
-        assert_eq!(decoded.microphone.as_deref(), Some("Test microphone"));
-        let old: AppSettings = serde_json::from_str("{}").unwrap();
-        assert!(old.transcription_recents.is_empty());
-    }
-
-    #[test]
-    fn failed_model_selection_save_preserves_selection_recents_and_unsaved_edits() {
-        let mut settings = AppSettings::default();
-        settings.dictation_processing.default_mode.name = "Unsaved mode".into();
-        let before = serde_json::to_value(&settings).unwrap();
-        let candidate = TranscriptionSelection {
-            model: TranscriptionModelId::WhisperLargeV3Turbo,
-            language: "fr".into(),
-            recognition_hints: String::new(),
-        };
-        let error = settings
-            .save_transcription_with(candidate.clone(), |next| {
-                assert_eq!(next.transcription, candidate);
-                assert_eq!(next.dictation_processing.default_mode.name, "Unsaved mode");
-                Err(eyre!("fixture save failed"))
-            })
-            .unwrap_err();
-        assert_eq!(error.to_string(), "fixture save failed");
-        assert_eq!(serde_json::to_value(&settings).unwrap(), before);
-        settings
-            .save_transcription_with(candidate.clone(), |_| Ok(()))
-            .unwrap();
-        assert_eq!(settings.transcription, candidate);
-        assert_eq!(
-            settings.dictation_processing.default_mode.name,
-            "Unsaved mode"
-        );
-    }
-
-    #[test]
-    fn invalid_remembered_languages_are_not_offered_by_model_switching() {
-        let mut settings = AppSettings {
-            transcription_recents: vec![
-                TranscriptionSelection {
-                    model: TranscriptionModelId::ParakeetV2,
-                    language: "fr".into(),
-                    recognition_hints: String::new(),
-                },
-                TranscriptionSelection {
-                    model: TranscriptionModelId::WhisperLargeV3Turbo,
-                    language: "not-a-language".into(),
-                    recognition_hints: String::new(),
-                },
-            ],
-            ..Default::default()
-        };
-        assert_eq!(
-            settings
-                .transcription_for_model(TranscriptionModelId::ParakeetV2)
-                .language,
-            "en"
-        );
-        assert_eq!(
-            settings
-                .transcription_for_model(TranscriptionModelId::WhisperLargeV3Turbo)
-                .language,
-            "en"
-        );
-        settings.normalize_transcription_recents();
-        assert!(settings.transcription_recents.is_empty());
-    }
-
-    #[test]
-    fn automatic_language_selection_round_trips_explicitly() {
-        let settings = AppSettings {
-            transcription: TranscriptionSelection {
-                model: crate::transcription_models::TranscriptionModelId::WhisperLargeV3Turbo,
-                language: crate::transcription_models::AUTO_LANGUAGE.into(),
-                recognition_hints: String::new(),
-            },
-            ..AppSettings::default()
-        };
-
-        let encoded = serde_json::to_string(&settings).unwrap();
-        let decoded: AppSettings = serde_json::from_str(&encoded).unwrap();
-
-        assert!(encoded.contains(r#""language":"auto""#));
-        assert_eq!(decoded.transcription, settings.transcription);
-        assert!(crate::transcription_models::validate(&decoded.transcription).is_ok());
-    }
-
-    #[test]
-    fn disabled_apple_speech_selection_migrates_to_the_default_model() {
-        let mut settings: AppSettings = serde_json::from_str(
-            r#"{"transcription":{"model":"apple_speech","language":"de","recognition_hints":""}}"#,
-        )
-        .unwrap();
-
-        settings.migrate_disabled_transcription_model();
-        assert_eq!(settings.transcription, TranscriptionSelection::default());
-    }
-
-    #[test]
-    fn voice_action_requires_explicit_opt_in_for_new_and_existing_settings() {
-        for json in [
-            r#"{}"#,
-            r#"{"voice_action":{"model":"example/model-a","variant":"fast"}}"#,
-        ] {
-            let settings: AppSettings = serde_json::from_str(json).unwrap();
-            assert!(settings.runtime_hotkeys().edit.is_none());
-            let saved = serde_json::to_value(settings).unwrap();
-            assert_eq!(saved["voice_action"]["enabled"], false);
-        }
-    }
-
-    #[test]
-    fn voice_action_settings_round_trip() {
-        let settings = AppSettings {
-            voice_action: VoiceActionSettings {
-                enabled: true,
-                model: Some("example/rewrite-model".into()),
-                variant: Some("fast".into()),
-                deadline_seconds: 12,
-            },
-            ..AppSettings::default()
-        };
-
-        let encoded = serde_json::to_string(&settings).unwrap();
-        let decoded: AppSettings = serde_json::from_str(&encoded).unwrap();
-
-        assert!(decoded.voice_action.enabled);
-        assert_eq!(
-            decoded.runtime_hotkeys().edit,
-            Some(decoded.edit_hotkey.runtime())
-        );
-        assert_eq!(decoded.voice_action.model, settings.voice_action.model);
-        assert_eq!(decoded.voice_action.variant, settings.voice_action.variant);
-        assert_eq!(decoded.voice_action.deadline_seconds, 12);
-    }
-
-    #[test]
-    fn legacy_global_replacements_migrate_into_every_mode() {
-        let mut settings: AppSettings = serde_json::from_str(
-            r#"{"text_replacements":[{"matched_phrase":"open code","output":"OpenCode"}]}"#,
-        )
-        .unwrap();
-        settings.dictation_processing.modes.push(DictationMode {
-            name: "Messages".into(),
-            ..DictationMode::default()
-        });
-        settings.migrate_legacy_replacements();
-
-        assert_eq!(
-            settings.dictation_processing.default_mode.replacements,
-            [TextReplacement {
-                matched_phrase: "open code".into(),
-                output: "OpenCode".into(),
-            }]
-        );
-        assert_eq!(
-            settings.dictation_processing.modes[0].replacements,
-            settings.dictation_processing.default_mode.replacements
-        );
-        assert!(settings.text_replacements.is_empty());
-        assert!(
-            !serde_json::to_string(&settings)
-                .unwrap()
-                .contains("text_replacements")
-        );
     }
 
     #[test]
@@ -1699,59 +968,6 @@ mod tests {
                 hotkeys.paste_last,
                 Some(HotkeyBinding::paste_last_default().runtime())
             );
-            #[cfg(debug_assertions)]
-            assert_eq!(
-                hotkeys.paste_meeting,
-                Some(HotkeyBinding::paste_meeting_default().runtime())
-            );
-            #[cfg(not(debug_assertions))]
-            assert_eq!(hotkeys.paste_meeting, None);
         }
-    }
-
-    #[test]
-    fn edit_shortcut_cannot_shadow_the_dictation_shortcut() {
-        let option = HotkeyBinding::default();
-        let option_command = HotkeyBinding::edit_default();
-
-        assert!(option.is_modifier_prefix_of(&option_command));
-        assert!(!option_command.is_modifier_prefix_of(&option));
-    }
-
-    #[test]
-    fn old_dictation_binding_cannot_be_taken_over_by_the_new_edit_default() {
-        let mut settings = AppSettings {
-            dictation_hotkey: HotkeyBinding::edit_default(),
-            edit_hotkey: HotkeyBinding::edit_default(),
-            ..Default::default()
-        };
-        settings.voice_action.enabled = true;
-
-        settings.repair_hotkey_conflict();
-
-        assert!(!hotkeys_conflict(
-            &settings.dictation_hotkey,
-            &settings.edit_hotkey
-        ));
-    }
-
-    #[test]
-    fn disabled_voice_action_preserves_its_binding_without_reserving_it() {
-        let mut settings = AppSettings {
-            dictation_hotkey: HotkeyBinding::edit_default(),
-            ..Default::default()
-        };
-        let saved_binding = settings.edit_hotkey.clone();
-        settings.repair_hotkey_conflict();
-        assert_eq!(settings.edit_hotkey, saved_binding);
-        assert!(settings.runtime_hotkeys().edit.is_none());
-        settings.voice_action.enabled = true;
-        assert_eq!(
-            settings.runtime_hotkeys().edit,
-            Some(saved_binding.runtime())
-        );
-        settings.voice_action.enabled = false;
-        assert!(settings.runtime_hotkeys().edit.is_none());
-        assert_eq!(settings.edit_hotkey, saved_binding);
     }
 }

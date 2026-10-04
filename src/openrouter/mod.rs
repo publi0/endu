@@ -1,28 +1,24 @@
-//! Fork-only OpenRouter runtime: cloud transcription with an ordered model
-//! fallback chain and optional LLM cleanup of the transcript.
-//!
-//! Everything fork-specific lives under this module so upstream merges touch
-//! as few shared files as possible. The behavior is compiled in by the
-//! `openrouter` Cargo feature (see `FORK.md`); without it the module is inert
-//! and HEX keeps its upstream local-model behavior.
+//! Cloud transcription through OpenRouter with an ordered model fallback
+//! chain, silence trimming, and per-dictation reports for History.
 //!
 //! Configuration is a JSON file in Application Support (`openrouter.json`),
 //! re-read on every request so edits apply without restarting. The API key
 //! comes from `OPENROUTER_API_KEY`, the config file, or the macOS Keychain
 //! (`security add-generic-password -s hex-openrouter -a openrouter -w`).
 
-#[cfg(test)]
-mod catalog_tests;
-pub mod cleanup;
+pub mod catalog;
 pub mod form;
 mod http;
 pub mod report;
 #[cfg(target_os = "macos")]
 pub mod settings_view;
+pub mod stats;
+#[cfg(target_os = "macos")]
+pub mod stats_view;
 pub mod transcribe;
 mod vad;
 
-pub use report::{AudioTrim, RunReport, StepReport};
+pub use report::{AudioTrim, StepReport};
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -34,21 +30,48 @@ use color_eyre::Result;
 use color_eyre::eyre::{WrapErr, bail};
 use serde::{Deserialize, Serialize};
 
-/// True when this binary is the OpenRouter fork build.
-pub const ENABLED: bool = cfg!(feature = "openrouter");
-
-/// The fork keeps its settings, logs, and lock apart from an installed
-/// upstream HEX (`voice-control`), so the two apps never share state.
-pub const SUPPORT_DIR_NAME: Option<&str> = if ENABLED {
-    Some("hex-openrouter")
-} else {
-    None
-};
-
 pub const CONFIG_FILE: &str = "openrouter.json";
 pub const KEYCHAIN_SERVICE: &str = "hex-openrouter";
 pub const KEYCHAIN_ACCOUNT: &str = "openrouter";
 pub const API_KEY_ENV: &str = "OPENROUTER_API_KEY";
+pub const AUTO_LANGUAGE: &str = "auto";
+
+/// Languages offered in Settings, as ISO-639-1 codes for the API.
+pub const LANGUAGES: &[(&str, &str)] = &[
+    (AUTO_LANGUAGE, "Auto-detect"),
+    ("pt", "Portuguese"),
+    ("en", "English"),
+    ("es", "Spanish"),
+    ("fr", "French"),
+    ("de", "German"),
+    ("it", "Italian"),
+    ("nl", "Dutch"),
+    ("pl", "Polish"),
+    ("ru", "Russian"),
+    ("uk", "Ukrainian"),
+    ("tr", "Turkish"),
+    ("ar", "Arabic"),
+    ("hi", "Hindi"),
+    ("zh", "Chinese"),
+    ("ja", "Japanese"),
+    ("ko", "Korean"),
+    ("vi", "Vietnamese"),
+    ("id", "Indonesian"),
+    ("sv", "Swedish"),
+    ("da", "Danish"),
+    ("fi", "Finnish"),
+    ("cs", "Czech"),
+    ("el", "Greek"),
+    ("ro", "Romanian"),
+    ("hu", "Hungarian"),
+];
+
+pub fn language_name(code: &str) -> &str {
+    LANGUAGES
+        .iter()
+        .find_map(|(candidate, name)| (*candidate == code).then_some(*name))
+        .unwrap_or(code)
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
@@ -59,7 +82,6 @@ pub struct Config {
     /// OpenRouter-compatible API root.
     pub base_url: String,
     pub transcription: TranscriptionConfig,
-    pub cleanup: CleanupConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -68,6 +90,8 @@ pub struct TranscriptionConfig {
     /// Tried in order. Any failure (transport, timeout, HTTP error, invalid
     /// response) moves on to the next model.
     pub models: Vec<String>,
+    /// ISO-639-1 code sent to the provider, or `auto` to let it detect.
+    pub language: String,
     /// Deadline for one request to one model.
     pub attempt_timeout_seconds: u64,
     /// Deadline for the whole fallback chain of one audio chunk.
@@ -85,26 +109,12 @@ pub struct TranscriptionConfig {
     pub trim_silence: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(default)]
-pub struct CleanupConfig {
-    /// Off by default: when on, a text model rewrites each dictation before
-    /// Modes processing. Any failure pastes the raw transcript instead.
-    pub enabled: bool,
-    pub models: Vec<String>,
-    pub timeout_seconds: u64,
-    /// Replaces the built-in system prompt when set.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt: Option<String>,
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
             api_key: None,
             base_url: "https://openrouter.ai/api/v1".into(),
             transcription: TranscriptionConfig::default(),
-            cleanup: CleanupConfig::default(),
         }
     }
 }
@@ -117,26 +127,13 @@ impl Default for TranscriptionConfig {
                 "openai/gpt-4o-mini-transcribe".into(),
                 "mistralai/voxtral-mini-transcribe".into(),
             ],
+            language: AUTO_LANGUAGE.into(),
             attempt_timeout_seconds: 30,
             total_timeout_seconds: 90,
             chunk_seconds: 120,
             rate_limit_retry_max_wait_ms: 2_000,
             temperature: Some(0.0),
             trim_silence: true,
-        }
-    }
-}
-
-impl Default for CleanupConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            models: vec![
-                "openai/gpt-4o-mini".into(),
-                "google/gemini-2.5-flash".into(),
-            ],
-            timeout_seconds: 15,
-            prompt: None,
         }
     }
 }
@@ -233,17 +230,6 @@ pub enum KeyStatus {
     /// Stored in the Keychain; the last four characters, for recognition.
     Keychain(String),
     Missing,
-}
-
-impl KeyStatus {
-    pub fn label(&self) -> String {
-        match self {
-            Self::Environment => "Using OPENROUTER_API_KEY from the environment".into(),
-            Self::ConfigFile => "Using api_key from openrouter.json".into(),
-            Self::Keychain(suffix) => format!("Saved in the Keychain · …{suffix}"),
-            Self::Missing => "No API key yet".into(),
-        }
-    }
 }
 
 /// Blocking: may run `security`. Call off the UI thread.
@@ -532,9 +518,20 @@ mod tests {
         .unwrap();
         assert_eq!(config.transcription.models, ["a/b"]);
         assert_eq!(config.transcription.attempt_timeout_seconds, 30);
-        assert!(config.cleanup.enabled);
-        assert_eq!(config.cleanup.models, CleanupConfig::default().models);
+        assert_eq!(config.transcription.language, AUTO_LANGUAGE);
+        assert!(config.transcription.trim_silence);
         assert_eq!(config.base_url, "https://openrouter.ai/api/v1");
+    }
+
+    #[test]
+    fn languages_are_iso_639_1_and_named() {
+        assert!(
+            LANGUAGES
+                .iter()
+                .all(|(code, _)| *code == AUTO_LANGUAGE || code.len() == 2)
+        );
+        assert_eq!(language_name("pt"), "Portuguese");
+        assert_eq!(language_name("xx"), "xx");
     }
 
     #[test]
@@ -552,7 +549,7 @@ mod tests {
         let dir = temp_dir("save");
         let path = dir.join(CONFIG_FILE);
         let mut config = Config::default();
-        config.cleanup.enabled = true;
+        config.transcription.language = "pt".into();
         config.transcription.models = vec!["x/y".into()];
         save_config_at(&path, &config).unwrap();
         assert_eq!(load_config_at(&path).unwrap(), config);

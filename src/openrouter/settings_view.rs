@@ -1,139 +1,168 @@
-//! Fork: the OpenRouter section of Settings. A self-contained GPUI view that
-//! `app_window` embeds with one line, so upstream UI changes rarely conflict.
+//! The OpenRouter sections of Settings: the API key, language, silence
+//! trimming, the primary and fallback models, and advanced request limits.
+//! Every control saves `openrouter.json` immediately; the next dictation
+//! reads it.
+
+use std::rc::Rc;
 
 use gpui::{
-    AnyElement, Context, Entity, FontWeight, IntoElement, Render, SharedString, Subscription,
-    Window, div, prelude::*, px, rgb,
+    AnyElement, App, Context, Entity, Focusable, FontWeight, IntoElement, MouseDownEvent, Render,
+    SharedString, Subscription, Window, deferred, div, prelude::*, px, rgb,
 };
 
-use super::form::Form;
+use super::catalog::{self, CatalogModel};
+use super::form::{self, AdvancedForm, MAX_FALLBACKS};
 use super::{Config, KeyStatus};
 use crate::desktop_ui::{
-    ACCENT, FAINT, LINE, MUTED, NEGATIVE, SURFACE_SELECTED, TEXT, TEXT_SOFT, compact_button,
-    settings_panel, settings_section_label, toggle,
+    ACCENT, CONTROL_HEIGHT, FAINT, LINE, MUTED, NEGATIVE, SURFACE, SURFACE_HOVER, SURFACE_SELECTED,
+    TEXT, TEXT_SOFT, compact_button, disclosure_button, settings_panel, settings_row,
+    settings_section_label, toggle,
 };
-use crate::text_input::{Changed, Submitted, TextInput};
+use crate::text_input::{Changed, Dismissed, Navigate, Submitted, TextInput};
 
-const WIDE_INPUT: f32 = 420.0;
+const MODEL_BUTTON_WIDTH: f32 = 300.0;
+const KEY_INPUT_WIDTH: f32 = 300.0;
 const NARROW_INPUT: f32 = 120.0;
+const WIDE_INPUT: f32 = 300.0;
+const PICKER_WIDTH: f32 = 380.0;
+const KEYS_URL: &str = "https://openrouter.ai/keys";
 
-/// The view, or `None` outside the OpenRouter build.
-pub fn new<V: 'static>(cx: &mut Context<V>) -> Option<Entity<OpenRouterSettings>> {
-    super::ENABLED.then(|| cx.new(|cx| OpenRouterSettings::new(false, cx)))
+pub fn new<V: 'static>(cx: &mut Context<V>) -> Entity<OpenRouterSettings> {
+    cx.new(|cx| OpenRouterSettings::new(false, cx))
 }
 
-/// Just the API key row, for the first-run setup sheet: the key has to be
-/// enterable before the sheet lets the rest of Settings through.
-pub fn new_key_setup<V: 'static>(cx: &mut Context<V>) -> Option<Entity<OpenRouterSettings>> {
-    super::ENABLED.then(|| cx.new(|cx| OpenRouterSettings::new(true, cx)))
+/// Just the API key row, for the first-run setup sheet.
+pub fn new_key_setup<V: 'static>(cx: &mut Context<V>) -> Entity<OpenRouterSettings> {
+    cx.new(|cx| OpenRouterSettings::new(true, cx))
 }
 
-/// Whether the setup sheet should offer the key row.
-pub fn setup_needs_key(selected: crate::transcription_models::TranscriptionModelId) -> bool {
-    super::ENABLED && selected == crate::transcription_models::TranscriptionModelId::OpenRouter
+/// Where the last action's outcome is shown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Scope {
+    Key,
+    Models,
+    Advanced,
 }
 
-#[derive(Clone, Copy)]
-enum InputKind {
-    Single,
-    Multiline,
+enum CatalogState {
+    Idle,
+    Loading,
+    Loaded(Vec<CatalogModel>),
+    Failed(String),
 }
 
-pub struct OpenRouterSettings {
-    key_only: bool,
-    base: Config,
-    key_input: Entity<TextInput>,
-    key_status: Option<KeyStatus>,
+impl CatalogState {
+    fn models(&self) -> &[CatalogModel] {
+        match self {
+            Self::Loaded(models) => models,
+            Self::Idle | Self::Loading | Self::Failed(_) => &[],
+        }
+    }
+}
+
+struct ModelPicker {
+    slot: usize,
+    search: Entity<TextInput>,
+    highlight: usize,
+    _subscriptions: Vec<Subscription>,
+}
+
+/// One row in the open model picker.
+#[derive(Clone, Debug, PartialEq)]
+enum PickerChoice {
+    Catalog(CatalogModel),
+    Custom(String),
+}
+
+impl PickerChoice {
+    fn id(&self) -> &str {
+        match self {
+            Self::Catalog(model) => &model.id,
+            Self::Custom(id) => id,
+        }
+    }
+}
+
+struct AdvancedInputs {
     base_url: Entity<TextInput>,
-    transcription_models: Entity<TextInput>,
     attempt_timeout: Entity<TextInput>,
     total_timeout: Entity<TextInput>,
     chunk_seconds: Entity<TextInput>,
     rate_limit_wait: Entity<TextInput>,
     temperature: Entity<TextInput>,
-    trim_silence: bool,
-    cleanup_enabled: bool,
-    cleanup_models: Entity<TextInput>,
-    cleanup_timeout: Entity<TextInput>,
-    cleanup_prompt: Entity<TextInput>,
-    dirty: bool,
+}
+
+pub struct OpenRouterSettings {
+    key_only: bool,
+    config: Config,
+    key_status: Option<KeyStatus>,
+    key_editing: bool,
+    key_remove_armed: bool,
+    key_input: Entity<TextInput>,
+    catalog: CatalogState,
+    picker: Option<ModelPicker>,
+    language_picker_open: bool,
+    advanced_open: bool,
+    advanced: AdvancedInputs,
+    advanced_dirty: bool,
     busy: bool,
-    /// `(ok, text)` for the last action.
-    message: Option<(bool, String)>,
+    message: Option<(Scope, bool, String)>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl OpenRouterSettings {
     fn new(key_only: bool, cx: &mut Context<Self>) -> Self {
-        let (base, message) = match super::load_config() {
+        let (config, message) = match super::load_config() {
             Ok(config) => (config, None),
             Err(error) => (
                 Config::default(),
                 Some((
+                    Scope::Models,
                     false,
-                    format!("{error:#}. Saving will replace the file with these values."),
+                    format!("{error:#}. Changing a setting replaces the file."),
                 )),
             ),
         };
-        let form = Form::from_config(&base);
         let mut subscriptions = Vec::new();
-        let mut field =
-            |kind: InputKind, placeholder: &'static str, value: &str, cx: &mut Context<Self>| {
-                let value = value.to_owned();
-                let entity = cx.new(|cx| match kind {
-                    InputKind::Single => TextInput::new(cx, placeholder, &value),
-                    InputKind::Multiline => TextInput::multiline(cx, placeholder, &value),
-                });
-                subscriptions.push(cx.subscribe(&entity, |this, _, _: &Changed, cx| {
-                    this.dirty = true;
-                    this.message = None;
-                    cx.notify();
-                }));
-                entity
-            };
-        use InputKind::{Multiline, Single};
-        let base_url = field(Single, "https://openrouter.ai/api/v1", &form.base_url, cx);
-        let transcription_models = field(
-            Multiline,
-            "openai/whisper-large-v3-turbo",
-            &form.transcription_models,
-            cx,
-        );
-        let attempt_timeout = field(Single, "30", &form.attempt_timeout_seconds, cx);
-        let total_timeout = field(Single, "90", &form.total_timeout_seconds, cx);
-        let chunk_seconds = field(Single, "120", &form.chunk_seconds, cx);
-        let rate_limit_wait = field(Single, "2000", &form.rate_limit_retry_max_wait_ms, cx);
-        let temperature = field(Single, "provider default", &form.temperature, cx);
-        let cleanup_models = field(Multiline, "openai/gpt-4o-mini", &form.cleanup_models, cx);
-        let cleanup_timeout = field(Single, "15", &form.cleanup_timeout_seconds, cx);
-        let cleanup_prompt = field(
-            Multiline,
-            "Empty uses the built-in prompt: fix punctuation and recognition errors, drop filler words, keep the wording.",
-            &form.cleanup_prompt,
-            cx,
-        );
-        let key_input = cx.new(|cx| TextInput::new(cx, "Paste a key (sk-or-v1-…)", ""));
+        let key_input = cx.new(|cx| TextInput::new(cx, "sk-or-v1-…", ""));
         subscriptions.push(cx.subscribe(&key_input, |this, _, _: &Submitted, cx| {
             this.save_key(cx);
         }));
+        let form = AdvancedForm::from_config(&config);
+        let mut field = |placeholder: &'static str, value: &str, cx: &mut Context<Self>| {
+            let value = value.to_owned();
+            let entity = cx.new(|cx| TextInput::new(cx, placeholder, &value));
+            subscriptions.push(cx.subscribe(&entity, |this, _, _: &Changed, cx| {
+                this.advanced_dirty = true;
+                this.clear_message(Scope::Advanced);
+                cx.notify();
+            }));
+            subscriptions.push(cx.subscribe(&entity, |this, _, _: &Submitted, cx| {
+                this.save_advanced(cx);
+            }));
+            entity
+        };
+        let advanced = AdvancedInputs {
+            base_url: field("https://openrouter.ai/api/v1", &form.base_url, cx),
+            attempt_timeout: field("30", &form.attempt_timeout_seconds, cx),
+            total_timeout: field("90", &form.total_timeout_seconds, cx),
+            chunk_seconds: field("120", &form.chunk_seconds, cx),
+            rate_limit_wait: field("2000", &form.rate_limit_retry_max_wait_ms, cx),
+            temperature: field("provider default", &form.temperature, cx),
+        };
         let mut view = Self {
             key_only,
-            base,
-            key_input,
+            config,
             key_status: None,
-            base_url,
-            transcription_models,
-            attempt_timeout,
-            total_timeout,
-            chunk_seconds,
-            rate_limit_wait,
-            temperature,
-            trim_silence: form.trim_silence,
-            cleanup_enabled: form.cleanup_enabled,
-            cleanup_models,
-            cleanup_timeout,
-            cleanup_prompt,
-            dirty: false,
+            key_editing: false,
+            key_remove_armed: false,
+            key_input,
+            catalog: CatalogState::Idle,
+            picker: None,
+            language_picker_open: false,
+            advanced_open: false,
+            advanced,
+            advanced_dirty: false,
             busy: false,
             message,
             _subscriptions: subscriptions,
@@ -142,89 +171,41 @@ impl OpenRouterSettings {
         view
     }
 
-    fn form(&self, cx: &Context<Self>) -> Form {
-        let text = |input: &Entity<TextInput>| input.read(cx).text().to_owned();
-        Form {
-            base_url: text(&self.base_url),
-            transcription_models: text(&self.transcription_models),
-            attempt_timeout_seconds: text(&self.attempt_timeout),
-            total_timeout_seconds: text(&self.total_timeout),
-            chunk_seconds: text(&self.chunk_seconds),
-            rate_limit_retry_max_wait_ms: text(&self.rate_limit_wait),
-            temperature: text(&self.temperature),
-            trim_silence: self.trim_silence,
-            cleanup_enabled: self.cleanup_enabled,
-            cleanup_models: text(&self.cleanup_models),
-            cleanup_timeout_seconds: text(&self.cleanup_timeout),
-            cleanup_prompt: text(&self.cleanup_prompt),
+    fn clear_message(&mut self, scope: Scope) {
+        if self
+            .message
+            .as_ref()
+            .is_some_and(|(current, ..)| *current == scope)
+        {
+            self.message = None;
         }
     }
 
-    fn load_form(&mut self, form: &Form, cx: &mut Context<Self>) {
-        let set = |input: &Entity<TextInput>, value: &str, cx: &mut Context<Self>| {
-            input.update(cx, |input, cx| input.set_text(value, cx));
-        };
-        set(&self.base_url, &form.base_url, cx);
-        set(&self.transcription_models, &form.transcription_models, cx);
-        set(&self.attempt_timeout, &form.attempt_timeout_seconds, cx);
-        set(&self.total_timeout, &form.total_timeout_seconds, cx);
-        set(&self.chunk_seconds, &form.chunk_seconds, cx);
-        set(
-            &self.rate_limit_wait,
-            &form.rate_limit_retry_max_wait_ms,
-            cx,
-        );
-        set(&self.temperature, &form.temperature, cx);
-        set(&self.cleanup_models, &form.cleanup_models, cx);
-        set(&self.cleanup_timeout, &form.cleanup_timeout_seconds, cx);
-        set(&self.cleanup_prompt, &form.cleanup_prompt, cx);
-        self.cleanup_enabled = form.cleanup_enabled;
-        self.trim_silence = form.trim_silence;
-        self.dirty = false;
+    fn report(&mut self, scope: Scope, result: Result<String, String>) {
+        self.message = Some(match result {
+            Ok(text) => (scope, true, text),
+            Err(text) => (scope, false, text),
+        });
     }
 
-    fn save(&mut self, cx: &mut Context<Self>) {
-        let config = match self.form(cx).apply(&self.base) {
-            Ok(config) => config,
-            Err(error) => {
-                self.message = Some((false, error));
-                cx.notify();
-                return;
-            }
-        };
-        match super::save_config(&config) {
-            Ok(()) => {
-                self.base = config;
-                self.dirty = false;
-                self.message = Some((true, "Saved. The next dictation uses it.".into()));
-            }
-            Err(error) => self.message = Some((false, format!("{error:#}"))),
-        }
-        cx.notify();
-    }
-
-    fn revert(&mut self, cx: &mut Context<Self>) {
-        match super::load_config() {
+    /// Saves `candidate` as the new configuration, reporting under `scope`.
+    fn commit(&mut self, scope: Scope, candidate: Result<Config, String>, success: &str) -> bool {
+        let saved = candidate.and_then(|config| {
+            super::save_config(&config)
+                .map(|()| config)
+                .map_err(|error| format!("{error:#}"))
+        });
+        match saved {
             Ok(config) => {
-                self.base = config;
-                let form = Form::from_config(&self.base);
-                self.load_form(&form, cx);
-                self.message = None;
+                self.config = config;
+                self.report(scope, Ok(success.to_owned()));
+                true
             }
-            Err(error) => self.message = Some((false, format!("{error:#}"))),
+            Err(error) => {
+                self.report(scope, Err(error));
+                false
+            }
         }
-        cx.notify();
-    }
-
-    fn reset_defaults(&mut self, cx: &mut Context<Self>) {
-        let defaults = Config {
-            api_key: self.base.api_key.clone(),
-            ..Config::default()
-        };
-        self.load_form(&Form::from_config(&defaults), cx);
-        self.dirty = true;
-        self.message = Some((true, "Defaults loaded. Save to apply them.".into()));
-        cx.notify();
     }
 
     /// Run blocking work (Keychain, network) off the UI thread.
@@ -250,68 +231,314 @@ impl OpenRouterSettings {
         .detach();
     }
 
+    // ---- API key -------------------------------------------------------
+
     fn refresh_key_status(&mut self, cx: &mut Context<Self>) {
-        let config = self.base.clone();
+        let config = self.config.clone();
         self.run(
             cx,
             move || super::key_status(&config),
-            |this, status, _| this.key_status = Some(status),
+            |this, status, _| {
+                this.key_editing = matches!(status, KeyStatus::Missing);
+                this.key_status = Some(status);
+            },
         );
     }
 
+    fn begin_key_replacement(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.key_editing = true;
+        self.key_remove_armed = false;
+        self.clear_message(Scope::Key);
+        self.key_input
+            .update(cx, |input, cx| input.set_text("", cx));
+        self.key_input.focus_handle(cx).focus(window);
+        cx.notify();
+    }
+
+    fn cancel_key_replacement(&mut self, cx: &mut Context<Self>) {
+        self.key_editing = matches!(self.key_status, Some(KeyStatus::Missing) | None);
+        self.key_input
+            .update(cx, |input, cx| input.set_text("", cx));
+        self.clear_message(Scope::Key);
+        cx.notify();
+    }
+
     fn save_key(&mut self, cx: &mut Context<Self>) {
-        let key = self.key_input.read(cx).text().to_owned();
+        let key = self.key_input.read(cx).text().trim().to_owned();
         if let Err(error) = super::validate_key(&key) {
-            self.message = Some((false, error.to_string()));
+            self.report(Scope::Key, Err(error.to_string()));
             cx.notify();
             return;
         }
-        let config = self.base.clone();
+        let config = self.config.clone();
         self.run(
             cx,
-            move || super::store_keychain_key(&key).map(|()| super::key_status(&config)),
+            move || {
+                super::store_keychain_key(&key)
+                    .map(|()| (super::key_status(&config), super::check_key(&config)))
+            },
             |this, result, cx| match result {
-                Ok(status) => {
+                Ok((status, check)) => {
                     this.key_input
                         .update(cx, |input, cx| input.set_text("", cx));
+                    this.key_editing = false;
                     this.key_status = Some(status);
-                    this.message = Some((true, "Key saved in the Keychain.".into()));
+                    this.report(
+                        Scope::Key,
+                        match check {
+                            Ok(summary) => Ok(format!("Key saved in the Keychain. {summary}")),
+                            Err(error) => Err(format!(
+                                "Key saved, but OpenRouter did not accept it: {error:#}"
+                            )),
+                        },
+                    );
                 }
-                Err(error) => this.message = Some((false, format!("{error:#}"))),
+                Err(error) => this.report(Scope::Key, Err(format!("{error:#}"))),
             },
         );
     }
 
     fn test_key(&mut self, cx: &mut Context<Self>) {
-        let config = self
-            .form(cx)
-            .apply(&self.base)
-            .unwrap_or_else(|_| self.base.clone());
+        let config = self.config.clone();
         self.run(
             cx,
             move || super::check_key(&config),
             |this, result, _| {
-                this.message = Some(match result {
-                    Ok(summary) => (true, summary),
-                    Err(error) => (false, format!("{error:#}")),
-                });
+                this.report(Scope::Key, result.map_err(|error| format!("{error:#}")));
             },
         );
     }
 
     fn remove_key(&mut self, cx: &mut Context<Self>) {
-        let config = self.base.clone();
+        if !self.key_remove_armed {
+            self.key_remove_armed = true;
+            cx.notify();
+            return;
+        }
+        self.key_remove_armed = false;
+        let config = self.config.clone();
         self.run(
             cx,
             move || super::delete_keychain_key().map(|()| super::key_status(&config)),
             |this, result, _| match result {
                 Ok(status) => {
+                    this.key_editing = matches!(status, KeyStatus::Missing);
                     this.key_status = Some(status);
-                    this.message = Some((true, "Key removed from the Keychain.".into()));
+                    this.report(Scope::Key, Ok("Key removed from the Keychain.".into()));
                 }
-                Err(error) => this.message = Some((false, format!("{error:#}"))),
+                Err(error) => this.report(Scope::Key, Err(format!("{error:#}"))),
             },
         );
+    }
+
+    /// Moves a plaintext key from `openrouter.json` into the Keychain.
+    fn move_key_to_keychain(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.config.api_key.clone() else {
+            return;
+        };
+        let mut config = self.config.clone();
+        config.api_key = None;
+        self.run(
+            cx,
+            move || {
+                super::store_keychain_key(&key)?;
+                super::save_config(&config)?;
+                Ok::<_, color_eyre::Report>((super::key_status(&config), config))
+            },
+            |this, result, _| match result {
+                Ok((status, config)) => {
+                    this.config = config;
+                    this.key_status = Some(status);
+                    this.report(
+                        Scope::Key,
+                        Ok("Key moved to the Keychain and removed from openrouter.json.".into()),
+                    );
+                }
+                Err(error) => this.report(Scope::Key, Err(format!("{error:#}"))),
+            },
+        );
+    }
+
+    // ---- Models ----------------------------------------------------------
+
+    fn ensure_catalog(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.catalog,
+            CatalogState::Loading | CatalogState::Loaded(_)
+        ) {
+            return;
+        }
+        self.catalog = CatalogState::Loading;
+        let config = self.config.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { catalog::fetch(&config) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.catalog = match result {
+                    Ok(models) => CatalogState::Loaded(models),
+                    Err(error) => CatalogState::Failed(format!("{error:#}")),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn open_picker(&mut self, slot: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.language_picker_open = false;
+        self.ensure_catalog(cx);
+        let search = cx.new(|cx| TextInput::picker(cx, "Search models or paste an id", ""));
+        let subscriptions = vec![
+            cx.subscribe(&search, |this, _, _: &Changed, cx| {
+                if let Some(picker) = &mut this.picker {
+                    picker.highlight = 0;
+                }
+                cx.notify();
+            }),
+            cx.subscribe(&search, |this, _, Navigate(direction): &Navigate, cx| {
+                let count = this.picker_choices(cx).len();
+                if let Some(picker) = &mut this.picker
+                    && count > 0
+                {
+                    picker.highlight = if *direction < 0 {
+                        picker.highlight.saturating_sub(1)
+                    } else {
+                        (picker.highlight + 1).min(count - 1)
+                    };
+                }
+                cx.notify();
+            }),
+            cx.subscribe(&search, |this, _, _: &Submitted, cx| {
+                let choices = this.picker_choices(cx);
+                if let Some(picker) = &this.picker
+                    && let Some(choice) = choices.get(picker.highlight)
+                {
+                    let slot = picker.slot;
+                    let id = choice.id().to_owned();
+                    this.choose_model(slot, Some(id), cx);
+                }
+            }),
+            cx.subscribe(&search, |this, _, _: &Dismissed, cx| {
+                this.picker = None;
+                cx.notify();
+            }),
+        ];
+        search.focus_handle(cx).focus(window);
+        self.picker = Some(ModelPicker {
+            slot,
+            search,
+            highlight: 0,
+            _subscriptions: subscriptions,
+        });
+        cx.notify();
+    }
+
+    fn picker_choices(&self, cx: &App) -> Vec<PickerChoice> {
+        let Some(picker) = &self.picker else {
+            return Vec::new();
+        };
+        picker_choices(self.catalog.models(), picker.search.read(cx).text())
+    }
+
+    fn choose_model(&mut self, slot: usize, model: Option<String>, cx: &mut Context<Self>) {
+        let success = match (&model, slot) {
+            (None, _) => "Fallback removed.".to_owned(),
+            (Some(model), 0) => format!("{model} is now the primary model."),
+            (Some(model), slot) => format!("{model} is fallback {slot}."),
+        };
+        let candidate = form::set_model(&self.config, slot, model.as_deref());
+        if self.commit(Scope::Models, candidate, &success) {
+            self.picker = None;
+        }
+        cx.notify();
+    }
+
+    fn promote_model(&mut self, slot: usize, cx: &mut Context<Self>) {
+        let candidate = form::promote_model(&self.config, slot);
+        self.commit(Scope::Models, Ok(candidate), "Order updated.");
+        cx.notify();
+    }
+
+    fn choose_language(&mut self, language: &str, cx: &mut Context<Self>) {
+        let candidate = form::set_language(&self.config, language);
+        let success = format!("Language: {}.", super::language_name(language));
+        if self.commit(Scope::Models, candidate, &success) {
+            self.language_picker_open = false;
+        }
+        cx.notify();
+    }
+
+    fn toggle_trim(&mut self, cx: &mut Context<Self>) {
+        let mut candidate = self.config.clone();
+        candidate.transcription.trim_silence = !candidate.transcription.trim_silence;
+        let success = if candidate.transcription.trim_silence {
+            "Silence is trimmed before sending."
+        } else {
+            "Recordings are sent untrimmed."
+        };
+        self.commit(Scope::Models, Ok(candidate), success);
+        cx.notify();
+    }
+
+    // ---- Advanced --------------------------------------------------------
+
+    fn advanced_form(&self, cx: &App) -> AdvancedForm {
+        let text = |input: &Entity<TextInput>| input.read(cx).text().to_owned();
+        AdvancedForm {
+            base_url: text(&self.advanced.base_url),
+            attempt_timeout_seconds: text(&self.advanced.attempt_timeout),
+            total_timeout_seconds: text(&self.advanced.total_timeout),
+            chunk_seconds: text(&self.advanced.chunk_seconds),
+            rate_limit_retry_max_wait_ms: text(&self.advanced.rate_limit_wait),
+            temperature: text(&self.advanced.temperature),
+        }
+    }
+
+    fn load_advanced(&mut self, form: &AdvancedForm, cx: &mut Context<Self>) {
+        let set = |input: &Entity<TextInput>, value: &str, cx: &mut Context<Self>| {
+            input.update(cx, |input, cx| input.set_text(value, cx));
+        };
+        set(&self.advanced.base_url, &form.base_url, cx);
+        set(
+            &self.advanced.attempt_timeout,
+            &form.attempt_timeout_seconds,
+            cx,
+        );
+        set(
+            &self.advanced.total_timeout,
+            &form.total_timeout_seconds,
+            cx,
+        );
+        set(&self.advanced.chunk_seconds, &form.chunk_seconds, cx);
+        set(
+            &self.advanced.rate_limit_wait,
+            &form.rate_limit_retry_max_wait_ms,
+            cx,
+        );
+        set(&self.advanced.temperature, &form.temperature, cx);
+    }
+
+    fn save_advanced(&mut self, cx: &mut Context<Self>) {
+        let candidate = self.advanced_form(cx).apply(&self.config);
+        if self.commit(Scope::Advanced, candidate, "Saved.") {
+            self.advanced_dirty = false;
+            // The API URL may have changed; fetch the catalog again on demand.
+            if matches!(
+                self.catalog,
+                CatalogState::Failed(_) | CatalogState::Loaded(_)
+            ) {
+                self.catalog = CatalogState::Idle;
+            }
+        }
+        cx.notify();
+    }
+
+    fn restore_advanced_defaults(&mut self, cx: &mut Context<Self>) {
+        let defaults = AdvancedForm::from_config(&Config::default());
+        self.load_advanced(&defaults, cx);
+        self.save_advanced(cx);
     }
 
     fn reveal_config(&mut self, cx: &mut Context<Self>) {
@@ -324,175 +551,616 @@ impl OpenRouterSettings {
                 .map_err(Into::into)
         });
         if let Err(error) = result {
-            self.message = Some((false, format!("{error:#}")));
+            self.report(Scope::Advanced, Err(format!("{error:#}")));
             cx.notify();
         }
     }
-}
 
-fn row(
-    title: &'static str,
-    description: impl Into<SharedString>,
-    control: impl IntoElement,
-) -> gpui::Div {
-    div()
-        .w_full()
-        .min_h(px(64.0))
-        .px_4()
-        .py_3()
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap_4()
-        .border_b_1()
-        .border_color(rgb(LINE))
-        .child(
+    // ---- Rendering -------------------------------------------------------
+
+    fn render_message(&self, scope: Scope) -> Option<AnyElement> {
+        let (ok, text) = if self.busy && scope == Scope::Key {
+            (true, "Working…".to_owned())
+        } else {
+            let (current, ok, text) = self.message.as_ref()?;
+            if *current != scope {
+                return None;
+            }
+            (*ok, text.clone())
+        };
+        Some(
             div()
-                .flex_1()
-                .min_w_0()
+                .px_1()
+                .pt_2()
+                .text_size(px(11.0))
+                .line_height(px(16.0))
+                .text_color(rgb(if ok { TEXT_SOFT } else { NEGATIVE }))
+                .child(text)
+                .into_any_element(),
+        )
+    }
+
+    fn render_key_control(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let editing = self.key_editing || matches!(self.key_status, Some(KeyStatus::Missing));
+        if editing {
+            let has_key = matches!(
+                self.key_status,
+                Some(KeyStatus::Keychain(_) | KeyStatus::ConfigFile | KeyStatus::Environment)
+            );
+            return div()
+                .w(px(KEY_INPUT_WIDTH))
+                .flex_none()
                 .flex()
                 .flex_col()
-                .gap_1()
+                .gap_2()
+                .child(self.key_input.clone())
                 .child(
                     div()
-                        .text_size(px(13.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(title),
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("openrouter-get-key")
+                                .text_size(px(11.0))
+                                .text_color(rgb(MUTED))
+                                .hover(|link| link.text_color(rgb(TEXT_SOFT)))
+                                .cursor_pointer()
+                                .child("Get a key ↗")
+                                .on_click(|_, _, cx| cx.open_url(KEYS_URL)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .when(has_key, |buttons| {
+                                    buttons.child(
+                                        button("Cancel", false)
+                                            .id("openrouter-cancel-key")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.cancel_key_replacement(cx)
+                                            })),
+                                    )
+                                })
+                                .child(
+                                    button("Save key", true)
+                                        .id("openrouter-save-key")
+                                        .on_click(cx.listener(|this, _, _, cx| this.save_key(cx))),
+                                ),
+                        ),
                 )
+                .into_any_element();
+        }
+        let (badge, actions): (String, Vec<AnyElement>) =
+            match &self.key_status {
+                None => ("Checking…".into(), Vec::new()),
+                Some(KeyStatus::Keychain(suffix)) => (
+                    format!("Key saved · …{suffix}"),
+                    vec![
+                        button("Test", false)
+                            .id("openrouter-test-key")
+                            .on_click(cx.listener(|this, _, _, cx| this.test_key(cx)))
+                            .into_any_element(),
+                        button("Replace", false)
+                            .id("openrouter-replace-key")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.begin_key_replacement(window, cx)
+                            }))
+                            .into_any_element(),
+                        button(
+                            if self.key_remove_armed {
+                                "Really remove?"
+                            } else {
+                                "Remove"
+                            },
+                            false,
+                        )
+                        .id("openrouter-remove-key")
+                        .when(self.key_remove_armed, |button| {
+                            button.text_color(rgb(NEGATIVE))
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| this.remove_key(cx)))
+                        .into_any_element(),
+                    ],
+                ),
+                Some(KeyStatus::ConfigFile) => (
+                    "Key in openrouter.json".into(),
+                    vec![
+                        button("Test", false)
+                            .id("openrouter-test-key")
+                            .on_click(cx.listener(|this, _, _, cx| this.test_key(cx)))
+                            .into_any_element(),
+                        button("Move to Keychain", true)
+                            .id("openrouter-move-key")
+                            .on_click(cx.listener(|this, _, _, cx| this.move_key_to_keychain(cx)))
+                            .into_any_element(),
+                    ],
+                ),
+                Some(KeyStatus::Environment) => (
+                    "Key from OPENROUTER_API_KEY".into(),
+                    vec![
+                        button("Test", false)
+                            .id("openrouter-test-key")
+                            .on_click(cx.listener(|this, _, _, cx| this.test_key(cx)))
+                            .into_any_element(),
+                    ],
+                ),
+                Some(KeyStatus::Missing) => unreachable!("handled by the editing branch"),
+            };
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .h(px(28.0))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded_sm()
+                    .bg(rgb(0x17231a))
+                    .text_size(px(11.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(0x91bd99))
+                    .child(div().size(px(6.0)).rounded_full().bg(rgb(0x69d89f)))
+                    .child(badge),
+            )
+            .children(actions)
+            .into_any_element()
+    }
+
+    fn key_description(&self) -> &'static str {
+        match &self.key_status {
+            None => "Looking for your OpenRouter key…",
+            Some(KeyStatus::Keychain(_)) => "Stored in the macOS Keychain, never in a file",
+            Some(KeyStatus::ConfigFile) => {
+                "Read from openrouter.json in plain text; moving it to the Keychain is safer"
+            }
+            Some(KeyStatus::Environment) => "Set by the environment; it overrides any saved key",
+            Some(KeyStatus::Missing) => "Required to transcribe. Paste a key and press Return",
+        }
+    }
+
+    fn render_key_row(&mut self, cx: &mut Context<Self>) -> gpui::Div {
+        let description = self.key_description();
+        let control = self.render_key_control(cx);
+        settings_row("OpenRouter API key", description, control)
+    }
+
+    fn render_model_button(
+        &self,
+        slot: usize,
+        model: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let catalog = self.catalog.models();
+        let (label, detail) = match model {
+            Some(id) => (catalog::label(id, catalog), Some(id.to_owned())),
+            None => ("Choose a model".to_owned(), None),
+        };
+        let open = self
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.slot == slot);
+        let menu = open.then(|| self.render_picker(slot, model, cx));
+        div()
+            .relative()
+            .flex_none()
+            .child(
+                disclosure_button(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .min_w_0()
+                        .child(div().flex_none().text_color(rgb(TEXT)).child(label.clone()))
+                        .when_some(detail.filter(|id| *id != label), |row, id| {
+                            row.child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(FAINT))
+                                    .child(id),
+                            )
+                        }),
+                )
+                .w(px(MODEL_BUTTON_WIDTH))
+                .id(("openrouter-model", slot))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if this
+                        .picker
+                        .as_ref()
+                        .is_some_and(|picker| picker.slot == slot)
+                    {
+                        this.picker = None;
+                        cx.notify();
+                    } else {
+                        this.open_picker(slot, window, cx);
+                    }
+                })),
+            )
+            .children(menu.map(deferred))
+            .into_any_element()
+    }
+
+    fn render_picker(
+        &self,
+        slot: usize,
+        current: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(picker) = &self.picker else {
+            return div().into_any_element();
+        };
+        let choices = picker_choices(self.catalog.models(), picker.search.read(cx).text());
+        let highlight = picker.highlight.min(choices.len().saturating_sub(1));
+        let status: Option<AnyElement> = match &self.catalog {
+            CatalogState::Idle | CatalogState::Loading => {
+                Some(picker_note("Loading OpenRouter's speech-to-text models…").into_any_element())
+            }
+            CatalogState::Failed(error) => Some(
+                div()
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_size(px(11.0))
+                            .text_color(rgb(NEGATIVE))
+                            .child(format!("Could not load models: {error}")),
+                    )
+                    .child(
+                        button("Retry", false)
+                            .id("openrouter-catalog-retry")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.catalog = CatalogState::Idle;
+                                this.ensure_catalog(cx);
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element(),
+            ),
+            CatalogState::Loaded(_) if choices.is_empty() => Some(
+                picker_note("No models match. Paste a full id such as provider/model.")
+                    .into_any_element(),
+            ),
+            CatalogState::Loaded(_) => None,
+        };
+        let rows = choices.into_iter().enumerate().map(|(index, choice)| {
+            let selected = current == Some(choice.id());
+            let highlighted = index == highlight;
+            let (title, subtitle) = match &choice {
+                PickerChoice::Catalog(model) => (
+                    model.name.clone(),
+                    if model.provider.is_empty() {
+                        model.id.clone()
+                    } else {
+                        format!("{} · {}", model.provider, model.id)
+                    },
+                ),
+                PickerChoice::Custom(id) => (
+                    format!("Use “{id}”"),
+                    "Custom model id, not in the catalog".to_owned(),
+                ),
+            };
+            let id = choice.id().to_owned();
+            div()
+                .id(("openrouter-model-choice", index))
+                .w_full()
+                .px_3()
+                .py(px(7.0))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .rounded_sm()
+                .when(highlighted, |row| row.bg(rgb(SURFACE_HOVER)))
+                .hover(|row| row.bg(rgb(SURFACE_HOVER)))
                 .child(
                     div()
-                        .text_size(px(11.0))
-                        .text_color(rgb(MUTED))
-                        .child(description.into()),
-                ),
-        )
-        .child(control)
-}
-
-fn sized(input: &Entity<TextInput>, width: f32) -> AnyElement {
-    div()
-        .w(px(width))
-        .flex_none()
-        .child(input.clone())
-        .into_any_element()
-}
-
-fn button(label: &'static str, primary: bool) -> gpui::Div {
-    let button = compact_button(label).border_1().border_color(rgb(LINE));
-    if primary {
-        button.bg(rgb(SURFACE_SELECTED)).text_color(rgb(TEXT))
-    } else {
-        button
-    }
-}
-
-impl Render for OpenRouterSettings {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let key_description: SharedString = match &self.key_status {
-            None => "Checking the Keychain…".into(),
-            Some(status) => status.label().into(),
-        };
-        let key_control = div()
-            .w(px(WIDE_INPUT))
-            .flex_none()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(rgb(if selected { TEXT } else { TEXT_SOFT }))
+                                .truncate()
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(rgb(FAINT))
+                                .truncate()
+                                .child(subtitle),
+                        ),
+                )
+                .when(selected, |row| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.0))
+                            .text_color(rgb(ACCENT))
+                            .child("✓"),
+                    )
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.choose_model(slot, Some(id.clone()), cx);
+                }))
+        });
+        div()
+            .id("openrouter-model-picker")
+            .absolute()
+            .top(px(CONTROL_HEIGHT + 4.0))
+            .right_0()
+            .w(px(PICKER_WIDTH))
+            .p_2()
             .flex()
             .flex_col()
             .gap_2()
-            .child(self.key_input.clone())
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(LINE))
+            .bg(rgb(SURFACE))
+            .shadow_lg()
+            .occlude()
+            .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                this.picker = None;
+                cx.notify();
+            }))
+            .child(picker.search.clone())
+            .children(status)
             .child(
                 div()
+                    .id("openrouter-model-choices")
+                    .max_h(px(280.0))
+                    .overflow_y_scroll()
                     .flex()
-                    .justify_end()
-                    .gap_2()
+                    .flex_col()
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
+    fn render_language_control(&self, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.config.transcription.language.clone();
+        let menu = self.language_picker_open.then(|| {
+            let choose = Rc::new(cx.listener(|this, code: &&'static str, _, cx| {
+                this.choose_language(code, cx);
+            }));
+            div()
+                .id("openrouter-language-picker")
+                .absolute()
+                .top(px(CONTROL_HEIGHT + 4.0))
+                .right_0()
+                .w(px(220.0))
+                .max_h(px(300.0))
+                .p_2()
+                .overflow_y_scroll()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(LINE))
+                .bg(rgb(SURFACE))
+                .shadow_lg()
+                .occlude()
+                .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.language_picker_open = false;
+                    cx.notify();
+                }))
+                .children(
+                    super::LANGUAGES
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (code, name))| {
+                            let selected = *code == current;
+                            let choose = choose.clone();
+                            let code: &'static str = code;
+                            div()
+                                .id(("openrouter-language", index))
+                                .w_full()
+                                .h(px(30.0))
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .rounded_sm()
+                                .text_size(px(12.0))
+                                .text_color(rgb(if selected { TEXT } else { TEXT_SOFT }))
+                                .when(selected, |row| row.bg(rgb(SURFACE_SELECTED)))
+                                .hover(|row| row.bg(rgb(SURFACE_HOVER)))
+                                .child(*name)
+                                .when(code != super::AUTO_LANGUAGE, |row| {
+                                    row.child(
+                                        div()
+                                            .text_size(px(10.0))
+                                            .text_color(rgb(FAINT))
+                                            .child(code),
+                                    )
+                                })
+                                .on_click(move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    choose(&code, window, cx);
+                                })
+                        }),
+                )
+        });
+        div()
+            .relative()
+            .flex_none()
+            .child(
+                disclosure_button(super::language_name(&current).to_owned())
+                    .id("openrouter-language")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.picker = None;
+                        this.language_picker_open = !this.language_picker_open;
+                        cx.notify();
+                    })),
+            )
+            .children(menu.map(deferred))
+            .into_any_element()
+    }
+
+    fn render_models_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let models = self.config.transcription.models.clone();
+        let mut panel = settings_panel();
+        let primary = self.render_model_button(0, models.first().map(String::as_str), cx);
+        panel = panel.child(settings_row(
+            "Primary model",
+            "Transcribes every dictation",
+            primary,
+        ));
+        let fallbacks = models.len().saturating_sub(1).min(MAX_FALLBACKS);
+        for (slot, model) in models.iter().enumerate().skip(1).take(fallbacks) {
+            let button = self.render_model_button(slot, Some(model.as_str()), cx);
+            let control = div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    icon_button("↑", "Move up")
+                        .id(("openrouter-promote", slot))
+                        .on_click(cx.listener(move |this, _, _, cx| this.promote_model(slot, cx))),
+                )
+                .child(
+                    icon_button("✕", "Remove")
+                        .id(("openrouter-remove-model", slot))
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.choose_model(slot, None, cx)),
+                        ),
+                )
+                .child(button);
+            panel = panel.child(settings_row(
+                if slot == 1 {
+                    "Fallback 1"
+                } else {
+                    "Fallback 2"
+                },
+                if slot == 1 {
+                    "Used when the primary model fails"
+                } else {
+                    "Used when fallback 1 also fails"
+                },
+                control,
+            ));
+        }
+        if fallbacks < MAX_FALLBACKS && !models.is_empty() {
+            let slot = models.len().min(MAX_FALLBACKS);
+            let open = self
+                .picker
+                .as_ref()
+                .is_some_and(|picker| picker.slot == slot);
+            let menu = open.then(|| self.render_picker(slot, None, cx));
+            panel = panel.child(
+                div()
+                    .w_full()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
                     .child(
-                        button("Remove", false)
-                            .id("openrouter-remove-key")
-                            .on_click(cx.listener(|this, _, _, cx| this.remove_key(cx))),
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(MUTED))
+                            .child(format!(
+                                "{} of {MAX_FALLBACKS} fallbacks. Any error — rate limit, timeout, server error — moves on to the next model.",
+                                fallbacks
+                            )),
                     )
                     .child(
-                        button("Test key", false)
-                            .id("openrouter-test-key")
-                            .on_click(cx.listener(|this, _, _, cx| this.test_key(cx))),
-                    )
-                    .child(
-                        button("Save key", true)
-                            .id("openrouter-save-key")
-                            .on_click(cx.listener(|this, _, _, cx| this.save_key(cx))),
+                        div()
+                            .relative()
+                            .flex_none()
+                            .child(
+                                button("+ Add fallback", false)
+                                    .id("openrouter-add-fallback")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        if this.picker.as_ref().is_some_and(|picker| picker.slot == slot) {
+                                            this.picker = None;
+                                            cx.notify();
+                                        } else {
+                                            this.open_picker(slot, window, cx);
+                                        }
+                                    })),
+                            )
+                            .children(menu.map(deferred)),
                     ),
             );
-        let trim_toggle = div()
-            .id("openrouter-trim-toggle")
-            .flex_none()
-            .child(toggle(if self.trim_silence { 1.0 } else { 0.0 }))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.trim_silence = !this.trim_silence;
-                this.dirty = true;
-                this.message = None;
-                cx.notify();
-            }));
-        let cleanup_toggle = div()
-            .id("openrouter-cleanup-toggle")
-            .flex_none()
-            .child(toggle(if self.cleanup_enabled { 1.0 } else { 0.0 }))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.cleanup_enabled = !this.cleanup_enabled;
-                this.dirty = true;
-                this.message = None;
-                cx.notify();
-            }));
-        let status = if self.busy {
-            Some((true, "Working…".to_owned()))
-        } else {
-            self.message.clone()
-        };
-        if self.key_only {
-            return div()
-                .pb_5()
-                .child(
-                    div()
-                        .pt_4()
-                        .pb_2()
-                        .text_size(px(10.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(FAINT))
-                        .child("OPENROUTER API KEY"),
-                )
-                .child(
-                    div().border_t_1().border_color(rgb(LINE)).child(
-                        row("API key", key_description, key_control)
-                            .px_0()
-                            .border_b_0(),
-                    ),
-                )
-                .children(status.map(|(ok, text)| {
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(rgb(if ok { TEXT_SOFT } else { NEGATIVE }))
-                        .child(text)
-                }))
-                .into_any_element();
         }
+        let extra = models.len().saturating_sub(MAX_FALLBACKS + 1);
+        if extra > 0 {
+            panel = panel.child(
+                div()
+                    .px_4()
+                    .py_3()
+                    .text_size(px(11.0))
+                    .text_color(rgb(MUTED))
+                    .child(format!(
+                        "{extra} more fallback model{} from openrouter.json are tried after these.",
+                        if extra == 1 { "" } else { "s" }
+                    )),
+            );
+        }
+        div()
+            .child(settings_section_label("MODELS"))
+            .child(panel)
+            .children(self.render_message(Scope::Models))
+            .into_any_element()
+    }
+
+    fn render_advanced(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let header = div()
+            .id("openrouter-advanced")
+            .pt_5()
+            .pb_2()
+            .px_1()
+            .flex()
+            .items_center()
+            .gap_2()
+            .cursor_pointer()
+            .text_size(px(11.0))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(FAINT))
+            .hover(|header| header.text_color(rgb(MUTED)))
+            .child(if self.advanced_open { "▾" } else { "▸" })
+            .child("ADVANCED")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.advanced_open = !this.advanced_open;
+                cx.notify();
+            }));
+        if !self.advanced_open {
+            return header.into_any_element();
+        }
+        let narrow = |input: &Entity<TextInput>| sized(input, NARROW_INPUT);
         let footer = div()
             .w_full()
-            .pt_3()
+            .px_4()
+            .py_3()
             .flex()
             .items_center()
             .justify_between()
             .gap_4()
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
                     .text_size(px(11.0))
-                    .text_color(rgb(match &status {
-                        Some((false, _)) => NEGATIVE,
-                        Some((true, _)) => TEXT_SOFT,
-                        None => FAINT,
-                    }))
-                    .child(match status {
-                        Some((_, text)) => SharedString::from(text),
-                        None if self.dirty => "Unsaved changes.".into(),
-                        None => "Saved in openrouter.json; read on every dictation.".into(),
+                    .text_color(rgb(FAINT))
+                    .child(if self.advanced_dirty {
+                        "Unsaved changes. Press Return or Save."
+                    } else {
+                        "Saved in openrouter.json."
                     }),
             )
             .child(
@@ -507,97 +1175,206 @@ impl Render for OpenRouterSettings {
                     .child(
                         button("Defaults", false)
                             .id("openrouter-defaults")
-                            .on_click(cx.listener(|this, _, _, cx| this.reset_defaults(cx))),
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.restore_advanced_defaults(cx)),
+                            ),
                     )
                     .child(
-                        button("Revert", false)
-                            .id("openrouter-revert")
-                            .on_click(cx.listener(|this, _, _, cx| this.revert(cx))),
-                    )
-                    .child(
-                        button("Save", true)
-                            .id("openrouter-save")
-                            .when(self.dirty, |save| save.border_color(rgb(ACCENT)))
-                            .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                        button("Save", self.advanced_dirty)
+                            .id("openrouter-save-advanced")
+                            .on_click(cx.listener(|this, _, _, cx| this.save_advanced(cx))),
                     ),
             );
+        div()
+            .child(header)
+            .child(
+                settings_panel()
+                    .child(settings_row(
+                        "Attempt timeout (s)",
+                        "Deadline for one request to one model",
+                        narrow(&self.advanced.attempt_timeout),
+                    ))
+                    .child(settings_row(
+                        "Total timeout (s)",
+                        "Deadline for the whole fallback chain",
+                        narrow(&self.advanced.total_timeout),
+                    ))
+                    .child(settings_row(
+                        "Chunk length (s)",
+                        "Long recordings are split at a quiet point, from 10 to 200",
+                        narrow(&self.advanced.chunk_seconds),
+                    ))
+                    .child(settings_row(
+                        "Rate-limit retry (ms)",
+                        "A 429 asking to wait at most this long is retried once on the same model; 0 falls back at once",
+                        narrow(&self.advanced.rate_limit_wait),
+                    ))
+                    .child(settings_row(
+                        "Temperature",
+                        "0 to 1; empty leaves it to the provider",
+                        narrow(&self.advanced.temperature),
+                    ))
+                    .child(settings_row(
+                        "API URL",
+                        "OpenRouter or a compatible endpoint",
+                        sized(&self.advanced.base_url, WIDE_INPUT),
+                    ))
+                    .child(footer),
+            )
+            .children(self.render_message(Scope::Advanced))
+            .into_any_element()
+    }
+}
+
+/// Catalog models matching `query`, then a custom-id choice when the query
+/// looks like an id the catalog does not list.
+fn picker_choices(catalog: &[CatalogModel], query: &str) -> Vec<PickerChoice> {
+    let query = query.trim();
+    let mut choices: Vec<PickerChoice> = catalog
+        .iter()
+        .filter(|model| model.matches(query))
+        .cloned()
+        .map(PickerChoice::Catalog)
+        .collect();
+    let looks_like_id = query.contains('/') && !query.chars().any(char::is_whitespace);
+    if looks_like_id && !catalog.iter().any(|model| model.id == query) {
+        choices.push(PickerChoice::Custom(query.to_owned()));
+    }
+    choices
+}
+
+fn sized(input: &Entity<TextInput>, width: f32) -> AnyElement {
+    div()
+        .w(px(width))
+        .flex_none()
+        .child(input.clone())
+        .into_any_element()
+}
+
+fn button(label: impl Into<SharedString>, primary: bool) -> gpui::Div {
+    let button = compact_button(label.into())
+        .flex_none()
+        .border_1()
+        .border_color(rgb(LINE));
+    if primary {
+        button.bg(rgb(SURFACE_SELECTED)).text_color(rgb(TEXT))
+    } else {
+        button
+    }
+}
+
+fn icon_button(glyph: &'static str, _label: &'static str) -> gpui::Div {
+    div()
+        .size(px(26.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .text_size(px(11.0))
+        .text_color(rgb(MUTED))
+        .hover(|button| button.bg(rgb(SURFACE_HOVER)).text_color(rgb(TEXT)))
+        .child(glyph)
+}
+
+fn picker_note(text: &'static str) -> gpui::Div {
+    div()
+        .px_3()
+        .py_2()
+        .text_size(px(11.0))
+        .text_color(rgb(MUTED))
+        .child(text)
+}
+
+impl Render for OpenRouterSettings {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.key_only {
+            let key_row = self.render_key_row(cx).px_0().border_b_0();
+            return div()
+                .child(div().border_t_1().border_color(rgb(LINE)).child(key_row))
+                .children(self.render_message(Scope::Key))
+                .into_any_element();
+        }
+        let key_row = self.render_key_row(cx);
+        let language = self.render_language_control(cx);
+        let trim = div()
+            .id("openrouter-trim")
+            .flex_none()
+            .cursor_pointer()
+            .child(toggle(if self.config.transcription.trim_silence {
+                1.0
+            } else {
+                0.0
+            }))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_trim(cx)));
+        let models = self.render_models_panel(cx);
+        let advanced = self.render_advanced(cx);
         div()
             .child(settings_section_label("OPENROUTER"))
             .child(
                 settings_panel()
-                    .child(row("API key", key_description, key_control))
-                    .child(row(
-                        "Transcription models",
-                        "One per line, tried in order. Any error moves on to the next model. Choose OpenRouter as the dictation model above to use them.",
-                        sized(&self.transcription_models, WIDE_INPUT),
-                    ))
-                    .child(row(
-                        "Trim silence",
-                        "Cut silence at the start and end and shorten long pauses before sending. Recordings with no speech are not sent.",
-                        trim_toggle,
-                    ))
-                    .child(row(
-                        "Attempt timeout (s)",
-                        "Deadline for one request to one model",
-                        sized(&self.attempt_timeout, NARROW_INPUT),
-                    ))
-                    .child(row(
-                        "Total timeout (s)",
-                        "Deadline for the whole fallback chain",
-                        sized(&self.total_timeout, NARROW_INPUT),
-                    ))
-                    .child(row(
-                        "Chunk length (s)",
-                        "Long recordings are split at a quiet point (10 to 200)",
-                        sized(&self.chunk_seconds, NARROW_INPUT),
-                    ))
-                    .child(row(
-                        "Rate-limit retry (ms)",
-                        "A 429 asking to wait at most this long is retried once on the same model; 0 falls back at once",
-                        sized(&self.rate_limit_wait, NARROW_INPUT),
-                    ))
-                    .child(row(
-                        "Temperature",
-                        "0 to 1; empty leaves it to the provider",
-                        sized(&self.temperature, NARROW_INPUT),
+                    .child(key_row)
+                    .child(settings_row(
+                        "Language",
+                        "Spoken language hint; Auto-detect lets the model decide",
+                        language,
                     ))
                     .child(
-                        row(
-                            "API URL",
-                            "OpenRouter or a compatible endpoint",
-                            sized(&self.base_url, WIDE_INPUT),
+                        settings_row(
+                            "Trim silence",
+                            "Cuts silence and long pauses before sending, so less audio is billed. Recordings with no speech are not sent",
+                            trim,
                         )
                         .border_b_0(),
                     ),
             )
-            .child(settings_section_label("OPENROUTER CLEANUP"))
+            .children(self.render_message(Scope::Key))
+            .child(models)
+            .child(advanced)
             .child(
-                settings_panel()
-                    .child(row(
-                        "Clean up transcripts",
-                        "A text model fixes punctuation and drops filler words before Modes. On failure the raw transcript is pasted.",
-                        cleanup_toggle,
-                    ))
-                    .child(row(
-                        "Cleanup models",
-                        "One per line, tried in order",
-                        sized(&self.cleanup_models, WIDE_INPUT),
-                    ))
-                    .child(row(
-                        "Cleanup timeout (s)",
-                        "Deadline for the whole cleanup chain",
-                        sized(&self.cleanup_timeout, NARROW_INPUT),
-                    ))
-                    .child(
-                        row(
-                            "Cleanup prompt",
-                            "System prompt for the cleanup model",
-                            sized(&self.cleanup_prompt, WIDE_INPUT),
-                        )
-                        .border_b_0(),
-                    ),
+                div()
+                    .px_1()
+                    .pt_3()
+                    .text_size(px(11.0))
+                    .text_color(rgb(FAINT))
+                    .child("Audio goes to OpenRouter and the model's provider for transcription. HEX never stores audio."),
             )
-            .child(footer)
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model(id: &str, name: &str) -> CatalogModel {
+        CatalogModel {
+            id: id.into(),
+            name: name.into(),
+            provider: id.split('/').next().unwrap().into(),
+        }
+    }
+
+    #[test]
+    fn picker_offers_a_custom_id_only_when_the_query_looks_like_an_unknown_id() {
+        let catalog = [
+            model("openai/whisper-1", "Whisper 1"),
+            model("deepgram/nova-3", "Nova-3"),
+        ];
+        assert_eq!(picker_choices(&catalog, "").len(), 2);
+        assert_eq!(
+            picker_choices(&catalog, "nova"),
+            [PickerChoice::Catalog(catalog[1].clone())]
+        );
+        assert_eq!(
+            picker_choices(&catalog, "acme/new-model"),
+            [PickerChoice::Custom("acme/new-model".into())]
+        );
+        assert_eq!(
+            picker_choices(&catalog, "openai/whisper-1"),
+            [PickerChoice::Catalog(catalog[0].clone())]
+        );
+        assert!(picker_choices(&catalog, "no such thing").is_empty());
+        assert!(picker_choices(&[], "acme/x y").is_empty());
     }
 }
