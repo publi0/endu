@@ -984,6 +984,8 @@ pub struct AppWindow {
     recording_audio_spring: ToggleSpring,
     variant_picker_open: Option<ModelPickerTarget>,
     transcription_hints: ProcessingInput,
+    // Fork: OpenRouter settings section (`None` outside the fork build).
+    openrouter_settings: Option<Entity<crate::openrouter::settings_view::OpenRouterSettings>>,
     transcription_picker_language: Option<String>,
     transcription_status: PreparationStatus,
     transcription_preparation: TranscriptionPreparation,
@@ -1415,6 +1417,7 @@ impl AppWindow {
             ) as f32),
             variant_picker_open: None,
             transcription_hints,
+            openrouter_settings: crate::openrouter::settings_view::new(cx),
             transcription_picker_language: preview_picker.map(|(language, _)| language.clone()),
             transcription_status: PreparationStatus {
                 model: preview_downloading,
@@ -3692,6 +3695,7 @@ impl AppWindow {
                                         .id("dictation-hotkey-setting"),
                                     ),
                             )
+                            .children(self.openrouter_settings.clone())
                             .child(settings_section_label("BEHAVIOR"))
                             .child(
                                 settings_panel()

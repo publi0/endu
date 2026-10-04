@@ -1,4 +1,4 @@
-//! One HTTPS POST through the system curl, matching upstream's OpenCode client:
+//! One HTTPS request through the system curl, matching upstream's OpenCode client:
 //! the URL, headers, credentials, and body travel on stdin as a curl config, so
 //! nothing sensitive reaches argv or a temporary file.
 
@@ -34,6 +34,14 @@ pub(crate) fn post_json(
     if body.len() > MAX_BODY_BYTES {
         bail!("request body is too large ({} bytes)", body.len());
     }
+    request(url, api_key, Some(body), timeout)
+}
+
+pub(crate) fn get(url: &str, api_key: &str, timeout: Duration) -> Result<Response> {
+    request(url, api_key, None, timeout)
+}
+
+fn request(url: &str, api_key: &str, body: Option<&str>, timeout: Duration) -> Result<Response> {
     let input = curl_config(url, api_key, body)?;
     let seconds = timeout.as_secs().max(1).to_string();
     let curl = if cfg!(target_os = "macos") {
@@ -76,17 +84,19 @@ pub(crate) fn post_json(
     parse_output(output.stdout).ok_or_else(|| eyre!("curl returned no HTTP status"))
 }
 
-fn curl_config(url: &str, api_key: &str, body: &str) -> Result<Vec<u8>> {
+fn curl_config(url: &str, api_key: &str, body: Option<&str>) -> Result<Vec<u8>> {
     let authorization = format!("Authorization: Bearer {api_key}");
-    let options = [
+    let mut options = vec![
         ("url", url),
-        ("request", "POST"),
         ("header", authorization.as_str()),
-        ("header", "Content-Type: application/json"),
         ("header", "X-Title: HEX (OpenRouter fork)"),
-        ("data-binary", body),
     ];
-    let mut input = String::with_capacity(body.len() + 512);
+    if let Some(body) = body {
+        options.push(("request", "POST"));
+        options.push(("header", "Content-Type: application/json"));
+        options.push(("data-binary", body));
+    }
+    let mut input = String::with_capacity(body.map_or(0, str::len) + 512);
     for (key, value) in options {
         input.push_str(key);
         input.push_str(" = \"");
@@ -156,7 +166,7 @@ mod tests {
     #[test]
     fn config_escapes_quotes_and_keeps_credentials_off_argv() {
         let config = String::from_utf8(
-            curl_config("https://x.test/v1", "sk-secret", r#"{"a":"b\"c"}"#).unwrap(),
+            curl_config("https://x.test/v1", "sk-secret", Some(r#"{"a":"b\"c"}"#)).unwrap(),
         )
         .unwrap();
         assert!(config.contains("header = \"Authorization: Bearer sk-secret\"\n"));
@@ -165,10 +175,20 @@ mod tests {
             "{config}"
         );
         assert!(config.contains("url = \"https://x.test/v1\"\n"));
+        assert!(config.contains("request = \"POST\"\n"));
+    }
+
+    #[test]
+    fn get_requests_carry_no_body_or_method_override() {
+        let config =
+            String::from_utf8(curl_config("https://x.test/v1/key", "k", None).unwrap()).unwrap();
+        assert!(!config.contains("request ="));
+        assert!(!config.contains("data-binary"));
+        assert!(config.contains("Authorization: Bearer k"));
     }
 
     #[test]
     fn config_rejects_raw_control_characters() {
-        assert!(curl_config("https://x.test", "k", "\u{7}").is_err());
+        assert!(curl_config("https://x.test", "k", Some("\u{7}")).is_err());
     }
 }

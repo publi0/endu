@@ -24,21 +24,24 @@ as permissões de Acessibilidade e Input Monitoring depois de um update.
 
 ## Configurar
 
-1. Guarde a chave da API no Keychain:
+Tudo é configurado em **Settings**, nas seções **OPENROUTER** e
+**OPENROUTER CLEANUP**, logo abaixo de Dictation:
 
-   ```sh
-   security add-generic-password -s hex-openrouter -a openrouter -w
-   ```
+1. **API key:** cole a chave e clique em **Save key**. Ela vai para o
+   Keychain; o campo é limpo em seguida e só os quatro últimos caracteres
+   aparecem. **Test key** consulta o OpenRouter e mostra o uso e o limite.
+   **Remove** apaga a chave do Keychain.
+2. **Modelos e limites:** edite os campos e clique em **Save**. **Revert**
+   descarta as edições, **Defaults** carrega os valores padrão e **Show file**
+   mostra o `openrouter.json` no Finder.
+3. Em **Local transcription**, escolha **OpenRouter** e clique em **Use**. Ele
+   já é o modelo padrão numa instalação nova.
 
-   Alternativas: a variável `OPENROUTER_API_KEY` ou o campo `api_key` do
-   arquivo de configuração.
-
-2. Em Settings, escolha **OpenRouter** no seletor de modelo e clique em
-   **Use**. Ele já é o modelo padrão numa instalação nova.
-
-3. Ajuste `~/Library/Application Support/hex-openrouter/openrouter.json`. O
-   arquivo é criado no primeiro uso e relido a cada ditado, então não precisa
-   reiniciar o app.
+Também dá para configurar sem a interface. A chave pode ficar no Keychain
+(`security add-generic-password -s hex-openrouter -a openrouter -w`), na
+variável `OPENROUTER_API_KEY` ou no campo `api_key` do arquivo. O arquivo
+`~/Library/Application Support/hex-openrouter/openrouter.json` é criado no
+primeiro uso e relido a cada ditado, então não precisa reiniciar o app.
 
 ```json
 {
@@ -98,6 +101,7 @@ Arquivos do upstream tocados (poucas linhas cada):
 | `src/local_api.rs` | readiness do runtime remoto |
 | `src/parakeet.rs` | cleanup opcional antes dos Modes |
 | `src/app_paths.rs` | diretório de dados próprio do fork |
+| `src/app_window.rs` | embute a seção OpenRouter no Settings (3 linhas) |
 
 Arquivos exclusivos do fork: `src/openrouter/`, `fork/`, `Casks/`, `FORK.md` e
 `.github/workflows/fork-*.yml`.

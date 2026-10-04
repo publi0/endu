@@ -14,7 +14,10 @@
 #[cfg(test)]
 mod catalog_tests;
 pub mod cleanup;
+pub mod form;
 mod http;
+#[cfg(target_os = "macos")]
+pub mod settings_view;
 pub mod transcribe;
 
 use std::fs::{self, OpenOptions};
@@ -188,6 +191,189 @@ fn write_template(path: &Path, config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Replace the configuration file atomically, owner-only.
+pub fn save_config(config: &Config) -> Result<()> {
+    save_config_at(&config_path()?, config)
+}
+
+pub(crate) fn save_config_at(path: &Path, config: &Config) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| color_eyre::eyre::eyre!("config path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let temporary = path.with_extension("json.tmp");
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    file.write_all(serde_json::to_string_pretty(config)?.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    fs::rename(&temporary, path).wrap_err_with(|| format!("could not save {}", path.display()))?;
+    Ok(())
+}
+
+/// Where the API key in use comes from, for display. Never holds the key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyStatus {
+    Environment,
+    ConfigFile,
+    /// Stored in the Keychain; the last four characters, for recognition.
+    Keychain(String),
+    Missing,
+}
+
+impl KeyStatus {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Environment => "Using OPENROUTER_API_KEY from the environment".into(),
+            Self::ConfigFile => "Using api_key from openrouter.json".into(),
+            Self::Keychain(suffix) => format!("Saved in the Keychain · …{suffix}"),
+            Self::Missing => "No API key yet".into(),
+        }
+    }
+}
+
+/// Blocking: may run `security`. Call off the UI thread.
+pub fn key_status(config: &Config) -> KeyStatus {
+    if std::env::var(API_KEY_ENV).is_ok_and(|key| !key.trim().is_empty()) {
+        return KeyStatus::Environment;
+    }
+    if config
+        .api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty())
+    {
+        return KeyStatus::ConfigFile;
+    }
+    forget_cached_key();
+    match api_key(config) {
+        Ok(key) => KeyStatus::Keychain(key_suffix(&key)),
+        Err(_) => KeyStatus::Missing,
+    }
+}
+
+fn key_suffix(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    chars[chars.len().saturating_sub(4)..].iter().collect()
+}
+
+/// OpenRouter keys are URL-safe tokens; anything else is almost certainly a
+/// paste mistake (and would need quoting for `security`).
+pub fn validate_key(key: &str) -> Result<&str> {
+    let key = key.trim();
+    if key.len() < 16 {
+        bail!("That does not look like an OpenRouter key.");
+    }
+    if !key
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        bail!("The key contains unexpected characters.");
+    }
+    Ok(key)
+}
+
+/// Store the key in the login Keychain. Blocking.
+#[cfg(target_os = "macos")]
+pub fn store_keychain_key(key: &str) -> Result<()> {
+    let key = validate_key(key)?;
+    // `security -i` reads the command from stdin, keeping the key off argv.
+    let mut child = std::process::Command::new("/usr/bin/security")
+        .arg("-i")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .wrap_err("could not start security")?;
+    let command =
+        format!("add-generic-password -U -s {KEYCHAIN_SERVICE} -a {KEYCHAIN_ACCOUNT} -w {key}\n");
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(command.as_bytes())?;
+    }
+    let output = child.wait_with_output()?;
+    forget_cached_key();
+    if keychain_key().as_deref() != Some(key) {
+        bail!(
+            "The Keychain did not accept the key: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Remove the key from the login Keychain. Blocking.
+#[cfg(target_os = "macos")]
+pub fn delete_keychain_key() -> Result<()> {
+    let _ = std::process::Command::new("/usr/bin/security")
+        .args([
+            "delete-generic-password",
+            "-s",
+            KEYCHAIN_SERVICE,
+            "-a",
+            KEYCHAIN_ACCOUNT,
+        ])
+        .output()
+        .wrap_err("could not start security")?;
+    forget_cached_key();
+    if keychain_key().is_some() {
+        bail!("The key is still in the Keychain.");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn store_keychain_key(_key: &str) -> Result<()> {
+    bail!("The Keychain is only available on macOS; set OPENROUTER_API_KEY instead.")
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn delete_keychain_key() -> Result<()> {
+    bail!("The Keychain is only available on macOS.")
+}
+
+/// Ask OpenRouter about the key in use. Blocking; makes one GET request.
+pub fn check_key(config: &Config) -> Result<String> {
+    let key = api_key(config)?;
+    let response = http::get(&config.endpoint("key"), &key, Duration::from_secs(15))?;
+    if response.status == 401 {
+        forget_cached_key();
+        bail!("OpenRouter rejected the key (HTTP 401).");
+    }
+    if !response.is_success() {
+        bail!("HTTP {}: {}", response.status, excerpt(&response.body));
+    }
+    describe_key(&response.body)
+}
+
+fn describe_key(body: &[u8]) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .wrap_err_with(|| format!("invalid JSON response: {}", excerpt(body)))?;
+    let data = value.get("data").unwrap_or(&value);
+    let mut parts = vec!["Key works".to_owned()];
+    if let Some(label) = data.get("label").and_then(serde_json::Value::as_str) {
+        parts.push(format!("label {label}"));
+    }
+    if let Some(usage) = data.get("usage").and_then(serde_json::Value::as_f64) {
+        parts.push(format!("used ${usage:.2}"));
+    }
+    match data
+        .get("limit_remaining")
+        .and_then(serde_json::Value::as_f64)
+    {
+        Some(remaining) => parts.push(format!("${remaining:.2} left")),
+        None if data.get("limit").is_some_and(serde_json::Value::is_null) => {
+            parts.push("no limit".into())
+        }
+        None => {}
+    }
+    Ok(parts.join(" · "))
+}
+
 enum CachedKey {
     Found(String),
     /// A recent lookup found nothing; avoid spawning `security` on every UI
@@ -351,6 +537,53 @@ mod tests {
         let error = load_config_at(&path).unwrap_err().to_string();
         assert!(error.contains(CONFIG_FILE), "{error}");
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn saved_config_round_trips_owner_only() {
+        let dir = temp_dir("save");
+        let path = dir.join(CONFIG_FILE);
+        let mut config = Config::default();
+        config.cleanup.enabled = true;
+        config.transcription.models = vec!["x/y".into()];
+        save_config_at(&path, &config).unwrap();
+        assert_eq!(load_config_at(&path).unwrap(), config);
+        assert!(!path.with_extension("json.tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn keys_are_validated_before_storage() {
+        assert_eq!(
+            validate_key("  sk-or-v1-0123456789abcdef  ").unwrap(),
+            "sk-or-v1-0123456789abcdef"
+        );
+        assert!(validate_key("short").is_err());
+        assert!(validate_key("sk-or-v1-0123456789 abcdef").is_err());
+        assert!(validate_key("sk-or-v1-0123456789\"abcdef").is_err());
+        assert_eq!(key_suffix("sk-or-v1-abcd1234"), "1234");
+        assert_eq!(key_suffix("ab"), "ab");
+    }
+
+    #[test]
+    fn key_description_summarizes_usage() {
+        let summary = describe_key(
+            br#"{"data":{"label":"sk-or-v1-abc...","usage":1.234,"limit":null,"limit_remaining":null}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            summary,
+            "Key works · label sk-or-v1-abc... · used $1.23 · no limit"
+        );
+        let limited =
+            describe_key(br#"{"data":{"usage":0,"limit":10,"limit_remaining":7.5}}"#).unwrap();
+        assert_eq!(limited, "Key works · used $0.00 · $7.50 left");
     }
 
     #[test]
