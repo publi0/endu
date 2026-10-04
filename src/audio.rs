@@ -4,6 +4,7 @@ use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::time::{Duration, Instant};
 
+use crate::microphone::{InputDescription, resolve_channel};
 use color_eyre::eyre::{Result, WrapErr, eyre};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, SizedSample, Stream, StreamConfig};
@@ -112,6 +113,7 @@ pub struct AudioInput {
     chunks: Receiver<(Vec<f32>, CaptureInstant)>,
     pub sample_rate: u32,
     pub device_name: String,
+    pub description: InputDescription,
     stream_errors: Receiver<String>,
 }
 
@@ -226,6 +228,14 @@ impl AudioInput {
                 stream_errors,
                 sample_rate: 48_000,
                 device_name: "Test microphone".into(),
+                description: InputDescription {
+                    device_id: Some("test-input".into()),
+                    name: "Test microphone".into(),
+                    channels: 1,
+                    channel: None,
+                    requested_channel: None,
+                    fallback_from: None,
+                },
             },
             sender,
         )
@@ -256,6 +266,11 @@ impl AudioInput {
         let config: StreamConfig = supported.into();
         let sample_rate = config.sample_rate;
         let channels = usize::from(config.channels);
+        if channels == 0 {
+            return Err(eyre!("microphone reports no input channels"));
+        }
+        let description = describe_device(&device, config.channels);
+        let selected_channel = description.channel;
         let (sender, chunks) = mpsc::channel();
         let (error_sender, stream_errors) = mpsc::sync_channel(1);
 
@@ -264,6 +279,7 @@ impl AudioInput {
                 &device,
                 &config,
                 channels,
+                selected_channel,
                 sender,
                 error_sender,
                 |sample: f32| sample,
@@ -272,6 +288,7 @@ impl AudioInput {
                 &device,
                 &config,
                 channels,
+                selected_channel,
                 sender,
                 error_sender,
                 |sample: i16| sample as f32 / i16::MAX as f32,
@@ -280,6 +297,7 @@ impl AudioInput {
                 &device,
                 &config,
                 channels,
+                selected_channel,
                 sender,
                 error_sender,
                 |sample: u16| sample as f32 / 32768.0 - 1.0,
@@ -295,6 +313,7 @@ impl AudioInput {
             chunks,
             sample_rate,
             device_name,
+            description,
             stream_errors,
         })
     }
@@ -514,6 +533,10 @@ impl RecoveringAudioInput {
             .device_name
     }
 
+    pub fn description(&self) -> Option<&InputDescription> {
+        self.input.as_ref().map(|input| &input.description)
+    }
+
     fn start_replacement(&mut self) {
         let revision = self
             .recovery
@@ -563,7 +586,10 @@ fn open_configured_input(
                 return Err(error);
             }
             tracing::warn!(%error, device, "selected microphone is unavailable; using automatic selection");
-            AudioInput::open(AUTOMATIC_INPUT_DEVICE_PREFERENCES)
+            AudioInput::open(AUTOMATIC_INPUT_DEVICE_PREFERENCES).map(|mut input| {
+                input.description.fallback_from = Some(device.to_owned());
+                input
+            })
         });
     }
     AudioInput::open(AUTOMATIC_INPUT_DEVICE_PREFERENCES)
@@ -579,6 +605,40 @@ pub fn input_device_names() -> Result<Vec<String>> {
     names.sort_by_key(|name| name.to_lowercase());
     names.dedup();
     Ok(names)
+}
+
+fn describe_device(device: &Device, channels: u16) -> InputDescription {
+    let device_id = device.id().ok().map(|id| id.id().to_owned());
+    let requested_channel = crate::app_settings::microphone_channel(device_id.as_deref());
+    InputDescription {
+        device_id,
+        name: device.to_string(),
+        channels,
+        channel: resolve_channel(requested_channel, channels),
+        requested_channel,
+        fallback_from: None,
+    }
+}
+
+/// Read routing metadata without opening or recording the microphone.
+pub fn input_description(selected_device: Option<&str>) -> Result<InputDescription> {
+    let host = cpal::default_host();
+    let selected = selected_device.and_then(|name| {
+        host.input_devices()
+            .ok()?
+            .find(|device| device.to_string() == name)
+    });
+    let fallback_from = selected_device
+        .filter(|_| selected.is_none())
+        .map(str::to_owned);
+    let device = match selected {
+        Some(device) => device,
+        None => find_device(&host, AUTOMATIC_INPUT_DEVICE_PREFERENCES)?,
+    };
+    let channels = device.default_input_config()?.channels();
+    let mut description = describe_device(&device, channels);
+    description.fallback_from = fallback_from;
+    Ok(description)
 }
 
 fn find_device(host: &cpal::Host, queries: &[&str]) -> Result<Device> {
@@ -713,10 +773,28 @@ fn input_transport(device: &Device) -> InputTransport {
     }
 }
 
-fn mono<T>(samples: &[T], channels: usize, convert: impl Fn(&T) -> f32) -> Vec<f32> {
+fn mono<T>(
+    samples: &[T],
+    channels: usize,
+    selected_channel: Option<u16>,
+    convert: impl Fn(&T) -> f32,
+) -> Vec<f32> {
+    if channels == 0 {
+        return Vec::new();
+    }
+    if channels == 1 {
+        return samples.iter().map(convert).collect();
+    }
+    let selected =
+        resolve_channel(selected_channel, channels as u16).map(|channel| usize::from(channel - 1));
     samples
-        .chunks(channels)
-        .map(|frame| frame.iter().map(&convert).sum::<f32>() / channels as f32)
+        .chunks_exact(channels)
+        .map(|frame| {
+            selected.map_or_else(
+                || frame.iter().map(&convert).sum::<f32>() / channels as f32,
+                |channel| convert(&frame[channel]),
+            )
+        })
         .collect()
 }
 
@@ -741,6 +819,7 @@ fn build_stream<T: SizedSample>(
     device: &Device,
     config: &StreamConfig,
     channels: usize,
+    selected_channel: Option<u16>,
     sender: Sender<(Vec<f32>, CaptureInstant)>,
     error_sender: SyncSender<String>,
     convert: impl Fn(T) -> f32 + Send + 'static,
@@ -753,7 +832,7 @@ fn build_stream<T: SizedSample>(
                 let captured_through = captured_through(info, data.len() / channels, sample_rate);
                 send(
                     &sender,
-                    mono(data, channels, |sample| convert(*sample)),
+                    mono(data, channels, selected_channel, |sample| convert(*sample)),
                     captured_through,
                 )
             },
@@ -777,6 +856,75 @@ fn captured_through(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_channels_avoid_silent_channel_attenuation_and_phase_cancellation() {
+        let signal = [0.25_f32, -0.5, 0.75];
+        let left: Vec<_> = signal.iter().flat_map(|&sample| [sample, 0.0]).collect();
+        let right: Vec<_> = signal.iter().flat_map(|&sample| [0.0, sample]).collect();
+        let opposed: Vec<_> = signal
+            .iter()
+            .flat_map(|&sample| [sample, -sample])
+            .collect();
+        assert_eq!(mono(&left, 2, Some(1), |sample| *sample), signal);
+        assert_eq!(mono(&right, 2, Some(2), |sample| *sample), signal);
+        assert_eq!(mono(&opposed, 2, Some(1), |sample| *sample), signal);
+        assert_eq!(
+            mono(&opposed, 2, Some(2), |sample| *sample),
+            signal.map(|sample| -sample)
+        );
+        // Mixing stays the default until the user makes an explicit choice.
+        assert_eq!(
+            mono(&left, 2, None, |sample| *sample),
+            signal.map(|sample| sample / 2.0)
+        );
+        assert_eq!(mono(&opposed, 2, None, |sample| *sample), [0.0; 3]);
+    }
+
+    #[test]
+    fn normal_stereo_and_integer_inputs_keep_their_expected_routing() {
+        let stereo = [0.2_f32, 0.6, -0.2, -0.6];
+        assert_eq!(mono(&stereo, 2, None, |sample| *sample), [0.4, -0.4]);
+        assert_eq!(mono(&stereo, 2, Some(2), |sample| *sample), [0.6, -0.6]);
+        assert_eq!(
+            mono(
+                &[0_i16, i16::MAX, 0, -i16::MAX],
+                2,
+                Some(2),
+                |sample| *sample as f32 / i16::MAX as f32
+            ),
+            [1.0, -1.0]
+        );
+        assert_eq!(
+            mono(
+                &[32768_u16, 49152, 32768, 16384],
+                2,
+                Some(2),
+                |sample| *sample as f32 / 32768.0 - 1.0
+            ),
+            [0.5, -0.5]
+        );
+    }
+
+    #[test]
+    fn mono_is_unchanged_and_invalid_routing_cannot_index_past_a_frame() {
+        let samples = [0.0_f32, -0.0, 0.75, -0.25];
+        for channel in [None, Some(1), Some(2)] {
+            let routed = mono(&samples, 1, channel, |sample| *sample);
+            assert_eq!(
+                routed
+                    .iter()
+                    .map(|sample| sample.to_bits())
+                    .collect::<Vec<_>>(),
+                samples.map(f32::to_bits)
+            );
+        }
+        assert_eq!(
+            mono(&[0.2_f32, 0.6, 0.9], 2, Some(8), |sample| *sample),
+            [0.4]
+        );
+        assert!(mono(&samples, 0, Some(1), |sample| *sample).is_empty());
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

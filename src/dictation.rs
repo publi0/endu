@@ -24,6 +24,7 @@ pub enum Finish {
 
 pub struct DictationClip {
     samples: Vec<f32>,
+    pub input: Option<crate::microphone::InputDescription>,
 }
 
 impl DictationClip {
@@ -37,7 +38,10 @@ impl DictationClip {
 
     #[cfg(test)]
     pub fn from_samples(samples: Vec<f32>) -> Self {
-        Self { samples }
+        Self {
+            samples,
+            input: None,
+        }
     }
 }
 
@@ -368,6 +372,7 @@ impl DictationCapture {
 
         Finish::Transcribe(DictationClip {
             samples: recording.finish(Some(now)),
+            input: None,
         })
     }
 }

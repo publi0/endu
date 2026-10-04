@@ -1,4 +1,4 @@
-//! The app window: Settings, History, and Statistics, plus the first-run
+//! The app window: Settings, Models, History, and Statistics, plus the first-run
 //! setup sheet.
 
 use std::cell::RefCell;
@@ -60,16 +60,18 @@ actions!(
 /// The microphone menu is deferred above the settings panel and occludes
 /// everything beneath it, so hovering or choosing a device never reaches the
 /// controls under the menu. A mouse-down anywhere else dismisses it.
-fn microphone_picker_menu(
-    choices: Vec<Option<String>>,
-    selected: Option<String>,
+fn selection_picker_menu<T: Clone + PartialEq + 'static>(
+    picker_id: &'static str,
+    choices: Vec<T>,
+    selected: T,
+    label: impl Fn(&T) -> String,
     error: Option<String>,
-    choose: impl Fn(&Option<String>, &mut Window, &mut App) + 'static,
+    choose: impl Fn(&T, &mut Window, &mut App) + 'static,
     dismiss: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<Div> {
     let choose = Rc::new(choose);
     div()
-        .id("microphone-picker")
+        .id(picker_id)
         .absolute()
         .top(px(CONTROL_HEIGHT + 4.0))
         .right_0()
@@ -86,10 +88,10 @@ fn microphone_picker_menu(
         .on_mouse_down_out(dismiss)
         .children(choices.into_iter().enumerate().map(|(index, device)| {
             let is_selected = selected == device;
-            let label = device.clone().unwrap_or_else(|| "Automatic".into());
+            let label = label(&device);
             let choose = choose.clone();
             div()
-                .id(("microphone-choice", index))
+                .id((picker_id, index))
                 .w_full()
                 .h(px(34.0))
                 .px_3()
@@ -394,6 +396,11 @@ pub struct AppWindow {
     microphone_devices: Vec<String>,
     microphone_picker_open: bool,
     microphone_picker_error: Option<String>,
+    microphone_channel_picker_open: bool,
+    microphone_description: Option<crate::microphone::InputDescription>,
+    microphone_description_error: Option<String>,
+    microphone_refresh_at: Instant,
+    microphone_diagnostic: Option<crate::microphone::RecordingDiagnostic>,
     launch_at_login_status: Option<LoginItemStatus>,
     login_item_worker: Option<LoginItemWorker>,
     launch_at_login_error: Option<String>,
@@ -439,7 +446,8 @@ impl AppWindow {
                 let updated = window.update(cx, |window, cx| {
                     let changed = window.poll_setup(false)
                         | window.poll_login_item()
-                        | window.poll_history(cx);
+                        | window.poll_history(cx)
+                        | window.poll_microphone();
                     if changed {
                         cx.notify();
                     }
@@ -552,6 +560,19 @@ impl AppWindow {
         let paste_side = side(settings.paste_last_hotkey.as_ref());
         let openrouter_settings = crate::openrouter::settings_view::new(preview_mode, cx);
         let openrouter_setup = crate::openrouter::settings_view::new_key_setup(preview_mode, cx);
+        let (microphone_description, microphone_description_error) = if preview_mode {
+            (
+                Some(crate::microphone::InputDescription::for_preview(
+                    settings.microphone_channel.as_ref(),
+                )),
+                None,
+            )
+        } else {
+            match crate::audio::input_description(settings.microphone.as_deref()) {
+                Ok(description) => (Some(description), None),
+                Err(error) => (None, Some(error.to_string())),
+            }
+        };
         subscriptions.push(cx.observe(&openrouter_settings, |_, _, cx| cx.notify()));
         subscriptions.push(
             cx.subscribe(&openrouter_setup, |this, _, event: &KeyChanged, cx| {
@@ -584,6 +605,12 @@ impl AppWindow {
             microphone_devices,
             microphone_picker_open: false,
             microphone_picker_error: None,
+            microphone_channel_picker_open: false,
+            microphone_description,
+            microphone_description_error,
+            microphone_refresh_at: Instant::now() + Duration::from_secs(5),
+            microphone_diagnostic: preview_mode
+                .then(crate::microphone::RecordingDiagnostic::for_preview),
             launch_at_login_status,
             login_item_worker,
             launch_at_login_error,
@@ -661,6 +688,7 @@ impl AppWindow {
         self.pane = pane;
         self.history_retention_open = false;
         self.microphone_picker_open = false;
+        self.microphone_channel_picker_open = false;
         match pane {
             Pane::History => self.reload_history(cx),
             Pane::Statistics => self.statistics.update(cx, |view, cx| {
@@ -1718,14 +1746,17 @@ impl AppWindow {
         let choices = std::iter::once(None)
             .chain(self.microphone_devices.iter().cloned().map(Some))
             .collect::<Vec<_>>();
-        microphone_picker_menu(
+        selection_picker_menu(
+            "microphone-picker",
             choices,
             self.settings.microphone.clone(),
+            |device| device.clone().unwrap_or_else(|| "Automatic".into()),
             self.microphone_picker_error.clone(),
             cx.listener(|this, device: &Option<String>, _, cx| {
                 if this.update_settings(cx, |settings| settings.microphone = device.clone()) {
                     this.microphone_picker_open = false;
                     this.microphone_picker_error = None;
+                    this.refresh_microphone_description();
                 }
             }),
             cx.listener(|this, _, _, cx| {
@@ -1738,6 +1769,7 @@ impl AppWindow {
     }
 
     fn toggle_microphone_picker(&mut self, cx: &mut Context<Self>) {
+        self.microphone_channel_picker_open = false;
         self.microphone_picker_open = !self.microphone_picker_open;
         if self.microphone_picker_open && !self.preview {
             match crate::audio::input_device_names() {
@@ -1749,6 +1781,244 @@ impl AppWindow {
             }
         }
         cx.notify();
+    }
+
+    fn refresh_microphone_description(&mut self) -> bool {
+        let previous = (
+            self.microphone_description.clone(),
+            self.microphone_description_error.clone(),
+        );
+        let result = if self.preview {
+            Ok(crate::microphone::InputDescription::for_preview(
+                self.settings.microphone_channel.as_ref(),
+            ))
+        } else {
+            crate::audio::input_description(self.settings.microphone.as_deref())
+        };
+        match result {
+            Ok(description) => {
+                self.microphone_description = Some(description);
+                self.microphone_description_error = None;
+            }
+            Err(error) => {
+                self.microphone_description = None;
+                self.microphone_description_error = Some(error.to_string());
+            }
+        }
+        self.microphone_refresh_at = Instant::now() + Duration::from_secs(5);
+        let changed = previous
+            != (
+                self.microphone_description.clone(),
+                self.microphone_description_error.clone(),
+            );
+        if changed {
+            self.microphone_channel_picker_open = false;
+        }
+        changed
+    }
+
+    fn poll_microphone(&mut self) -> bool {
+        if self.preview || self.pane != Pane::Settings {
+            return false;
+        }
+        let latest = crate::microphone::latest();
+        let mut changed = self.microphone_diagnostic != latest;
+        self.microphone_diagnostic = latest;
+        if Instant::now() >= self.microphone_refresh_at {
+            changed |= self.refresh_microphone_description();
+        }
+        changed
+    }
+
+    fn select_microphone_channel(
+        &mut self,
+        device: &crate::microphone::InputDescription,
+        channel: Option<u16>,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_microphone_description();
+        self.microphone_channel_picker_open = false;
+        let Some(current) = &self.microphone_description else {
+            cx.notify();
+            return;
+        };
+        if current.device_id != device.device_id
+            || channel.is_some_and(|channel| {
+                crate::microphone::resolve_channel(Some(channel), current.channels).is_none()
+            })
+        {
+            self.settings_error = Some("Microphone changed. Open the channel picker again.".into());
+            cx.notify();
+            return;
+        }
+        let Some(device_id) = &current.device_id else {
+            return;
+        };
+        let selection = channel.map(|channel| crate::microphone::ChannelSelection {
+            device_id: device_id.clone(),
+            device_name: current.name.clone(),
+            channel,
+        });
+        let device_id = device_id.clone();
+        if self.update_settings(cx, |settings| {
+            if selection.is_some()
+                || settings
+                    .microphone_channel
+                    .as_ref()
+                    .is_some_and(|previous| previous.device_id == device_id)
+            {
+                settings.microphone_channel = selection;
+            }
+        }) {
+            self.refresh_microphone_description();
+        }
+        cx.notify();
+    }
+
+    fn render_microphone_channel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(description) = self.microphone_description.clone() else {
+            return settings_row(
+                "Input channel",
+                self.microphone_description_error
+                    .clone()
+                    .unwrap_or_else(|| "Input metadata is unavailable".into()),
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(MUTED))
+                    .child("Unavailable"),
+            )
+            .into_any_element();
+        };
+        let note = if description.channel_unavailable() {
+            format!(
+                "{}: saved channel unavailable; using the existing mix",
+                description.name
+            )
+        } else if let Some(previous) = &description.fallback_from {
+            format!(
+                "Using {} because {previous} is unavailable",
+                description.name
+            )
+        } else if description.channels == 1 {
+            format!("{} · one input channel", description.name)
+        } else {
+            format!(
+                "{} · all channels are mixed until you select one",
+                description.name
+            )
+        };
+        let menu = self.microphone_channel_picker_open.then(|| {
+            let source = description.clone();
+            selection_picker_menu(
+                "microphone-channel-picker",
+                std::iter::once(None)
+                    .chain((1..=source.channels).map(Some))
+                    .collect(),
+                source.channel,
+                |channel| {
+                    channel.map_or_else(
+                        || "Mix channels".into(),
+                        |channel| format!("Channel {channel}"),
+                    )
+                },
+                None,
+                cx.listener(move |this, channel: &Option<u16>, _, cx| {
+                    this.select_microphone_channel(&source, *channel, cx)
+                }),
+                cx.listener(|this, _, _, cx| {
+                    this.microphone_channel_picker_open = false;
+                    cx.notify();
+                }),
+            )
+        });
+        let selectable = description.device_id.is_some()
+            && (description.channels > 1 || description.requested_channel.is_some());
+        if !selectable {
+            return settings_row(
+                "Input channel",
+                note,
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(MUTED))
+                    .child(description.channel_label()),
+            )
+            .into_any_element();
+        }
+        settings_row(
+            "Input channel",
+            note,
+            div()
+                .relative()
+                .flex_none()
+                .child(
+                    disclosure_button(description.channel_label())
+                        .id("microphone-channel")
+                        .when(selectable, |button| {
+                            button.on_click(cx.listener(|this, _, _, cx| {
+                                this.microphone_picker_open = false;
+                                this.refresh_microphone_description();
+                                this.microphone_channel_picker_open =
+                                    !this.microphone_channel_picker_open;
+                                cx.notify();
+                            }))
+                        }),
+                )
+                .children(menu.map(deferred)),
+        )
+        .into_any_element()
+    }
+
+    fn render_microphone_diagnostic(&self) -> AnyElement {
+        let Some(report) = &self.microphone_diagnostic else {
+            return settings_row(
+                "Input levels",
+                "Measured from the last analyzed recording, before silence trimming",
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(MUTED))
+                    .child("Record a short dictation first"),
+            )
+            .into_any_element();
+        };
+        let db = |value: Option<f64>| {
+            value.map_or_else(|| "−∞ dBFS".into(), |value| format!("{value:.1} dBFS"))
+        };
+        let source = report.input.as_ref().map_or_else(
+            || "Input not identified".into(),
+            |input| format!("{} · {}", input.name, input.channel_label()),
+        );
+        div()
+            .border_b_1()
+            .border_color(rgb(LINE))
+            .child(
+                settings_row(
+                    "Input levels",
+                    format!(
+                        "Last analyzed recording: {source} · {:.1} s",
+                        report.duration_ms as f64 / 1_000.0
+                    ),
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_end()
+                        .text_size(px(11.0))
+                        .text_color(rgb(TEXT_SOFT))
+                        .child(format!("RMS {}", db(report.levels.rms_dbfs())))
+                        .child(format!("Peak {}", db(report.levels.peak_dbfs()))),
+                )
+                .border_b_0(),
+            )
+            .when_some(report.levels.warning(), |panel, warning| {
+                panel.child(
+                    div()
+                        .px_4()
+                        .pb_3()
+                        .text_size(px(11.0))
+                        .text_color(rgb(NEGATIVE))
+                        .child(warning),
+                )
+            })
+            .into_any_element()
     }
 
     fn render_permission_warnings(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1865,6 +2135,8 @@ impl AppWindow {
 
     fn render_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let permission_warnings = self.render_permission_warnings(cx);
+        let microphone_channel = self.render_microphone_channel(cx);
+        let microphone_diagnostic = self.render_microphone_diagnostic();
         let trim_enabled = self.openrouter_settings.read(cx).trim_silence();
         let trim_control = div()
             .id("microphone-trim-silence")
@@ -2093,6 +2365,8 @@ impl AppWindow {
                                 )
                                 .children(microphone_picker.map(deferred)),
                         ))
+                        .child(microphone_channel)
+                        .child(microphone_diagnostic)
                         .child(settings_row(
                             "Microphone mode",
                             if self.settings.release_microphone_while_idle {
@@ -2110,7 +2384,9 @@ impl AppWindow {
                         .child(
                             settings_row(
                                 "While dictating",
-                                "What happens to other audio once a hold becomes a dictation",
+                                if self.settings.recording_audio_behavior == RecordingAudioBehavior::Mute {
+                                    "Fades system audio out and back in quickly; preserves detected manual volume changes"
+                                } else { "What happens to other audio once a hold becomes a dictation" },
                                 audio_behavior,
                             )
                             .border_b_0(),
@@ -2344,9 +2620,13 @@ impl Render for AppWindow {
                 if event.keystroke.key != "escape" {
                     return;
                 }
-                if this.history_retention_open || this.microphone_picker_open {
+                if this.history_retention_open
+                    || this.microphone_picker_open
+                    || this.microphone_channel_picker_open
+                {
                     this.history_retention_open = false;
                     this.microphone_picker_open = false;
+                    this.microphone_channel_picker_open = false;
                     cx.stop_propagation();
                     cx.notify();
                 }
@@ -2915,6 +3195,37 @@ mod tests {
                 assert!(!view.openrouter_settings.read(cx).trim_silence());
                 view.toggle_trim_silence(cx);
                 assert!(view.openrouter_settings.read(cx).trim_silence());
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn explicit_microphone_channel_stays_bound_to_its_device(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(preview_fixture);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let device = view.microphone_description.clone().unwrap();
+                assert_eq!(device.channel, None);
+                view.select_microphone_channel(&device, Some(2), cx);
+                assert_eq!(
+                    view.microphone_description.as_ref().unwrap().channel,
+                    Some(2)
+                );
+                assert_eq!(
+                    view.settings.microphone, None,
+                    "automatic device selection must stay unchanged"
+                );
+                let saved = view.settings.microphone_channel.clone();
+                let mut stale = device.clone();
+                stale.device_id = Some("different-device".into());
+                view.select_microphone_channel(&stale, Some(1), cx);
+                assert_eq!(view.settings.microphone_channel, saved);
+                assert!(view.settings_error.is_some());
+                view.select_microphone_channel(&device, None, cx);
+                assert_eq!(view.settings.microphone_channel, None);
+                assert_eq!(view.microphone_description.as_ref().unwrap().channel, None);
+                assert!(view.settings_error.is_none());
             });
         });
         cx.run_until_parked();

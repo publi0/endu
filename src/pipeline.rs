@@ -390,7 +390,9 @@ fn run_transcription_worker(
         let _ = events.send(WorkerEvent::Transcribing { job_id: job.job_id });
         let queue_ms = job.submitted_at.elapsed().as_millis();
         let audio_ms = job.clip.duration_ms();
+        let input_description = job.clip.input.clone();
         let samples = job.clip.into_transcription_samples();
+        crate::microphone::record(&samples, input_description);
         let started = Instant::now();
         let result = transcribe(&samples);
         if is_shutting_down(state) {

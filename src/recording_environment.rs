@@ -3,18 +3,22 @@ use std::ffi::c_void;
 use std::mem::size_of;
 use std::process::Command;
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use objc2_app_kit::NSWorkspace;
 use objc2_core_audio::{
     AudioObjectGetPropertyData, AudioObjectPropertyAddress, AudioObjectSetPropertyData,
-    kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyElementMain,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
+    kAudioDevicePropertyMute, kAudioHardwarePropertyDefaultOutputDevice,
+    kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
 };
 use objc2_core_foundation::CFString;
 
 use crate::app_settings::{self, RecordingAudioBehavior};
+use crate::volume_fade::{FADE_TICK, VolumeDevice, VolumeFade, VolumeState};
 
 const VIRTUAL_MAIN_VOLUME: u32 = u32::from_be_bytes(*b"vmvc");
 const POWER_ASSERTION_LEVEL_ON: u32 = 255;
@@ -76,18 +80,68 @@ impl MediaPlayer {
 }
 
 struct RecordingEnvironment {
-    _sleep: Option<PreventSleep>,
-    _audio: AudioBehaviorGuard,
+    sleep: Option<PreventSleep>,
+    audio: AudioBehaviorGuard,
+    behavior: RecordingAudioBehavior,
 }
 
 impl RecordingEnvironment {
     pub fn start() -> Self {
+        let behavior = app_settings::recording_audio_behavior();
         Self {
-            _sleep: prevent_sleep(),
-            _audio: AudioBehaviorGuard::start(app_settings::recording_audio_behavior()),
+            sleep: prevent_sleep(),
+            audio: AudioBehaviorGuard::start(behavior),
+            behavior,
         }
     }
 }
+
+trait EnvironmentState {
+    fn set_active(&mut self, _active: bool, _now: Instant) {}
+    fn tick(&mut self, _now: Instant) {}
+    fn needs_tick(&self) -> bool {
+        false
+    }
+    fn restoring(&self) -> bool {
+        false
+    }
+    fn can_reactivate(&mut self) -> bool {
+        true
+    }
+}
+
+impl EnvironmentState for RecordingEnvironment {
+    fn set_active(&mut self, active: bool, now: Instant) {
+        if active && self.sleep.is_none() {
+            self.sleep = prevent_sleep();
+        }
+        if !active {
+            self.sleep = None;
+        }
+        self.audio.set_active(active, now);
+    }
+    fn tick(&mut self, now: Instant) {
+        if let AudioBehaviorGuard::Faded(fade) = &mut self.audio {
+            fade.tick(now);
+        }
+    }
+    fn needs_tick(&self) -> bool {
+        matches!(&self.audio, AudioBehaviorGuard::Faded(fade) if fade.is_animating())
+    }
+    fn restoring(&self) -> bool {
+        matches!(&self.audio, AudioBehaviorGuard::Faded(fade) if fade.is_restoring())
+    }
+    fn can_reactivate(&mut self) -> bool {
+        self.behavior == app_settings::recording_audio_behavior()
+            && match &mut self.audio {
+                AudioBehaviorGuard::Faded(fade) => fade.can_reactivate(),
+                _ => true,
+            }
+    }
+}
+
+#[cfg(test)]
+impl EnvironmentState for () {}
 
 enum EnvironmentCommand {
     Start,
@@ -98,7 +152,26 @@ enum EnvironmentCommand {
 
 #[derive(Clone)]
 pub struct RecordingEnvironmentController {
+    // Senders drop before the last worker owner joins, closing its receiver.
     commands: Sender<EnvironmentCommand>,
+    worker: Arc<EnvironmentWorker>,
+}
+
+struct EnvironmentWorker(Option<thread::JoinHandle<()>>);
+impl Drop for EnvironmentWorker {
+    fn drop(&mut self) {
+        if let Some(worker) = self.0.take() {
+            // Volume restoration normally finishes as soon as the channel closes.
+            // A stalled media-player Apple event must not trap application shutdown.
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while !worker.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if worker.is_finished() && worker.join().is_err() {
+                tracing::error!("recording environment worker panicked");
+            }
+        }
+    }
 }
 
 impl RecordingEnvironmentController {
@@ -111,45 +184,81 @@ impl RecordingEnvironmentController {
         Self::with_environment(|| ())
     }
 
-    fn with_environment<E>(start: impl Fn() -> E + Send + 'static) -> Self {
+    fn with_environment<E: EnvironmentState>(start: impl Fn() -> E + Send + 'static) -> Self {
         let (commands, receiver) = mpsc::channel();
-        thread::spawn(move || {
+        let worker = thread::spawn(move || {
             let mut sessions = 0_u32;
-            let mut _environment = None;
-            while let Ok(command) = receiver.recv() {
+            let mut environment: Option<E> = None;
+            loop {
+                let command = if environment
+                    .as_ref()
+                    .is_some_and(EnvironmentState::needs_tick)
+                {
+                    receiver.recv_timeout(FADE_TICK)
+                } else {
+                    receiver
+                        .recv()
+                        .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+                };
+                let now = Instant::now();
                 match command {
-                    EnvironmentCommand::Start => {
+                    Ok(EnvironmentCommand::Start) => {
                         sessions = sessions.saturating_add(1);
                         if sessions == 1 {
-                            _environment = Some(start());
+                            if environment
+                                .as_mut()
+                                .is_some_and(|value| !value.can_reactivate())
+                            {
+                                environment = None;
+                            }
+                            if let Some(value) = &mut environment {
+                                value.set_active(true, now);
+                            } else {
+                                environment = Some(start());
+                            }
                         }
                     }
-                    EnvironmentCommand::Stop => {
+                    Ok(EnvironmentCommand::Stop) => {
                         sessions = sessions.saturating_sub(1);
-                        if sessions == 0 {
-                            _environment = None;
+                        if sessions == 0
+                            && let Some(value) = &mut environment
+                        {
+                            value.set_active(false, now);
                         }
                     }
                     #[cfg(test)]
-                    EnvironmentCommand::Barrier(reply) => {
+                    Ok(EnvironmentCommand::Barrier(reply)) => {
                         let _ = reply.send(());
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                if let Some(value) = &mut environment {
+                    value.tick(now);
+                    if sessions == 0 && !value.restoring() {
+                        environment = None;
                     }
                 }
             }
         });
-        Self { commands }
+        Self {
+            commands,
+            worker: Arc::new(EnvironmentWorker(Some(worker))),
+        }
     }
 
     pub fn begin(&self) -> RecordingEnvironmentSession {
         let _ = self.commands.send(EnvironmentCommand::Start);
         RecordingEnvironmentSession {
             commands: self.commands.clone(),
+            _worker: self.worker.clone(),
         }
     }
 }
 
 pub struct RecordingEnvironmentSession {
     commands: Sender<EnvironmentCommand>,
+    _worker: Arc<EnvironmentWorker>,
 }
 
 impl Drop for RecordingEnvironmentSession {
@@ -224,7 +333,7 @@ unsafe extern "C" {
 }
 
 enum AudioBehaviorGuard {
-    Muted { device: u32, previous: f32 },
+    Faded(VolumeFade<CoreAudioVolume>),
     Paused { players: Vec<MediaPlayer> },
     None,
 }
@@ -232,12 +341,9 @@ enum AudioBehaviorGuard {
 impl AudioBehaviorGuard {
     fn start(behavior: RecordingAudioBehavior) -> Self {
         match behavior {
-            RecordingAudioBehavior::Mute => {
-                mute_output().map_or(Self::None, |(device, previous)| {
-                    tracing::info!(previous, "muted system output for dictation");
-                    Self::Muted { device, previous }
-                })
-            }
+            RecordingAudioBehavior::Mute => default_output_device()
+                .and_then(|device| VolumeFade::new(CoreAudioVolume(device), Instant::now()))
+                .map_or(Self::None, Self::Faded),
             RecordingAudioBehavior::PauseMedia => {
                 let players = pause_media();
                 if players.is_empty() {
@@ -250,28 +356,62 @@ impl AudioBehaviorGuard {
             RecordingAudioBehavior::DoNothing => Self::None,
         }
     }
+
+    fn set_active(&mut self, active: bool, now: Instant) {
+        match self {
+            Self::Faded(fade) => fade.set_muted(active, now),
+            Self::Paused { players } if !active => {
+                resume_media(players);
+                players.clear();
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Drop for AudioBehaviorGuard {
     fn drop(&mut self) {
         match self {
-            Self::Muted { device, previous } => {
-                if output_volume(*device).is_some_and(|volume| volume <= 0.001)
-                    && set_output_volume(*device, *previous)
-                {
-                    tracing::info!(volume = *previous, "restored system output after dictation");
-                }
-            }
             Self::Paused { players } => resume_media(players),
-            Self::None => {}
+            Self::Faded(_) | Self::None => {}
         }
     }
 }
 
-fn mute_output() -> Option<(u32, f32)> {
-    let device = default_output_device()?;
-    let previous = output_volume(device)?;
-    set_output_volume(device, 0.0).then_some((device, previous))
+struct CoreAudioVolume(u32);
+
+impl VolumeDevice for CoreAudioVolume {
+    fn is_current_output(&mut self) -> bool {
+        default_output_device() == Some(self.0)
+    }
+    fn read(&mut self) -> Option<VolumeState> {
+        Some(VolumeState {
+            volume: output_volume(self.0)?,
+            muted: output_muted(self.0),
+        })
+    }
+    fn write(&mut self, volume: f32) -> bool {
+        set_output_volume(self.0, volume)
+    }
+}
+
+fn output_muted(device: u32) -> Option<bool> {
+    let mut address = volume_address();
+    address.mSelector = kAudioDevicePropertyMute;
+    let mut muted = 0_u32;
+    let mut size = size_of::<u32>() as u32;
+    // SAFETY: each pointer refers to correctly sized, initialized stack storage.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            device,
+            NonNull::from(&mut address),
+            0,
+            std::ptr::null(),
+            NonNull::from(&mut size),
+            NonNull::from(&mut muted).cast::<c_void>(),
+        )
+    };
+    (status == 0 && size == size_of::<u32>() as u32).then_some(muted != 0)
 }
 
 fn default_output_device() -> Option<u32> {
@@ -417,7 +557,6 @@ fn pause_media_script(players: &HashSet<MediaPlayer>) -> String {
 mod tests {
     use super::*;
     use std::sync::mpsc::{Receiver, RecvTimeoutError};
-    use std::time::Duration;
 
     #[derive(Debug, PartialEq)]
     enum Event {
@@ -426,6 +565,8 @@ mod tests {
     }
 
     struct ObservedEnvironment(Sender<Event>);
+
+    impl EnvironmentState for ObservedEnvironment {}
 
     impl Drop for ObservedEnvironment {
         fn drop(&mut self) {
@@ -457,7 +598,10 @@ mod tests {
     fn sessions_are_harmless_after_the_environment_worker_disconnects() {
         let (commands, receiver) = mpsc::channel();
         drop(receiver);
-        let controller = RecordingEnvironmentController { commands };
+        let controller = RecordingEnvironmentController {
+            commands,
+            worker: Arc::new(EnvironmentWorker(None)),
+        };
         drop(controller.begin());
     }
 
@@ -496,6 +640,79 @@ mod tests {
             drop(session);
             assert_events(&controller.commands, &events, &[Event::Restored]);
         }
+    }
+
+    #[test]
+    fn quick_restart_reuses_a_fade_only_while_it_owns_the_output() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Debug, PartialEq)]
+        enum Transition {
+            Started,
+            Active(bool),
+            Dropped,
+        }
+        struct FadingEnvironment {
+            events: Sender<Transition>,
+            owned: Arc<AtomicBool>,
+            restoring: bool,
+        }
+        impl EnvironmentState for FadingEnvironment {
+            fn set_active(&mut self, active: bool, _: Instant) {
+                self.restoring = !active;
+                self.events.send(Transition::Active(active)).unwrap();
+            }
+            fn restoring(&self) -> bool {
+                self.restoring
+            }
+            fn can_reactivate(&mut self) -> bool {
+                self.owned.load(Ordering::SeqCst)
+            }
+        }
+        impl Drop for FadingEnvironment {
+            fn drop(&mut self) {
+                self.events.send(Transition::Dropped).unwrap();
+            }
+        }
+
+        let (events, observed) = mpsc::channel();
+        let owned = Arc::new(AtomicBool::new(true));
+        let worker_owned = owned.clone();
+        let controller = RecordingEnvironmentController::with_environment(move || {
+            events.send(Transition::Started).unwrap();
+            FadingEnvironment {
+                events: events.clone(),
+                owned: worker_owned.clone(),
+                restoring: false,
+            }
+        });
+        let check = |expected: &[Transition]| {
+            let (reply, response) = mpsc::channel();
+            controller
+                .commands
+                .send(EnvironmentCommand::Barrier(reply))
+                .unwrap();
+            response.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(observed.try_iter().collect::<Vec<_>>(), expected);
+        };
+        let first = controller.begin();
+        drop(first);
+        check(&[Transition::Started, Transition::Active(false)]);
+        let second = controller.begin();
+        check(&[Transition::Active(true)]);
+        drop(second);
+        check(&[Transition::Active(false)]);
+        owned.store(false, Ordering::SeqCst);
+        let third = controller.begin();
+        check(&[Transition::Dropped, Transition::Started]);
+        drop(third);
+        check(&[Transition::Active(false)]);
+        drop(controller);
+        // The last worker owner waits for guarded restoration on shutdown.
+        assert_eq!(
+            observed.try_iter().collect::<Vec<_>>(),
+            [Transition::Dropped]
+        );
     }
 
     #[test]

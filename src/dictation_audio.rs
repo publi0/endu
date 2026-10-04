@@ -429,13 +429,16 @@ impl Owner {
                 let _ = reply.send(became_intentional);
             }
             Command::Finish { at, reply } => {
-                let finish = if self.pending_capture.take().is_some() {
+                let mut finish = if self.pending_capture.take().is_some() {
                     self.input.cancel_open();
                     Finish::Discard
                 } else {
                     self.drain_through(at);
                     self.capture.finish(at)
                 };
+                if let Finish::Transcribe(clip) = &mut finish {
+                    clip.input = self.input.description().cloned();
+                }
                 self.state.recording.store(false, Ordering::Release);
                 let _ = reply.send(finish);
             }
@@ -940,6 +943,8 @@ mod tests {
                 panic!("second capture must preserve its original press and produce one clip");
             };
             assert_eq!(clip.duration_ms(), 100);
+            assert_eq!(clip.input.as_ref().unwrap().name, "Test microphone");
+            assert_eq!(clip.input.as_ref().unwrap().channels, 1);
             owner.reconcile_input();
             assert!(!input.is_recording());
             assert!(!owner.input.is_open());

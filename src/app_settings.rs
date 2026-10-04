@@ -22,6 +22,7 @@ static MICROPHONE_SELECTION: OnceLock<RwLock<RuntimeMicrophoneSelection>> = Once
 struct RuntimeMicrophoneSelection {
     revision: u64,
     device: Option<String>,
+    channel: Option<crate::microphone::ChannelSelection>,
 }
 
 pub const SHIFT_KEY_MASK: u64 = 1 << 17;
@@ -394,6 +395,7 @@ pub struct AppSettings {
     pub sound_effects: bool,
     pub sound_effect_volume: f32,
     pub microphone: Option<String>,
+    pub microphone_channel: Option<crate::microphone::ChannelSelection>,
     pub recording_audio_behavior: RecordingAudioBehavior,
     pub double_tap_lock: bool,
     pub double_tap_only: bool,
@@ -410,6 +412,7 @@ impl Default for AppSettings {
             sound_effects: true,
             sound_effect_volume: 0.5,
             microphone: None,
+            microphone_channel: None,
             recording_audio_behavior: RecordingAudioBehavior::DoNothing,
             double_tap_lock: true,
             double_tap_only: false,
@@ -501,7 +504,7 @@ impl AppSettings {
             .get_or_init(Default::default)
             .write()
             .unwrap_or_else(|error| error.into_inner()) = self.runtime_hotkeys();
-        set_microphone_selection(self.microphone.as_deref());
+        set_microphone_selection(self.microphone.as_deref(), self.microphone_channel.as_ref());
     }
 
     pub fn runtime_hotkeys(&self) -> RuntimeHotkeys {
@@ -526,16 +529,20 @@ pub fn hotkey_conflicts(
         .any(|binding| candidate.overlaps(&binding))
 }
 
-fn set_microphone_selection(device: Option<&str>) {
+fn set_microphone_selection(
+    device: Option<&str>,
+    channel: Option<&crate::microphone::ChannelSelection>,
+) {
     let device = device
         .map(str::trim)
         .filter(|device| !device.is_empty())
         .map(str::to_string);
     let state = MICROPHONE_SELECTION.get_or_init(Default::default);
     let mut state = state.write().unwrap_or_else(|error| error.into_inner());
-    if state.device != device {
+    if state.device != device || state.channel.as_ref() != channel {
         state.revision = state.revision.wrapping_add(1);
         state.device = device;
+        state.channel = channel.cloned();
     }
 }
 
@@ -543,6 +550,18 @@ pub fn microphone_selection() -> (u64, Option<String>) {
     let state = MICROPHONE_SELECTION.get_or_init(Default::default);
     let state = state.read().unwrap_or_else(|error| error.into_inner());
     (state.revision, state.device.clone())
+}
+
+pub fn microphone_channel(device_id: Option<&str>) -> Option<u16> {
+    let state = MICROPHONE_SELECTION
+        .get_or_init(Default::default)
+        .read()
+        .unwrap_or_else(|error| error.into_inner());
+    state
+        .channel
+        .as_ref()
+        .filter(|selection| Some(selection.device_id.as_str()) == device_id)
+        .map(|selection| selection.channel)
 }
 
 pub fn recording_audio_behavior() -> RecordingAudioBehavior {
@@ -626,6 +645,7 @@ mod tests {
         assert!(settings.sound_effects);
         assert_eq!(settings.sound_effect_volume, 0.5);
         assert_eq!(settings.microphone, None);
+        assert_eq!(settings.microphone_channel, None);
         assert_eq!(
             settings.recording_audio_behavior,
             RecordingAudioBehavior::DoNothing
@@ -647,6 +667,27 @@ mod tests {
         )
         .unwrap();
         assert!(!settings.double_tap_lock);
+    }
+
+    #[test]
+    fn explicit_channel_preference_round_trips_without_changing_the_device_preference() {
+        let settings = AppSettings {
+            microphone: None,
+            microphone_channel: Some(crate::microphone::ChannelSelection {
+                device_id: "stable-device-uid".into(),
+                device_name: "USB interface".into(),
+                channel: 2,
+            }),
+            ..AppSettings::default()
+        };
+        let decoded: AppSettings =
+            serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(decoded.microphone, None);
+        assert_eq!(decoded.microphone_channel, settings.microphone_channel);
+        let legacy: AppSettings =
+            serde_json::from_str(r#"{"microphone":"USB interface"}"#).unwrap();
+        assert_eq!(legacy.microphone.as_deref(), Some("USB interface"));
+        assert_eq!(legacy.microphone_channel, None);
     }
 
     #[test]

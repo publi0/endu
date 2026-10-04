@@ -1,6 +1,6 @@
 use gpui::{
-    AnyElement, Div, ElementId, FontWeight, IntoElement, Rgba, Stateful, div, prelude::*, px, rgb,
-    rgba,
+    AnyElement, Div, ElementId, FontWeight, IntoElement, Rgba, SharedString, Stateful, div,
+    prelude::*, px, rgb, rgba,
 };
 
 #[derive(Clone, Copy)]
@@ -308,7 +308,11 @@ pub(crate) fn settings_section_label(label: &'static str) -> AnyElement {
         .into_any_element()
 }
 
-pub(crate) fn settings_copy(title: &'static str, description: &'static str) -> AnyElement {
+pub(crate) fn settings_copy(
+    title: &'static str,
+    description: impl Into<SharedString>,
+) -> AnyElement {
+    let description = description.into();
     div()
         .debug_selector(|| "settings-copy".into())
         .flex()
@@ -402,7 +406,7 @@ pub(crate) fn disclosure_button(label: impl IntoElement) -> Div {
 
 pub(crate) fn settings_row(
     title: &'static str,
-    description: &'static str,
+    description: impl Into<SharedString>,
     control: impl IntoElement,
 ) -> Div {
     div()

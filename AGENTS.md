@@ -23,6 +23,8 @@ not reintroduce seams for them.
   disposable audio projection used only for the HUD meter.
 - `audio`: `cpal` device enumeration, timestamped mono PCM, live selection,
   and bounded stream recovery.
+- `microphone`: explicit device-bound channel selection and the last clip's
+  in-memory RMS/peak diagnostics, measured at 16 kHz before silence trimming.
 - `pipeline`: one transcription worker and one ordered output worker with
   bounded queues, cancellation, paste-last, and History recording.
 - `openrouter`: configuration (`openrouter.json`), Keychain key handling,
@@ -34,6 +36,8 @@ not reintroduce seams for them.
 - `keyboard`: active-layout key resolution and synthetic Command shortcuts.
 - `recording_environment`: idle-sleep prevention, output muting, and media
   pause while a hold is intentional.
+- `volume_fade`: interruptible output fades with guarded restoration; manual
+  volume or mute changes relinquish ownership when detected.
 - `context`: the foreground application name, recorded in History.
 - `history`: the owner-only bounded store of pasted text and metadata.
 - `events`: bounded asynchronous NDJSON observations in `logs/live.ndjson`.
@@ -57,6 +61,17 @@ not reintroduce seams for them.
   cancels the newest unfinished job; cancelled jobs never paste.
 - Recording audio behavior and idle-sleep prevention begin only after the
   intentional-hold threshold.
+- Preserve the existing channel mix until the user explicitly selects a
+  channel. Bind that choice to the device UID, apply changes between clips,
+  and fall back to the mix with a visible warning if the channel disappears.
+  Mono samples must stay unchanged. Never infer a voice channel from volume.
+- RMS/peak diagnostics never modify or retain audio. Do not enable automatic
+  normalization, AGC, high-pass filtering, Apple VoiceProcessing, or neural
+  denoising by default without a separate user decision.
+- Output fades run on the environment worker, never on the capture callback
+  or shortcut loop. Preserve the original volume across quick restarts and
+  restore only when Hex still owns the level; do not overwrite detected
+  manual volume/mute changes.
 - CoreAudio capture timestamps and annotated-session CGEvent timestamps share
   the boot-time nanosecond clock; do not apply the Mach timebase to them.
 - GUI startup calls `keyboard::initialize_layout` on the main thread before

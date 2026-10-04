@@ -135,10 +135,28 @@ As preferências gerais do aplicativo ficam em **Settings**:
 | --- | --- |
 | **Dictation / Paste last** | Atalhos e comportamento do double-tap. |
 | **Microphone / Application** | Microfone, liberação do dispositivo enquanto ocioso, comportamento de outros áudios durante a gravação, sons, ícone no Dock e início no login. |
+| **Microphone / Input channel** | Mantém a mistura atual por padrão. Em interfaces com vários canais, permite escolher explicitamente o canal do microfone. A escolha fica vinculada ao dispositivo. |
+| **Microphone / Input levels** | Mostra RMS, pico e avisos de sinal muito baixo, ausência de sinal ou possível clipping na última gravação analisada. |
 | **Microphone / Trim silence** | Remove silêncio nas bordas e reduz pausas longas antes do envio. Usa uma heurística de energia do áudio; clipes classificados como silenciosos não são enviados. Pode ser desligado. |
 
 O **Trim silence** é salvo assim que você muda o controle. Avisos e atalhos
 para conceder permissões do macOS também aparecem nessa tela.
+
+A escolha do canal não muda o dispositivo selecionado: **Automatic** continua
+automático. Se o canal salvo deixar de existir no dispositivo, o app volta à
+mistura e mostra um aviso. A troca é aplicada entre gravações; os diagnósticos
+identificam o dispositivo e o canal usados no clipe analisado.
+
+Os níveis são medidos depois da conversão para 16 kHz e antes do corte de
+silêncio. São uma indicação do sinal enviado para transcrição, não uma
+medição calibrada do hardware. Ficam apenas na memória da sessão, sem guardar
+o áudio. Não há normalização automática, AGC ou filtro de voz adicional.
+
+Em **While dictating → Mute**, o volume desce e volta em cerca de **120 ms**
+por transição. O fade roda fora da captura e pode inverter o sentido se outro
+ditado começar logo em seguida. Se detectar uma mudança manual de volume ou
+mute, o Hex deixa de controlar o nível para preservar sua escolha. A opção
+**Pause media** mantém seu comportamento de pausar e retomar os players.
 
 O sinal sonoro de início tem um reforço de volume para facilitar perceber
 quando a gravação começou. O controle geral continua valendo, inclusive

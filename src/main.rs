@@ -33,6 +33,8 @@ mod listener;
 #[cfg(target_os = "macos")]
 mod login_item;
 #[cfg(target_os = "macos")]
+mod microphone;
+#[cfg(target_os = "macos")]
 mod onboarding;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod openrouter;
@@ -50,6 +52,8 @@ mod status_item;
 mod suppression;
 #[cfg(target_os = "macos")]
 mod text_input;
+#[cfg(target_os = "macos")]
+mod volume_fade;
 
 use std::sync::atomic::AtomicBool;
 
