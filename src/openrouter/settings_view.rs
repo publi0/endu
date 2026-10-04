@@ -19,7 +19,18 @@ const NARROW_INPUT: f32 = 120.0;
 
 /// The view, or `None` outside the OpenRouter build.
 pub fn new<V: 'static>(cx: &mut Context<V>) -> Option<Entity<OpenRouterSettings>> {
-    super::ENABLED.then(|| cx.new(OpenRouterSettings::new))
+    super::ENABLED.then(|| cx.new(|cx| OpenRouterSettings::new(false, cx)))
+}
+
+/// Just the API key row, for the first-run setup sheet: the key has to be
+/// enterable before the sheet lets the rest of Settings through.
+pub fn new_key_setup<V: 'static>(cx: &mut Context<V>) -> Option<Entity<OpenRouterSettings>> {
+    super::ENABLED.then(|| cx.new(|cx| OpenRouterSettings::new(true, cx)))
+}
+
+/// Whether the setup sheet should offer the key row.
+pub fn setup_needs_key(selected: crate::transcription_models::TranscriptionModelId) -> bool {
+    super::ENABLED && selected == crate::transcription_models::TranscriptionModelId::OpenRouter
 }
 
 #[derive(Clone, Copy)]
@@ -29,6 +40,7 @@ enum InputKind {
 }
 
 pub struct OpenRouterSettings {
+    key_only: bool,
     base: Config,
     key_input: Entity<TextInput>,
     key_status: Option<KeyStatus>,
@@ -51,7 +63,7 @@ pub struct OpenRouterSettings {
 }
 
 impl OpenRouterSettings {
-    fn new(cx: &mut Context<Self>) -> Self {
+    fn new(key_only: bool, cx: &mut Context<Self>) -> Self {
         let (base, message) = match super::load_config() {
             Ok(config) => (config, None),
             Err(error) => (
@@ -104,6 +116,7 @@ impl OpenRouterSettings {
             this.save_key(cx);
         }));
         let mut view = Self {
+            key_only,
             base,
             key_input,
             key_status: None,
@@ -418,6 +431,33 @@ impl Render for OpenRouterSettings {
         } else {
             self.message.clone()
         };
+        if self.key_only {
+            return div()
+                .pb_5()
+                .child(
+                    div()
+                        .pt_4()
+                        .pb_2()
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(FAINT))
+                        .child("OPENROUTER API KEY"),
+                )
+                .child(
+                    div().border_t_1().border_color(rgb(LINE)).child(
+                        row("API key", key_description, key_control)
+                            .px_0()
+                            .border_b_0(),
+                    ),
+                )
+                .children(status.map(|(ok, text)| {
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(if ok { TEXT_SOFT } else { NEGATIVE }))
+                        .child(text)
+                }))
+                .into_any_element();
+        }
         let footer = div()
             .w_full()
             .pt_3()
@@ -539,5 +579,6 @@ impl Render for OpenRouterSettings {
                     ),
             )
             .child(footer)
+            .into_any_element()
     }
 }

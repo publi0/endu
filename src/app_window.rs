@@ -986,6 +986,7 @@ pub struct AppWindow {
     transcription_hints: ProcessingInput,
     // Fork: OpenRouter settings section (`None` outside the fork build).
     openrouter_settings: Option<Entity<crate::openrouter::settings_view::OpenRouterSettings>>,
+    openrouter_setup: Option<Entity<crate::openrouter::settings_view::OpenRouterSettings>>,
     transcription_picker_language: Option<String>,
     transcription_status: PreparationStatus,
     transcription_preparation: TranscriptionPreparation,
@@ -1418,6 +1419,7 @@ impl AppWindow {
             variant_picker_open: None,
             transcription_hints,
             openrouter_settings: crate::openrouter::settings_view::new(cx),
+            openrouter_setup: crate::openrouter::settings_view::new_key_setup(cx),
             transcription_picker_language: preview_picker.map(|(language, _)| language.clone()),
             transcription_status: PreparationStatus {
                 model: preview_downloading,
@@ -4000,6 +4002,13 @@ impl AppWindow {
                                     },
                                     models,
                                 )),
+                            )
+                            .when(
+                                !models_ready
+                                    && crate::openrouter::settings_view::setup_needs_key(
+                                        self.settings.transcription.model,
+                                    ),
+                                |setup| setup.children(self.openrouter_setup.clone()),
                             ),
                     )
                     .when(crate::DEVELOPER_FEATURES_ENABLED, |setup| {
