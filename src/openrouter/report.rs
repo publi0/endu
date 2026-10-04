@@ -62,7 +62,8 @@ impl StepReport {
     }
 }
 
-/// Representative report for the History preview.
+/// Representative report for tests.
+#[cfg(test)]
 pub fn preview() -> StepReport {
     StepReport {
         model: Some("openai/gpt-4o-mini-transcribe".into()),

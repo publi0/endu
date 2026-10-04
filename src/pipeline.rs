@@ -430,9 +430,12 @@ fn run_output_worker(
     }
 }
 
+/// `paste(text, commit)` pastes `text` once `commit` accepts.
+type OutputPasteFn<'a> = dyn FnMut(&str, &dyn Fn() -> bool) -> Result<()> + 'a;
+
 fn finish_output(
     job: OutputJob,
-    paste: &mut dyn FnMut(&str, &dyn Fn() -> bool) -> Result<()>,
+    paste: &mut OutputPasteFn<'_>,
     last_transcript: &mut Option<String>,
     history: Option<&History>,
 ) -> WorkerEvent {

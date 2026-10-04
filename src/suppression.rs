@@ -10,7 +10,6 @@ use std::time::Duration;
 use color_eyre::eyre::{Result, eyre};
 
 #[cfg(test)]
-#[cfg(test)]
 use crate::app_settings::HotkeyBinding;
 use crate::app_settings::{HOTKEY_MODIFIERS_MASK, RuntimeHotkey, RuntimeHotkeys};
 use crate::audio::CaptureInstant;

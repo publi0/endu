@@ -228,6 +228,7 @@ impl DictationAudio {
         })
     }
 
+    #[cfg(test)]
     pub fn sample_rate(&self) -> u32 {
         self.state.sample_rate.load(Ordering::Acquire) as u32
     }

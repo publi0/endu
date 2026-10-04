@@ -362,8 +362,6 @@ pub enum RecordingAudioBehavior {
 }
 
 impl RecordingAudioBehavior {
-    pub const ALL: [Self; 3] = [Self::DoNothing, Self::Mute, Self::PauseMedia];
-
     pub const fn label(self) -> &'static str {
         match self {
             Self::Mute => "Mute",

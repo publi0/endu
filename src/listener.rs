@@ -361,7 +361,9 @@ pub fn listen(
                     hotkey.suspend();
                     session.fail(format!("Could not open microphone: {error}"))?;
                 }
-                DictationAudioEvent::RecognitionDiscontinuity { .. } => {}
+                DictationAudioEvent::RecognitionDiscontinuity { dropped_frames } => {
+                    tracing::debug!(dropped_frames, "HUD meter audio fell behind");
+                }
                 DictationAudioEvent::CaptureDiscontinuity {
                     was_recording,
                     gap_ms,
