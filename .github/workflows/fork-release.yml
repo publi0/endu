@@ -1,0 +1,84 @@
+# Fork: build "Hex OpenRouter.app", publish it as a GitHub release, and update
+# the Homebrew cask in Casks/ so `brew upgrade` picks it up.
+name: Fork release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "src/**"
+      - "native/**"
+      - "app/**"
+      - "sdk/commands/**"
+      - "sdk/bun.lock"
+      - "scripts/setup.sh"
+      - "fork/**"
+      - ".github/workflows/fork-release.yml"
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Called after an upstream sync: build the merged main, not the
+          # caller's starting commit.
+          ref: ${{ github.event_name == 'push' && github.sha || 'main' }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: oven-sh/setup-bun@v2
+      - name: Install Moonshine for voice Commands
+        run: |
+          command -v uv >/dev/null || brew install uv
+          moonshine=$(sed -n 's/.*\(moonshine-voice==[0-9.]*\).*/\1/p' scripts/setup.sh | head -1)
+          uv venv .venv
+          uv pip install --python .venv/bin/python "$moonshine"
+      - name: Test the OpenRouter runtime
+        run: cargo test --locked --release --features openrouter --bin voice-control -- 'openrouter::'
+      - name: Build the app
+        id: build
+        run: |
+          upstream=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          version="$upstream-$GITHUB_RUN_NUMBER"
+          archive=$(fork/build-app.sh "$version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(shasum -a 256 "$archive" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.build.outputs.version }}
+          ARCHIVE: ${{ steps.build.outputs.archive }}
+        run: |
+          gh release create "fork-v$VERSION" "$ARCHIVE" \
+            --target "$(git rev-parse HEAD)" \
+            --title "Hex OpenRouter $VERSION" \
+            --notes "Built from $(git rev-parse --short HEAD) (upstream HEX $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')). Install or update with \`brew upgrade --cask hex-openrouter\`."
+      - name: Update the Homebrew cask
+        env:
+          VERSION: ${{ steps.build.outputs.version }}
+          SHA256: ${{ steps.build.outputs.sha256 }}
+        run: |
+          git fetch origin main
+          git checkout -B main origin/main
+          fork/write-cask.sh "$VERSION" "$SHA256" "$GITHUB_REPOSITORY"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/hex-openrouter.rb
+          git commit -m "chore(cask): hex-openrouter $VERSION"
+          git push origin main
