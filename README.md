@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".github/assets/hex-icon.png" width="96" height="96" alt="HEX app icon" />
+  <img src=".github/assets/hex-icon.png" width="96" height="96" alt="Hex app icon" />
 </p>
 
 <h1 align="center">Hex</h1>

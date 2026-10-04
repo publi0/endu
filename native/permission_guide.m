@@ -60,7 +60,7 @@ static HexPermission activePermission;
         NSFontAttributeName: [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],
         NSForegroundColorAttributeName: [NSColor colorWithWhite:(dark ? 0.94 : 0.12) alpha:1],
     };
-    [@"HEX" drawAtPoint:NSMakePoint(52, 14) withAttributes:attributes];
+    [@"Hex" drawAtPoint:NSMakePoint(52, 14) withAttributes:attributes];
 }
 
 - (void)mouseDown:(NSEvent *)event {
@@ -233,7 +233,7 @@ void hex_show_permission_guide(int permission) {
     content.layer.borderColor = [NSColor colorWithWhite:0 alpha:0.10].CGColor;
 
     NSTextField *instruction = [NSTextField labelWithString:[NSString stringWithFormat:
-        @"↑  Drag HEX into the %@ list above", permissionName]];
+        @"↑  Drag Hex into the %@ list above", permissionName]];
     instruction.frame = NSMakeRect(18, 73, panelSize.width - 36, 24);
     instruction.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
     instruction.textColor = NSColor.labelColor;

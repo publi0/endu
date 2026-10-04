@@ -27,12 +27,12 @@
   <key>LSUIElement</key>
   <true/>
   <key>NSAppleEventsUsageDescription</key>
-  <string>HEX uses automation to pause supported media players while you dictate.</string>
+  <string>Hex uses automation to pause supported media players while you dictate.</string>
   <key>NSAccessibilityUsageDescription</key>
-  <string>HEX uses Accessibility to paste the transcript into the app you are using.</string>
+  <string>Hex uses Accessibility to paste the transcript into the app you are using.</string>
   <key>NSInputMonitoringUsageDescription</key>
-  <string>HEX uses Input Monitoring to detect your dictation shortcut in every app.</string>
+  <string>Hex uses Input Monitoring to detect your dictation shortcut in every app.</string>
   <key>NSMicrophoneUsageDescription</key>
-  <string>HEX records while you hold the shortcut and sends the recording to OpenRouter for transcription. Audio is never stored.</string>
+  <string>Hex records while you hold the shortcut and sends the recording to OpenRouter for transcription. Audio is never stored.</string>
 </dict>
 </plist>
