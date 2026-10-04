@@ -156,18 +156,17 @@ não é colocada nos argumentos dos processos de rede ou de acesso ao Keychain.
 ## Desenvolvimento
 
 O aplicativo é escrito em Rust com GPUI. O build para macOS requer Rust
-stable e Xcode com as ferramentas de compilação Metal disponíveis.
+stable, Python 3.11 ou mais novo e Xcode com as ferramentas de compilação
+Metal disponíveis. Antes de cada commit, rode a validação local completa:
 
 ```sh
-cargo fmt --all --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
-fork/build-app.sh
+scripts/check-local.sh
+scripts/build-app.sh
 ```
 
-O empacotamento gera `target/fork-app/Hex.app` e
-`target/fork-app/Hex-<versão>.zip`. Para builds locais com uma identidade de
-assinatura estável, configure `FORK_CODESIGN_IDENTITY` antes de executar o
+O empacotamento gera `target/app/Hex.app` e
+`target/app/Hex-<versão>.zip`. Para builds locais com uma identidade de
+assinatura estável, configure `HEX_CODESIGN_IDENTITY` antes de executar o
 script.
 
 Previews isolados para conferir a interface, sem gravação ou acesso à
@@ -186,16 +185,39 @@ rodar os testes dos módulos portáveis, como OpenRouter, History e Statistics;
 isso não constitui uma versão Linux do app. Veja [AGENTS.md](AGENTS.md) para
 os módulos e contratos internos.
 
-### CI e releases
+### Validação local e releases
 
-O [Fork check](.github/workflows/fork-check.yml) roda formatação, Clippy e
-testes no macOS para branches diferentes de `main`. A integração em `main`
-deve acontecer com esse check aprovado.
+Formatação, Clippy, testes unitários e de integração são executados **na
+máquina de desenvolvimento, antes de cada commit**, pelo
+[`scripts/check-local.sh`](scripts/check-local.sh), junto com os testes da
+automação de publicação. A suíte completa roda uma vez no perfil de
+desenvolvimento. Use `scripts/check-local.sh --release` para conferir também
+o perfil otimizado quando alterar otimizações ou investigar uma diferença
+exclusiva de release. Corrija falhas antes de comitar ou enviar mudanças.
 
-Alterações de código ou empacotamento em `main` disparam o
-[Fork release](.github/workflows/fork-release.yml): testes em modo release,
-build, assinatura, publicação de `fork-v<versão>-<run>` e atualização do cask.
-As atualizações são distribuídas pelo Homebrew.
+Mantenha o cache do Cargo e o diretório `target/` entre execuções; não é
+necessário fazer `cargo clean`. O script informa o tempo de cada etapa e
+salva os tempos de compilação em `target/cargo-timings/`.
+
+O GitHub Actions é usado **somente para releases**: compilar o aplicativo,
+empacotar, assinar, publicar e atualizar o cask. Ele não executa testes nem
+substitui a validação local. Essa divisão está definida em
+[AGENTS.md](AGENTS.md).
+
+A versão vem do `Cargo.toml`, com a entrada correspondente no `Cargo.lock`.
+Ao chegar à `main`, uma versão ainda não publicada dispara o
+[workflow de release](.github/workflows/release.yml). Por exemplo:
+
+- Versão do pacote: `3.0.0`.
+- Tag: `v3.0.0`.
+- Release: **Hex 3.0.0**.
+- Arquivo: `Hex-3.0.0.zip`.
+
+Novos commits sem mudança de versão não criam outro release. Para publicar
+a próxima versão, altere explicitamente o número, rode os checks locais e
+integre a mudança. Não há incremento automático nem sufixo com número da
+execução. Reexecutar o workflow pode concluir uma publicação interrompida ou
+reparar o cask, preservando os releases já publicados.
 
 ## Escopo do fork
 

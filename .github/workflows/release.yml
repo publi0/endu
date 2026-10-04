@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "src/**"
+      - "native/**"
+      - "app/**"
+      - "resources/**"
+      - "scripts/**"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hex-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Select the Cargo version
+        id: plan
+        run: python3 scripts/release.py plan
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.plan.outputs.build == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.plan.outputs.build == 'true'
+        with:
+          shared-key: release
+          cache-on-failure: true
+      - name: Build the app
+        if: steps.plan.outputs.build == 'true'
+        run: scripts/build-app.sh
+      - name: Publish and update Homebrew
+        if: steps.plan.outputs.skip != 'true'
+        run: python3 scripts/release.py publish
