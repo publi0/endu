@@ -17,6 +17,7 @@ import secrets
 import stat
 import subprocess
 import tempfile
+import time
 import tomllib
 import zipfile
 
@@ -69,6 +70,30 @@ def verify_bundle(bundle, identity):
     run("/usr/bin/codesign", "--verify", "--deep", "--strict",
         "-R", "=" + expected_requirement(identity), str(bundle))
     check_requirement(run("/usr/bin/codesign", "-d", "-r-", str(bundle)), identity)
+
+
+def require_identity(keychain, identity):
+    certificates = run("/usr/bin/security", "find-certificate", "-a", "-Z", str(keychain))
+    fingerprints = re.findall(r"SHA-1 hash: ([0-9A-Fa-f]{40})", certificates)
+    if identity not in {value.lower() for value in fingerprints}:
+        raise ValueError("The imported certificate does not match the public release pin")
+    for attempt in range(4):
+        identities = run("/usr/bin/security", "find-identity", "-p", "codesigning", str(keychain))
+        if identity in identities.lower():
+            print("Pinned signing identity is available.")
+            return
+        if attempt < 3:
+            time.sleep(0.25 * 2 ** attempt)
+    generic = run("/usr/bin/security", "find-identity", str(keychain))
+    private_key = subprocess.run(
+        ["/usr/bin/security", "find-key", "-t", "private", "-s", str(keychain)],
+        text=True, capture_output=True,
+    ).returncode == 0
+    # Only presence flags and scoped public identity metadata, never key data.
+    print(f"Pinned certificate present; private signing key present: {private_key}")
+    print(f"Generic identity matches pin: {identity in generic.lower()}")
+    print(identities.strip())
+    raise ValueError("The runner could not discover the pinned signing identity")
 
 
 def verify_archive(archive, certificate):
@@ -125,7 +150,7 @@ def signing_keychain(archive, password):
                 security("delete-keychain", str(keychain))
 
 
-def sign_release(root):
+def signing_material(root):
     archive, password = read_secrets(os.environ)
     os.environ.pop("HEX_SIGNING_P12_BASE64", None)
     os.environ.pop("HEX_SIGNING_P12_PASSWORD", None)
@@ -133,6 +158,18 @@ def sign_release(root):
     if not certificate.is_file():
         raise ValueError("Pin the public release certificate in app/release-signing.pem first")
     identity = certificate_identity(certificate)
+    return archive, password, identity
+
+
+def check_identity(root):
+    archive, password, identity = signing_material(root)
+    with signing_keychain(archive, password) as keychain:
+        require_identity(keychain, identity)
+
+
+def sign_release(root):
+    archive, password, identity = signing_material(root)
+    certificate = root / CERTIFICATE
     bundle = root / "target/app/Hex.app"
     version = tomllib.loads((root / "Cargo.toml").read_text())["package"]["version"]
     if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version):
@@ -141,8 +178,9 @@ def sign_release(root):
     if plist.get("CFBundleShortVersionString") != version or plist.get("CFBundleIdentifier") != BUNDLE_ID:
         raise ValueError("Prepare the matching app bundle before signing")
     with signing_keychain(archive, password) as keychain:
+        require_identity(keychain, identity)
         # Compilation has already completed in a separate step without secrets.
-        run("/usr/bin/codesign", "--force", "--sign", identity, "--keychain", str(keychain),
+        run("/usr/bin/codesign", "--force", "--sign", identity.upper(), "--keychain", str(keychain),
             "--timestamp=none", "--entitlements", str(root / "app/VoiceControl.entitlements"), str(bundle))
     verify_bundle(bundle, identity)
     destination = root / f"target/app/Hex-{version}.zip"
@@ -154,12 +192,16 @@ def sign_release(root):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--verify-bundle", type=Path)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--verify-bundle", type=Path)
+    modes.add_argument("--check-identity", action="store_true")
     arguments = parser.parse_args()
     try:
         root = Path(__file__).resolve().parent.parent
         if arguments.verify_bundle:
             verify_bundle(arguments.verify_bundle, certificate_identity(root / CERTIFICATE))
+        elif arguments.check_identity:
+            check_identity(root)
         else:
             sign_release(root)
     except (ValueError, RuntimeError) as error:

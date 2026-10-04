@@ -113,7 +113,10 @@ extendedKeyUsage=critical,codeSigning
                 signing.run("/usr/bin/clang", str(source), "-o", str(bundle / "Contents/MacOS/probe"))
                 # Each build imports into a new keychain, like separate Actions runs.
                 with signing.signing_keychain(archives[signer], password) as keychain:
-                    signing.run("/usr/bin/codesign", "--force", "--sign", identities[signer],
+                    signing.require_identity(keychain, identities[signer])
+                    with self.assertRaisesRegex(ValueError, "does not match"):
+                        signing.require_identity(keychain, "0" * 40)
+                    signing.run("/usr/bin/codesign", "--force", "--sign", identities[signer].upper(),
                                 "--keychain", str(keychain), "--timestamp=none", str(bundle))
                 self.assertFalse(keychain.exists())
                 if signer == 0:

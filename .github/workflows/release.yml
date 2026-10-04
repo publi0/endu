@@ -48,6 +48,12 @@ jobs:
         with:
           shared-key: release
           cache-on-failure: true
+      - name: Prepare the persistent signing identity
+        if: steps.plan.outputs.build == 'true'
+        env:
+          HEX_SIGNING_P12_BASE64: ${{ secrets.HEX_SIGNING_P12_BASE64 }}
+          HEX_SIGNING_P12_PASSWORD: ${{ secrets.HEX_SIGNING_P12_PASSWORD }}
+        run: python3 scripts/code_signing.py --check-identity
       - name: Build the app
         if: steps.plan.outputs.build == 'true'
         run: scripts/build-app.sh --prepare
