@@ -5,7 +5,7 @@ use gpui::{
     AnyElement, Context, Div, FontWeight, IntoElement, Render, Window, div, prelude::*, px, rgb,
 };
 
-use super::stats::{self, ErrorKind, Period, Totals};
+use super::stats::{self, ErrorKind, ModelLatency, Period, Totals};
 use crate::desktop_ui::{
     ACCENT, FAINT, LINE, MUTED, NEGATIVE, PANEL_RADIUS, SURFACE, TEXT, TEXT_SOFT, compact_panel,
     compact_panel_header, empty_message, error_message, header_button, pane_body, pane_content,
@@ -106,6 +106,20 @@ impl StatisticsView {
         totals
             .models
             .insert("openai/gpt-4o-mini-transcribe".into(), 9);
+        totals.model_latency.insert(
+            "openai/whisper-large-v3-turbo".into(),
+            ModelLatency {
+                responses: 190,
+                total_ms: 190 * 820,
+            },
+        );
+        totals.model_latency.insert(
+            "openai/gpt-4o-mini-transcribe".into(),
+            ModelLatency {
+                responses: 11,
+                total_ms: 11 * 1_240,
+            },
+        );
         totals.errors.insert(
             "rate_limited".into(),
             [("openai/whisper-large-v3-turbo".into(), 7)].into(),
@@ -316,7 +330,11 @@ impl StatisticsView {
 
     fn render_models(&self) -> AnyElement {
         let total = self.totals.dictations;
-        let mut models: Vec<_> = self.totals.models.iter().collect();
+        let mut counts = self.totals.models.clone();
+        for model in self.totals.model_latency.keys() {
+            counts.entry(model.clone()).or_default();
+        }
+        let mut models: Vec<_> = counts.iter().collect();
         models.sort_by(|left, right| right.1.cmp(left.1).then(left.0.cmp(right.0)));
         let body: Vec<AnyElement> = if models.is_empty() {
             vec![empty_message("No transcripts in this period.")]
@@ -359,6 +377,12 @@ impl StatisticsView {
                                 ),
                         )
                         .child(meter(share))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(rgb(TEXT_SOFT))
+                                .child(model_latency_label(self.totals.model_latency.get(model))),
+                        )
                         .into_any_element()
                 })
                 .collect()
@@ -366,7 +390,15 @@ impl StatisticsView {
         compact_panel()
             .flex_1()
             .min_w_0()
-            .child(compact_panel_header("Models used by dictation", None))
+            .child(compact_panel_header("Models and latency", None))
+            .child(
+                div()
+                    .px_4()
+                    .py_2()
+                    .text_size(px(10.0))
+                    .text_color(rgb(FAINT))
+                    .child("Successful requests, including network time. Excludes queue and retry waits."),
+            )
             .children(body)
             .into_any_element()
     }
@@ -570,6 +602,18 @@ fn format_latency(ms: u64) -> String {
     }
 }
 
+fn model_latency_label(latency: Option<&ModelLatency>) -> String {
+    match latency.and_then(|latency| latency.average_ms().map(|average| (latency, average))) {
+        Some((latency, average)) => format!(
+            "Avg response: {} · {} response{}",
+            format_latency(average),
+            format_count(latency.responses),
+            if latency.responses == 1 { "" } else { "s" },
+        ),
+        None => "Avg response: — · no measurements yet".into(),
+    }
+}
+
 fn format_cost(usd: f64) -> String {
     if usd <= 0.0 {
         "$0".into()
@@ -598,6 +642,32 @@ fn short_day(day: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_latency_labels_distinguish_missing_data_from_zero() {
+        assert_eq!(
+            model_latency_label(None),
+            "Avg response: — · no measurements yet"
+        );
+        assert_eq!(
+            model_latency_label(Some(&ModelLatency::default())),
+            model_latency_label(None)
+        );
+        assert_eq!(
+            model_latency_label(Some(&ModelLatency {
+                responses: 2,
+                total_ms: 1_600
+            })),
+            "Avg response: 800 ms · 2 responses",
+        );
+        assert_eq!(
+            model_latency_label(Some(&ModelLatency {
+                responses: 1,
+                total_ms: 0
+            })),
+            "Avg response: 0 ms · 1 response",
+        );
+    }
 
     #[test]
     fn numbers_are_formatted_for_reading() {

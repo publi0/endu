@@ -8,6 +8,26 @@
   Ditado por atalho para macOS, com transcrição via OpenRouter.
 </p>
 
+## Instalação rápida
+
+**Mac com Apple silicon e macOS 15 ou mais novo**, com
+[Homebrew instalado](https://brew.sh/).
+
+No GitHub, passe o cursor sobre o bloco abaixo e clique no ícone de copiar
+no canto superior direito. Cole tudo no Terminal e pressione **Return**:
+
+```sh
+brew tap publi0/hex https://github.com/publi0/hex &&
+brew install --cask publi0/hex/hex-openrouter &&
+open -a Hex
+```
+
+O bloco adiciona o tap, instala o aplicativo e abre o Hex. Depois, siga o
+[primeiro uso](#primeiro-uso) para conceder as permissões e cadastrar sua chave.
+Já tem o Hex instalado? Use os [comandos de atualização](#atualizar).
+
+## Como funciona
+
 Segure o atalho, fale e solte. O Hex transcreve o áudio e cola o resultado no
 aplicativo em foco. Você escolhe o modelo e os fallbacks; o app cuida da
 captura, do corte de silêncio e da ordem de entrega dos ditados.
@@ -22,20 +42,14 @@ O app fica na barra de menus e reúne três telas: **Settings**, **History** e
 **Statistics**. A transcrição exige conexão à internet e uma chave própria do
 [OpenRouter](https://openrouter.ai/keys).
 
-## Instalar e atualizar
+## Atualizar
 
-Requisitos: **Mac com Apple silicon**, **macOS 15 ou mais novo** e Homebrew.
-
-```sh
-brew tap publi0/hex https://github.com/publi0/hex
-brew install --cask publi0/hex/hex-openrouter
-```
-
-Para atualizar:
+Copie este bloco inteiro para atualizar o Hex e abri-lo:
 
 ```sh
-brew update
-brew upgrade --cask hex-openrouter
+brew update &&
+brew upgrade --cask publi0/hex/hex-openrouter &&
+open -a Hex
 ```
 
 O aplicativo instalado se chama **Hex.app**. O pacote Homebrew continua se
@@ -126,6 +140,13 @@ silenciosos, tokens, custo informado pelo OpenRouter, latência de transcrição
 fallbacks e erros por tipo e modelo. Não armazena texto nem áudio. A latência
 mostrada corresponde ao processamento da transcrição, sem o tempo na fila
 ou na colagem. Um ditado com vários trechos pode contar para mais de um modelo.
+
+Em **Models and latency**, cada modelo mostra sua latência média e a
+quantidade de respostas medidas no período. A média usa apenas requisições
+bem-sucedidas, incluindo o tempo de rede; não inclui a fila local, tentativas
+que falharam nem a espera entre retries. Cada trecho de áudio respondido
+fornece uma medição. Os registros anteriores à versão 3.0.1 continuam
+preservados, mas aparecem sem latência por modelo até haver novas medições.
 
 Os períodos são **Today**, **7 days**, **30 days** e **All time**, calculados
 por datas locais. São mantidos até 400 dias com registros; **All time** soma

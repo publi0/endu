@@ -1,6 +1,7 @@
 //! Cloud transcription through OpenRouter's `/audio/transcriptions` with an
 //! ordered fallback chain: any failure on one model moves on to the next.
 
+use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -10,7 +11,7 @@ use color_eyre::eyre::{WrapErr, bail, eyre};
 use serde_json::{Value, json};
 
 use super::http::{self, Response};
-use super::stats::{self, ErrorKind, Failure, Sample};
+use super::stats::{self, ErrorKind, Failure, ModelLatency, Sample};
 use super::vad::{self, Trimmed};
 use super::{AUTO_LANGUAGE, AudioTrim, Config, StepReport, excerpt};
 
@@ -32,6 +33,8 @@ pub(crate) struct Success {
     pub text: String,
     pub model: String,
     pub usage: Usage,
+    /// The successful request only; excludes earlier failures and retry waits.
+    pub latency_ms: u64,
     /// Attempts that failed before `model` answered, in order.
     pub failures: Vec<Failure>,
 }
@@ -119,6 +122,7 @@ pub fn transcribe(samples: &[f32]) -> Result<Transcription> {
     let sent_ms = duration_ms(samples.len());
     let mut texts = Vec::new();
     let mut models_used: Vec<String> = Vec::new();
+    let mut model_latency: BTreeMap<String, ModelLatency> = BTreeMap::new();
     let mut failures: Vec<Failure> = Vec::new();
     let mut usage = Usage::default();
     for range in chunk_ranges(samples, chunk_samples) {
@@ -141,6 +145,7 @@ pub fn transcribe(samples: &[f32]) -> Result<Transcription> {
                     latency_ms: started.elapsed().as_millis() as u64,
                     tokens: usage.tokens,
                     cost_usd: usage.cost_usd,
+                    model_latency,
                     failures,
                     ..Sample::default()
                 });
@@ -154,6 +159,10 @@ pub fn transcribe(samples: &[f32]) -> Result<Transcription> {
         );
         usage.tokens += success.usage.tokens;
         usage.cost_usd += success.usage.cost_usd;
+        model_latency
+            .entry(success.model.clone())
+            .or_default()
+            .record(success.latency_ms);
         push_unique(&mut models_used, success.model);
         failures.extend(success.failures);
         if !success.text.is_empty() {
@@ -166,6 +175,7 @@ pub fn transcribe(samples: &[f32]) -> Result<Transcription> {
     stats::record(&Sample {
         words: Some(stats::word_count(&text)),
         models: models_used,
+        model_latency,
         recorded_ms,
         sent_ms,
         latency_ms,
@@ -218,6 +228,26 @@ pub(crate) fn transcribe_with_fallback(
     audio_base64: &str,
     language: Option<&str>,
     mut send: impl FnMut(&str, Duration) -> Result<Response>,
+    sleep: impl FnMut(Duration),
+) -> std::result::Result<Success, ChainFailure> {
+    transcribe_with_timed_requests(
+        config,
+        audio_base64,
+        language,
+        |body, timeout| {
+            let started = Instant::now();
+            let response = send(body, timeout);
+            (response, started.elapsed())
+        },
+        sleep,
+    )
+}
+
+fn transcribe_with_timed_requests(
+    config: &Config,
+    audio_base64: &str,
+    language: Option<&str>,
+    mut send: impl FnMut(&str, Duration) -> (Result<Response>, Duration),
     mut sleep: impl FnMut(Duration),
 ) -> std::result::Result<Success, ChainFailure> {
     let started = Instant::now();
@@ -244,7 +274,8 @@ pub(crate) fn transcribe_with_fallback(
                 config.transcription.temperature,
             );
             let timeout = config.attempt_timeout().min(remaining);
-            let (kind, detail) = match send(&body, timeout) {
+            let (response, request_latency) = send(&body, timeout);
+            let (kind, detail) = match response {
                 Ok(response) if response.is_success() => match parse_transcript(&response.body) {
                     Ok((text, usage)) => {
                         if !failures.is_empty() {
@@ -258,6 +289,7 @@ pub(crate) fn transcribe_with_fallback(
                             text,
                             model: model.to_owned(),
                             usage,
+                            latency_ms: request_latency.as_millis() as u64,
                             failures,
                         });
                     }
@@ -563,6 +595,32 @@ mod tests {
         assert!(success.failures.is_empty(), "a retry is not a fallback");
         assert_eq!(*calls.borrow(), ["a", "a"]);
         assert_eq!(*slept.borrow(), [Duration::from_secs(1)]);
+    }
+
+    #[test]
+    fn model_latency_excludes_failed_attempts_and_retry_waits() {
+        let mut calls = Vec::new();
+        let mut waits = Vec::new();
+        let success = transcribe_with_timed_requests(
+            &config(&["a", "b"]),
+            "AAAA",
+            None,
+            |body, _| {
+                calls.push(model_of(body));
+                match calls.len() {
+                    1 => (status(503, None), Duration::from_secs(8)),
+                    2 => (status(429, Some(1)), Duration::from_millis(100)),
+                    _ => (ok(r#"{"text":"done"}"#), Duration::from_millis(450)),
+                }
+            },
+            |wait| waits.push(wait),
+        )
+        .unwrap();
+        assert_eq!(calls, ["a", "b", "b"]);
+        assert_eq!(waits, [Duration::from_secs(1)]);
+        assert_eq!(success.model, "b");
+        assert_eq!(success.latency_ms, 450);
+        assert_eq!(success.failures.len(), 1);
     }
 
     #[test]

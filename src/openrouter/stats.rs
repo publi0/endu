@@ -89,6 +89,30 @@ pub struct Failure {
     pub detail: String,
 }
 
+/// Timings of successful HTTP transcription requests, including network time.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct ModelLatency {
+    pub responses: u64,
+    pub total_ms: u64,
+}
+
+impl ModelLatency {
+    pub fn record(&mut self, latency_ms: u64) {
+        self.responses += 1;
+        self.total_ms += latency_ms;
+    }
+
+    pub fn average_ms(&self) -> Option<u64> {
+        self.total_ms.checked_div(self.responses)
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.responses += other.responses;
+        self.total_ms += other.total_ms;
+    }
+}
+
 /// What one dictation contributed.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Sample {
@@ -96,6 +120,7 @@ pub struct Sample {
     pub words: Option<u64>,
     /// Models used by a successful dictation, counted once each.
     pub models: Vec<String>,
+    pub model_latency: BTreeMap<String, ModelLatency>,
     pub recorded_ms: u64,
     pub sent_ms: u64,
     pub latency_ms: u64,
@@ -121,6 +146,8 @@ pub struct Totals {
     pub fallbacks: u64,
     /// Successful dictations using each model; one dictation can use several.
     pub models: BTreeMap<String, u64>,
+    /// Successful requests, not dictations; absent for data collected before 3.0.1.
+    pub model_latency: BTreeMap<String, ModelLatency>,
     /// Failed attempts per error kind, then per model.
     pub errors: BTreeMap<String, BTreeMap<String, u64>>,
 }
@@ -149,6 +176,12 @@ impl Totals {
         self.latency_ms += sample.latency_ms;
         self.tokens += sample.tokens;
         self.cost_usd += sample.cost_usd;
+        for (model, latency) in &sample.model_latency {
+            self.model_latency
+                .entry(model.clone())
+                .or_default()
+                .merge(latency);
+        }
         for failure in &sample.failures {
             *self
                 .errors
@@ -172,6 +205,12 @@ impl Totals {
         self.fallbacks += other.fallbacks;
         for (model, count) in &other.models {
             *self.models.entry(model.clone()).or_default() += count;
+        }
+        for (model, latency) in &other.model_latency {
+            self.model_latency
+                .entry(model.clone())
+                .or_default()
+                .merge(latency);
         }
         for (kind, models) in &other.errors {
             let target = self.errors.entry(kind.clone()).or_default();
@@ -441,6 +480,7 @@ mod tests {
         Sample {
             words: Some(words),
             models: vec![model.into()],
+            model_latency: BTreeMap::new(),
             recorded_ms: 10_000,
             sent_ms: 7_000,
             latency_ms: 800,
@@ -530,6 +570,88 @@ mod tests {
         totals.add_sample(&sample);
         assert_eq!(totals.dictations, 1);
         assert_eq!(totals.models, [("a".into(), 1), ("b".into(), 1)].into());
+    }
+
+    #[test]
+    fn model_latency_is_weighted_by_responses_and_filtered_by_period() {
+        let path = temp_path("model-latency");
+        let now = 1_791_100_000;
+        let today = local_day(now);
+        let yesterday = local_day_before(now, 1);
+        let mut sample = success(10, "a", Vec::new());
+        sample.models.push("b".into());
+        sample
+            .model_latency
+            .entry("a".into())
+            .or_default()
+            .record(100);
+        sample
+            .model_latency
+            .entry("a".into())
+            .or_default()
+            .record(300);
+        sample
+            .model_latency
+            .entry("b".into())
+            .or_default()
+            .record(900);
+        record_at(&path, &sample, &yesterday).unwrap();
+
+        // An earlier chunk can succeed even when a later chunk fails the dictation.
+        let mut partial = Sample::default();
+        partial
+            .model_latency
+            .entry("a".into())
+            .or_default()
+            .record(1_600);
+        record_at(&path, &partial, &today).unwrap();
+
+        let all = summary_at(&path, Period::Week, now);
+        assert_eq!(all.models["a"], 1);
+        assert_eq!(all.model_latency["a"].responses, 3);
+        assert_eq!(all.model_latency["a"].average_ms(), Some(2_000 / 3));
+        assert_eq!(all.model_latency["b"].average_ms(), Some(900));
+        let current = summary_at(&path, Period::Today, now);
+        assert!(current.models.is_empty());
+        assert_eq!(current.model_latency["a"].responses, 1);
+        assert_eq!(current.model_latency["a"].average_ms(), Some(1_600));
+        assert!(!current.model_latency.contains_key("b"));
+    }
+
+    #[test]
+    fn old_statistics_do_not_invent_model_latency_measurements() {
+        let path = temp_path("legacy-latency");
+        for version in [1, VERSION] {
+            fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({
+                    "version": version,
+                    "days": {"2026-10-04": {
+                        "dictations": 100,
+                        "latency_ms": 90_000,
+                        "models": {"a": 100}
+                    }}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let old = summary_at(&path, Period::AllTime, 0);
+            assert_eq!(old.models["a"], 100);
+            assert!(old.model_latency.is_empty());
+            assert_eq!(ModelLatency::default().average_ms(), None);
+
+            let mut sample = success(1, "a", Vec::new());
+            sample
+                .model_latency
+                .entry("a".into())
+                .or_default()
+                .record(250);
+            record_at(&path, &sample, "2026-10-04").unwrap();
+            let updated = summary_at(&path, Period::AllTime, 0);
+            assert_eq!(updated.models["a"], 101);
+            assert_eq!(updated.model_latency["a"].responses, 1);
+            assert_eq!(updated.model_latency["a"].average_ms(), Some(250));
+        }
     }
 
     #[test]
