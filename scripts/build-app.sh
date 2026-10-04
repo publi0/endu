@@ -1,15 +1,29 @@
 #!/bin/sh
-# Build "Hex.app": no Developer ID, no Sparkle (Homebrew updates it).
-# Signs ad hoc by default, or with HEX_CODESIGN_IDENTITY when set (a stable
-# identity keeps macOS permission grants across updates).
+# Build "Hex.app" using the persistent release identity. For isolated UI
+# development use cargo run -- preview; never replace the app with an ad hoc build.
 #
-# Usage: scripts/build-app.sh   -> prints the path of the .zip it built
+# Usage: scripts/build-app.sh [--prepare]
+# --prepare builds the bundle only; code_signing.py signs and packages it.
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-[ "$#" -eq 0 ] || { echo "Usage: scripts/build-app.sh" >&2; exit 1; }
+prepare=false
+case "$#:${1:-}" in
+  0:) ;;
+  1:--prepare) prepare=true ;;
+  *) echo "Usage: scripts/build-app.sh [--prepare]" >&2; exit 1 ;;
+esac
 version=$(python3 "$root/scripts/release.py" version)
 identity=${HEX_CODESIGN_IDENTITY:--}
+if [ "${GITHUB_ACTIONS:-}" = "true" ] && [ "$prepare" = false ]; then
+  echo "Releases require the pinned signing identity; refusing ad hoc signing." >&2
+  exit 1
+fi
+if [ "$prepare" = false ] && [ "$identity" = "-" ]; then
+  echo "Set HEX_CODESIGN_IDENTITY to the pinned release certificate; refusing ad hoc signing." >&2
+  echo "For isolated UI development use: cargo run -- preview settings" >&2
+  exit 1
+fi
 
 bundle_name="Hex.app"
 bundle="$root/target/app/$bundle_name"
@@ -39,8 +53,18 @@ xcrun actool "$root/app/AppIcon.icon" \
   --output-format human-readable-text >&2
 cp "$icon_output/AppIcon.icns" "$icon_output/Assets.car" "$bundle/Contents/Resources/"
 
-codesign --force --sign "$identity" --entitlements "$root/app/VoiceControl.entitlements" "$bundle" >&2
+if [ "$prepare" = true ]; then
+  echo "$bundle"
+  exit 0
+fi
+
+set -- --force --sign "$identity" --entitlements "$root/app/VoiceControl.entitlements"
+if [ -n "${HEX_CODESIGN_KEYCHAIN:-}" ]; then
+  set -- "$@" --keychain "$HEX_CODESIGN_KEYCHAIN" --timestamp=none
+fi
+codesign "$@" "$bundle" >&2
 codesign --verify --deep --strict --verbose=2 "$bundle" >&2
+python3 "$root/scripts/code_signing.py" --verify-bundle "$bundle"
 
 archive="$root/target/app/Hex-$version.zip"
 rm -f "$archive"

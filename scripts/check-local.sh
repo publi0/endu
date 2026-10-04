@@ -39,7 +39,7 @@ unset OPENROUTER_API_KEY
 
 run_step "Formatting" cargo fmt --all --check
 run_step "Shell syntax" sh -n scripts/build-app.sh scripts/write-cask.sh
-run_step "Release automation tests" python3 -m unittest discover -s scripts -p 'test_release.py' -v
+run_step "Release and signing automation tests" python3 -m unittest discover -s scripts -p 'test_*.py' -v
 run_step "Whitespace" git diff --check
 run_step "Metal compiler" xcrun metal --version
 run_step "Clippy" cargo clippy --locked --all-targets -- -D warnings

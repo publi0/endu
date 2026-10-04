@@ -112,7 +112,7 @@ The script must finish successfully. It runs:
 - `cargo clippy --locked --all-targets -- -D warnings`
 - `cargo test --locked --timings` (the full unit and integration suite)
 - Shell syntax checks for the build and cask scripts.
-- `python3 -m unittest discover -s scripts -p 'test_release.py' -v`
+- `python3 -m unittest discover -s scripts -p 'test_*.py' -v`
 - `git diff --check`
 
 The complete suite runs once in the development profile. Use
@@ -182,6 +182,27 @@ release asset is available and verified. Keep `main` installable.
 
 The app is named **Hex**. Keep the existing bundle id, Keychain identifiers,
 data directory, and `hex-openrouter` Homebrew token for upgrade continuity.
+
+Release signing must use the same persistent certificate, pinned publicly in
+`app/release-signing.pem`. Compile and prepare the bundle in a separate step
+without signing secrets. Then `scripts/code_signing.py` imports the encrypted
+identity from Actions secrets into a disposable keychain, signs, removes the
+keychain, and packages the app. Passwords reach `security -i` through stdin,
+never argv. Normal failures also clean up; forced termination relies on the
+disposable GitHub-hosted runner. The publisher verifies the downloaded asset's
+signature too, including resumed drafts. Never fall back to ad hoc signing in
+Actions or regenerate an identity for each build. Rotating the certificate
+changes the app identity and can require new user permissions.
+The regular local packager also rejects ad hoc or mismatched certificates;
+use isolated `cargo run -- preview` sessions for UI development. Never install
+an unsigned `--prepare` intermediate over the user's signed app. Preserve an
+encrypted backup of the full identity; the public PEM cannot restore the key.
+
+The current distribution uses a self-signed identity, not Developer ID or
+Apple notarization. Do not install a trusted root, alter trust settings, reset
+TCC, or grant macOS permissions to make it work. The user grants permissions.
+The local signing regression test uses disposable certificates and tiny test
+apps to check continuity across builds and rejection of a different signer.
 
 ## Diagnostics
 

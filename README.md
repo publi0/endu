@@ -57,9 +57,19 @@ chamando `hex-openrouter`, para manter o caminho de atualização das versões
 anteriores. O bundle id `dev.publio.hex-openrouter` e o diretório de dados
 também foram preservados.
 
-Os releases são assinados ad hoc, sem notarização. O cask remove a quarentena
-do aplicativo durante a instalação. Como a assinatura muda entre builds, o
-macOS pode pedir novamente Acessibilidade e Input Monitoring após atualizar.
+As versões até 3.0.4 usam assinatura ad hoc, que muda de identidade a cada
+build e pode fazer o macOS pedir permissões novamente. A partir da 3.0.5,
+os releases usam um certificado próprio persistente. A migração exige uma
+nova autorização; as versões seguintes preservam a identidade de assinatura.
+Essa continuidade é verificada com duas builds diferentes nos testes locais.
+A preservação das permissões deve ser confirmada também numa atualização real.
+Outro usuário/Mac, recursos novos e cada novo alvo de Automação, como Music,
+Spotify ou VLC, ainda podem exigir autorizações próprias.
+
+O certificado próprio não é um Developer ID e não oferece notarização da
+Apple. O cask mantém a remoção de quarentena usada nas versões anteriores.
+A instalação não adiciona certificados confiáveis ao sistema, altera o TCC
+ou concede permissões por conta própria.
 
 ## Primeiro uso
 
@@ -221,9 +231,29 @@ scripts/build-app.sh
 ```
 
 O empacotamento gera `target/app/Hex.app` e
-`target/app/Hex-<versão>.zip`. Para builds locais com uma identidade de
-assinatura estável, configure `HEX_CODESIGN_IDENTITY` antes de executar o
-script.
+`target/app/Hex-<versão>.zip`. Para empacotar localmente, configure
+`HEX_CODESIGN_IDENTITY` com o certificado persistente e tenha sua chave no
+Keychain. O script rejeita assinaturas ad hoc e certificados diferentes do
+PEM público fixado no repositório. Para trabalhar na interface sem essa chave,
+use os previews isolados abaixo. Não substitua o aplicativo instalado por
+uma build de desenvolvimento. `--prepare` gera somente o bundle intermediário,
+que ainda precisa da etapa de assinatura e não deve ser instalado.
+
+No GitHub, `scripts/code_signing.py` usa os secrets `HEX_SIGNING_P12_BASE64`
+e `HEX_SIGNING_P12_PASSWORD`. O certificado público correspondente fica em
+`app/release-signing.pem`; a chave privada nunca entra no repositório. O
+runner compila sem os secrets e só depois importa a identidade em um keychain
+temporário para assinar. As senhas passam pela entrada padrão, sem aparecer
+nos argumentos dos processos. O keychain é removido antes do empacotamento,
+inclusive quando a assinatura falha normalmente. O arquivo baixado do GitHub
+também tem sua assinatura conferida antes da publicação. Sem os secrets ou com outra identidade,
+o release falha em vez de voltar à assinatura ad hoc. Preserve essa identidade
+entre publicações: uma troca de certificado pode exigir novas permissões.
+Mantenha um backup criptografado da identidade completa (certificado e chave
+privada, em P12), com a senha guardada separadamente em um gerenciador de
+senhas. O PEM público não permite reconstruir a chave. Não renove recriando
+um certificado com o mesmo nome: o fingerprint muda mesmo ao reutilizar a
+chave. Planeje a rotação antes do vencimento e uma nova autorização do usuário.
 
 Previews isolados para conferir a interface, sem gravação ou acesso à
 configuração e às credenciais reais:

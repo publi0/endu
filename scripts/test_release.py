@@ -214,6 +214,24 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(self.github.uploads, 1)
         self.assertEqual(self.github.publications, 1)
 
+    def test_signed_release_rechecks_a_resumed_remote_asset_before_publication(self):
+        (self.root / "Cargo.toml").write_text('[package]\nname="hex"\nversion="3.0.5"\n')
+        self.git("add", "Cargo.toml")
+        self.git("commit", "-m", "signing migration")
+        self.git("push", "origin", "main")
+        archive = make_archive(self.root, "3.0.5")
+        publisher = self.publisher()
+        publisher.ensure_source_tag()
+        self.github.create_draft("v3.0.5", publisher.source)
+        self.github.upload("v3.0.5", archive)
+        with patch("release.verify_archive", side_effect=ValueError("wrong signing identity")) as verify:
+            with self.assertRaisesRegex(ValueError, "wrong signing identity"):
+                publisher.publish()
+            verify.assert_called_once()
+        self.assertEqual(self.github.publications, 0)
+        self.assertTrue(self.github.find("v3.0.5")["draft"])
+        self.assertIn('version "2.1.24-4"', self.remote_file(CASK))
+
     def test_create_response_survives_stale_listing_and_delayed_assets(self):
         self.github.stale_listing = True
         self.github.asset_visibility_delay = 2

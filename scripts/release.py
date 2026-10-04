@@ -14,6 +14,8 @@ import time
 import tomllib
 import zipfile
 
+from code_signing import CERTIFICATE, verify_archive
+
 
 CASK = Path("Casks/hex-openrouter.rb")
 VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
@@ -95,7 +97,7 @@ cask "hex-openrouter" do
 
   app "Hex.app"
 
-  # The build is signed ad hoc, not notarized.
+  # The build is not notarized by Apple.
   postflight do
     system_command "/usr/bin/xattr",
                    args: ["-dr", "com.apple.quarantine", "#{{appdir}}/Hex.app"]
@@ -229,6 +231,9 @@ class Publisher:
         with tempfile.TemporaryDirectory(prefix="hex-release-") as temporary:
             downloaded = self.github.download(self.tag, asset["name"], Path(temporary))
             checksum = archive_checksum(downloaded, self.version, asset.get("digest"))
+            if version_tuple(self.version) >= (3, 0, 5):
+                # Check the actual remote asset, including resumed drafts.
+                verify_archive(downloaded, self.root / CERTIFICATE)
         if not published:
             newer = any(item > version_tuple(self.version)
                         for item in stable_releases(self.github.releases()))

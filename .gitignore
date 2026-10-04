@@ -9,6 +9,9 @@ node_modules/
 __pycache__/
 *.py[cod]
 *.rmeta
+*.p12
+*.pfx
+*.key
 /ios/*DerivedData
 /ios/HEXMobile.xcodeproj
 /result
