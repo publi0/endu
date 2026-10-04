@@ -5,66 +5,93 @@
 <h1 align="center">Hex</h1>
 
 <p align="center">
-  Segure o atalho, fale, solte: o texto aparece onde você está digitando.<br />
-  Um fork enxuto do <a href="https://github.com/anomalyco/hex">HEX</a> que transcreve pelo OpenRouter.
+  Ditado por atalho para macOS, com transcrição via OpenRouter.
 </p>
 
-O app faz uma coisa só, do jeito mais direto possível:
+Segure o atalho, fale e solte. O Hex transcreve o áudio e cola o resultado no
+aplicativo em foco. Você escolhe o modelo e os fallbacks; o app cuida da
+captura, do corte de silêncio e da ordem de entrega dos ditados.
 
+```text
+atalho → gravação → corte de silêncio → OpenRouter → colar
+                                             ↓ erro
+                                       próximo modelo
 ```
-atalho → gravação → corte de silêncio → OpenRouter (com fallback) → colar
-```
 
-Ficaram de fora os modelos locais, os comandos de voz, o Voice Action, os
-Modes/OpenCode, as reuniões, a API local, o SDK e a versão Linux. Sobraram
-o atalho de ditado, o HUD, o History e uma página de Statistics.
+O app fica na barra de menus e reúne três telas: **Settings**, **History** e
+**Statistics**. A transcrição exige conexão à internet e uma chave própria do
+[OpenRouter](https://openrouter.ai/keys).
 
-## Instalar
+## Instalar e atualizar
 
-Apple silicon, macOS 15 ou mais novo:
+Requisitos: **Mac com Apple silicon**, **macOS 15 ou mais novo** e Homebrew.
 
 ```sh
 brew tap publi0/hex https://github.com/publi0/hex
 brew install --cask publi0/hex/hex-openrouter
 ```
 
-Atualizar: `brew upgrade --cask hex-openrouter`.
+Para atualizar:
 
-O app se chama **Hex** (bundle id `dev.publio.hex-openrouter`) e
-guarda tudo em `~/Library/Application Support/hex-openrouter`. O identificador e o diretório
-de dados permanecem os mesmos das versões anteriores. O build é assinado ad hoc e o cask
-remove a quarentena; como a assinatura muda a cada versão, o macOS pode pedir
-de novo Acessibilidade e Input Monitoring depois de um update.
+```sh
+brew update
+brew upgrade --cask hex-openrouter
+```
+
+O aplicativo instalado se chama **Hex.app**. O pacote Homebrew continua se
+chamando `hex-openrouter`, para manter o caminho de atualização das versões
+anteriores. O bundle id `dev.publio.hex-openrouter` e o diretório de dados
+também foram preservados.
+
+Os releases são assinados ad hoc, sem notarização. O cask remove a quarentena
+do aplicativo durante a instalação. Como a assinatura muda entre builds, o
+macOS pode pedir novamente Acessibilidade e Input Monitoring após atualizar.
 
 ## Primeiro uso
 
-A tela de setup pede Microfone, Input Monitoring, Acessibilidade e a chave do
-OpenRouter ([crie uma aqui](https://openrouter.ai/keys)). A chave vai para o
-Keychain. Depois disso o atalho padrão é **Option**: segure para gravar,
-solte para transcrever. Dois toques rápidos travam a gravação; um terceiro
-termina. **Esc** cancela.
+1. Abra o **Hex** e conceda Microfone, Input Monitoring e Acessibilidade na
+   tela de setup. As permissões são concedidas por você nos ajustes do macOS.
+2. Cole sua chave do OpenRouter. O app a salva no Keychain e testa o acesso.
+3. Em **Settings**, escolha o modelo principal, os fallbacks e o idioma.
+4. Coloque o cursor onde quer escrever, segure **Option**, fale e solte.
+
+O atalho é configurável. Com double-tap habilitado, dois toques rápidos travam
+a gravação; a próxima pressão a encerra. **Esc** cancela a captura ou, quando
+não há gravação ativa, o ditado pendente mais recente. Capturas com menos de
+300 ms são descartadas.
+
+O indicador flutuante mostra gravação e processamento. Você pode iniciar
+outro ditado enquanto o anterior é transcrito: os resultados são colados na
+ordem em que foram enviados. **Paste Last Dictation**, no menu, cola novamente
+o último resultado da sessão; se houver uma captura ativa, ela é descartada.
 
 ## Settings
 
-- **OpenRouter API key.** Com uma chave salva, aparece "Key saved · …abcd"
-  com **Test**, **Replace** e **Remove**. Se a chave estiver em texto puro no
-  `openrouter.json`, **Move to Keychain** move para o Keychain.
-- **Language.** Dica de idioma enviada ao modelo; Auto-detect deixa o modelo
-  decidir.
-- **Trim silence.** Corta silêncio no início e no fim e encurta pausas longas
-  antes de enviar, então menos áudio é cobrado. Gravações sem fala não são
-  enviadas.
-- **Models.** Um modelo principal e até dois fallbacks, escolhidos no
-  catálogo de speech-to-text do OpenRouter (dá para colar qualquer id).
-  Qualquer erro (rate limit, timeout, erro do provedor, resposta vazia) passa
-  para o próximo. **↑** reordena, **✕** remove.
-- **Advanced.** Timeout por tentativa e total, tamanho máximo de trecho para
-  áudio longo, espera máxima para repetir um 429, temperatura e URL da API.
-- **Dictation, Paste last, Microphone, Application.** Atalhos, double-tap,
-  colar o último ditado de novo, microfone, o que fazer com outros áudios
-  durante o ditado, abrir no login, ícone no Dock e volume dos sons.
+| Controle | Comportamento |
+| --- | --- |
+| **OpenRouter API key** | Uma chave salva mostra seus últimos quatro caracteres, com **Test**, **Replace** e **Remove**. A remoção pede confirmação. **Move to Keychain** migra uma chave que esteja no arquivo de configuração. |
+| **Models** | Um modelo principal e até dois fallbacks pela interface. O picker consulta o catálogo de speech-to-text do OpenRouter e aceita IDs customizados. **↑** muda a ordem e **✕** remove um fallback. |
+| **Language** | Envia uma dica de idioma ao modelo. **Auto-detect** deixa a identificação com o provedor. |
+| **Trim silence** | Remove silêncio nas bordas e reduz pausas longas antes do envio. Usa uma heurística de energia do áudio; clipes classificados como silenciosos não são enviados. Pode ser desligado. |
+| **Advanced** | URL da API, timeout por tentativa e por trecho, duração dos trechos, espera máxima para repetir um HTTP 429 e temperatura. |
+| **Dictation / Paste last** | Atalhos e comportamento do double-tap. |
+| **Microphone / Application** | Microfone, liberação do dispositivo enquanto ocioso, comportamento de outros áudios durante a gravação, sons, ícone no Dock e início no login. |
 
-Tudo do OpenRouter fica em `openrouter.json`, relido a cada ditado:
+Idioma, trim e modelos são salvos ao mudar o controle. Os campos de
+**Advanced** são aplicados com **Save** ou **Return**. A configuração é relida
+antes de cada ditado, sem precisar reiniciar o app.
+
+Qualquer falha de um modelo — timeout, erro de transporte, resposta vazia ou
+erro HTTP — permite tentar o próximo. Um HTTP 429 com espera informada dentro
+do limite configurado recebe uma tentativa adicional no mesmo modelo.
+Gravações longas são divididas em trechos; cada trecho usa a mesma cadeia de
+fallbacks e seu próprio limite total de tempo.
+
+### Configuração em arquivo
+
+As opções ficam em `~/Library/Application Support/hex-openrouter/openrouter.json`.
+**Show file**, em Advanced, abre sua localização. Exemplo de formato; escolha
+os IDs de modelo no catálogo da interface:
 
 ```json
 {
@@ -82,44 +109,103 @@ Tudo do OpenRouter fica em `openrouter.json`, relido a cada ditado:
 }
 ```
 
-A chave também pode vir de `OPENROUTER_API_KEY` ou do campo `api_key` do
-arquivo; nessa ordem, ambas têm prioridade sobre o Keychain.
+A chave é resolvida nesta ordem: `OPENROUTER_API_KEY`, campo `api_key` do
+arquivo e Keychain. Prefira o Keychain para evitar uma chave em texto puro.
+O arquivo pode conter mais fallbacks que os dois editáveis pela interface.
 
 ## History e Statistics
 
-O **History** guarda o texto colado, o app em foco, o modelo que respondeu e
-a latência, os modelos que falharam antes e quanto áudio foi enviado depois do
-corte de silêncio. A retenção padrão é de 7 dias; nunca guarda áudio.
+**History** registra os ditados colados com sucesso: texto, aplicativo em
+foco, duração, latência, modelos utilizados, fallbacks e corte de silêncio.
+Tem busca, cópia e controles de retenção e limpeza. A retenção padrão é de
+**7 dias**, com limites adicionais de quantidade e tamanho. A atualização da
+versão 2.x preserva o texto e os relatórios de transcrição existentes.
 
-**Statistics** soma, por dia, palavras, ditados, áudio gravado e enviado,
-tokens e custo (como o OpenRouter informa em cada resposta), latência média,
-quantas vezes precisou de fallback e por quê, por modelo. Os totais ficam em
-`stats.json`, sem texto nem áudio.
+**Statistics** reúne palavras, ditados, áudio gravado e enviado, clipes
+silenciosos, tokens, custo informado pelo OpenRouter, latência de transcrição,
+fallbacks e erros por tipo e modelo. Não armazena texto nem áudio. A latência
+mostrada corresponde ao processamento da transcrição, sem o tempo na fila
+ou na colagem. Um ditado com vários trechos pode contar para mais de um modelo.
 
-## Privacidade
+Os períodos são **Today**, **7 days**, **30 days** e **All time**, calculados
+por datas locais. São mantidos até 400 dias com registros; **All time** soma
+os dias retidos e seu gráfico mostra os últimos 30 dias. **Reset** limpa as
+estatísticas após confirmação. Tokens e custos dependem dos dados de uso
+retornados pelo provedor.
 
-O áudio de cada ditado vai para o OpenRouter e para o provedor do modelo
-escolhido. Nada de áudio é salvo localmente. O History guarda só texto e
-metadados, e pode ser desligado ou limpo na própria tela.
+## Dados e privacidade
+
+O áudio enviado passa pelo OpenRouter e pelo provedor do modelo escolhido.
+O Hex não salva arquivos de áudio localmente. As regras de retenção desses
+serviços são independentes dos controles locais do app.
+
+Os arquivos locais ficam em `~/Library/Application Support/hex-openrouter`:
+
+| Local | Conteúdo |
+| --- | --- |
+| `settings.json` | Preferências do aplicativo e atalhos. |
+| `openrouter.json` | Modelos, idioma e parâmetros de transcrição; a chave só aparece se configurada em texto puro. |
+| `history.json` | Texto dos ditados e metadados, conforme a retenção escolhida. |
+| `stats.json` | Totais diários, sem texto, áudio ou corpos de respostas de erro. |
+| `logs/live.ndjson` e `logs/process.log` | Eventos e diagnósticos. O log de eventos inclui texto colado e aplicativo em foco; erros podem incluir detalhes retornados pelo provedor. |
+
+Desligar ou limpar o **History** não desliga nem limpa os logs. Considere seu
+conteúdo antes de compartilhá-los para diagnóstico. A chave salva no Keychain
+não é colocada nos argumentos dos processos de rede ou de acesso ao Keychain.
 
 ## Desenvolvimento
 
+O aplicativo é escrito em Rust com GPUI. O build para macOS requer Rust
+stable e Xcode com as ferramentas de compilação Metal disponíveis.
+
 ```sh
-cargo test
-cargo clippy --all-targets -- -D warnings
-fork/build-app.sh            # target/fork-app/Hex-<versão>.zip
+cargo fmt --all --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+fork/build-app.sh
 ```
 
-O app só compila para macOS. Em outras plataformas, `cargo test` roda os
-módulos portáveis (OpenRouter, History, Statistics). Para manter as
-permissões do macOS entre builds locais, assine com uma identidade estável:
-`FORK_CODESIGN_IDENTITY="Apple Development: …" fork/build-app.sh`.
+O empacotamento gera `target/fork-app/Hex.app` e
+`target/fork-app/Hex-<versão>.zip`. Para builds locais com uma identidade de
+assinatura estável, configure `FORK_CODESIGN_IDENTITY` antes de executar o
+script.
 
-Cada push numa branch roda `fork-check.yml` (fmt, clippy e testes no macOS).
-Cada push em `main` roda `fork-release.yml`, que publica o release e atualiza
-o cask em `Casks/`.
+Previews isolados para conferir a interface, sem gravação ou acesso à
+configuração e às credenciais reais:
+
+```sh
+cargo run -- preview settings
+cargo run -- preview history
+cargo run -- preview statistics
+cargo run -- preview onboarding
+cargo run -- preview dictation-hud
+```
+
+Somente macOS executa o aplicativo. Em outras plataformas, o crate permite
+rodar os testes dos módulos portáveis, como OpenRouter, History e Statistics;
+isso não constitui uma versão Linux do app. Veja [AGENTS.md](AGENTS.md) para
+os módulos e contratos internos.
+
+### CI e releases
+
+O [Fork check](.github/workflows/fork-check.yml) roda formatação, Clippy e
+testes no macOS para branches diferentes de `main`. A integração em `main`
+deve acontecer com esse check aprovado.
+
+Alterações de código ou empacotamento em `main` disparam o
+[Fork release](.github/workflows/fork-release.yml): testes em modo release,
+build, assinatura, publicação de `fork-v<versão>-<run>` e atualização do cask.
+As atualizações são distribuídas pelo Homebrew.
+
+## Escopo do fork
+
+Este projeto deriva do [HEX](https://github.com/anomalyco/hex) de Kit Langton
+e mantém o fluxo de ditado com transcrição remota. Foram removidos os modelos
+locais, Voice Commands, Voice Action, Modes/OpenCode, reuniões, API local,
+SDK, Linux, cleanup adicional do OpenRouter, Sparkle e sincronização
+automática com o upstream.
 
 ## Licença
 
-MIT, como o [HEX](https://github.com/anomalyco/hex) original de Kit Langton.
-Veja `LICENSE` e `THIRD_PARTY_NOTICES.md`.
+[MIT](LICENSE). Dependências e atribuições estão em
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
