@@ -27,8 +27,6 @@ pub struct Paster {
     prepared_clipboard: Option<PreparedClipboard>,
 }
 
-#[derive(Clone, Copy)]
-
 struct PreparedClipboard {
     change_count: isize,
     snapshot: ClipboardSnapshot,
