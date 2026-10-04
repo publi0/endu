@@ -155,7 +155,7 @@ pub fn set_language(base: &Config, language: &str) -> Result<Config, String> {
 
 pub fn remove_migrated_key(base: &Config, stored_key: &str) -> Result<Config, String> {
     if base.api_key.as_deref().map(str::trim) != Some(stored_key.trim()) {
-        return Err("The file's API key changed. Reload Settings before moving it.".into());
+        return Err("The file's API key changed. Reopen Models before moving it.".into());
     }
     let mut config = base.clone();
     config.api_key = None;

@@ -37,7 +37,7 @@ pub const KEYCHAIN_ACCOUNT: &str = "openrouter";
 pub const API_KEY_ENV: &str = "OPENROUTER_API_KEY";
 pub const AUTO_LANGUAGE: &str = "auto";
 
-/// Languages offered in Settings, as ISO-639-1 codes for the API.
+/// Languages offered in Models, as ISO-639-1 codes for the API.
 pub const LANGUAGES: &[(&str, &str)] = &[
     (AUTO_LANGUAGE, "Auto-detect"),
     ("pt", "Portuguese"),

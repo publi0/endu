@@ -4,7 +4,9 @@
 
 A slim macOS fork of HEX: hold a shortcut to record, trim the silence, send
 the clip to OpenRouter with an ordered model fallback chain, and paste the
-transcript. Settings, History, and Statistics are the only windows. Everything
+transcript. Settings, Models, History, and Statistics are the only panes.
+OpenRouter key, language, models, and advanced limits belong in Models;
+silence trimming belongs in Settings under Microphone. Everything
 else from upstream (local models, voice commands, Voice Action, Modes and
 OpenCode, meetings, the local API and SDK, Linux) was deleted on purpose; do
 not reintroduce seams for them.
@@ -26,7 +28,7 @@ not reintroduce seams for them.
 - `openrouter`: configuration (`openrouter.json`), Keychain key handling,
   energy VAD (`vad`), chunking and fallback (`transcribe`), curl transport
   (`http`), the STT catalog (`catalog`), History reports (`report`), daily
-  statistics (`stats`), and the Settings and Statistics GPUI views.
+  statistics (`stats`), and the Models configuration and Statistics GPUI views.
 - `paste`: clipboard insertion, continuation joins, and generation-safe
   clipboard restoration.
 - `keyboard`: active-layout key resolution and synthetic Command shortcuts.
@@ -129,6 +131,7 @@ the changes uncommitted. Do not move the checks into GitHub Actions.
 ```sh
 scripts/build-app.sh  # target/app/Hex-<version>.zip
 cargo run -- preview settings
+cargo run -- preview models
 cargo run -- preview history --open-history-retention
 cargo run -- preview statistics
 cargo run -- preview onboarding

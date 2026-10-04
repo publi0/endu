@@ -50,6 +50,7 @@ actions!(
         MinimizeWindow,
         QuitApplication,
         ShowHistory,
+        ShowModels,
         ShowSettings,
         ShowStatistics,
         ToggleFullscreen,
@@ -122,15 +123,15 @@ fn microphone_picker_menu(
         })
 }
 
-fn settings_pane(content: Div) -> AnyElement {
+fn configuration_pane(title: &'static str, scroll_id: &'static str, content: Div) -> AnyElement {
     div()
         .size_full()
         .flex()
         .flex_col()
-        .child(pane_header("Settings"))
+        .child(pane_header(title))
         .child(
             div()
-                .id("settings-scroll")
+                .id(scroll_id)
                 .flex_1()
                 .overflow_y_scroll()
                 .px_8()
@@ -223,6 +224,7 @@ fn open_new(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PreviewPane {
     Settings,
+    Models,
     History,
     Statistics,
 }
@@ -240,16 +242,23 @@ pub struct AppWindowPreview {
 enum Pane {
     #[default]
     Settings,
+    Models,
     History,
     Statistics,
 }
 
 impl Pane {
-    const ALL: [Self; 3] = [Self::Settings, Self::History, Self::Statistics];
+    const ALL: [Self; 4] = [
+        Self::Settings,
+        Self::Models,
+        Self::History,
+        Self::Statistics,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Self::Settings => "Settings",
+            Self::Models => "Models",
             Self::History => "History",
             Self::Statistics => "Statistics",
         }
@@ -258,16 +267,19 @@ impl Pane {
     fn icon(self) -> NavigationIcon {
         match self {
             Self::Settings => NavigationIcon::Settings,
+            Self::Models => NavigationIcon::Models,
             Self::History => NavigationIcon::History,
             Self::Statistics => NavigationIcon::Statistics,
         }
     }
 
     fn on_reopen(self, status: SetupStatus) -> Self {
-        if crate::onboarding::permission_warnings(status).is_empty() && status.api_key {
-            self
-        } else {
+        if !crate::onboarding::permission_warnings(status).is_empty() {
             Self::Settings
+        } else if !status.api_key {
+            Self::Models
+        } else {
+            self
         }
     }
 }
@@ -540,6 +552,7 @@ impl AppWindow {
         let paste_side = side(settings.paste_last_hotkey.as_ref());
         let openrouter_settings = crate::openrouter::settings_view::new(preview_mode, cx);
         let openrouter_setup = crate::openrouter::settings_view::new_key_setup(preview_mode, cx);
+        subscriptions.push(cx.observe(&openrouter_settings, |_, _, cx| cx.notify()));
         subscriptions.push(
             cx.subscribe(&openrouter_setup, |this, _, event: &KeyChanged, cx| {
                 this.openrouter_settings.update(cx, |view, cx| {
@@ -558,6 +571,7 @@ impl AppWindow {
         let mut window = Self {
             preview: preview_mode,
             pane: match preview.as_ref().map(|preview| preview.pane) {
+                Some(PreviewPane::Models) => Pane::Models,
                 Some(PreviewPane::History) => Pane::History,
                 Some(PreviewPane::Statistics) => Pane::Statistics,
                 Some(PreviewPane::Settings) | None => Pane::Settings,
@@ -653,13 +667,17 @@ impl AppWindow {
                 view.refresh();
                 cx.notify();
             }),
-            Pane::Settings => self.permission_refresh_at = Instant::now(),
+            Pane::Settings | Pane::Models => self.permission_refresh_at = Instant::now(),
         }
         cx.notify();
     }
 
     pub(crate) fn show_settings(&mut self, cx: &mut Context<Self>) {
         self.select_pane(Pane::Settings, cx);
+    }
+
+    pub(crate) fn show_models(&mut self, cx: &mut Context<Self>) {
+        self.select_pane(Pane::Models, cx);
     }
 
     pub(crate) fn show_history(&mut self, cx: &mut Context<Self>) {
@@ -676,7 +694,7 @@ impl AppWindow {
                 && (Instant::now() < self.permission_refresh_at
                     || !self.setup_visible
                         && self.listener_start.is_none()
-                        && self.pane != Pane::Settings
+                        && !matches!(self.pane, Pane::Settings | Pane::Models)
                         && self.setup_status.api_key)
         {
             return false;
@@ -1761,7 +1779,7 @@ impl AppWindow {
 
     /// A banner over every pane while dictation cannot work for lack of a key.
     fn render_key_notice(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.setup_visible || self.setup_status.api_key || self.pane == Pane::Settings {
+        if self.setup_visible || self.setup_status.api_key || self.pane == Pane::Models {
             return None;
         }
         Some(
@@ -1796,13 +1814,13 @@ impl AppWindow {
                                 )),
                         )
                         .child(
-                            compact_button("Open Settings")
-                                .id("open-key-settings")
+                            compact_button("Open Models")
+                                .id("open-key-models")
                                 .flex_none()
                                 .bg(rgb(ACCENT))
                                 .text_color(rgb(TEXT))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.select_pane(Pane::Settings, cx)
+                                    this.select_pane(Pane::Models, cx)
                                 })),
                         ),
                 )
@@ -1829,8 +1847,31 @@ impl AppWindow {
         self.permission_refresh_at = Instant::now() + PERMISSION_REFRESH_INTERVAL;
     }
 
+    fn toggle_trim_silence(&mut self, cx: &mut Context<Self>) {
+        let result = self
+            .openrouter_settings
+            .update(cx, |settings, cx| settings.toggle_trim(cx));
+        self.settings_error = result.err();
+        cx.notify();
+    }
+
+    fn render_models(&self) -> AnyElement {
+        configuration_pane(
+            "Models",
+            "models-scroll",
+            div().child(self.openrouter_settings.clone()),
+        )
+    }
+
     fn render_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let permission_warnings = self.render_permission_warnings(cx);
+        let trim_enabled = self.openrouter_settings.read(cx).trim_silence();
+        let trim_control = div()
+            .id("microphone-trim-silence")
+            .flex_none()
+            .cursor_pointer()
+            .child(toggle(if trim_enabled { 1.0 } else { 0.0 }))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_trim_silence(cx)));
         let hotkey_control = self.render_hotkey_setting_control(HotkeyKind::Dictation, window, cx);
         let paste_last_control =
             self.render_hotkey_setting_control(HotkeyKind::PasteLast, window, cx);
@@ -1962,10 +2003,11 @@ impl AppWindow {
                         }))
                     }),
             );
-        settings_pane(
+        configuration_pane(
+            "Settings",
+            "settings-scroll",
             div()
                 .children(permission_warnings)
-                .child(self.openrouter_settings.clone())
                 .child(settings_section_label("DICTATION"))
                 .child(
                     settings_panel()
@@ -2059,6 +2101,11 @@ impl AppWindow {
                                 "Keeps the microphone open so a short pre-roll catches the start of speech. Audio is never saved"
                             },
                             microphone_mode,
+                        ))
+                        .child(settings_row(
+                            "Trim silence",
+                            "Cuts silence and long pauses before sending, so less audio is billed. Recordings with no speech are not sent",
+                            trim_control,
                         ))
                         .child(
                             settings_row(
@@ -2286,6 +2333,7 @@ impl Render for AppWindow {
         let notice = self.render_key_notice(cx);
         let content = match self.pane {
             Pane::Settings => self.render_settings(window, cx),
+            Pane::Models => self.render_models(),
             Pane::History => self.render_history(cx),
             Pane::Statistics => self.statistics.clone().into_any_element(),
         };
@@ -2308,6 +2356,10 @@ impl Render for AppWindow {
             .on_action(|_: &ToggleFullscreen, window, _| window.toggle_fullscreen())
             .on_action(cx.listener(|this, _: &ShowSettings, window, cx| {
                 this.select_pane(Pane::Settings, cx);
+                window.activate_window();
+            }))
+            .on_action(cx.listener(|this, _: &ShowModels, window, cx| {
+                this.select_pane(Pane::Models, cx);
                 window.activate_window();
             }))
             .on_action(cx.listener(|this, _: &ShowHistory, window, cx| {
@@ -2824,6 +2876,51 @@ mod tests {
     }
 
     #[gpui::test]
+    fn models_has_its_own_navigation_and_reuses_the_key_editor(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(preview_fixture);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let status = crate::openrouter::KeyStatus::Keychain("demo".into());
+                view.openrouter_settings.update(cx, |editor, cx| {
+                    editor.sync_key_status(status.clone(), cx);
+                });
+                view.setup_status.api_key = false;
+                view.show_settings(cx);
+                assert!(view.render_key_notice(cx).is_some());
+                view.show_models(cx);
+                assert_eq!(view.pane, Pane::Models);
+                assert!(view.render_key_notice(cx).is_none());
+                view.show_history(cx);
+                view.show_models(cx);
+                assert_eq!(
+                    view.openrouter_settings.read(cx).key_status(),
+                    Some(&status)
+                );
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn microphone_trim_control_keeps_its_value_across_panes(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(preview_fixture);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.openrouter_settings.read(cx).trim_silence());
+                view.toggle_trim_silence(cx);
+                assert!(!view.openrouter_settings.read(cx).trim_silence());
+                assert!(view.settings_error.is_none());
+                view.show_models(cx);
+                view.show_settings(cx);
+                assert!(!view.openrouter_settings.read(cx).trim_silence());
+                view.toggle_trim_silence(cx);
+                assert!(view.openrouter_settings.read(cx).trim_silence());
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
     fn setup_key_changes_update_the_settings_editor(cx: &mut gpui::TestAppContext) {
         let (view, cx) = cx.add_window_view(preview_fixture);
         let status = crate::openrouter::KeyStatus::Keychain("demo".into());
@@ -2935,7 +3032,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_key_or_permissions_reopen_on_settings() {
+    fn reopening_targets_models_for_a_missing_key_and_settings_for_permissions() {
         let ready = SetupStatus {
             microphone: PermissionState::Ready,
             input_monitoring: PermissionState::Ready,
@@ -2943,16 +3040,25 @@ mod tests {
             api_key: true,
         };
         assert_eq!(Pane::History.on_reopen(ready), Pane::History);
+        assert_eq!(Pane::Models.on_reopen(ready), Pane::Models);
         assert_eq!(
             Pane::History.on_reopen(SetupStatus {
                 api_key: false,
                 ..ready
             }),
-            Pane::Settings
+            Pane::Models
         );
         assert_eq!(
             Pane::Statistics.on_reopen(SetupStatus {
                 accessibility: PermissionState::NeedsSettings,
+                ..ready
+            }),
+            Pane::Settings
+        );
+        assert_eq!(
+            Pane::Models.on_reopen(SetupStatus {
+                api_key: false,
+                microphone: PermissionState::NeedsRequest,
                 ..ready
             }),
             Pane::Settings

@@ -6,6 +6,7 @@ use gpui::{
 #[derive(Clone, Copy)]
 pub(crate) enum NavigationIcon {
     Settings,
+    Models,
     History,
     Statistics,
 }
@@ -14,6 +15,7 @@ impl NavigationIcon {
     fn sf_symbol(self) -> &'static str {
         match self {
             Self::Settings => "slider.horizontal.3",
+            Self::Models => "square.stack.3d.up",
             Self::History => "clock.fill",
             Self::Statistics => "chart.bar.fill",
         }

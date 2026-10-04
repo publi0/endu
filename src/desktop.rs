@@ -232,8 +232,8 @@ fn join_listener(worker: &Rc<RefCell<Option<JoinHandle<()>>>>) {
 
 fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
     use crate::app_window::{
-        CloseWindow, HideApplication, MinimizeWindow, QuitApplication, ShowHistory, ShowSettings,
-        ShowStatistics, ToggleFullscreen,
+        CloseWindow, HideApplication, MinimizeWindow, QuitApplication, ShowHistory, ShowModels,
+        ShowSettings, ShowStatistics, ToggleFullscreen,
     };
     cx.bind_keys([
         KeyBinding::new("cmd-w", CloseWindow, None),
@@ -245,11 +245,16 @@ fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
         KeyBinding::new("cmd-1", ShowSettings, None),
         KeyBinding::new("cmd-2", ShowHistory, None),
         KeyBinding::new("cmd-3", ShowStatistics, None),
+        KeyBinding::new("cmd-4", ShowModels, None),
     ]);
     cx.bind_keys(crate::text_input::key_bindings());
     let settings_ui = ui.clone();
     cx.on_action(move |_: &ShowSettings, cx| {
         settings_ui.open_pane(cx, |window, cx| window.show_settings(cx));
+    });
+    let models_ui = ui.clone();
+    cx.on_action(move |_: &ShowModels, cx| {
+        models_ui.open_pane(cx, |window, cx| window.show_models(cx));
     });
     let history_ui = ui.clone();
     cx.on_action(move |_: &ShowHistory, cx| {
@@ -272,6 +277,7 @@ fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
             name: "Hex".into(),
             items: vec![
                 MenuItem::action("Settings…", ShowSettings),
+                MenuItem::action("Models…", ShowModels),
                 MenuItem::action("History", ShowHistory),
                 MenuItem::action("Statistics", ShowStatistics),
                 MenuItem::separator(),
@@ -329,6 +335,9 @@ async fn drive_ui(
                 StatusItemAction::OpenSettings => {
                     ui.open_pane(cx, |window, cx| window.show_settings(cx))
                 }
+                StatusItemAction::OpenModels => {
+                    ui.open_pane(cx, |window, cx| window.show_models(cx))
+                }
                 StatusItemAction::OpenHistory => {
                     ui.open_pane(cx, |window, cx| window.show_history(cx))
                 }
@@ -378,7 +387,9 @@ mod tests {
 
     #[gpui::test]
     fn menu_actions_reopen_a_closed_window(cx: &mut gpui::TestAppContext) {
-        use crate::app_window::{PreviewPane, ShowHistory, ShowSettings, ShowStatistics};
+        use crate::app_window::{
+            PreviewPane, ShowHistory, ShowModels, ShowSettings, ShowStatistics,
+        };
 
         let (listener_controls, _controls) = mpsc::sync_channel(1);
         let ui = Rc::new(Ui {
@@ -395,7 +406,8 @@ mod tests {
             }),
         });
         cx.update(|cx| install_menus(cx, &ui));
-        let actions: [&dyn gpui::Action; 3] = [&ShowSettings, &ShowHistory, &ShowStatistics];
+        let actions: [&dyn gpui::Action; 4] =
+            [&ShowSettings, &ShowModels, &ShowHistory, &ShowStatistics];
         for action in actions {
             cx.update(|cx| {
                 assert!(cx.windows().is_empty());

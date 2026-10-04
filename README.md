@@ -38,8 +38,8 @@ atalho → gravação → corte de silêncio → OpenRouter → colar
                                        próximo modelo
 ```
 
-O app fica na barra de menus e reúne três telas: **Settings**, **History** e
-**Statistics**. A transcrição exige conexão à internet e uma chave própria do
+O app fica na barra de menus e reúne quatro telas: **Settings**, **Models**,
+**History** e **Statistics**. A transcrição exige conexão à internet e uma chave própria do
 [OpenRouter](https://openrouter.ai/keys).
 
 ## Atualizar
@@ -66,7 +66,7 @@ macOS pode pedir novamente Acessibilidade e Input Monitoring após atualizar.
 1. Abra o **Hex** e conceda Microfone, Input Monitoring e Acessibilidade na
    tela de setup. As permissões são concedidas por você nos ajustes do macOS.
 2. Cole sua chave do OpenRouter. O app a salva no Keychain e testa o acesso.
-3. Em **Settings**, escolha o modelo principal, os fallbacks e o idioma.
+3. Em **Models**, escolha o modelo principal, os fallbacks e o idioma.
 4. Coloque o cursor onde quer escrever, segure **Option**, fale e solte.
 
 O atalho é configurável. Com double-tap habilitado, dois toques rápidos travam
@@ -79,19 +79,19 @@ outro ditado enquanto o anterior é transcrito: os resultados são colados na
 ordem em que foram enviados. **Paste Last Dictation**, no menu, cola novamente
 o último resultado da sessão; se houver uma captura ativa, ela é descartada.
 
-## Settings
+## Models
+
+A tela **Models**, na barra lateral, concentra a chave, o idioma, os modelos
+e os parâmetros avançados de transcrição pelo OpenRouter.
 
 | Controle | Comportamento |
 | --- | --- |
 | **OpenRouter API key** | Uma chave salva mostra seus últimos quatro caracteres, com **Test**, **Replace** e **Remove**. A remoção pede confirmação. **Move to Keychain** migra uma chave que esteja no arquivo de configuração. |
 | **Models** | Um modelo principal e até dois fallbacks pela interface. O picker consulta o catálogo de speech-to-text do OpenRouter e aceita IDs customizados. **↑** muda a ordem e **✕** remove um fallback. |
 | **Language** | Envia uma dica de idioma ao modelo. **Auto-detect** deixa a identificação com o provedor. |
-| **Trim silence** | Remove silêncio nas bordas e reduz pausas longas antes do envio. Usa uma heurística de energia do áudio; clipes classificados como silenciosos não são enviados. Pode ser desligado. |
 | **Advanced** | URL da API, timeout por tentativa e por trecho, duração dos trechos, espera máxima para repetir um HTTP 429 e temperatura. |
-| **Dictation / Paste last** | Atalhos e comportamento do double-tap. |
-| **Microphone / Application** | Microfone, liberação do dispositivo enquanto ocioso, comportamento de outros áudios durante a gravação, sons, ícone no Dock e início no login. |
 
-Idioma, trim e modelos são salvos ao mudar o controle. Os campos de
+Idioma e modelos são salvos ao mudar o controle. Os campos de
 **Advanced** são aplicados com **Save** ou **Return**. A configuração é relida
 antes de cada ditado, sem precisar reiniciar o app.
 
@@ -126,6 +126,19 @@ os IDs de modelo no catálogo da interface:
 A chave é resolvida nesta ordem: `OPENROUTER_API_KEY`, campo `api_key` do
 arquivo e Keychain. Prefira o Keychain para evitar uma chave em texto puro.
 O arquivo pode conter mais fallbacks que os dois editáveis pela interface.
+
+## Settings
+
+As preferências gerais do aplicativo ficam em **Settings**:
+
+| Controle | Comportamento |
+| --- | --- |
+| **Dictation / Paste last** | Atalhos e comportamento do double-tap. |
+| **Microphone / Application** | Microfone, liberação do dispositivo enquanto ocioso, comportamento de outros áudios durante a gravação, sons, ícone no Dock e início no login. |
+| **Microphone / Trim silence** | Remove silêncio nas bordas e reduz pausas longas antes do envio. Usa uma heurística de energia do áudio; clipes classificados como silenciosos não são enviados. Pode ser desligado. |
+
+O **Trim silence** é salvo assim que você muda o controle. Avisos e atalhos
+para conceder permissões do macOS também aparecem nessa tela.
 
 ## History e Statistics
 
@@ -195,6 +208,7 @@ configuração e às credenciais reais:
 
 ```sh
 cargo run -- preview settings
+cargo run -- preview models
 cargo run -- preview history
 cargo run -- preview statistics
 cargo run -- preview onboarding

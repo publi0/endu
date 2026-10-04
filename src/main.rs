@@ -100,6 +100,7 @@ enum AppPreviewTarget {
     DictationHud,
     Onboarding,
     Settings,
+    Models,
     History,
     Statistics,
 }
@@ -139,6 +140,7 @@ fn main() -> Result<()> {
                     app_window::PreviewPane::Settings
                 }
                 AppPreviewTarget::History => app_window::PreviewPane::History,
+                AppPreviewTarget::Models => app_window::PreviewPane::Models,
                 AppPreviewTarget::Statistics => app_window::PreviewPane::Statistics,
             };
             desktop::run(
@@ -178,6 +180,15 @@ mod tests {
             })
         ));
         assert!(Cli::try_parse_from(["hex", "preview", "statistics"]).is_ok());
+        assert!(matches!(
+            Cli::try_parse_from(["hex", "preview", "models"])
+                .unwrap()
+                .command,
+            Some(Command::Preview {
+                target: super::AppPreviewTarget::Models,
+                ..
+            })
+        ));
         assert!(Cli::try_parse_from(["hex", "preview", "voice-action"]).is_err());
     }
 }

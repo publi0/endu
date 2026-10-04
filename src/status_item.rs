@@ -11,6 +11,7 @@ use objc2_foundation::{MainThreadMarker, NSObject, NSString};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatusItemAction {
     OpenSettings,
+    OpenModels,
     OpenHistory,
     OpenStatistics,
     PasteLast,
@@ -34,6 +35,11 @@ objc2::define_class!(
         #[unsafe(method(openSettings:))]
         fn open_settings(&self, _sender: &AnyObject) {
             let _ = self.ivars().actions.try_send(StatusItemAction::OpenSettings);
+        }
+
+        #[unsafe(method(openModels:))]
+        fn open_models(&self, _sender: &AnyObject) {
+            let _ = self.ivars().actions.try_send(StatusItemAction::OpenModels);
         }
 
         #[unsafe(method(openHistory:))]
@@ -91,6 +97,7 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
     );
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     add_item(&menu, &target, "Settings…", sel!(openSettings:), mtm);
+    add_item(&menu, &target, "Models…", sel!(openModels:), mtm);
     add_item(&menu, &target, "History…", sel!(openHistory:), mtm);
     add_item(&menu, &target, "Statistics…", sel!(openStatistics:), mtm);
     menu.addItem(&NSMenuItem::separatorItem(mtm));

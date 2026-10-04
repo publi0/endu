@@ -1,5 +1,6 @@
-//! The OpenRouter sections of Settings: the API key, language, silence
-//! trimming, the primary and fallback models, and advanced request limits.
+//! The Models pane: the API key, language, primary and fallback models,
+//! and advanced request limits. Silence trimming shares this configuration
+//! but is controlled from Settings under Microphone.
 //! Every control saves `openrouter.json` immediately; the next dictation
 //! reads it.
 
@@ -16,7 +17,7 @@ use super::{Config, KeyStatus};
 use crate::desktop_ui::{
     ACCENT, CONTROL_HEIGHT, FAINT, LINE, MUTED, NEGATIVE, SURFACE, SURFACE_HOVER, SURFACE_SELECTED,
     TEXT, TEXT_SOFT, compact_button, disclosure_button, settings_panel, settings_row,
-    settings_section_label, toggle,
+    settings_section_label,
 };
 use crate::text_input::{Changed, Dismissed, Navigate, Submitted, TextInput};
 
@@ -43,6 +44,7 @@ pub struct KeyChanged(pub KeyStatus);
 enum Scope {
     Key,
     Models,
+    Microphone,
     Advanced,
 }
 
@@ -573,15 +575,19 @@ impl OpenRouterSettings {
         cx.notify();
     }
 
-    fn toggle_trim(&mut self, cx: &mut Context<Self>) {
+    pub fn trim_silence(&self) -> bool {
+        self.config.transcription.trim_silence
+    }
+
+    pub fn toggle_trim(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
         let enabled = !self.config.transcription.trim_silence;
         let success = if enabled {
             "Silence is trimmed before sending."
         } else {
             "Recordings are sent untrimmed."
         };
-        self.commit(
-            Scope::Models,
+        let saved = self.commit(
+            Scope::Microphone,
             |config| {
                 let mut config = config.clone();
                 config.transcription.trim_silence = enabled;
@@ -590,6 +596,15 @@ impl OpenRouterSettings {
             success,
         );
         cx.notify();
+        if saved {
+            Ok(())
+        } else {
+            Err(self
+                .message
+                .as_ref()
+                .map(|(_, _, message)| message.clone())
+                .unwrap_or_else(|| "Could not save silence trimming.".into()))
+        }
     }
 
     // ---- Advanced --------------------------------------------------------
@@ -1430,16 +1445,6 @@ impl Render for OpenRouterSettings {
         }
         let key_row = self.render_key_row(cx);
         let language = self.render_language_control(cx);
-        let trim = div()
-            .id("openrouter-trim")
-            .flex_none()
-            .cursor_pointer()
-            .child(toggle(if self.config.transcription.trim_silence {
-                1.0
-            } else {
-                0.0
-            }))
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_trim(cx)));
         let models = self.render_models_panel(cx);
         let advanced = self.render_advanced(cx);
         div()
@@ -1447,16 +1452,11 @@ impl Render for OpenRouterSettings {
             .child(
                 settings_panel()
                     .child(key_row)
-                    .child(settings_row(
-                        "Language",
-                        "Spoken language hint; Auto-detect lets the model decide",
-                        language,
-                    ))
                     .child(
                         settings_row(
-                            "Trim silence",
-                            "Cuts silence and long pauses before sending, so less audio is billed. Recordings with no speech are not sent",
-                            trim,
+                            "Language",
+                            "Spoken language hint; Auto-detect lets the model decide",
+                            language,
                         )
                         .border_b_0(),
                     ),
@@ -1521,7 +1521,7 @@ mod tests {
                 view.busy = true;
                 view.choose_language("pt", cx);
                 view.choose_model(0, Some("preview/model".into()), cx);
-                view.toggle_trim(cx);
+                assert!(view.toggle_trim(cx).is_err());
                 view.restore_advanced_defaults(cx);
                 assert_eq!(view.config, original);
                 view.busy = false;
