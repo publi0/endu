@@ -14,6 +14,7 @@ from pathlib import PurePosixPath
 import plistlib
 import re
 import secrets
+import shlex
 import stat
 import subprocess
 import tempfile
@@ -96,6 +97,23 @@ def require_identity(keychain, identity):
     raise ValueError("The runner could not discover the pinned signing identity")
 
 
+def keychain_search_list():
+    return shlex.split(run("/usr/bin/security", "list-keychains", "-d", "user"))
+
+
+def add_signing_keychain(keychain):
+    current = keychain_search_list()
+    remaining = [path for path in current if Path(path).resolve() != keychain.resolve()]
+    security("list-keychains", "-d", "user", "-s", str(keychain), *remaining)
+
+
+def remove_signing_keychain(keychain):
+    current = keychain_search_list()
+    remaining = [path for path in current if Path(path).resolve() != keychain.resolve()]
+    if remaining != current:
+        security("list-keychains", "-d", "user", "-s", *remaining)
+
+
 def verify_archive(archive, certificate):
     identity = certificate_identity(certificate)
     with zipfile.ZipFile(archive) as zipped:
@@ -144,10 +162,16 @@ def signing_keychain(archive, password):
             p12.unlink()
             security("set-key-partition-list", "-S", "apple-tool:,apple:",
                      "-s", "-k", keychain_password, str(keychain))
+            # Explicitly include it for headless codesign discovery. Keep every
+            # existing keychain; this changes neither default keychain nor trust.
+            add_signing_keychain(keychain)
             yield keychain
         finally:
             if created:
-                security("delete-keychain", str(keychain))
+                try:
+                    remove_signing_keychain(keychain)
+                finally:
+                    security("delete-keychain", str(keychain))
 
 
 def signing_material(root):
@@ -180,7 +204,7 @@ def sign_release(root):
     with signing_keychain(archive, password) as keychain:
         require_identity(keychain, identity)
         # Compilation has already completed in a separate step without secrets.
-        run("/usr/bin/codesign", "--force", "--sign", identity.upper(), "--keychain", str(keychain),
+        run("/usr/bin/codesign", "--force", "--keychain", str(keychain), "--sign", identity.upper(),
             "--timestamp=none", "--entitlements", str(root / "app/VoiceControl.entitlements"), str(bundle))
     verify_bundle(bundle, identity)
     destination = root / f"target/app/Hex-{version}.zip"
