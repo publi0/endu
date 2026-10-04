@@ -75,10 +75,17 @@ primeiro uso e relido a cada ditado, então não precisa reiniciar o app.
   deixa o provedor detectar.
 - **Áudio longo:** é cortado em trechos de até `chunk_seconds`, no ponto mais
   silencioso perto do limite, e os textos são concatenados.
+- **Silêncio:** com `transcription.trim_silence` (ligado por padrão), um
+  detector de voz por energia corta o silêncio do início e do fim, com 200 ms
+  de margem, e encurta pausas longas para cerca de 700 ms. Gravações sem fala
+  não são enviadas. O limiar se adapta ao ruído de cada gravação.
 - **Cleanup:** com `cleanup.enabled: true`, cada ditado passa por um modelo de
   texto antes dos Modes, com a mesma lógica de fallback. Se tudo falhar, cola
   o texto bruto. O History guarda o texto bruto e o final. Defina
   `cleanup.prompt` para trocar o prompt padrão.
+- **History:** cada ditado mostra o modelo do OpenRouter que respondeu, a
+  latência, os modelos que falharam antes e quanto áudio foi enviado depois do
+  corte de silêncio. Se o cleanup rodou, mostra o modelo e a latência dele.
 
 Lista de modelos de STT disponíveis:
 <https://openrouter.ai/api/v1/models?output_modalities=transcription>.
@@ -99,9 +106,10 @@ Arquivos do upstream tocados (poucas linhas cada):
 | `src/transcription_models.rs` | entrada `OpenRouter` no catálogo, seleção padrão e choices do fork |
 | `src/transcription.rs` | variante `Transcriber::OpenRouter` |
 | `src/local_api.rs` | readiness do runtime remoto |
-| `src/parakeet.rs` | cleanup opcional antes dos Modes |
+| `src/parakeet.rs` | cleanup opcional antes dos Modes e repasse do relatório ao History |
 | `src/app_paths.rs` | diretório de dados próprio do fork |
-| `src/app_window.rs` | embute a seção OpenRouter no Settings (3 linhas) |
+| `src/app_window.rs` | embute a seção OpenRouter no Settings e na tela de setup, e as linhas do OpenRouter no History |
+| `src/history.rs` | guarda o relatório do OpenRouter em cada entrada |
 
 Arquivos exclusivos do fork: `src/openrouter/`, `fork/`, `Casks/`, `FORK.md` e
 `.github/workflows/fork-*.yml`.

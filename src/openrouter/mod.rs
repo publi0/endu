@@ -16,9 +16,13 @@ mod catalog_tests;
 pub mod cleanup;
 pub mod form;
 mod http;
+pub mod report;
 #[cfg(target_os = "macos")]
 pub mod settings_view;
 pub mod transcribe;
+mod vad;
+
+pub use report::{AudioTrim, RunReport, StepReport};
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -76,6 +80,9 @@ pub struct TranscriptionConfig {
     pub rate_limit_retry_max_wait_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// Cut silence before sending: leading and trailing silence is removed,
+    /// long pauses are shortened, and a clip with no speech is not sent.
+    pub trim_silence: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -115,6 +122,7 @@ impl Default for TranscriptionConfig {
             chunk_seconds: 120,
             rate_limit_retry_max_wait_ms: 2_000,
             temperature: Some(0.0),
+            trim_silence: true,
         }
     }
 }

@@ -2634,6 +2634,12 @@ impl AppWindow {
                                 }
                                 detail.child(detail_row("Processing", summary))
                             })
+                            .children(entry.openrouter.iter().flat_map(|report| {
+                                report
+                                    .history_rows()
+                                    .into_iter()
+                                    .map(|(label, value)| detail_row(label, value))
+                            }))
                             .child(detail_row("Latency", latency)),
                     ),
             )
@@ -7587,6 +7593,7 @@ fn preview_history() -> Option<History> {
                 audio_ms: 2_800,
                 inference_ms: 96,
                 total_ms: 3_400,
+                openrouter: crate::openrouter::report::preview(),
             },
             now.saturating_sub(age_ms),
         );

@@ -123,6 +123,9 @@ pub struct HistoryEntry {
     pub inference_ms: u64,
     #[serde(default)]
     pub total_ms: u64,
+    /// Fork: OpenRouter models and latencies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openrouter: Option<crate::openrouter::RunReport>,
 }
 
 impl HistoryEntry {
@@ -153,6 +156,7 @@ pub struct HistoryDraft {
     pub audio_ms: u64,
     pub inference_ms: u64,
     pub total_ms: u64,
+    pub openrouter: Option<crate::openrouter::RunReport>,
 }
 
 #[derive(Serialize)]
@@ -247,6 +251,7 @@ impl HistoryStore {
             audio_ms: draft.audio_ms,
             inference_ms: draft.inference_ms,
             total_ms: draft.total_ms,
+            openrouter: draft.openrouter.map(crate::openrouter::RunReport::bounded),
         });
         self.prune(now_ms);
         self.persist()?;
@@ -515,6 +520,7 @@ mod tests {
             audio_ms: 900,
             inference_ms: 80,
             total_ms: 1_100,
+            openrouter: None,
         }
     }
 

@@ -63,6 +63,14 @@ impl Transcriber {
         }
     }
 
+    /// Fork: what OpenRouter did for the last transcription, for History.
+    pub fn take_openrouter_report(&mut self) -> Option<crate::openrouter::StepReport> {
+        match self {
+            Self::OpenRouter(model) => model.take_report(),
+            _ => None,
+        }
+    }
+
     /// Transcribe normalized 16 kHz audio. Backend padding is applied once here,
     /// before GGUF chunking or any voice-control retranscription.
     pub fn transcribe(&mut self, samples: Vec<f32>) -> Result<String> {

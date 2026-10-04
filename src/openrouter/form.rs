@@ -14,6 +14,7 @@ pub struct Form {
     pub rate_limit_retry_max_wait_ms: String,
     /// Empty means "provider default".
     pub temperature: String,
+    pub trim_silence: bool,
     pub cleanup_enabled: bool,
     pub cleanup_models: String,
     pub cleanup_timeout_seconds: String,
@@ -38,6 +39,7 @@ impl Form {
                 .temperature
                 .map(|value| value.to_string())
                 .unwrap_or_default(),
+            trim_silence: config.transcription.trim_silence,
             cleanup_enabled: config.cleanup.enabled,
             cleanup_models: config.cleanup.models.join("\n"),
             cleanup_timeout_seconds: config.cleanup.timeout_seconds.to_string(),
@@ -84,6 +86,8 @@ impl Form {
             }
             Some(value)
         };
+
+        config.transcription.trim_silence = self.trim_silence;
 
         let cleanup_models = parse_models(&self.cleanup_models);
         if self.cleanup_enabled && cleanup_models.is_empty() {
@@ -139,6 +143,7 @@ mod tests {
         form.attempt_timeout_seconds = " 12 ".into();
         form.temperature = "0,2".into();
         form.cleanup_enabled = true;
+        form.trim_silence = false;
         form.cleanup_prompt = "  Clean it.  ".into();
         form.base_url = "https://proxy.test/api/v1/".into();
         let config = form.apply(&base).unwrap();
@@ -146,6 +151,7 @@ mod tests {
         assert_eq!(config.transcription.attempt_timeout_seconds, 12);
         assert_eq!(config.transcription.temperature, Some(0.2));
         assert!(config.cleanup.enabled);
+        assert!(!config.transcription.trim_silence);
         assert_eq!(config.cleanup.prompt.as_deref(), Some("Clean it."));
         assert_eq!(config.base_url, "https://proxy.test/api/v1");
         assert_eq!(config.api_key.as_deref(), Some("sk-from-file"));

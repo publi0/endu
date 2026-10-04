@@ -10,7 +10,8 @@ use color_eyre::eyre::{WrapErr, bail, eyre};
 use serde_json::{Value, json};
 
 use super::http::{self, Response};
-use super::{Config, excerpt};
+use super::vad::{self, Trimmed};
+use super::{AudioTrim, Config, StepReport, excerpt};
 use crate::transcription_models::{AUTO_LANGUAGE, TranscriptionSelection};
 
 /// HEX hands transcribers normalized 16 kHz mono samples.
@@ -20,6 +21,17 @@ const QUIET_FRAME_SAMPLES: usize = SAMPLE_RATE as usize / 10;
 
 pub struct OpenRouterTranscriber {
     selection: TranscriptionSelection,
+    /// What the last `transcribe` call did, for History.
+    last_report: Option<StepReport>,
+}
+
+/// One model's successful answer in a fallback chain.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Success {
+    pub text: String,
+    pub model: String,
+    /// Models that failed before `model`, in order.
+    pub failed: Vec<String>,
 }
 
 impl OpenRouterTranscriber {
@@ -36,6 +48,7 @@ impl OpenRouterTranscriber {
         super::api_key(&config)?;
         Ok(Self {
             selection: selection.clone(),
+            last_report: None,
         })
     }
 
@@ -43,11 +56,34 @@ impl OpenRouterTranscriber {
         &self.selection == selection
     }
 
-    pub fn transcribe(&self, samples: &[f32]) -> Result<String> {
+    /// Report for the most recent `transcribe` call, once.
+    pub fn take_report(&mut self) -> Option<StepReport> {
+        self.last_report.take()
+    }
+
+    pub fn transcribe(&mut self, samples: &[f32]) -> Result<String> {
+        self.last_report = None;
         if samples.is_empty() {
             return Ok(String::new());
         }
         let config = super::load_config()?;
+        let recorded_ms = duration_ms(samples.len());
+        let trimmed;
+        let samples = if config.transcription.trim_silence {
+            match vad::trim(samples) {
+                Trimmed::Silent => {
+                    tracing::info!(recorded_ms, "no speech detected; skipped OpenRouter");
+                    return Ok(String::new());
+                }
+                Trimmed::Speech(speech) => {
+                    trimmed = speech;
+                    &trimmed[..]
+                }
+            }
+        } else {
+            samples
+        };
+        let started = Instant::now();
         let api_key = super::api_key(&config)?;
         let language =
             (self.selection.language != AUTO_LANGUAGE).then_some(self.selection.language.as_str());
@@ -56,10 +92,12 @@ impl OpenRouterTranscriber {
         let chunk_seconds = config.transcription.chunk_seconds.clamp(10, 200);
         let chunk_samples = (chunk_seconds * u64::from(SAMPLE_RATE)) as usize;
         let mut texts = Vec::new();
+        let mut models_used: Vec<String> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
         for range in chunk_ranges(samples, chunk_samples) {
-            let started = Instant::now();
+            let chunk_started = Instant::now();
             let audio = encode_base64(&encode_wav(&samples[range])?);
-            let text = transcribe_with_fallback(
+            let success = transcribe_with_fallback(
                 &config,
                 &audio,
                 language,
@@ -67,14 +105,38 @@ impl OpenRouterTranscriber {
                 std::thread::sleep,
             )?;
             tracing::info!(
-                latency_ms = started.elapsed().as_millis(),
+                model = success.model,
+                latency_ms = chunk_started.elapsed().as_millis(),
                 "OpenRouter transcribed audio chunk"
             );
-            if !text.is_empty() {
-                texts.push(text);
+            push_unique(&mut models_used, success.model);
+            for model in success.failed {
+                push_unique(&mut failed, model);
+            }
+            if !success.text.is_empty() {
+                texts.push(success.text);
             }
         }
+        self.last_report = Some(StepReport {
+            model: Some(models_used.join(", ")),
+            latency_ms: started.elapsed().as_millis() as u64,
+            failed,
+            audio: Some(AudioTrim {
+                recorded_ms,
+                sent_ms: duration_ms(samples.len()),
+            }),
+        });
         Ok(texts.join(" "))
+    }
+}
+
+fn duration_ms(samples: usize) -> u64 {
+    samples as u64 * 1_000 / u64::from(SAMPLE_RATE)
+}
+
+fn push_unique(list: &mut Vec<String>, value: String) {
+    if !list.contains(&value) {
+        list.push(value);
     }
 }
 
@@ -95,12 +157,13 @@ pub(crate) fn transcribe_with_fallback(
     language: Option<&str>,
     mut send: impl FnMut(&str, Duration) -> Result<Response>,
     mut sleep: impl FnMut(Duration),
-) -> Result<String> {
+) -> Result<Success> {
     let started = Instant::now();
     let total = config.total_timeout();
     let max_rate_limit_wait =
         Duration::from_millis(config.transcription.rate_limit_retry_max_wait_ms);
     let mut failures = Vec::new();
+    let mut failed_models = Vec::new();
     for model in models(config) {
         let mut retried = false;
         loop {
@@ -126,7 +189,11 @@ pub(crate) fn transcribe_with_fallback(
                                 "OpenRouter transcription succeeded on a fallback model"
                             );
                         }
-                        return Ok(text);
+                        return Ok(Success {
+                            text,
+                            model: model.to_owned(),
+                            failed: failed_models,
+                        });
                     }
                     Err(error) => format!("{model}: {error}"),
                 },
@@ -157,6 +224,7 @@ pub(crate) fn transcribe_with_fallback(
             };
             tracing::warn!(failure, "OpenRouter transcription attempt failed");
             failures.push(failure);
+            failed_models.push(model.to_owned());
             break;
         }
     }
@@ -321,7 +389,7 @@ mod tests {
     #[test]
     fn first_model_success_returns_trimmed_text() {
         let calls = RefCell::new(Vec::new());
-        let text = transcribe_with_fallback(
+        let success = transcribe_with_fallback(
             &config(&["a", "b"]),
             "AAAA",
             Some("pt"),
@@ -332,14 +400,16 @@ mod tests {
             |_| panic!("no sleep expected"),
         )
         .unwrap();
-        assert_eq!(text, "olá mundo");
+        assert_eq!(success.text, "olá mundo");
+        assert_eq!(success.model, "a");
+        assert!(success.failed.is_empty());
         assert_eq!(*calls.borrow(), ["a"]);
     }
 
     #[test]
     fn every_kind_of_failure_falls_back_to_the_next_model() {
         let calls = RefCell::new(Vec::new());
-        let text = transcribe_with_fallback(
+        let success = transcribe_with_fallback(
             &config(&[
                 "transport",
                 "server",
@@ -365,7 +435,12 @@ mod tests {
             |_| {},
         )
         .unwrap();
-        assert_eq!(text, "done");
+        assert_eq!(success.text, "done");
+        assert_eq!(success.model, "good");
+        assert_eq!(
+            success.failed,
+            ["transport", "server", "garbage", "provider", "missing"]
+        );
         assert_eq!(calls.borrow().len(), 6);
     }
 
@@ -373,7 +448,7 @@ mod tests {
     fn short_rate_limit_retries_the_same_model_once() {
         let calls = RefCell::new(Vec::new());
         let slept = RefCell::new(Vec::new());
-        let text = transcribe_with_fallback(
+        let success = transcribe_with_fallback(
             &config(&["a", "b"]),
             "AAAA",
             None,
@@ -389,7 +464,9 @@ mod tests {
             |wait| slept.borrow_mut().push(wait),
         )
         .unwrap();
-        assert_eq!(text, "ok");
+        assert_eq!(success.text, "ok");
+        assert_eq!(success.model, "a");
+        assert!(success.failed.is_empty(), "a retry is not a fallback");
         assert_eq!(*calls.borrow(), ["a", "a"]);
         assert_eq!(*slept.borrow(), [Duration::from_secs(1)]);
     }

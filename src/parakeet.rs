@@ -111,6 +111,8 @@ struct ProcessorJob {
     text: String,
     context: ContextSnapshot,
     timings: JobTimings,
+    /// Fork: OpenRouter models and latencies, for History.
+    openrouter: crate::openrouter::RunReport,
 }
 
 /// Pipeline timings carried from inference through output for the final log.
@@ -130,6 +132,8 @@ struct CompletedTranscript {
     application: Option<String>,
     timings: JobTimings,
     processing: Option<ProcessingObservation>,
+    /// Fork: OpenRouter models and latencies, for History.
+    openrouter: crate::openrouter::RunReport,
 }
 
 enum OutputJob {
@@ -490,7 +494,10 @@ fn run_processor_worker(
                     });
                 })
         {
-            raw = Some(std::mem::replace(&mut job.text, cleaned));
+            job.openrouter.cleanup = Some(cleaned.report);
+            if let Some(text) = cleaned.text {
+                raw = Some(std::mem::replace(&mut job.text, text));
+            }
         }
         let mut processed = process_job_text(
             &job,
@@ -561,6 +568,7 @@ fn run_processor_worker(
                     application: job.context.application,
                     timings: job.timings,
                     processing: processed.observation,
+                    openrouter: job.openrouter,
                 })),
             })
             .is_err()
@@ -663,6 +671,10 @@ fn run_inference_worker(
             corrected
         })
         .map_err(|error| error.to_string());
+        let openrouter = crate::openrouter::RunReport {
+            transcription: transcriber.take_openrouter_report(),
+            cleanup: None,
+        };
         let timings = JobTimings {
             total_started,
             queue_ms,
@@ -691,6 +703,7 @@ fn run_inference_worker(
                         text,
                         context: job.context,
                         timings,
+                        openrouter,
                     })
                     .is_err()
                 {
@@ -705,6 +718,7 @@ fn run_inference_worker(
                     application,
                     timings,
                     processing: None,
+                    openrouter,
                 });
                 if output
                     .send(OutputJob::Completed {
@@ -878,6 +892,7 @@ fn record_history(history: &History, target: TranscriptionTarget, completed: &Co
         audio_ms: completed.timings.audio_ms,
         inference_ms: completed.timings.inference_ms as u64,
         total_ms: completed.timings.total_started.elapsed().as_millis() as u64,
+        openrouter: (!completed.openrouter.is_empty()).then(|| completed.openrouter.clone()),
     };
     if let Err(error) = history.record(draft) {
         tracing::warn!(%error, "could not record dictation history");
@@ -1212,6 +1227,7 @@ mod tests {
                 prepare_ms: 0,
                 inference_ms: 0,
             },
+            openrouter: Default::default(),
         }
     }
 
@@ -1529,6 +1545,7 @@ mod tests {
                 inference_ms: 0,
             },
             processing: None,
+            openrouter: Default::default(),
         };
         for target in [
             TranscriptionTarget::Paste,

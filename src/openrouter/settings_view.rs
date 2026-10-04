@@ -51,6 +51,7 @@ pub struct OpenRouterSettings {
     chunk_seconds: Entity<TextInput>,
     rate_limit_wait: Entity<TextInput>,
     temperature: Entity<TextInput>,
+    trim_silence: bool,
     cleanup_enabled: bool,
     cleanup_models: Entity<TextInput>,
     cleanup_timeout: Entity<TextInput>,
@@ -127,6 +128,7 @@ impl OpenRouterSettings {
             chunk_seconds,
             rate_limit_wait,
             temperature,
+            trim_silence: form.trim_silence,
             cleanup_enabled: form.cleanup_enabled,
             cleanup_models,
             cleanup_timeout,
@@ -150,6 +152,7 @@ impl OpenRouterSettings {
             chunk_seconds: text(&self.chunk_seconds),
             rate_limit_retry_max_wait_ms: text(&self.rate_limit_wait),
             temperature: text(&self.temperature),
+            trim_silence: self.trim_silence,
             cleanup_enabled: self.cleanup_enabled,
             cleanup_models: text(&self.cleanup_models),
             cleanup_timeout_seconds: text(&self.cleanup_timeout),
@@ -176,6 +179,7 @@ impl OpenRouterSettings {
         set(&self.cleanup_timeout, &form.cleanup_timeout_seconds, cx);
         set(&self.cleanup_prompt, &form.cleanup_prompt, cx);
         self.cleanup_enabled = form.cleanup_enabled;
+        self.trim_silence = form.trim_silence;
         self.dirty = false;
     }
 
@@ -416,6 +420,16 @@ impl Render for OpenRouterSettings {
                             .on_click(cx.listener(|this, _, _, cx| this.save_key(cx))),
                     ),
             );
+        let trim_toggle = div()
+            .id("openrouter-trim-toggle")
+            .flex_none()
+            .child(toggle(if self.trim_silence { 1.0 } else { 0.0 }))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.trim_silence = !this.trim_silence;
+                this.dirty = true;
+                this.message = None;
+                cx.notify();
+            }));
         let cleanup_toggle = div()
             .id("openrouter-cleanup-toggle")
             .flex_none()
@@ -516,6 +530,11 @@ impl Render for OpenRouterSettings {
                         "Transcription models",
                         "One per line, tried in order. Any error moves on to the next model. Choose OpenRouter as the dictation model above to use them.",
                         sized(&self.transcription_models, WIDE_INPUT),
+                    ))
+                    .child(row(
+                        "Trim silence",
+                        "Cut silence at the start and end and shorten long pauses before sending. Recordings with no speech are not sent.",
+                        trim_toggle,
                     ))
                     .child(row(
                         "Attempt timeout (s)",
