@@ -20,12 +20,26 @@ class FakeGitHub:
         self.uploads = 0
         self.publications = 0
         self.latest = None
+        self.stale_listing = False
+        self.asset_visibility_delay = 0
+        self.release_reads = 0
 
     def releases(self):
-        return copy.deepcopy(self.items)
+        return [] if self.stale_listing else copy.deepcopy(self.items)
 
     def create_draft(self, tag, source):
-        self.items.append({"tag_name": tag, "draft": True, "prerelease": False, "assets": []})
+        release = {"id": len(self.items) + 1, "tag_name": tag,
+                   "draft": True, "prerelease": False, "assets": []}
+        self.items.append(release)
+        return copy.deepcopy(release)
+
+    def get_release(self, release_id):
+        self.release_reads += 1
+        release = copy.deepcopy(next(item for item in self.items if item["id"] == release_id))
+        if self.asset_visibility_delay:
+            self.asset_visibility_delay -= 1
+            release["assets"] = []
+        return release
 
     def upload(self, tag, archive):
         self.uploads += 1
@@ -199,6 +213,29 @@ class ReleaseTests(unittest.TestCase):
         publisher.publish()
         self.assertEqual(self.github.uploads, 1)
         self.assertEqual(self.github.publications, 1)
+
+    def test_create_response_survives_stale_listing_and_delayed_assets(self):
+        self.github.stale_listing = True
+        self.github.asset_visibility_delay = 2
+        with patch("release.time.sleep") as sleep:
+            self.publisher().publish()
+        self.assertEqual(self.github.release_reads, 3)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(self.github.uploads, 1)
+        self.assertEqual(self.github.publications, 1)
+        self.assertIn('version "3.0.0"', self.remote_file(CASK))
+
+    def test_asset_visibility_timeout_preserves_draft_and_cask(self):
+        self.github.asset_visibility_delay = 10
+        with patch("release.time.sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "rerun to resume the draft"):
+                self.publisher().publish()
+        self.assertEqual(self.github.release_reads, 5)
+        self.assertEqual(sleep.call_count, 4)
+        self.assertEqual(self.github.uploads, 1)
+        self.assertEqual(self.github.publications, 0)
+        self.assertTrue(self.github.find("v3.0.0")["draft"])
+        self.assertIn('version "2.1.24-4"', self.remote_file(CASK))
 
     def test_tag_collision_rejects_different_source(self):
         self.publisher().ensure_source_tag()

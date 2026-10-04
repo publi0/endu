@@ -10,6 +10,7 @@ import plistlib
 import re
 import subprocess
 import tempfile
+import time
 import tomllib
 import zipfile
 
@@ -126,12 +127,18 @@ class GitHub:
 
     def create_draft(self, tag, source):
         notes = f"Built from {source}. Install or update with `brew upgrade --cask hex-openrouter`.\n"
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md") as body:
-            body.write(notes)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as body:
+            json.dump({"tag_name": tag, "target_commitish": source,
+                       "name": f"Hex {tag[1:]}", "body": notes,
+                       "draft": True, "prerelease": False}, body)
             body.flush()
-            run("gh", "release", "create", tag, "--repo", self.repository,
-                "--verify-tag", "--draft", "--title", f"Hex {tag[1:]}",
-                "--notes-file", body.name)
+            result = run("gh", "api", "--method", "POST",
+                         f"repos/{self.repository}/releases", "--input", body.name)
+        return json.loads(result.stdout)
+
+    def get_release(self, release_id):
+        result = run("gh", "api", f"repos/{self.repository}/releases/{release_id}")
+        return json.loads(result.stdout)
 
     def upload(self, tag, archive):
         run("gh", "release", "upload", tag, str(archive), "--repo", self.repository)
@@ -206,15 +213,15 @@ class Publisher:
             archive_checksum(archive, self.version)
             self.ensure_source_tag()
             if release is None:
-                self.github.create_draft(self.tag, self.source)
-                release = self.find_release()
+                # The create response is authoritative before the list endpoint catches up.
+                release = self.github.create_draft(self.tag, self.source)
             asset = self.find_asset(release)
             if asset and (asset.get("state") != "uploaded" or asset.get("size", 0) == 0):
                 self.github.delete_incomplete_asset(self.tag, asset["name"])
                 asset = None
             if asset is None:
                 self.github.upload(self.tag, archive)
-                release = self.find_release()
+                release = self.wait_for_asset(release["id"])
 
         asset = self.find_asset(release)
         if not asset or asset.get("state") != "uploaded" or asset.get("size", 0) == 0:
@@ -228,8 +235,21 @@ class Publisher:
             self.github.publish(self.tag, latest=not newer)
         self.update_cask(checksum)
 
-    def find_release(self):
-        return next(item for item in self.github.releases() if item["tag_name"] == self.tag)
+    def wait_for_asset(self, release_id):
+        last_error = None
+        for attempt in range(5):
+            try:
+                release = self.github.get_release(release_id)
+                asset = self.find_asset(release)
+                if asset and asset.get("state") == "uploaded" and asset.get("size", 0) > 0:
+                    return release
+            except RuntimeError as error:
+                last_error = error
+            if attempt < 4:
+                time.sleep(min(0.5 * 2 ** attempt, 2))
+        raise RuntimeError(
+            f"Uploaded archive for {self.tag} is not readable yet; rerun to resume the draft"
+        ) from last_error
 
     def find_asset(self, release):
         name = f"Hex-{self.version}.zip"
