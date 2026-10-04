@@ -28,8 +28,10 @@ CERTIFICATE = Path("app/release-signing.pem")
 def run(*args, env=None, input=None):
     result = subprocess.run(args, env=env, input=input, text=True, capture_output=True)
     if result.returncode:
-        # Never include command arguments or tool output: import/keychain
-        # commands contain passwords, and tools may repeat them on errors.
+        # codesign receives only public fingerprints and bundle/keychain paths.
+        # Keep its diagnostics; never print import/keychain output or arguments.
+        if args[0] == "/usr/bin/codesign":
+            raise RuntimeError(f"codesign failed (exit {result.returncode}): {result.stderr.strip()}")
         raise RuntimeError(f"{Path(args[0]).name} failed (exit {result.returncode})")
     return result.stdout + result.stderr
 

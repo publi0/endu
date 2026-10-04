@@ -13,6 +13,17 @@ import code_signing as signing
 
 
 class SigningTests(unittest.TestCase):
+    def test_security_errors_stay_private_but_codesign_diagnostics_are_available(self):
+        result = subprocess.CompletedProcess([], 1, "", "sensitive import details")
+        with patch("code_signing.subprocess.run", return_value=result):
+            with self.assertRaises(RuntimeError) as error:
+                signing.security("import", "test.p12")
+            self.assertNotIn("sensitive import details", str(error.exception))
+        result = subprocess.CompletedProcess([], 1, "", "a sealed resource is missing")
+        with patch("code_signing.subprocess.run", return_value=result):
+            with self.assertRaisesRegex(RuntimeError, "a sealed resource is missing"):
+                signing.run("/usr/bin/codesign", "--verify", "test.app")
+
     def test_passwords_use_stdin_and_cannot_inject_security_commands(self):
         with patch("code_signing.run") as command:
             signing.security("unlock-keychain", "-p", 'secret \\"quoted', "temporary.keychain")
