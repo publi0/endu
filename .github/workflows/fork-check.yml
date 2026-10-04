@@ -28,5 +28,24 @@ jobs:
           shared-key: fork-check
           cache-on-failure: true
       - run: cargo fmt --all --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - name: Clippy
+        run: |
+          set -o pipefail
+          cargo clippy --locked --all-targets --message-format=short -- -D warnings 2>&1 | tee check.log
+      - name: Test
+        run: |
+          set -o pipefail
+          cargo test --locked 2>&1 | tee check.log
+      # Repeat the failure as annotations, which stay readable through the
+      # API when the raw log is not.
+      - name: Report failures
+        if: failure()
+        run: |
+          [ -f check.log ] || exit 0
+          grep -E 'error|warning|panicked|FAILED|failed|assert' check.log | grep -v '^\s*Compiling' | head -100 > failures.log || true
+          [ -s failures.log ] || tail -100 check.log > failures.log
+          split -l 10 failures.log chunk.
+          for chunk in chunk.*; do
+            message=$(sed 's/%/%25/g' "$chunk" | awk '{printf "%s%%0A", $0}')
+            echo "::error title=check::$message"
+          done
