@@ -140,6 +140,10 @@ As preferências gerais do aplicativo ficam em **Settings**:
 O **Trim silence** é salvo assim que você muda o controle. Avisos e atalhos
 para conceder permissões do macOS também aparecem nessa tela.
 
+O sinal sonoro de início tem um reforço de volume para facilitar perceber
+quando a gravação começou. O controle geral continua valendo, inclusive
+quando os sons estão desligados; o sinal de término mantém seu volume.
+
 ## History e Statistics
 
 **History** registra os ditados colados com sucesso: texto, aplicativo em

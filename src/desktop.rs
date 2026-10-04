@@ -276,8 +276,8 @@ fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
         Menu {
             name: "Hex".into(),
             items: vec![
-                MenuItem::action("Settings…", ShowSettings),
-                MenuItem::action("Models…", ShowModels),
+                MenuItem::action("Settings", ShowSettings),
+                MenuItem::action("Models", ShowModels),
                 MenuItem::action("History", ShowHistory),
                 MenuItem::action("Statistics", ShowStatistics),
                 MenuItem::separator(),

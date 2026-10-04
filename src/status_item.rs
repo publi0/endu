@@ -96,10 +96,10 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
         mtm,
     );
     menu.addItem(&NSMenuItem::separatorItem(mtm));
-    add_item(&menu, &target, "Settings…", sel!(openSettings:), mtm);
-    add_item(&menu, &target, "Models…", sel!(openModels:), mtm);
-    add_item(&menu, &target, "History…", sel!(openHistory:), mtm);
-    add_item(&menu, &target, "Statistics…", sel!(openStatistics:), mtm);
+    add_item(&menu, &target, "Settings", sel!(openSettings:), mtm);
+    add_item(&menu, &target, "Models", sel!(openModels:), mtm);
+    add_item(&menu, &target, "History", sel!(openHistory:), mtm);
+    add_item(&menu, &target, "Statistics", sel!(openStatistics:), mtm);
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     add_item(&menu, &target, "Quit Hex", sel!(quit:), mtm);
 

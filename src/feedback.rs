@@ -35,6 +35,17 @@ fn volume() -> f32 {
     f32::from_bits(VOLUME.load(Ordering::Relaxed))
 }
 
+fn playback_volume(tone: Tone, master_volume: f32) -> f32 {
+    // Emphasize capture onset (+3.5 dB) without amplifying a normalized clip
+    // above unity gain. The shared volume control still mutes every tone.
+    let gain = if tone == Tone::DictationStart {
+        1.5
+    } else {
+        1.0
+    };
+    (master_volume * gain).clamp(0.0, 1.0)
+}
+
 fn sounds_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed) && volume() > 0.0
 }
@@ -189,7 +200,8 @@ pub fn preload() -> Result<()> {
             let Some(sink) = output.sink.as_ref() else {
                 continue;
             };
-            sink.mixer().add(sound.clone().amplify(volume()));
+            sink.mixer()
+                .add(sound.clone().amplify(playback_volume(tone, volume())));
             output.mark_playing(
                 Instant::now(),
                 sound.total_duration().unwrap_or(Duration::ZERO),
@@ -256,6 +268,39 @@ fn decode(bytes: &'static [u8]) -> Result<SamplesBuffer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_cue_is_emphasized_while_mute_and_other_tones_keep_their_levels() {
+        for tone in [Tone::DictationStart, Tone::DictationStop, Tone::Cancel] {
+            assert_eq!(playback_volume(tone, 0.0), 0.0);
+            assert!(playback_volume(tone, 1.0) <= 1.0);
+        }
+        assert_eq!(playback_volume(Tone::DictationStart, 0.5), 0.75);
+        assert_eq!(playback_volume(Tone::DictationStop, 0.5), 0.5);
+        assert_eq!(playback_volume(Tone::Cancel, 0.5), 0.5);
+    }
+
+    #[test]
+    fn louder_bundled_start_cue_stays_below_full_scale() {
+        let sound = decode(include_bytes!("../resources/audio/startRecording.mp3")).unwrap();
+        let peak = |samples: Vec<f32>| samples.into_iter().map(f32::abs).fold(0.0, f32::max);
+        let before = peak(sound.clone().amplify(0.5).collect());
+        let after = peak(
+            sound
+                .clone()
+                .amplify(playback_volume(Tone::DictationStart, 0.5))
+                .collect(),
+        );
+        let maximum = peak(
+            sound
+                .amplify(playback_volume(Tone::DictationStart, 1.0))
+                .collect(),
+        );
+        assert!(before > 0.0);
+        assert!(after > before * 1.4);
+        assert!(after <= 1.0);
+        assert!(maximum <= 1.0);
+    }
 
     impl<S> FeedbackOutput<S> {
         fn is_open(&self) -> bool {
