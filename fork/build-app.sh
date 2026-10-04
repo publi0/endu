@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build "Hex OpenRouter.app": no Developer ID, no Sparkle (Homebrew updates it).
+# Build "Hex.app": no Developer ID, no Sparkle (Homebrew updates it).
 # Signs ad hoc by default, or with FORK_CODESIGN_IDENTITY when set (a stable
 # identity keeps macOS permission grants across updates).
 #
@@ -12,7 +12,7 @@ version=${1:-$crate_version}
 build_number=$(printf '%s\n' "$crate_version" | awk -F. '{ print ($1 * 10000) + ($2 * 100) + $3 }')
 identity=${FORK_CODESIGN_IDENTITY:--}
 
-bundle_name="Hex OpenRouter.app"
+bundle_name="Hex.app"
 bundle="$root/target/fork-app/$bundle_name"
 plist="$bundle/Contents/Info.plist"
 icon_output="$root/target/fork-AppIcon.assets"
@@ -43,7 +43,7 @@ cp "$icon_output/AppIcon.icns" "$icon_output/Assets.car" "$bundle/Contents/Resou
 codesign --force --sign "$identity" --entitlements "$root/app/VoiceControl.entitlements" "$bundle" >&2
 codesign --verify --deep --strict --verbose=2 "$bundle" >&2
 
-archive="$root/target/fork-app/Hex-OpenRouter-$version.zip"
+archive="$root/target/fork-app/Hex-$version.zip"
 rm -f "$archive"
 (cd "$root/target/fork-app" && /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$bundle_name" "$archive")
 echo "$archive"

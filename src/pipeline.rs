@@ -7,10 +7,10 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use color_eyre::eyre::Result;
 
@@ -22,6 +22,7 @@ use crate::paste::Paster;
 use crate::suppression::InputActivity;
 
 const MAX_PENDING_OUTPUTS: usize = 16;
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 pub enum WorkerEvent {
     Completed {
@@ -166,14 +167,19 @@ pub struct DictationWorker {
     output_worker: Option<thread::JoinHandle<()>>,
 }
 
+#[derive(Default)]
 struct WorkerState {
     next_sequence: u64,
     jobs: BTreeMap<DictationJobId, Arc<JobControl>>,
     pending_pastes: usize,
+    shutting_down: bool,
 }
 
 impl WorkerState {
     fn next_output_sequence(&self) -> Result<u64, &'static str> {
+        if self.shutting_down {
+            return Err("dictation worker is unavailable");
+        }
         // Count accepted work even after it leaves a channel for ordered buffering.
         if self.jobs.len() + self.pending_pastes >= MAX_PENDING_OUTPUTS {
             return Err("dictation queue is full");
@@ -191,46 +197,55 @@ impl WorkerState {
 
 impl DictationWorker {
     pub fn start(activity: InputActivity, history: Option<History>) -> Self {
+        Self::start_with(
+            history,
+            crate::openrouter::transcribe::transcribe,
+            move || {
+                let mut paster = Paster::new(activity);
+                Box::new(move |prepare_only, text, commit| {
+                    if prepare_only {
+                        paster.prepare();
+                        Ok(())
+                    } else {
+                        paster.paste(text, commit)
+                    }
+                })
+            },
+        )
+    }
+
+    fn start_with(
+        history: Option<History>,
+        transcribe: impl FnMut(&[f32]) -> Result<crate::openrouter::transcribe::Transcription>
+        + Send
+        + 'static,
+        create_paste: impl FnOnce() -> Box<PasteFn<'static>> + Send + 'static,
+    ) -> Self {
         let (transcription_jobs, transcription_receiver) =
             mpsc::sync_channel::<TranscriptionJob>(4);
         let (output_jobs, output_receiver) = mpsc::sync_channel::<OutputJob>(8);
         let (event_sender, events) = mpsc::channel();
-        let state = Arc::new(Mutex::new(WorkerState {
-            next_sequence: 0,
-            jobs: BTreeMap::new(),
-            pending_pastes: 0,
-        }));
+        let state = Arc::new(Mutex::new(WorkerState::default()));
 
         let output_worker = thread::spawn({
             let state = state.clone();
             let events = event_sender.clone();
             move || {
-                let mut paster = Paster::new(activity);
-                run_output_worker(
-                    output_receiver,
-                    &mut |prepare_only, text, commit| {
-                        if prepare_only {
-                            paster.prepare();
-                            Ok(())
-                        } else {
-                            paster.paste(text, commit)
-                        }
-                    },
-                    history,
-                    &state,
-                    &events,
-                )
+                let mut paste = create_paste();
+                run_output_worker(output_receiver, &mut *paste, history, &state, &events)
             }
         });
 
         let transcription_worker = thread::spawn({
             let output = output_jobs.clone();
+            let state = state.clone();
             move || {
                 run_transcription_worker(
                     transcription_receiver,
                     &output,
                     &event_sender,
-                    crate::openrouter::transcribe::transcribe,
+                    &state,
+                    transcribe,
                 )
             }
         });
@@ -274,7 +289,7 @@ impl DictationWorker {
     /// Capture the clipboard ahead of the first paste while nothing is queued.
     pub fn prepare_paste(&self) {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if !state.jobs.is_empty() || state.pending_pastes > 0 {
+        if state.shutting_down || !state.jobs.is_empty() || state.pending_pastes > 0 {
             return;
         }
         drop(state);
@@ -326,10 +341,27 @@ impl DictationWorker {
     }
 
     fn shutdown(&mut self) {
+        {
+            // Output commits take this same lock. A pending clipboard write can
+            // no longer begin once shutdown wins; an already committed paste finishes.
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.shutting_down = true;
+            for control in state.jobs.values() {
+                control.cancel();
+            }
+            state.jobs.clear();
+            state.pending_pastes = 0;
+        }
         self.transcription_jobs.take();
-        join_worker(self.transcription_worker.take(), "dictation transcription");
         self.output_jobs.take();
         join_worker(self.output_worker.take(), "dictation output");
+        if let Some(worker) = self.transcription_worker.take()
+            && worker.is_finished()
+        {
+            join_worker(Some(worker), "dictation transcription");
+        }
+        // Dropping an unfinished handle detaches the remote request. Its worker
+        // checks shutdown before publishing the result or starting queued clips.
     }
 }
 
@@ -339,16 +371,18 @@ impl Drop for DictationWorker {
     }
 }
 
-type Transcribe = fn(&[f32]) -> Result<crate::openrouter::transcribe::Transcription>;
-
 fn run_transcription_worker(
     jobs: Receiver<TranscriptionJob>,
     output: &SyncSender<OutputJob>,
     events: &mpsc::Sender<WorkerEvent>,
-    transcribe: Transcribe,
+    state: &Mutex<WorkerState>,
+    mut transcribe: impl FnMut(&[f32]) -> Result<crate::openrouter::transcribe::Transcription>,
 ) {
     prioritize_transcription_thread();
     while let Ok(job) = jobs.recv() {
+        if is_shutting_down(state) {
+            break;
+        }
         if job.control.is_cancelled() {
             let _ = output.send(OutputJob::Cancelled { job_id: job.job_id });
             continue;
@@ -359,6 +393,9 @@ fn run_transcription_worker(
         let samples = job.clip.into_transcription_samples();
         let started = Instant::now();
         let result = transcribe(&samples);
+        if is_shutting_down(state) {
+            break;
+        }
         let timings = JobTimings {
             total_started: job.submitted_at,
             queue_ms,
@@ -400,17 +437,29 @@ fn run_output_worker(
 ) {
     let mut last_transcript = None;
     let mut ordered = OrderedOutputs::default();
-    while let Ok(job) = jobs.recv() {
+    while !is_shutting_down(state) {
+        let job = match jobs.recv_timeout(SHUTDOWN_POLL_INTERVAL) {
+            Ok(job) => job,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        if is_shutting_down(state) {
+            break;
+        }
         if matches!(job, OutputJob::PreparePaste) {
             let _ = paste(true, "", &|| true);
             continue;
         }
         for job in ordered.push(job) {
+            if is_shutting_down(state) {
+                return;
+            }
             let event = finish_output(
                 job,
                 &mut |text, commit| paste(false, text, commit),
                 &mut last_transcript,
                 history.as_ref(),
+                state,
             );
             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
             match &event {
@@ -430,6 +479,19 @@ fn run_output_worker(
     }
 }
 
+fn is_shutting_down(state: &Mutex<WorkerState>) -> bool {
+    state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .shutting_down
+}
+
+/// Serialize every clipboard commit, including Paste Last, against shutdown.
+fn commit_output(state: &Mutex<WorkerState>, commit: &dyn Fn() -> bool) -> bool {
+    let state = state.lock().unwrap_or_else(|error| error.into_inner());
+    !state.shutting_down && commit()
+}
+
 /// `paste(text, commit)` pastes `text` once `commit` accepts.
 type OutputPasteFn<'a> = dyn FnMut(&str, &dyn Fn() -> bool) -> Result<()> + 'a;
 
@@ -438,6 +500,7 @@ fn finish_output(
     paste: &mut OutputPasteFn<'_>,
     last_transcript: &mut Option<String>,
     history: Option<&History>,
+    state: &Mutex<WorkerState>,
 ) -> WorkerEvent {
     match job {
         OutputJob::PreparePaste => unreachable!("paste preparation bypasses ordered output"),
@@ -449,7 +512,7 @@ fn finish_output(
             let result = (*result).and_then(|completed| {
                 let paste_started = Instant::now();
                 if !completed.text.is_empty() {
-                    let commit = || control.begin_output();
+                    let commit = || commit_output(state, &|| control.begin_output());
                     paste(&completed.text, &commit).map_err(|error| error.to_string())?;
                     *last_transcript = Some(completed.text.clone());
                     if let Some(history) = history {
@@ -480,7 +543,8 @@ fn finish_output(
                 .as_deref()
                 .ok_or_else(|| "no previous transcript is available".to_string())
                 .and_then(|text| {
-                    paste(text, &|| true).map_err(|error| error.to_string())?;
+                    paste(text, &|| commit_output(state, &|| true))
+                        .map_err(|error| error.to_string())?;
                     Ok(text.to_string())
                 });
             WorkerEvent::Pasted { result }
@@ -580,6 +644,7 @@ mod tests {
     fn completed_text_is_pasted_and_becomes_the_last_transcript() {
         let pasted = RefCell::new(Vec::new());
         let mut last = None;
+        let state = Mutex::new(WorkerState::default());
         let event = finish_output(
             completed(0, "olá"),
             &mut |text, commit| {
@@ -589,6 +654,7 @@ mod tests {
             },
             &mut last,
             None,
+            &state,
         );
         assert!(
             matches!(event, WorkerEvent::Completed { result: Ok(ref text), .. } if text == "olá")
@@ -597,12 +663,14 @@ mod tests {
 
         let event = finish_output(
             OutputJob::PasteLast { sequence: 1 },
-            &mut |text, _| {
+            &mut |text, commit| {
+                assert!(commit());
                 pasted.borrow_mut().push(text.to_owned());
                 Ok(())
             },
             &mut last,
             None,
+            &state,
         );
         assert!(matches!(event, WorkerEvent::Pasted { result: Ok(_) }));
         assert_eq!(*pasted.borrow(), ["olá", "olá"]);
@@ -615,7 +683,8 @@ mod tests {
             control.cancel();
         }
         let mut last = None;
-        let event = finish_output(job, &mut |_, _| panic!("no paste"), &mut last, None);
+        let state = Mutex::new(WorkerState::default());
+        let event = finish_output(job, &mut |_, _| panic!("no paste"), &mut last, None, &state);
         assert!(matches!(event, WorkerEvent::Cancelled { .. }));
 
         let event = finish_output(
@@ -623,6 +692,7 @@ mod tests {
             &mut |_, _| panic!("no paste"),
             &mut last,
             None,
+            &state,
         );
         assert!(
             matches!(event, WorkerEvent::Completed { result: Ok(ref text), .. } if text.is_empty())
@@ -645,15 +715,169 @@ mod tests {
         })
         .unwrap();
         drop(jobs);
-        run_transcription_worker(receiver, &output, &events, |_| {
-            Err(color_eyre::eyre::eyre!("offline"))
-        });
+        run_transcription_worker(
+            receiver,
+            &output,
+            &events,
+            &Mutex::new(WorkerState::default()),
+            |_| Err(color_eyre::eyre::eyre!("offline")),
+        );
         match outputs.recv().unwrap() {
             OutputJob::Completed { result, .. } => match *result {
                 Err(error) => assert_eq!(error, "offline"),
                 Ok(_) => panic!("error expected"),
             },
             _ => panic!("completed job expected"),
+        }
+    }
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn test_transcription(text: &str) -> crate::openrouter::transcribe::Transcription {
+        crate::openrouter::transcribe::Transcription {
+            text: text.into(),
+            report: None,
+        }
+    }
+
+    fn submit_test_clip(worker: &DictationWorker) {
+        worker
+            .transcribe(
+                DictationClip::from_samples(vec![0.1; 1_600]),
+                ContextSnapshot::default(),
+            )
+            .unwrap();
+    }
+
+    fn wait_for_shutdown(state: &Mutex<WorkerState>) {
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        while !is_shutting_down(state) {
+            assert!(Instant::now() < deadline, "shutdown did not begin");
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn drop_does_not_wait_for_network_or_paste_queued_work() {
+        use std::sync::atomic::AtomicUsize;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (started, network_started) = mpsc::channel();
+        let (release, network_release) = mpsc::channel();
+        let (network_alive, network_stopped) = mpsc::channel::<()>();
+        let (pasted, pastes) = mpsc::channel();
+        let worker = DictationWorker::start_with(
+            None,
+            {
+                let calls = calls.clone();
+                move |_| {
+                    let _alive = &network_alive;
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Ok(test_transcription("previous"));
+                    }
+                    started.send(()).unwrap();
+                    network_release.recv_timeout(TEST_TIMEOUT).unwrap();
+                    Ok(test_transcription("must not paste"))
+                }
+            },
+            move || {
+                Box::new(move |prepare_only, text, commit| {
+                    if !prepare_only {
+                        assert!(commit());
+                        pasted.send(text.to_owned()).unwrap();
+                    }
+                    Ok(())
+                })
+            },
+        );
+        submit_test_clip(&worker);
+        assert_eq!(pastes.recv_timeout(TEST_TIMEOUT).unwrap(), "previous");
+        submit_test_clip(&worker);
+        network_started.recv_timeout(TEST_TIMEOUT).unwrap();
+        submit_test_clip(&worker);
+        worker.paste_last().unwrap();
+
+        let (dropped, drop_finished) = mpsc::channel();
+        let drop_worker = thread::spawn(move || {
+            drop(worker);
+            dropped.send(()).unwrap();
+        });
+        let shutdown_result = drop_finished.recv_timeout(Duration::from_secs(2));
+        // Release even if shutdown regressed, so a failed test leaves no blocked worker.
+        release.send(()).unwrap();
+        drop_worker.join().unwrap();
+        assert!(
+            shutdown_result.is_ok(),
+            "shutdown waited for the remote request"
+        );
+        assert_eq!(
+            network_stopped.recv_timeout(TEST_TIMEOUT),
+            Err(RecvTimeoutError::Disconnected)
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "queued clip was transcribed"
+        );
+        assert_eq!(pastes.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+    }
+
+    #[test]
+    fn shutdown_rejects_prepared_paste_last_but_finishes_committed_output() {
+        for committed_before_shutdown in [false, true] {
+            let (prepared, paste_prepared) = mpsc::channel();
+            let (release, paste_release) = mpsc::channel();
+            let (pasted, pastes) = mpsc::channel();
+            let worker = DictationWorker::start_with(
+                None,
+                |_| Ok(test_transcription("previous")),
+                move || {
+                    let mut first = true;
+                    Box::new(move |prepare_only, text, commit| {
+                        if prepare_only {
+                            return Ok(());
+                        }
+                        let accepted = if first {
+                            first = false;
+                            commit()
+                        } else {
+                            let committed = committed_before_shutdown && commit();
+                            prepared.send(()).unwrap();
+                            paste_release.recv_timeout(TEST_TIMEOUT).unwrap();
+                            committed || commit()
+                        };
+                        if !accepted {
+                            return Err(color_eyre::eyre::eyre!("paste cancelled"));
+                        }
+                        pasted.send(text.to_owned()).unwrap();
+                        Ok(())
+                    })
+                },
+            );
+            submit_test_clip(&worker);
+            assert_eq!(pastes.recv_timeout(TEST_TIMEOUT).unwrap(), "previous");
+            worker.paste_last().unwrap();
+            paste_prepared.recv_timeout(TEST_TIMEOUT).unwrap();
+
+            let state = worker.state.clone();
+            let (dropped, drop_finished) = mpsc::channel();
+            let drop_worker = thread::spawn(move || {
+                drop(worker);
+                dropped.send(()).unwrap();
+            });
+            wait_for_shutdown(&state);
+            assert_eq!(drop_finished.try_recv(), Err(mpsc::TryRecvError::Empty));
+            release.send(()).unwrap();
+            drop_finished.recv_timeout(TEST_TIMEOUT).unwrap();
+            drop_worker.join().unwrap();
+
+            let remaining: Vec<_> = pastes.try_iter().collect();
+            if committed_before_shutdown {
+                assert_eq!(remaining, ["previous"]);
+            } else {
+                assert!(remaining.is_empty(), "Paste Last committed after shutdown");
+            }
+            assert_eq!(pastes.try_recv(), Err(mpsc::TryRecvError::Disconnected));
         }
     }
 }

@@ -2,7 +2,7 @@
 //! the errors that caused them. Daily totals only, never text, so they are
 //! kept regardless of the History retention setting.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -12,10 +12,9 @@ use color_eyre::Result;
 use serde::{Deserialize, Serialize};
 
 const FILE: &str = "stats.json";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 /// Days kept on disk; older buckets are dropped.
 const MAX_DAYS: usize = 400;
-const MAX_EXAMPLE_CHARS: usize = 200;
 
 static LOCK: Mutex<()> = Mutex::new(());
 
@@ -95,7 +94,8 @@ pub struct Failure {
 pub struct Sample {
     /// `None` when nothing was transcribed (every model failed).
     pub words: Option<u64>,
-    pub model: Option<String>,
+    /// Models used by a successful dictation, counted once each.
+    pub models: Vec<String>,
     pub recorded_ms: u64,
     pub sent_ms: u64,
     pub latency_ms: u64,
@@ -119,16 +119,15 @@ pub struct Totals {
     pub cost_usd: f64,
     /// Dictations that needed at least one fallback.
     pub fallbacks: u64,
-    /// Successful answers per model.
+    /// Successful dictations using each model; one dictation can use several.
     pub models: BTreeMap<String, u64>,
     /// Failed attempts per error kind, then per model.
     pub errors: BTreeMap<String, BTreeMap<String, u64>>,
-    /// The most recent message seen for each error kind.
-    pub error_examples: BTreeMap<String, String>,
 }
 
 impl Totals {
     fn add_sample(&mut self, sample: &Sample) {
+        self.recorded_ms += sample.recorded_ms;
         if sample.skipped_silent {
             self.skipped_silent += 1;
             return;
@@ -137,7 +136,7 @@ impl Totals {
             Some(words) => {
                 self.dictations += 1;
                 self.words += words;
-                if let Some(model) = &sample.model {
+                for model in sample.models.iter().collect::<BTreeSet<_>>() {
                     *self.models.entry(model.clone()).or_default() += 1;
                 }
                 if !sample.failures.is_empty() {
@@ -146,7 +145,6 @@ impl Totals {
             }
             None => self.failed_dictations += 1,
         }
-        self.recorded_ms += sample.recorded_ms;
         self.sent_ms += sample.sent_ms;
         self.latency_ms += sample.latency_ms;
         self.tokens += sample.tokens;
@@ -158,10 +156,6 @@ impl Totals {
                 .or_default()
                 .entry(failure.model.clone())
                 .or_default() += 1;
-            self.error_examples.insert(
-                failure.kind.key().into(),
-                failure.detail.chars().take(MAX_EXAMPLE_CHARS).collect(),
-            );
         }
     }
 
@@ -184,9 +178,6 @@ impl Totals {
             for (model, count) in models {
                 *target.entry(model.clone()).or_default() += count;
             }
-        }
-        for (kind, example) in &other.error_examples {
-            self.error_examples.insert(kind.clone(), example.clone());
         }
     }
 
@@ -304,9 +295,7 @@ fn record_at(path: &Path, sample: &Sample, day: &str) -> Result<()> {
 fn summary_at(path: &Path, period: Period, now: i64) -> Totals {
     let _guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let file = load(path);
-    let first_day = period
-        .days()
-        .map(|days| local_day(now - (days - 1) * 86_400));
+    let first_day = period.days().map(|days| local_day_before(now, days - 1));
     let mut totals = Totals::default();
     for (day, day_totals) in &file.days {
         if first_day
@@ -326,7 +315,7 @@ fn daily_words_at(path: &Path, period: Period, now: i64) -> Vec<(String, u64)> {
     (0..days)
         .rev()
         .map(|offset| {
-            let day = local_day(now - offset * 86_400);
+            let day = local_day_before(now, offset);
             let words = file.days.get(&day).map_or(0, |totals| totals.words);
             (day, words)
         })
@@ -336,7 +325,24 @@ fn daily_words_at(path: &Path, period: Period, now: i64) -> Vec<(String, u64)> {
 fn load(path: &Path) -> StatsFile {
     match fs::read(path) {
         Ok(bytes) => match serde_json::from_slice::<StatsFile>(&bytes) {
-            Ok(file) if file.version == VERSION => file,
+            Ok(mut file) if file.version == 1 || file.version == VERSION => {
+                if file.version == 1 {
+                    // Version 1 joined every model used by a dictation into one key.
+                    // Keep the original dictation unit while separating those labels.
+                    for totals in file.days.values_mut() {
+                        let models = std::mem::take(&mut totals.models);
+                        for (joined, count) in models {
+                            for model in joined.split(", ").collect::<BTreeSet<_>>() {
+                                *totals.models.entry(model.to_owned()).or_default() += count;
+                            }
+                        }
+                    }
+                    file.version = VERSION;
+                }
+                // Legacy error_examples are deliberately not deserialized. The next
+                // save removes response bodies without discarding any daily totals.
+                file
+            }
             Ok(_) | Err(_) => {
                 tracing::warn!(path = %path.display(), "unreadable statistics; starting over");
                 let _ = fs::rename(path, path.with_extension("json.corrupt"));
@@ -379,12 +385,28 @@ fn now_seconds() -> i64 {
 
 /// The local calendar day of a Unix time, as `YYYY-MM-DD`.
 fn local_day(seconds: i64) -> String {
+    local_day_before(seconds, 0)
+}
+
+/// Calendar arithmetic in the local timezone; a local day can have 23 or 25 hours.
+fn local_day_before(seconds: i64, days: i64) -> String {
     let time = seconds as libc::time_t;
     let mut parts: libc::tm = unsafe { std::mem::zeroed() };
     // SAFETY: both pointers reference valid stack values for the call.
     let converted = unsafe { !libc::localtime_r(&time, &mut parts).is_null() };
     if !converted {
-        return format!("{}", seconds / 86_400);
+        return format!("{}", seconds / 86_400 - days);
+    }
+    if days != 0 {
+        parts.tm_mday -= days as i32;
+        // Noon avoids clock changes around midnight. Ask libc to resolve DST for
+        // the target date instead of retaining the offset of the current day.
+        parts.tm_hour = 12;
+        parts.tm_min = 0;
+        parts.tm_sec = 0;
+        parts.tm_isdst = -1;
+        // SAFETY: mktime normalizes the valid, initialized local calendar fields.
+        unsafe { libc::mktime(&mut parts) };
     }
     format!(
         "{:04}-{:02}-{:02}",
@@ -418,7 +440,7 @@ mod tests {
     fn success(words: u64, model: &str, failures: Vec<Failure>) -> Sample {
         Sample {
             words: Some(words),
-            model: Some(model.into()),
+            models: vec![model.into()],
             recorded_ms: 10_000,
             sent_ms: 7_000,
             latency_ms: 800,
@@ -481,8 +503,82 @@ mod tests {
         assert_eq!(all.error_count("rate_limited"), 2);
         assert_eq!(all.errors["rate_limited"]["a"], 2);
         assert_eq!(all.errors_by_count()[0], ("rate_limited", 2));
-        assert_eq!(all.error_examples["timeout"], "b failed");
         assert_eq!(all.average_latency_ms(), Some(1_600 / 3));
+    }
+
+    #[test]
+    fn silent_audio_counts_as_recorded_but_never_as_sent_or_failed() {
+        let mut totals = Totals::default();
+        totals.add_sample(&Sample {
+            skipped_silent: true,
+            recorded_ms: 10_000,
+            ..Sample::default()
+        });
+        assert_eq!(totals.skipped_silent, 1);
+        assert_eq!(totals.recorded_ms, 10_000);
+        assert_eq!(totals.sent_ms, 0);
+        assert_eq!(totals.dictations, 0);
+        assert_eq!(totals.failed_dictations, 0);
+        assert_eq!(totals.average_latency_ms(), None);
+    }
+
+    #[test]
+    fn each_model_counts_once_per_successful_dictation() {
+        let mut sample = success(10, "a", Vec::new());
+        sample.models = vec!["a".into(), "b".into(), "a".into()];
+        let mut totals = Totals::default();
+        totals.add_sample(&sample);
+        assert_eq!(totals.dictations, 1);
+        assert_eq!(totals.models, [("a".into(), 1), ("b".into(), 1)].into());
+    }
+
+    #[test]
+    fn legacy_totals_migrate_without_retaining_response_text() {
+        let path = temp_path("legacy-privacy");
+        let marker = "PRIVATE_TRANSCRIPT_MARKER";
+        let legacy = serde_json::json!({
+            "version": 1,
+            "days": {
+                "2026-10-04": {
+                    "dictations": 3,
+                    "words": 12,
+                    "models": {"a": 1, "a, b": 2},
+                    "errors": {"invalid_response": {"a": 1}},
+                    "error_examples": {"invalid_response": marker}
+                }
+            }
+        });
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let loaded = load(&path);
+        let totals = &loaded.days["2026-10-04"];
+        assert_eq!(loaded.version, VERSION);
+        assert_eq!(totals.dictations, 3);
+        assert_eq!(totals.words, 12);
+        assert_eq!(totals.models, [("a".into(), 3), ("b".into(), 2)].into());
+        assert_eq!(totals.error_count("invalid_response"), 1);
+        assert!(!serde_json::to_string(&loaded).unwrap().contains(marker));
+
+        record_at(
+            &path,
+            &Sample {
+                failures: vec![Failure {
+                    model: "b".into(),
+                    kind: ErrorKind::InvalidResponse,
+                    detail: format!("invalid JSON response: {{\"text\":\"{marker}"),
+                }],
+                ..Sample::default()
+            },
+            "2026-10-04",
+        )
+        .unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains(marker));
+        assert!(!saved.contains("error_examples"));
+        let loaded = load(&path);
+        assert_eq!(loaded.days["2026-10-04"].dictations, 3);
+        assert_eq!(loaded.days["2026-10-04"].failed_dictations, 1);
+        assert_eq!(loaded.days["2026-10-04"].error_count("invalid_response"), 2);
     }
 
     #[test]
@@ -505,6 +601,64 @@ mod tests {
         assert_eq!(week[1], (five_days_ago.clone(), 10));
         assert_eq!(daily_words_at(&path, Period::AllTime, now).len(), 30);
         assert_eq!(daily_words_at(&path, Period::Today, now), [(today, 1)]);
+    }
+
+    #[test]
+    fn periods_follow_calendar_days_across_dst() {
+        const CHILD_ENV: &str = "HEX_STATS_DST_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // Give this test its own timezone without changing the environment of
+            // other tests running on concurrent threads.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("periods_follow_calendar_days_across_dst")
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .env("TZ", "America/New_York")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        fn local_time(year: i32, month: i32, day: i32, hour: i32) -> i64 {
+            // SAFETY: all fields are initialized before passing the local time to libc.
+            let mut parts: libc::tm = unsafe { std::mem::zeroed() };
+            parts.tm_year = year - 1900;
+            parts.tm_mon = month - 1;
+            parts.tm_mday = day;
+            parts.tm_hour = hour;
+            parts.tm_min = 30;
+            parts.tm_isdst = -1;
+            // SAFETY: parts points to an initialized, valid local calendar time.
+            unsafe { libc::mktime(&mut parts) as i64 }
+        }
+
+        let now = local_time(2026, 11, 1, 23);
+        let path = temp_path("dst");
+        for day in [
+            "2026-10-26",
+            "2026-10-27",
+            "2026-10-28",
+            "2026-10-29",
+            "2026-10-30",
+            "2026-10-31",
+            "2026-11-01",
+        ] {
+            record_at(&path, &success(1, "a", Vec::new()), day).unwrap();
+        }
+        let week = daily_words_at(&path, Period::Week, now);
+        assert_eq!(week.first(), Some(&("2026-10-26".into(), 1)));
+        assert_eq!(week.last(), Some(&("2026-11-01".into(), 1)));
+        assert_eq!(week.iter().collect::<BTreeSet<_>>().len(), 7);
+        assert_eq!(summary_at(&path, Period::Week, now).words, 7);
+        assert_eq!(local_day_before(local_time(2026, 3, 9, 0), 1), "2026-03-08");
+        assert_eq!(local_day_before(local_time(2024, 3, 1, 0), 1), "2024-02-29");
+        assert_eq!(local_day_before(local_time(2026, 1, 1, 0), 1), "2025-12-31");
     }
 
     #[test]

@@ -6,8 +6,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, Context, Entity, Focusable, FontWeight, IntoElement, MouseDownEvent, Render,
-    SharedString, Subscription, Window, deferred, div, prelude::*, px, rgb,
+    AnyElement, App, Context, Entity, EventEmitter, Focusable, FontWeight, IntoElement,
+    MouseDownEvent, Render, SharedString, Subscription, Window, deferred, div, prelude::*, px, rgb,
 };
 
 use super::catalog::{self, CatalogModel};
@@ -27,14 +27,16 @@ const WIDE_INPUT: f32 = 300.0;
 const PICKER_WIDTH: f32 = 380.0;
 const KEYS_URL: &str = "https://openrouter.ai/keys";
 
-pub fn new<V: 'static>(cx: &mut Context<V>) -> Entity<OpenRouterSettings> {
-    cx.new(|cx| OpenRouterSettings::new(false, cx))
+pub fn new<V: 'static>(preview: bool, cx: &mut Context<V>) -> Entity<OpenRouterSettings> {
+    cx.new(|cx| OpenRouterSettings::new(false, preview, cx))
 }
 
 /// Just the API key row, for the first-run setup sheet.
-pub fn new_key_setup<V: 'static>(cx: &mut Context<V>) -> Entity<OpenRouterSettings> {
-    cx.new(|cx| OpenRouterSettings::new(true, cx))
+pub fn new_key_setup<V: 'static>(preview: bool, cx: &mut Context<V>) -> Entity<OpenRouterSettings> {
+    cx.new(|cx| OpenRouterSettings::new(true, preview, cx))
 }
+
+pub struct KeyChanged(pub KeyStatus);
 
 /// Where the last action's outcome is shown.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,8 +96,10 @@ struct AdvancedInputs {
 
 pub struct OpenRouterSettings {
     key_only: bool,
+    preview: bool,
     config: Config,
     key_status: Option<KeyStatus>,
+    key_revision: u64,
     key_editing: bool,
     key_remove_armed: bool,
     key_input: Entity<TextInput>,
@@ -104,22 +108,30 @@ pub struct OpenRouterSettings {
     language_picker_open: bool,
     advanced_open: bool,
     advanced: AdvancedInputs,
+    advanced_saved: AdvancedForm,
     advanced_dirty: bool,
     busy: bool,
     message: Option<(Scope, bool, String)>,
     _subscriptions: Vec<Subscription>,
 }
 
+impl EventEmitter<KeyChanged> for OpenRouterSettings {}
+
 impl OpenRouterSettings {
-    fn new(key_only: bool, cx: &mut Context<Self>) -> Self {
-        let (config, message) = match super::load_config() {
+    fn new(key_only: bool, preview: bool, cx: &mut Context<Self>) -> Self {
+        let loaded = if preview {
+            Ok(Config::default())
+        } else {
+            super::load_config()
+        };
+        let (config, message) = match loaded {
             Ok(config) => (config, None),
             Err(error) => (
                 Config::default(),
                 Some((
                     Scope::Models,
                     false,
-                    format!("{error:#}. Changing a setting replaces the file."),
+                    format!("{error:#}. Fix the file before saving settings."),
                 )),
             ),
         };
@@ -152,8 +164,10 @@ impl OpenRouterSettings {
         };
         let mut view = Self {
             key_only,
+            preview,
             config,
             key_status: None,
+            key_revision: 0,
             key_editing: false,
             key_remove_armed: false,
             key_input,
@@ -162,12 +176,17 @@ impl OpenRouterSettings {
             language_picker_open: false,
             advanced_open: false,
             advanced,
+            advanced_saved: form,
             advanced_dirty: false,
             busy: false,
             message,
             _subscriptions: subscriptions,
         };
-        view.refresh_key_status(cx);
+        if preview {
+            view.sync_key_status(KeyStatus::Missing, cx);
+        } else {
+            view.refresh_key_status(cx);
+        }
         view
     }
 
@@ -188,13 +207,28 @@ impl OpenRouterSettings {
         });
     }
 
-    /// Saves `candidate` as the new configuration, reporting under `scope`.
-    fn commit(&mut self, scope: Scope, candidate: Result<Config, String>, success: &str) -> bool {
-        let saved = candidate.and_then(|config| {
-            super::save_config(&config)
-                .map(|()| config)
-                .map_err(|error| format!("{error:#}"))
-        });
+    /// Rebase one edit onto the latest file, leaving unrelated fields intact.
+    fn commit(
+        &mut self,
+        scope: Scope,
+        edit: impl FnOnce(&Config) -> Result<Config, String>,
+        success: &str,
+    ) -> bool {
+        if self.busy {
+            self.report(
+                scope,
+                Err("Wait for the key operation to finish, then try again.".into()),
+            );
+            return false;
+        }
+        let saved = if self.preview {
+            edit(&self.config)
+        } else {
+            super::update_config(|config| {
+                edit(config).map_err(|error| color_eyre::eyre::eyre!("{error}"))
+            })
+            .map_err(|error| format!("{error:#}"))
+        };
         match saved {
             Ok(config) => {
                 self.config = config;
@@ -215,7 +249,7 @@ impl OpenRouterSettings {
         work: impl FnOnce() -> R + Send + 'static,
         done: impl FnOnce(&mut Self, R, &mut Context<Self>) + 'static,
     ) {
-        if self.busy {
+        if self.busy || self.preview {
             return;
         }
         self.busy = true;
@@ -233,14 +267,37 @@ impl OpenRouterSettings {
 
     // ---- API key -------------------------------------------------------
 
+    /// Reconcile another editor's key change without starting another lookup.
+    pub fn sync_key_status(&mut self, status: KeyStatus, cx: &mut Context<Self>) {
+        self.key_revision += 1;
+        self.key_editing = matches!(status, KeyStatus::Missing);
+        self.key_remove_armed = false;
+        self.key_status = Some(status);
+        self.key_input
+            .update(cx, |input, cx| input.set_text("", cx));
+        cx.notify();
+    }
+
+    fn key_changed(&mut self, status: KeyStatus, cx: &mut Context<Self>) {
+        self.sync_key_status(status.clone(), cx);
+        cx.emit(KeyChanged(status));
+    }
+
+    #[cfg(test)]
+    pub fn key_status(&self) -> Option<&KeyStatus> {
+        self.key_status.as_ref()
+    }
+
     fn refresh_key_status(&mut self, cx: &mut Context<Self>) {
         let config = self.config.clone();
+        let revision = self.key_revision;
         self.run(
             cx,
             move || super::key_status(&config),
-            |this, status, _| {
-                this.key_editing = matches!(status, KeyStatus::Missing);
-                this.key_status = Some(status);
+            move |this, status, cx| {
+                if this.key_revision == revision {
+                    this.sync_key_status(status, cx);
+                }
             },
         );
     }
@@ -270,19 +327,21 @@ impl OpenRouterSettings {
             cx.notify();
             return;
         }
-        let config = self.config.clone();
+        if self.preview {
+            self.key_changed(KeyStatus::Keychain("demo".into()), cx);
+            self.report(Scope::Key, Ok("Preview: no key was stored or sent.".into()));
+            return;
+        }
         self.run(
             cx,
             move || {
-                super::store_keychain_key(&key)
-                    .map(|()| (super::key_status(&config), super::check_key(&config)))
+                super::store_keychain_key(&key)?;
+                let config = super::load_config()?;
+                Ok::<_, color_eyre::Report>((super::key_status(&config), super::check_key(&config)))
             },
             |this, result, cx| match result {
                 Ok((status, check)) => {
-                    this.key_input
-                        .update(cx, |input, cx| input.set_text("", cx));
-                    this.key_editing = false;
-                    this.key_status = Some(status);
+                    this.key_changed(status, cx);
                     this.report(
                         Scope::Key,
                         match check {
@@ -299,10 +358,17 @@ impl OpenRouterSettings {
     }
 
     fn test_key(&mut self, cx: &mut Context<Self>) {
-        let config = self.config.clone();
+        if self.preview {
+            self.report(
+                Scope::Key,
+                Ok("Preview: no network request was made.".into()),
+            );
+            cx.notify();
+            return;
+        }
         self.run(
             cx,
-            move || super::check_key(&config),
+            move || super::load_config().and_then(|config| super::check_key(&config)),
             |this, result, _| {
                 this.report(Scope::Key, result.map_err(|error| format!("{error:#}")));
             },
@@ -316,14 +382,20 @@ impl OpenRouterSettings {
             return;
         }
         self.key_remove_armed = false;
-        let config = self.config.clone();
+        if self.preview {
+            self.key_changed(KeyStatus::Missing, cx);
+            self.report(Scope::Key, Ok("Preview: no stored key was removed.".into()));
+            return;
+        }
         self.run(
             cx,
-            move || super::delete_keychain_key().map(|()| super::key_status(&config)),
-            |this, result, _| match result {
+            move || {
+                super::delete_keychain_key()?;
+                super::load_config().map(|config| super::key_status(&config))
+            },
+            |this, result, cx| match result {
                 Ok(status) => {
-                    this.key_editing = matches!(status, KeyStatus::Missing);
-                    this.key_status = Some(status);
+                    this.key_changed(status, cx);
                     this.report(Scope::Key, Ok("Key removed from the Keychain.".into()));
                 }
                 Err(error) => this.report(Scope::Key, Err(format!("{error:#}"))),
@@ -333,22 +405,29 @@ impl OpenRouterSettings {
 
     /// Moves a plaintext key from `openrouter.json` into the Keychain.
     fn move_key_to_keychain(&mut self, cx: &mut Context<Self>) {
-        let Some(key) = self.config.api_key.clone() else {
+        if self.preview {
+            self.config.api_key = None;
+            self.key_changed(KeyStatus::Keychain("demo".into()), cx);
+            self.report(Scope::Key, Ok("Preview: no key was moved.".into()));
             return;
-        };
-        let mut config = self.config.clone();
-        config.api_key = None;
+        }
         self.run(
             cx,
             move || {
+                let key = super::load_config()?.api_key.ok_or_else(|| {
+                    color_eyre::eyre::eyre!("The file no longer contains an API key.")
+                })?;
                 super::store_keychain_key(&key)?;
-                super::save_config(&config)?;
+                let config = super::update_config(|latest| {
+                    form::remove_migrated_key(latest, &key)
+                        .map_err(|error| color_eyre::eyre::eyre!("{error}"))
+                })?;
                 Ok::<_, color_eyre::Report>((super::key_status(&config), config))
             },
-            |this, result, _| match result {
+            |this, result, cx| match result {
                 Ok((status, config)) => {
                     this.config = config;
-                    this.key_status = Some(status);
+                    this.key_changed(status, cx);
                     this.report(
                         Scope::Key,
                         Ok("Key moved to the Keychain and removed from openrouter.json.".into()),
@@ -362,6 +441,21 @@ impl OpenRouterSettings {
     // ---- Models ----------------------------------------------------------
 
     fn ensure_catalog(&mut self, cx: &mut Context<Self>) {
+        if self.preview {
+            self.catalog = CatalogState::Loaded(
+                self.config
+                    .transcription
+                    .models
+                    .iter()
+                    .map(|id| CatalogModel {
+                        id: id.clone(),
+                        name: id.clone(),
+                        provider: "Preview".into(),
+                    })
+                    .collect(),
+            );
+            return;
+        }
         if matches!(
             self.catalog,
             CatalogState::Loading | CatalogState::Loaded(_)
@@ -448,37 +542,53 @@ impl OpenRouterSettings {
             (Some(model), 0) => format!("{model} is now the primary model."),
             (Some(model), slot) => format!("{model} is fallback {slot}."),
         };
-        let candidate = form::set_model(&self.config, slot, model.as_deref());
-        if self.commit(Scope::Models, candidate, &success) {
+        if self.commit(
+            Scope::Models,
+            |config| form::set_model(config, slot, model.as_deref()),
+            &success,
+        ) {
             self.picker = None;
         }
         cx.notify();
     }
 
     fn promote_model(&mut self, slot: usize, cx: &mut Context<Self>) {
-        let candidate = form::promote_model(&self.config, slot);
-        self.commit(Scope::Models, Ok(candidate), "Order updated.");
+        self.commit(
+            Scope::Models,
+            |config| Ok(form::promote_model(config, slot)),
+            "Order updated.",
+        );
         cx.notify();
     }
 
     fn choose_language(&mut self, language: &str, cx: &mut Context<Self>) {
-        let candidate = form::set_language(&self.config, language);
         let success = format!("Language: {}.", super::language_name(language));
-        if self.commit(Scope::Models, candidate, &success) {
+        if self.commit(
+            Scope::Models,
+            |config| form::set_language(config, language),
+            &success,
+        ) {
             self.language_picker_open = false;
         }
         cx.notify();
     }
 
     fn toggle_trim(&mut self, cx: &mut Context<Self>) {
-        let mut candidate = self.config.clone();
-        candidate.transcription.trim_silence = !candidate.transcription.trim_silence;
-        let success = if candidate.transcription.trim_silence {
+        let enabled = !self.config.transcription.trim_silence;
+        let success = if enabled {
             "Silence is trimmed before sending."
         } else {
             "Recordings are sent untrimmed."
         };
-        self.commit(Scope::Models, Ok(candidate), success);
+        self.commit(
+            Scope::Models,
+            |config| {
+                let mut config = config.clone();
+                config.transcription.trim_silence = enabled;
+                Ok(config)
+            },
+            success,
+        );
         cx.notify();
     }
 
@@ -521,8 +631,15 @@ impl OpenRouterSettings {
     }
 
     fn save_advanced(&mut self, cx: &mut Context<Self>) {
-        let candidate = self.advanced_form(cx).apply(&self.config);
-        if self.commit(Scope::Advanced, candidate, "Saved.") {
+        let form = self.advanced_form(cx);
+        let original = self.advanced_saved.clone();
+        if self.commit(
+            Scope::Advanced,
+            |config| form.apply_changes(&original, config),
+            "Saved.",
+        ) {
+            self.advanced_saved = AdvancedForm::from_config(&self.config);
+            self.load_advanced(&self.advanced_saved.clone(), cx);
             self.advanced_dirty = false;
             // The API URL may have changed; fetch the catalog again on demand.
             if matches!(
@@ -537,11 +654,23 @@ impl OpenRouterSettings {
 
     fn restore_advanced_defaults(&mut self, cx: &mut Context<Self>) {
         let defaults = AdvancedForm::from_config(&Config::default());
-        self.load_advanced(&defaults, cx);
-        self.save_advanced(cx);
+        if self.commit(
+            Scope::Advanced,
+            |config| defaults.apply(config),
+            "Advanced defaults restored.",
+        ) {
+            self.load_advanced(&defaults, cx);
+            self.advanced_saved = defaults;
+            self.advanced_dirty = false;
+            self.catalog = CatalogState::Idle;
+        }
+        cx.notify();
     }
 
     fn reveal_config(&mut self, cx: &mut Context<Self>) {
+        if self.preview {
+            return;
+        }
         let result = super::config_path().and_then(|path| {
             std::process::Command::new("/usr/bin/open")
                 .arg("-R")
@@ -608,7 +737,11 @@ impl OpenRouterSettings {
                                 .hover(|link| link.text_color(rgb(TEXT_SOFT)))
                                 .cursor_pointer()
                                 .child("Get a key ↗")
-                                .on_click(|_, _, cx| cx.open_url(KEYS_URL)),
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if !this.preview {
+                                        cx.open_url(KEYS_URL);
+                                    }
+                                })),
                         )
                         .child(
                             div()
@@ -1337,7 +1470,7 @@ impl Render for OpenRouterSettings {
                     .pt_3()
                     .text_size(px(11.0))
                     .text_color(rgb(FAINT))
-                    .child("Audio goes to OpenRouter and the model's provider for transcription. HEX never stores audio."),
+                    .child("Audio goes to OpenRouter and the model's provider for transcription. Hex never stores audio."),
             )
             .into_any_element()
     }
@@ -1346,6 +1479,57 @@ impl Render for OpenRouterSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn preview_edits_and_key_actions_stay_in_memory(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| OpenRouterSettings::new(false, true, cx));
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(view.config, Config::default());
+                assert_eq!(view.key_status(), Some(&KeyStatus::Missing));
+                view.choose_language("pt", cx);
+                view.choose_model(0, Some("preview/model".into()), cx);
+                assert_eq!(view.config.transcription.language, "pt");
+                assert_eq!(view.config.transcription.models[0], "preview/model");
+                view.ensure_catalog(cx);
+                assert!(!view.catalog.models().is_empty());
+                view.key_input
+                    .update(cx, |input, cx| input.set_text("preview-key-0123456789", cx));
+                view.save_key(cx);
+                assert_eq!(view.key_status(), Some(&KeyStatus::Keychain("demo".into())));
+                assert!(!view.key_editing);
+                assert!(view.key_input.read(cx).text().is_empty());
+                view.test_key(cx);
+                view.remove_key(cx);
+                view.remove_key(cx);
+                assert_eq!(view.key_status(), Some(&KeyStatus::Missing));
+                view.move_key_to_keychain(cx);
+                view.reveal_config(cx);
+                view.run(cx, || panic!("preview ran external work"), |_, (), _| {});
+                assert!(!view.busy);
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn preferences_wait_for_key_migration(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| OpenRouterSettings::new(false, true, cx));
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let original = view.config.clone();
+                view.busy = true;
+                view.choose_language("pt", cx);
+                view.choose_model(0, Some("preview/model".into()), cx);
+                view.toggle_trim(cx);
+                view.restore_advanced_defaults(cx);
+                assert_eq!(view.config, original);
+                view.busy = false;
+                view.choose_language("pt", cx);
+                assert_eq!(view.config.transcription.language, "pt");
+            });
+        });
+    }
 
     fn model(id: &str, name: &str) -> CatalogModel {
         CatalogModel {

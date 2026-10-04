@@ -63,30 +63,80 @@ impl HistoryRetention {
     }
 }
 
-/// One retained successful dictation. Files from older builds load too:
-/// their extra fields are ignored and `final_text` becomes `text`.
+/// One retained successful dictation. Files from older builds keep their text
+/// and OpenRouter transcription report; removed features are ignored.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(from = "LoadedHistoryEntry")]
 pub struct HistoryEntry {
     pub id: u64,
     pub timestamp_ms: u64,
     /// Text that was actually inserted.
-    #[serde(alias = "final_text")]
     pub text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub application: Option<String>,
-    #[serde(default)]
     pub audio_ms: u64,
-    #[serde(default)]
     pub inference_ms: u64,
-    #[serde(default)]
     pub total_ms: u64,
     /// The OpenRouter model, latency, fallbacks, and trimming.
     #[serde(
-        default,
         rename = "openrouter_transcription",
         skip_serializing_if = "Option::is_none"
     )]
     pub transcription: Option<crate::openrouter::StepReport>,
+}
+
+#[derive(Deserialize)]
+struct LoadedHistoryEntry {
+    id: u64,
+    timestamp_ms: u64,
+    #[serde(alias = "final_text")]
+    text: String,
+    #[serde(default)]
+    application: Option<String>,
+    #[serde(default)]
+    audio_ms: u64,
+    #[serde(default)]
+    inference_ms: u64,
+    #[serde(default)]
+    total_ms: u64,
+    #[serde(default, deserialize_with = "deserialize_present_transcription")]
+    openrouter_transcription: Option<Option<crate::openrouter::StepReport>>,
+    #[serde(default)]
+    openrouter: Option<LegacyOpenRouterReport>,
+}
+
+#[derive(Deserialize)]
+struct LegacyOpenRouterReport {
+    #[serde(default)]
+    transcription: Option<crate::openrouter::StepReport>,
+}
+
+// Missing means migrate the legacy report. Explicit null is a current value
+// and must take precedence over a legacy report in the same entry.
+fn deserialize_present_transcription<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<crate::openrouter::StepReport>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<crate::openrouter::StepReport>::deserialize(deserializer).map(Some)
+}
+
+impl From<LoadedHistoryEntry> for HistoryEntry {
+    fn from(entry: LoadedHistoryEntry) -> Self {
+        Self {
+            id: entry.id,
+            timestamp_ms: entry.timestamp_ms,
+            text: entry.text,
+            application: entry.application,
+            audio_ms: entry.audio_ms,
+            inference_ms: entry.inference_ms,
+            total_ms: entry.total_ms,
+            transcription: entry
+                .openrouter_transcription
+                .unwrap_or_else(|| entry.openrouter.and_then(|report| report.transcription)),
+        }
+    }
 }
 
 impl HistoryEntry {
@@ -759,13 +809,121 @@ mod tests {
     }
 
     #[test]
-    fn entries_from_older_builds_load_and_keep_their_text() {
-        let entry: HistoryEntry = serde_json::from_str(
-            r#"{"id":1,"timestamp_ms":2,"kind":"voice_action","raw_text":"raw","final_text":"final","processing":{"profile":"Messages","latency_ms":3},"openrouter":{"transcription":{"model":"m","latency_ms":4}}}"#,
-        )
-        .unwrap();
-        assert_eq!(entry.text, "final");
-        assert!(entry.transcription.is_none());
+    fn legacy_history_keeps_text_and_transcription_after_persist_and_reopen() {
+        let path = temp_path("legacy-migration");
+        let legacy = serde_json::json!({
+            "version": 1,
+            "next_id": 8,
+            "entries": [{
+                "id": 7,
+                "timestamp_ms": 1_000,
+                "kind": "voice_action",
+                "raw_text": "raw text",
+                "final_text": "Final text.",
+                "application": "Zed",
+                "audio_ms": 9_400,
+                "inference_ms": 820,
+                "total_ms": 1_050,
+                "processing": {"profile": "Messages", "latency_ms": 100},
+                "openrouter": {
+                    "transcription": {
+                        "model": "openai/gpt-4o-mini-transcribe",
+                        "latency_ms": 820,
+                        "failed": ["openai/whisper-large-v3-turbo"],
+                        "audio": {"recorded_ms": 9_400, "sent_ms": 6_100}
+                    },
+                    "cleanup": {"model": "old-cleanup-model", "latency_ms": 100}
+                }
+            }]
+        });
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let expected = HistoryEntry {
+            id: 7,
+            timestamp_ms: 1_000,
+            text: "Final text.".into(),
+            application: Some("Zed".into()),
+            audio_ms: 9_400,
+            inference_ms: 820,
+            total_ms: 1_050,
+            transcription: Some(crate::openrouter::StepReport {
+                model: Some("openai/gpt-4o-mini-transcribe".into()),
+                latency_ms: 820,
+                failed: vec!["openai/whisper-large-v3-turbo".into()],
+                audio: Some(crate::openrouter::AudioTrim {
+                    recorded_ms: 9_400,
+                    sent_ms: 6_100,
+                }),
+            }),
+        };
+
+        let mut store = HistoryStore::open(path.clone(), HistoryRetention::Week, 2_000);
+        assert_eq!(store.entry(7), Some(&expected));
+        assert_eq!(store.search("gpt-4o-mini-transcribe", 2_000), [&expected]);
+        assert_eq!(store.record(draft("new entry"), 2_000).unwrap(), Some(8));
+
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let saved_entry = &saved["entries"][0];
+        assert_eq!(saved_entry["text"], "Final text.");
+        assert_eq!(
+            saved_entry["openrouter_transcription"],
+            legacy["entries"][0]["openrouter"]["transcription"]
+        );
+        for removed in ["final_text", "raw_text", "kind", "processing", "openrouter"] {
+            assert!(saved_entry.get(removed).is_none());
+        }
+
+        let reopened = HistoryStore::open(path, HistoryRetention::Week, 3_000);
+        assert_eq!(reopened.len(), 2);
+        assert_eq!(reopened.entry(7), Some(&expected));
+        assert_eq!(
+            reopened.search("gpt-4o-mini-transcribe", 3_000),
+            [&expected]
+        );
+    }
+
+    #[test]
+    fn current_transcription_takes_precedence_over_legacy_including_null() {
+        for current in [
+            serde_json::json!({"model": "current/model", "latency_ms": 10}),
+            serde_json::Value::Null,
+        ] {
+            let expected: Option<crate::openrouter::StepReport> =
+                serde_json::from_value(current.clone()).unwrap();
+            let entry: HistoryEntry = serde_json::from_value(serde_json::json!({
+                "id": 1,
+                "timestamp_ms": 2,
+                "text": "final",
+                "openrouter_transcription": current,
+                "openrouter": {
+                    "transcription": {"model": "legacy/model", "latency_ms": 4}
+                }
+            }))
+            .unwrap();
+            assert_eq!(entry.transcription, expected);
+
+            let roundtrip: HistoryEntry =
+                serde_json::from_value(serde_json::to_value(&entry).unwrap()).unwrap();
+            assert_eq!(roundtrip, entry);
+        }
+    }
+
+    #[test]
+    fn legacy_entries_without_transcription_still_load() {
+        for legacy_report in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"cleanup": {"model": "old/model", "latency_ms": 4}}),
+        ] {
+            let entry: HistoryEntry = serde_json::from_value(serde_json::json!({
+                "id": 1,
+                "timestamp_ms": 2,
+                "final_text": "final",
+                "openrouter": legacy_report
+            }))
+            .unwrap();
+            assert_eq!(entry.text, "final");
+            assert!(entry.transcription.is_none());
+        }
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# Hex OpenRouter Agent Guide
+# Hex Agent Guide
 
 ## Purpose
 

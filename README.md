@@ -2,7 +2,7 @@
   <img src=".github/assets/hex-icon.png" width="96" height="96" alt="HEX app icon" />
 </p>
 
-<h1 align="center">Hex OpenRouter</h1>
+<h1 align="center">Hex</h1>
 
 <p align="center">
   Segure o atalho, fale, solte: o texto aparece onde você está digitando.<br />
@@ -30,9 +30,9 @@ brew install --cask publi0/hex/hex-openrouter
 
 Atualizar: `brew upgrade --cask hex-openrouter`.
 
-O app se chama **Hex OpenRouter** (bundle id `dev.publio.hex-openrouter`) e
-guarda tudo em `~/Library/Application Support/hex-openrouter`. Ele convive
-com o HEX oficial sem compartilhar nada. O build é assinado ad hoc e o cask
+O app se chama **Hex** (bundle id `dev.publio.hex-openrouter`) e
+guarda tudo em `~/Library/Application Support/hex-openrouter`. O identificador e o diretório
+de dados permanecem os mesmos das versões anteriores. O build é assinado ad hoc e o cask
 remove a quarentena; como a assinatura muda a cada versão, o macOS pode pedir
 de novo Acessibilidade e Input Monitoring depois de um update.
 
@@ -107,7 +107,7 @@ metadados, e pode ser desligado ou limpo na própria tela.
 ```sh
 cargo test
 cargo clippy --all-targets -- -D warnings
-fork/build-app.sh            # target/fork-app/Hex-OpenRouter-<versão>.zip
+fork/build-app.sh            # target/fork-app/Hex-<versão>.zip
 ```
 
 O app só compila para macOS. Em outras plataformas, `cargo test` roda os

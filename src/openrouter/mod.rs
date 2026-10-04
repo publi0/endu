@@ -24,6 +24,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use color_eyre::Result;
@@ -196,9 +197,27 @@ fn write_template(path: &Path, config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Replace the configuration file atomically, owner-only.
-pub fn save_config(config: &Config) -> Result<()> {
-    save_config_at(&config_path()?, config)
+static CONFIG_EDITS: Mutex<()> = Mutex::new(());
+static CONFIG_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Apply one edit to the latest readable configuration. Serialize application
+/// writers so a Keychain migration cannot overwrite a preferences edit.
+pub fn update_config(edit: impl FnOnce(&Config) -> Result<Config>) -> Result<Config> {
+    update_config_at(&config_path()?, edit)
+}
+
+fn update_config_at(path: &Path, edit: impl FnOnce(&Config) -> Result<Config>) -> Result<Config> {
+    let _guard = CONFIG_EDITS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let config = edit(&load_config_at(path)?)?;
+    save_config_at(path, &config)?;
+    Ok(config)
+}
+
+fn config_temporary_path(path: &Path) -> PathBuf {
+    let sequence = CONFIG_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("json.{}.{}.tmp", std::process::id(), sequence))
 }
 
 pub(crate) fn save_config_at(path: &Path, config: &Config) -> Result<()> {
@@ -206,20 +225,27 @@ pub(crate) fn save_config_at(path: &Path, config: &Config) -> Result<()> {
         .parent()
         .ok_or_else(|| color_eyre::eyre::eyre!("config path has no parent"))?;
     fs::create_dir_all(parent)?;
-    let temporary = path.with_extension("json.tmp");
+    let temporary = config_temporary_path(path);
     let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
     let mut file = options.open(&temporary)?;
-    file.write_all(serde_json::to_string_pretty(config)?.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    fs::rename(&temporary, path).wrap_err_with(|| format!("could not save {}", path.display()))?;
-    Ok(())
+    let result = (|| -> Result<()> {
+        file.write_all(serde_json::to_string_pretty(config)?.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)
+            .wrap_err_with(|| format!("could not save {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
 
 /// Where the API key in use comes from, for display. Never holds the key.
@@ -560,6 +586,61 @@ mod tests {
             let mode = fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn editing_latest_config_preserves_other_changes_and_invalid_files() {
+        let dir = temp_dir("edits");
+        let path = dir.join(CONFIG_FILE);
+        let mut external = Config {
+            base_url: "https://example.test/v1".into(),
+            ..Config::default()
+        };
+        external.transcription.models = vec!["custom/new".into()];
+        save_config_at(&path, &external).unwrap();
+        let saved = update_config_at(&path, |latest| {
+            let mut config = latest.clone();
+            config.transcription.language = "pt".into();
+            Ok(config)
+        })
+        .unwrap();
+        assert_eq!(saved.transcription.models, external.transcription.models);
+        assert_eq!(saved.base_url, external.base_url);
+        assert_eq!(saved.transcription.language, "pt");
+        fs::write(&path, "{ invalid").unwrap();
+        assert!(update_config_at(&path, |latest| Ok(latest.clone())).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{ invalid");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_edits_are_serialized_and_use_distinct_temporary_files() {
+        let dir = temp_dir("concurrent-edits");
+        let path = dir.join(CONFIG_FILE);
+        assert_ne!(config_temporary_path(&path), config_temporary_path(&path));
+        save_config_at(&path, &Config::default()).unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let path = &path;
+                scope.spawn(move || {
+                    update_config_at(path, |latest| {
+                        let mut config = latest.clone();
+                        config.transcription.attempt_timeout_seconds += 1;
+                        Ok(config)
+                    })
+                    .unwrap();
+                });
+            }
+        });
+        assert_eq!(
+            load_config_at(&path)
+                .unwrap()
+                .transcription
+                .attempt_timeout_seconds,
+            38
+        );
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         fs::remove_dir_all(dir).unwrap();
     }
 

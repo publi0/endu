@@ -161,7 +161,6 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
     }
     let quit_worker = listener_worker.clone();
     application.run(move |cx| {
-        install_menus(cx, &app_window);
         let status_actions = if preview.is_none() && !hud_preview {
             crate::status_item::install()
                 .inspect_err(|error| tracing::error!(%error, "could not install the menu bar item"))
@@ -173,14 +172,15 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
             show_dock_icon,
             status_actions.is_some(),
         ));
-        let ui = Ui {
+        let ui = Rc::new(Ui {
             app_window: app_window.clone(),
             listener_start,
             history,
             listener_controls: control_sender,
             status_actions,
             preview,
-        };
+        });
+        install_menus(cx, &ui);
         let open_on_launch = ui.preview.is_some()
             || !hud_preview
                 && should_open_app_on_launch(
@@ -230,7 +230,7 @@ fn join_listener(worker: &Rc<RefCell<Option<JoinHandle<()>>>>) {
     }
 }
 
-fn install_menus(cx: &mut App, app_window: &AppWindowSlot) {
+fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
     use crate::app_window::{
         CloseWindow, HideApplication, MinimizeWindow, QuitApplication, ShowHistory, ShowSettings,
         ShowStatistics, ToggleFullscreen,
@@ -247,7 +247,19 @@ fn install_menus(cx: &mut App, app_window: &AppWindowSlot) {
         KeyBinding::new("cmd-3", ShowStatistics, None),
     ]);
     cx.bind_keys(crate::text_input::key_bindings());
-    let close_window = app_window.clone();
+    let settings_ui = ui.clone();
+    cx.on_action(move |_: &ShowSettings, cx| {
+        settings_ui.open_pane(cx, |window, cx| window.show_settings(cx));
+    });
+    let history_ui = ui.clone();
+    cx.on_action(move |_: &ShowHistory, cx| {
+        history_ui.open_pane(cx, |window, cx| window.show_history(cx));
+    });
+    let statistics_ui = ui.clone();
+    cx.on_action(move |_: &ShowStatistics, cx| {
+        statistics_ui.open_pane(cx, |window, cx| window.show_statistics(cx));
+    });
+    let close_window = ui.app_window.clone();
     cx.on_action(move |_: &CloseWindow, cx| {
         if let Some(window) = close_window.borrow_mut().take() {
             let _ = window.update(cx, |_, window, _| window.remove_window());
@@ -257,7 +269,7 @@ fn install_menus(cx: &mut App, app_window: &AppWindowSlot) {
     cx.on_action(|_: &HideApplication, _| crate::app_settings::hide_application());
     cx.set_menus(vec![
         Menu {
-            name: "HEX".into(),
+            name: "Hex".into(),
             items: vec![
                 MenuItem::action("Settings…", ShowSettings),
                 MenuItem::action("History", ShowHistory),
@@ -265,9 +277,9 @@ fn install_menus(cx: &mut App, app_window: &AppWindowSlot) {
                 MenuItem::separator(),
                 MenuItem::os_submenu("Services", SystemMenuType::Services),
                 MenuItem::separator(),
-                MenuItem::action("Hide HEX", HideApplication),
+                MenuItem::action("Hide Hex", HideApplication),
                 MenuItem::separator(),
-                MenuItem::action("Quit HEX", QuitApplication),
+                MenuItem::action("Quit Hex", QuitApplication),
             ],
         },
         Menu {
@@ -286,7 +298,7 @@ fn install_menus(cx: &mut App, app_window: &AppWindowSlot) {
 
 async fn drive_ui(
     indicator_events: Receiver<DictationIndicatorEvent>,
-    ui: Ui,
+    ui: Rc<Ui>,
     shutdown: &AtomicBool,
     indicator_enabled: bool,
     cx: &mut gpui::AsyncApp,
@@ -363,6 +375,43 @@ fn spawn_hud_preview(sender: crate::dictation_indicator::DictationIndicatorSende
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn menu_actions_reopen_a_closed_window(cx: &mut gpui::TestAppContext) {
+        use crate::app_window::{PreviewPane, ShowHistory, ShowSettings, ShowStatistics};
+
+        let (listener_controls, _controls) = mpsc::sync_channel(1);
+        let ui = Rc::new(Ui {
+            app_window: Rc::new(RefCell::new(None)),
+            listener_start: None,
+            history: None,
+            listener_controls,
+            status_actions: None,
+            preview: Some(AppWindowPreview {
+                pane: PreviewPane::Settings,
+                onboarding: false,
+                permissions_missing: false,
+                open_history_retention: false,
+            }),
+        });
+        cx.update(|cx| install_menus(cx, &ui));
+        let actions: [&dyn gpui::Action; 3] = [&ShowSettings, &ShowHistory, &ShowStatistics];
+        for action in actions {
+            cx.update(|cx| {
+                assert!(cx.windows().is_empty());
+                assert!(cx.is_action_available(action));
+                cx.dispatch_action(action);
+            });
+            cx.run_until_parked();
+            cx.update(|cx| assert_eq!(cx.windows().len(), 1));
+            let handle = ui.app_window.borrow_mut().take().unwrap();
+            cx.update(|cx| {
+                handle
+                    .update(cx, |_, window, _| window.remove_window())
+                    .unwrap();
+            });
+        }
+    }
 
     #[test]
     fn dockless_startup_stays_quiet_only_when_setup_and_menu_bar_are_ready() {

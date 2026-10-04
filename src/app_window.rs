@@ -30,7 +30,7 @@ use crate::login_item::{LoginItemRequest, LoginItemResponse, LoginItemStatus, Lo
 use crate::onboarding::{
     PermissionAction, PermissionKind, PermissionState, PermissionWarning, SetupStatus,
 };
-use crate::openrouter::settings_view::OpenRouterSettings;
+use crate::openrouter::settings_view::{KeyChanged, OpenRouterSettings};
 use crate::openrouter::stats_view::StatisticsView;
 use crate::text_input::{Changed as TextChanged, TextInput};
 
@@ -203,7 +203,7 @@ fn open_new(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions {
-                title: Some("HEX".into()),
+                title: Some("Hex".into()),
                 appears_transparent: true,
                 ..Default::default()
             }),
@@ -538,6 +538,23 @@ impl AppWindow {
         let side = |binding: Option<&HotkeyBinding>| binding.and_then(standalone_modifier_side);
         let dictation_side = side(Some(&settings.dictation_hotkey));
         let paste_side = side(settings.paste_last_hotkey.as_ref());
+        let openrouter_settings = crate::openrouter::settings_view::new(preview_mode, cx);
+        let openrouter_setup = crate::openrouter::settings_view::new_key_setup(preview_mode, cx);
+        subscriptions.push(
+            cx.subscribe(&openrouter_setup, |this, _, event: &KeyChanged, cx| {
+                this.openrouter_settings.update(cx, |view, cx| {
+                    view.sync_key_status(event.0.clone(), cx);
+                });
+            }),
+        );
+        subscriptions.push(cx.subscribe(
+            &openrouter_settings,
+            |this, _, event: &KeyChanged, cx| {
+                this.openrouter_setup.update(cx, |view, cx| {
+                    view.sync_key_status(event.0.clone(), cx);
+                });
+            },
+        ));
         let mut window = Self {
             preview: preview_mode,
             pane: match preview.as_ref().map(|preview| preview.pane) {
@@ -569,8 +586,8 @@ impl AppWindow {
             recording_audio_spring: ToggleSpring::at(recording_audio_index(
                 settings.recording_audio_behavior,
             ) as f32),
-            openrouter_settings: crate::openrouter::settings_view::new(cx),
-            openrouter_setup: crate::openrouter::settings_view::new_key_setup(cx),
+            openrouter_settings,
+            openrouter_setup,
             statistics: cx.new(|_| StatisticsView::new(preview_mode)),
             hotkey_capture: HotkeyCaptureState::Idle,
             hotkey_capture_animation: ToggleSpring::new(false),
@@ -1253,7 +1270,7 @@ impl AppWindow {
                     .items_center()
                     .text_size(px(11.0))
                     .text_color(rgb(MUTED))
-                    .child(format!("HEX OpenRouter {}", env!("CARGO_PKG_VERSION"))),
+                    .child(format!("Hex {}", env!("CARGO_PKG_VERSION"))),
             )
             .into_any_element()
     }
@@ -1775,7 +1792,7 @@ impl AppWindow {
                                 .pl_3()
                                 .child(settings_copy(
                                     "Add your OpenRouter key to start dictating",
-                                    "HEX transcribes through OpenRouter. The key is stored in your Keychain.",
+                                    "Hex transcribes through OpenRouter. The key is stored in your Keychain.",
                                 )),
                         )
                         .child(
@@ -2058,7 +2075,7 @@ impl AppWindow {
                         .child(
                             settings_row(
                                 "Launch at login",
-                                "Start HEX when you sign in to your Mac",
+                                "Start Hex when you sign in to your Mac",
                                 launch_at_login_control,
                             )
                             .id("launch-at-login-setting")
@@ -2088,7 +2105,7 @@ impl AppWindow {
                         .child(
                             settings_row(
                                 "Show Dock icon",
-                                "When off, HEX lives in the menu bar while this window is closed",
+                                "When off, Hex lives in the menu bar while this window is closed",
                                 toggle(dock_icon_position),
                             )
                             .id("dock-icon-setting")
@@ -2203,7 +2220,7 @@ impl AppWindow {
                                 div()
                                     .text_size(px(22.0))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Set up HEX"),
+                                    .child("Set up Hex"),
                             )
                             .child(
                                 div()
@@ -2211,7 +2228,7 @@ impl AppWindow {
                                     .text_size(px(12.0))
                                     .line_height(px(19.0))
                                     .text_color(rgb(MUTED))
-                                    .child("Hold the shortcut, speak, and release: HEX trims the silence, transcribes through OpenRouter, and pastes the text. It is ready once these permissions and your key are in place."),
+                                    .child("Hold the shortcut, speak, and release: Hex trims the silence, transcribes through OpenRouter, and pastes the text. It is ready once these permissions and your key are in place."),
                             ),
                     )
                     .when(!permission_rows.is_empty(), |setup| {
@@ -2568,15 +2585,15 @@ const fn permission_warning_copy(kind: PermissionKind) -> (&'static str, &'stati
     match kind {
         PermissionKind::Microphone => (
             "Microphone access is off",
-            "HEX cannot record dictation until microphone access is restored.",
+            "Hex cannot record dictation until microphone access is restored.",
         ),
         PermissionKind::InputMonitoring => (
             "Input Monitoring is off",
-            "HEX cannot recognize the dictation shortcut in other apps.",
+            "Hex cannot recognize the dictation shortcut in other apps.",
         ),
         PermissionKind::Accessibility => (
             "Accessibility is off",
-            "HEX cannot paste the transcript into the foreground app.",
+            "Hex cannot paste the transcript into the foreground app.",
         ),
     }
 }
@@ -2804,6 +2821,40 @@ mod tests {
             cx.update(|_, cx| view.update(cx, |view, cx| view.select_pane(pane, cx)));
             cx.run_until_parked();
         }
+    }
+
+    #[gpui::test]
+    fn setup_key_changes_update_the_settings_editor(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(preview_fixture);
+        let status = crate::openrouter::KeyStatus::Keychain("demo".into());
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.openrouter_setup.update(cx, |_, cx| {
+                    cx.emit(KeyChanged(status.clone()));
+                });
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(
+                    view.openrouter_settings.read(cx).key_status(),
+                    Some(&status)
+                );
+                view.openrouter_settings.update(cx, |_, cx| {
+                    cx.emit(KeyChanged(crate::openrouter::KeyStatus::Missing));
+                });
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(
+                    view.openrouter_setup.read(cx).key_status(),
+                    Some(&crate::openrouter::KeyStatus::Missing),
+                );
+            });
+        });
     }
 
     #[test]

@@ -165,7 +165,7 @@ pub fn transcribe(samples: &[f32]) -> Result<Transcription> {
     let model = models_used.join(", ");
     stats::record(&Sample {
         words: Some(stats::word_count(&text)),
-        model: Some(model.clone()),
+        models: models_used,
         recorded_ms,
         sent_ms,
         latency_ms,

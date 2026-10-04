@@ -2,8 +2,7 @@
 //! needed a fallback, over a chosen period.
 
 use gpui::{
-    AnyElement, Context, Div, FontWeight, IntoElement, Render, SharedString, Window, div,
-    prelude::*, px, rgb,
+    AnyElement, Context, Div, FontWeight, IntoElement, Render, Window, div, prelude::*, px, rgb,
 };
 
 use super::stats::{self, ErrorKind, Period, Totals};
@@ -80,6 +79,8 @@ impl StatisticsView {
         }
         if let Err(error) = stats::clear() {
             self.error = Some(format!("{error:#}"));
+            cx.notify();
+            return;
         }
         self.refresh();
         cx.notify();
@@ -116,14 +117,6 @@ impl StatisticsView {
                 ("openai/gpt-4o-mini-transcribe".into(), 2),
             ]
             .into(),
-        );
-        totals.error_examples.insert(
-            "rate_limited".into(),
-            "HTTP 429: Rate limit exceeded: free-models-per-min".into(),
-        );
-        totals.error_examples.insert(
-            "timeout".into(),
-            "network error (exit status: 28): Operation timed out".into(),
         );
         self.totals = totals;
         self.daily = [820, 1_430, 990, 0, 1_870, 2_210, 2_092]
@@ -209,7 +202,7 @@ impl StatisticsView {
                 totals
                     .average_latency_ms()
                     .map_or_else(|| "—".into(), format_latency),
-                "From release to transcript".into(),
+                "Transcription processing, excluding queue".into(),
             ))
             .child(card(
                 "FALLBACKS",
@@ -322,7 +315,7 @@ impl StatisticsView {
     }
 
     fn render_models(&self) -> AnyElement {
-        let total: u64 = self.totals.models.values().sum();
+        let total = self.totals.dictations;
         let mut models: Vec<_> = self.totals.models.iter().collect();
         models.sort_by(|left, right| right.1.cmp(left.1).then(left.0.cmp(right.0)));
         let body: Vec<AnyElement> = if models.is_empty() {
@@ -359,7 +352,10 @@ impl StatisticsView {
                                         .flex_none()
                                         .text_size(px(11.0))
                                         .text_color(rgb(MUTED))
-                                        .child(format!("{} · {share}%", format_count(*count))),
+                                        .child(format!(
+                                            "{} dictations · {share}%",
+                                            format_count(*count)
+                                        )),
                                 ),
                         )
                         .child(meter(share))
@@ -370,7 +366,7 @@ impl StatisticsView {
         compact_panel()
             .flex_1()
             .min_w_0()
-            .child(compact_panel_header("Models that answered", None))
+            .child(compact_panel_header("Models used by dictation", None))
             .children(body)
             .into_any_element()
     }
@@ -392,7 +388,6 @@ impl StatisticsView {
                     models.sort_by(|left: &(&String, &u64), right| {
                         right.1.cmp(left.1).then(left.0.cmp(right.0))
                     });
-                    let example = self.totals.error_examples.get(kind).cloned();
                     div()
                         .px_4()
                         .py_3()
@@ -431,16 +426,6 @@ impl StatisticsView {
                                 .child(div().min_w_0().truncate().child(model.clone()))
                                 .child(div().flex_none().child(format_count(*count)))
                         }))
-                        .when_some(example, |row, example| {
-                            row.child(
-                                div()
-                                    .pt_1()
-                                    .text_size(px(10.0))
-                                    .line_height(px(15.0))
-                                    .text_color(rgb(FAINT))
-                                    .child(SharedString::from(format!("Last: {example}"))),
-                            )
-                        })
                         .into_any_element()
                 })
                 .collect()

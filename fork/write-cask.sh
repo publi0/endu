@@ -15,21 +15,21 @@ cask "hex-openrouter" do
   version "$version"
   sha256 "$sha256"
 
-  url "https://github.com/$repository/releases/download/fork-v#{version}/Hex-OpenRouter-#{version}.zip"
-  name "Hex OpenRouter"
+  url "https://github.com/$repository/releases/download/fork-v#{version}/Hex-#{version}.zip"
+  name "Hex"
   desc "Hold-to-talk dictation transcribed through OpenRouter with model fallback"
   homepage "https://github.com/$repository"
 
   depends_on arch: :arm64
   depends_on macos: ">= :sequoia"
 
-  app "Hex OpenRouter.app"
+  app "Hex.app"
 
   # The build is signed ad hoc, not notarized: drop the download quarantine so
   # Gatekeeper does not refuse to open it.
   postflight do
     system_command "/usr/bin/xattr",
-                   args: ["-dr", "com.apple.quarantine", "#{appdir}/Hex OpenRouter.app"]
+                   args: ["-dr", "com.apple.quarantine", "#{appdir}/Hex.app"]
   end
 
   zap trash: [

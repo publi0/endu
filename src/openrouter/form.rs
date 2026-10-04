@@ -37,6 +37,27 @@ impl AdvancedForm {
         }
     }
 
+    /// Preserve external edits to fields that the user has not changed.
+    pub fn apply_changes(&self, original: &Self, base: &Config) -> Result<Config, String> {
+        let mut latest = Self::from_config(base);
+        macro_rules! merge {
+            ($($field:ident),+ $(,)?) => {
+                $(if self.$field != original.$field {
+                    latest.$field.clone_from(&self.$field);
+                })+
+            };
+        }
+        merge!(
+            base_url,
+            attempt_timeout_seconds,
+            total_timeout_seconds,
+            chunk_seconds,
+            rate_limit_retry_max_wait_ms,
+            temperature,
+        );
+        latest.apply(base)
+    }
+
     /// Apply the form onto `base`, keeping every field it does not show.
     /// Errors name the offending field.
     pub fn apply(&self, base: &Config) -> Result<Config, String> {
@@ -132,6 +153,15 @@ pub fn set_language(base: &Config, language: &str) -> Result<Config, String> {
     Ok(config)
 }
 
+pub fn remove_migrated_key(base: &Config, stored_key: &str) -> Result<Config, String> {
+    if base.api_key.as_deref().map(str::trim) != Some(stored_key.trim()) {
+        return Err("The file's API key changed. Reload Settings before moving it.".into());
+    }
+    let mut config = base.clone();
+    config.api_key = None;
+    Ok(config)
+}
+
 fn number(text: &str, field: &str, min: u64, max: u64) -> Result<u64, String> {
     text.trim()
         .parse::<u64>()
@@ -177,6 +207,34 @@ mod tests {
         assert_eq!(config.transcription.models, ["a/one", "b/two"]);
         form.temperature = " ".into();
         assert_eq!(form.apply(&base).unwrap().transcription.temperature, None);
+    }
+
+    #[test]
+    fn advanced_edits_preserve_external_changes_to_untouched_fields() {
+        let mut latest = Config::default();
+        let original = AdvancedForm::from_config(&latest);
+        let mut edited = original.clone();
+        edited.attempt_timeout_seconds = "12".into();
+        latest.base_url = "https://proxy.test/v1".into();
+        latest.transcription.temperature = None;
+        latest.transcription.language = "pt".into();
+        let saved = edited.apply_changes(&original, &latest).unwrap();
+        latest.transcription.attempt_timeout_seconds = 12;
+        assert_eq!(saved, latest);
+    }
+
+    #[test]
+    fn key_migration_removes_only_the_key_that_was_stored() {
+        let mut latest = Config {
+            api_key: Some("test-key".into()),
+            ..Config::default()
+        };
+        latest.transcription.language = "pt".into();
+        let saved = remove_migrated_key(&latest, "test-key").unwrap();
+        assert_eq!(saved.api_key, None);
+        assert_eq!(saved.transcription.language, "pt");
+        latest.api_key = Some("replacement".into());
+        assert!(remove_migrated_key(&latest, "test-key").is_err());
     }
 
     type Edit = fn(&mut AdvancedForm);

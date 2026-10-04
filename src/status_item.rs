@@ -80,7 +80,7 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
         MainThreadMarker::new().ok_or_else(|| eyre!("status item requires the main thread"))?;
     let (actions, receiver) = sync_channel(8);
     let target = StatusItemTarget::new(actions, mtm);
-    let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("HEX"));
+    let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Hex"));
 
     add_item(
         &menu,
@@ -94,7 +94,7 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
     add_item(&menu, &target, "History…", sel!(openHistory:), mtm);
     add_item(&menu, &target, "Statistics…", sel!(openStatistics:), mtm);
     menu.addItem(&NSMenuItem::separatorItem(mtm));
-    add_item(&menu, &target, "Quit HEX", sel!(quit:), mtm);
+    add_item(&menu, &target, "Quit Hex", sel!(quit:), mtm);
 
     let item = NSStatusBar::systemStatusBar().statusItemWithLength(-2.0);
     let button = item
@@ -102,7 +102,7 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
         .ok_or_else(|| eyre!("status item button is unavailable"))?;
     let symbol = NSImage::imageWithSystemSymbolName_accessibilityDescription(
         &NSString::from_str("hexagon"),
-        Some(&NSString::from_str("HEX")),
+        Some(&NSString::from_str("Hex")),
     )
     .ok_or_else(|| eyre!("HEX status symbol is unavailable"))?;
     symbol.setTemplate(true);

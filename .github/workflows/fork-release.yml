@@ -1,4 +1,4 @@
-# Fork: build "Hex OpenRouter.app", publish it as a GitHub release, and update
+# Fork: build "Hex.app", publish it as a GitHub release, and update
 # the Homebrew cask in Casks/ so `brew upgrade` picks it up.
 name: Fork release
 
@@ -53,7 +53,7 @@ jobs:
         run: |
           gh release create "fork-v$VERSION" "$ARCHIVE" \
             --target "$(git rev-parse HEAD)" \
-            --title "Hex OpenRouter $VERSION" \
+            --title "Hex $VERSION" \
             --notes "Built from $(git rev-parse --short HEAD). Install or update with \`brew upgrade --cask hex-openrouter\`."
       - name: Update the Homebrew cask
         env:

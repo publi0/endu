@@ -91,7 +91,9 @@ impl Session<'_> {
     }
 
     fn paste_last(&self) -> Result<()> {
-        self.input.cancel()?;
+        // A repaste ends any capture, including a double-tap lock. Keep the
+        // HUD in sync with the audio owner before queueing the previous text.
+        self.end(CaptureEnd::Discarded)?;
         if let Err(error) = self.worker.paste_last() {
             feedback::play(Tone::Error);
             self.events
@@ -275,7 +277,10 @@ pub fn listen(
         if let Some(controls) = &controls {
             while let Ok(control) = controls.try_recv() {
                 match control {
-                    ListenerControl::PasteLast => session.paste_last()?,
+                    ListenerControl::PasteLast => {
+                        hotkey.suspend();
+                        session.paste_last()?;
+                    }
                 }
             }
         }
@@ -311,6 +316,7 @@ pub fn listen(
         while let Ok(observed) = input_monitor.events.try_recv() {
             let _acknowledge = input_monitor.acknowledge_after(observed);
             if suspended {
+                hotkey.track_key_state(observed.event, observed.capture_at);
                 continue;
             }
             let input_event = observed.event;
