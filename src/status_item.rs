@@ -72,7 +72,8 @@ impl StatusItemTarget {
 }
 
 struct StatusItemController {
-    _item: Retained<NSStatusItem>,
+    item: Retained<NSStatusItem>,
+    paste_item: Retained<NSMenuItem>,
     _menu: Retained<NSMenu>,
     _target: Retained<StatusItemTarget>,
 }
@@ -88,7 +89,7 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
     let target = StatusItemTarget::new(actions, mtm);
     let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Hex"));
 
-    add_item(
+    let paste_item = add_item(
         &menu,
         &target,
         "Paste Last Dictation",
@@ -118,7 +119,8 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
 
     STATUS_ITEM.with(|status_item| {
         *status_item.borrow_mut() = Some(StatusItemController {
-            _item: item,
+            item,
+            paste_item,
             _menu: menu,
             _target: target,
         });
@@ -148,4 +150,28 @@ fn add_item(
 
 pub fn installed() -> bool {
     STATUS_ITEM.with(|controller| controller.borrow().is_some())
+}
+
+pub fn set_ready_to_paste(ready: bool) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    STATUS_ITEM.with(|controller| {
+        if let Some(controller) = controller.borrow().as_ref() {
+            controller
+                .paste_item
+                .setTitle(&NSString::from_str(if ready {
+                    "Paste Last Dictation (ready)"
+                } else {
+                    "Paste Last Dictation"
+                }));
+            if let Some(button) = controller.item.button(mtm) {
+                button.setToolTip(Some(&NSString::from_str(if ready {
+                    "Dictation ready — choose an app, then Paste Last Dictation"
+                } else {
+                    "Hex"
+                })));
+            }
+        }
+    });
 }

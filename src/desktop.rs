@@ -29,6 +29,7 @@ pub enum Launch {
     App(ListenerConfig),
     /// The dictation HUD driven by a synthetic capture loop.
     DictationHudPreview,
+    PasteNoticePreview,
     /// One isolated, deterministic window without app services.
     Shell(AppWindowPreview),
 }
@@ -64,7 +65,10 @@ impl Ui {
     ) {
         match self.open(cx) {
             Ok(handle) => {
-                let _ = handle.update(cx, |window, _, cx| show(window, cx));
+                let _ = handle.update(cx, |view, window, cx| {
+                    show(view, cx);
+                    view.focus_pane(window);
+                });
             }
             Err(error) => tracing::error!(%error, "could not open HEX"),
         }
@@ -84,9 +88,10 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
     if objc2::MainThreadMarker::new().is_none() {
         return Err(eyre!("desktop startup requires the main thread"));
     }
+    let notice_preview = matches!(&launch, Launch::PasteNoticePreview);
     let (listener, hud_preview, preview) = match launch {
         Launch::App(listener) => (Some(listener), false, None),
-        Launch::DictationHudPreview => (None, true, None),
+        Launch::DictationHudPreview | Launch::PasteNoticePreview => (None, true, None),
         Launch::Shell(preview) => (None, false, Some(preview)),
     };
     shutdown.store(false, Ordering::Relaxed);
@@ -105,7 +110,15 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
             .ok()
     });
     let (indicator_sender, indicator_receiver) = dictation_indicator::channel();
-    if hud_preview {
+    if notice_preview {
+        let sender = indicator_sender.clone();
+        thread::spawn(move || {
+            while !shutdown.load(Ordering::Relaxed) {
+                sender.send(DictationIndicatorEvent::ReadyToPaste);
+                thread::sleep(Duration::from_secs(1));
+            }
+        });
+    } else if hud_preview {
         spawn_hud_preview(indicator_sender.clone());
     }
     let (control_sender, control_receiver) = mpsc::sync_channel(8);
@@ -137,6 +150,16 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
     };
     let listener_worker = Rc::new(RefCell::new(listener_worker));
 
+    // Native HUD/notice previews can also receive menu and reopen actions.
+    // Keep those actions isolated from real preferences and credentials too.
+    let preview = preview.or_else(|| {
+        hud_preview.then_some(AppWindowPreview {
+            pane: crate::app_window::PreviewPane::Settings,
+            onboarding: false,
+            permissions_missing: false,
+            open_history_retention: false,
+        })
+    });
     let app_window: AppWindowSlot = Rc::new(RefCell::new(None));
     let application = Application::new();
     {
@@ -181,14 +204,14 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
             preview,
         });
         install_menus(cx, &ui);
-        let open_on_launch = ui.preview.is_some()
-            || !hud_preview
-                && should_open_app_on_launch(
+        let open_on_launch = !hud_preview
+            && (ui.preview.is_some()
+                || should_open_app_on_launch(
                     show_dock_icon,
                     setup_ready,
                     onboarding_completed,
                     ui.status_actions.is_some(),
-                );
+                ));
         if open_on_launch && let Err(error) = ui.open(cx) {
             tracing::error!(%error, "could not open HEX");
         }
@@ -198,7 +221,7 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
             async {}
         })
         .detach();
-        let indicator_enabled = ui.preview.is_none();
+        let indicator_enabled = hud_preview || ui.preview.is_none();
         cx.spawn(async move |cx| {
             drive_ui(indicator_receiver, ui, shutdown, indicator_enabled, cx).await;
         })
@@ -310,21 +333,66 @@ async fn drive_ui(
     cx: &mut gpui::AsyncApp,
 ) {
     let mut indicator = indicator_enabled.then(DictationIndicatorUi::new);
+    let mut paste_notice: Option<crate::paste_notice::PasteNotice> = None;
     loop {
         if shutdown.load(Ordering::Relaxed) {
             let _ = cx.update(|cx| cx.quit());
             return;
         }
         while let Ok(event) = indicator_events.try_recv() {
-            if let Some(indicator) = &mut indicator
-                && let Err(error) = cx.update(|cx| indicator.handle(event, cx))
-            {
+            let notice_event = matches!(
+                event,
+                DictationIndicatorEvent::Preparing
+                    | DictationIndicatorEvent::Started
+                    | DictationIndicatorEvent::JobReadyToPaste { .. }
+                    | DictationIndicatorEvent::ReadyToPaste
+                    | DictationIndicatorEvent::PasteCommitted
+            );
+            if indicator.is_none() && !notice_event {
+                continue;
+            }
+            if let Err(error) = cx.update(|cx| {
+                match event {
+                    DictationIndicatorEvent::JobReadyToPaste { .. }
+                    | DictationIndicatorEvent::ReadyToPaste => {
+                        crate::status_item::set_ready_to_paste(true);
+                        if paste_notice.is_none() {
+                            paste_notice = crate::paste_notice::PasteNotice::new()
+                                .inspect_err(
+                                    |error| tracing::warn!(%error, "could not show paste notice"),
+                                )
+                                .ok();
+                        }
+                        if let Some(notice) = &mut paste_notice {
+                            notice.show();
+                        }
+                    }
+                    DictationIndicatorEvent::PasteCommitted => {
+                        crate::status_item::set_ready_to_paste(false);
+                        if let Some(notice) = &mut paste_notice {
+                            notice.hide();
+                        }
+                    }
+                    DictationIndicatorEvent::Preparing | DictationIndicatorEvent::Started => {
+                        if let Some(notice) = &mut paste_notice {
+                            notice.hide();
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(indicator) = &mut indicator {
+                    indicator.handle(event, cx);
+                }
+            }) {
                 tracing::error!(%error, "could not update the dictation indicator");
                 return;
             }
         }
         if let Some(indicator) = &mut indicator {
             let _ = cx.update(|cx| indicator.follow_pointer(cx));
+        }
+        if let Some(notice) = &mut paste_notice {
+            let _ = cx.update(|_| notice.maintain());
         }
         while let Some(action) = ui
             .status_actions
@@ -361,6 +429,8 @@ async fn drive_ui(
 fn spawn_hud_preview(sender: crate::dictation_indicator::DictationIndicatorSender) {
     thread::spawn(move || {
         loop {
+            sender.send(DictationIndicatorEvent::Preparing);
+            thread::sleep(Duration::from_millis(900));
             sender.send(DictationIndicatorEvent::Started);
             thread::sleep(Duration::from_millis(450));
             let started = Instant::now();

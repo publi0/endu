@@ -38,7 +38,10 @@ not reintroduce seams for them.
   pause while a hold is intentional.
 - `volume_fade`: interruptible output fades with guarded restoration; manual
   volume or mute changes relinquish ownership when detected.
-- `context`: the foreground application name, recorded in History.
+- `context`: a retained foreground application identity captured when recording
+  starts, plus the display name recorded in History.
+- `paste_notice`: a short, click-through notice when automatic insertion is
+  deferred because the foreground application changed.
 - `history`: the owner-only bounded store of pasted text and metadata.
 - `events`: bounded asynchronous NDJSON observations in `logs/live.ndjson`.
 - `app_settings`: persisted app settings and their live runtime projection.
@@ -90,10 +93,30 @@ not reintroduce seams for them.
   them must never affect dictation.
 - History records only successful pasted output: text plus bounded metadata,
   never audio. Retention defaults to seven days with hard entry and byte caps.
+- Capture the destination at recording start. Immediately before writing the
+  clipboard, verify it is still the foreground application. Send the shortcut
+  to that verified process, never globally. A different or missing target
+  defers insertion without touching the clipboard or continuation state.
+- Deferred output releases the ordered output worker and retains only the
+  latest result in memory for explicit Paste Last. That action captures a new
+  destination. Record History only on its first successful paste; repeated
+  pastes must not duplicate entries. Cancellation/shutdown must not retain or
+  paste cancelled output. Do not treat the foreground monitor as authorization.
+- Destination protection is per application, not per window or text field.
 - Audio is never persisted.
-- The HUD is observational and click-through.
+- The HUD is observational and click-through. Its preparing capsule follows
+  the audio owner's actual readiness, never a timer. A warm microphone starts
+  directly in Recording; a cold open emits a generation-scoped CaptureReady.
+  Ignore late readiness after cancellation or a newer capture. Preserve the
+  existing red recording and blue transcription shaders and tone threshold;
+  transitioning from preparation must not restart the entrance animation.
 - Every pane renders the `desktop_ui` scaffold: `pane_header` or
   `pane_header_with_action`, then one column bounded by `PANE_CONTENT_WIDTH`.
+
+- Choice menus support Tab, arrows, Enter, and Escape, restore focus to their
+  trigger, and keep errors visible outside scrollable choices. Setup must not
+  allow keyboard focus into hidden settings. Keep save/error feedback beside
+  its control and disable incompatible key operations while one is pending.
 
 ## Mandatory local validation before every commit
 
@@ -151,6 +174,7 @@ cargo run -- preview history --open-history-retention
 cargo run -- preview statistics
 cargo run -- preview onboarding
 cargo run -- preview dictation-hud
+cargo run -- preview paste-notice
 ```
 
 Only macOS builds the app. Other platforms can run the portable modules'

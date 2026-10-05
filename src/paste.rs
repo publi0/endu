@@ -19,6 +19,12 @@ use objc2_foundation::NSString;
 use crate::keyboard;
 use crate::suppression::InputActivity;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PasteOutcome {
+    Pasted,
+    Deferred,
+}
+
 pub struct Paster {
     clipboard: Retained<NSPasteboard>,
     activity: InputActivity,
@@ -35,7 +41,14 @@ struct PreparedClipboard {
 
 struct Continuation {
     revision: u64,
+    target: Option<crate::context::ForegroundApplication>,
     inserted: String,
+}
+
+impl Continuation {
+    fn applies_to(&self, revision: u64, target: &crate::context::ContextSnapshot) -> bool {
+        self.revision == revision && self.target.is_some() && self.target == target.target
+    }
 }
 
 #[derive(Default)]
@@ -196,17 +209,22 @@ impl Paster {
 
     /// Commit only after clipboard preparation, immediately before the first write.
     /// A rejected commit leaves both the clipboard and continuation unchanged.
-    pub fn paste(&mut self, text: &str, commit: impl FnOnce() -> bool) -> Result<()> {
+    pub fn paste(
+        &mut self,
+        text: &str,
+        target: &crate::context::ContextSnapshot,
+        commit: impl FnOnce() -> bool,
+    ) -> Result<PasteOutcome> {
         let revision = self.activity.revision();
         let text = self
             .continuation
             .as_ref()
-            .filter(|continuation| continuation.revision == revision)
+            .filter(|continuation| continuation.applies_to(revision, target))
             .map_or_else(
                 || text.to_string(),
                 |continuation| join(&continuation.inserted, text),
             );
-        let generation = commit_prepared_paste(
+        let generation = commit_targeted_paste(
             || {
                 let restore = self
                     .clipboard_restore
@@ -237,7 +255,13 @@ impl Paster {
                 Ok((restore, previous, previous_change_count))
             },
             commit,
-            |(mut restore, previous, previous_change_count)| {
+            || {
+                target
+                    .target
+                    .as_ref()
+                    .and_then(|target| target.current_process_id())
+            },
+            |(mut restore, previous, previous_change_count), pid| {
                 if let Err(error) = write_clipboard_text(&self.clipboard, &text) {
                     if let Err(restore_error) = restore_clipboard(&self.clipboard, &previous) {
                         tracing::error!(%restore_error, "could not recover the clipboard after a failed write");
@@ -245,13 +269,19 @@ impl Paster {
                     return Err(error);
                 }
                 let inserted_change_count = self.clipboard.changeCount();
-                Ok(restore.register(previous, previous_change_count, inserted_change_count))
+                Ok((
+                    restore.register(previous, previous_change_count, inserted_change_count),
+                    pid,
+                ))
             },
         )?;
 
+        let Some((generation, pid)) = generation else {
+            return Ok(PasteOutcome::Deferred);
+        };
         let clipboard_restore = self.clipboard_restore.clone();
         complete_paste(
-            || keyboard::post_command('v'),
+            || keyboard::post_command_to_pid('v', pid),
             move || {
                 thread::spawn(move || {
                     thread::sleep(Duration::from_millis(500));
@@ -281,9 +311,10 @@ impl Paster {
         )?;
         self.continuation = Some(Continuation {
             revision,
+            target: target.target.clone(),
             inserted: text,
         });
-        Ok(())
+        Ok(PasteOutcome::Pasted)
     }
 }
 
@@ -299,6 +330,17 @@ pub(crate) fn commit_prepared_paste<P, T>(
         return Err(eyre!("paste was cancelled"));
     }
     paste(prepared)
+}
+
+fn commit_targeted_paste<P, T>(
+    prepare: impl FnOnce() -> Result<P>,
+    commit: impl FnOnce() -> bool,
+    target: impl FnOnce() -> Option<i32>,
+    paste: impl FnOnce(P, i32) -> Result<T>,
+) -> Result<Option<T>> {
+    commit_prepared_paste(prepare, commit, |prepared| {
+        target().map(|pid| paste(prepared, pid)).transpose()
+    })
 }
 
 fn complete_paste(
@@ -629,6 +671,73 @@ mod tests {
     use objc2_foundation::NSData;
 
     static PASTEBOARD_TEST: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn continuation_requires_the_same_application_and_input_revision() {
+        use crate::context::{ContextSnapshot, ForegroundApplication};
+        let target = ContextSnapshot {
+            application: Some("Fixture A".into()),
+            target: Some(ForegroundApplication::Test(1)),
+        };
+        let continuation = Continuation {
+            revision: 7,
+            target: target.target.clone(),
+            inserted: "Previous dictation".into(),
+        };
+        assert!(continuation.applies_to(7, &target));
+        assert!(!continuation.applies_to(8, &target));
+        assert!(!continuation.applies_to(
+            7,
+            &ContextSnapshot {
+                target: Some(ForegroundApplication::Test(2)),
+                ..target.clone()
+            }
+        ));
+        assert!(!continuation.applies_to(7, &ContextSnapshot::default()));
+    }
+
+    #[test]
+    fn a_focus_change_during_clipboard_preparation_prevents_writes() {
+        let current = Cell::new(10);
+        let output = commit_targeted_paste(
+            || {
+                current.set(20);
+                Ok("original clipboard")
+            },
+            || true,
+            || (current.get() == 10).then_some(10),
+            |_, _| -> Result<()> { panic!("changed target must not receive text") },
+        )
+        .unwrap();
+        assert_eq!(output, None);
+    }
+
+    #[test]
+    fn the_verified_process_is_kept_for_delivery_even_if_focus_moves_again() {
+        let current = Cell::new(10);
+        let routed = commit_targeted_paste(
+            || Ok(()),
+            || true,
+            || {
+                let verified = current.get();
+                current.set(20);
+                Some(verified)
+            },
+            |(), pid| Ok(pid),
+        )
+        .unwrap();
+        assert_eq!(routed, Some(10));
+        assert_eq!(current.get(), 20);
+        assert!(
+            commit_targeted_paste(
+                || Ok(()),
+                || false,
+                || panic!("cancelled output must not inspect or deliver to a target"),
+                |(), _| Ok(())
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn rejected_commit_does_not_write_paste_or_restore() {

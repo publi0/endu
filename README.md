@@ -29,7 +29,8 @@ Já tem o Hex instalado? Use os [comandos de atualização](#atualizar).
 ## Como funciona
 
 Segure o atalho, fale e solte. O Hex transcreve o áudio e cola o resultado no
-aplicativo em foco. Você escolhe o modelo e os fallbacks; o app cuida da
+aplicativo onde você começou a gravar, se ele continuar em foco ao concluir.
+Você escolhe o modelo e os fallbacks; o app cuida da
 captura, do corte de silêncio e da ordem de entrega dos ditados.
 
 ```text
@@ -62,7 +63,8 @@ build e pode fazer o macOS pedir permissões novamente. A partir da 3.0.5,
 os releases usam um certificado próprio persistente. A migração exige uma
 nova autorização; as versões seguintes preservam a identidade de assinatura.
 Essa continuidade é verificada com duas builds diferentes nos testes locais.
-A preservação das permissões deve ser confirmada também numa atualização real.
+Na atualização real de 3.0.5 para 3.0.6, Microfone, Input Monitoring e
+Acessibilidade permaneceram autorizados sem novos pedidos.
 Outro usuário/Mac, recursos novos e cada novo alvo de Automação, como Music,
 Spotify ou VLC, ainda podem exigir autorizações próprias.
 
@@ -84,10 +86,27 @@ a gravação; a próxima pressão a encerra. **Esc** cancela a captura ou, quand
 não há gravação ativa, o ditado pendente mais recente. Capturas com menos de
 300 ms são descartadas.
 
-O indicador flutuante mostra gravação e processamento. Você pode iniciar
+O indicador flutuante mantém a cápsula vermelha durante a gravação e a esfera
+azul na transcrição. Se o microfone precisar abrir, a mesma cápsula aparece
+apagada até o dispositivo estar pronto. Com o microfone já aberto, entra
+direto no vermelho, sem espera adicional. Você pode iniciar
 outro ditado enquanto o anterior é transcrito: os resultados são colados na
 ordem em que foram enviados. **Paste Last Dictation**, no menu, cola novamente
 o último resultado da sessão; se houver uma captura ativa, ela é descartada.
+
+Se outro aplicativo estiver em foco ao concluir, o Hex não altera o clipboard
+nem cola automaticamente. O aviso **Dictation ready** aparece por alguns
+segundos, e **Paste Last Dictation (ready)** fica disponível no menu. Coloque
+o cursor no destino e use essa ação para inserir o texto. O resultado fica
+apenas na memória até outro ditado substituí-lo ou o app encerrar; entra no
+History somente depois da colagem. A proteção identifica o aplicativo,
+não a janela ou o campo dentro dele.
+
+Os seletores de microfone, canal, idioma, modelo e retenção do History aceitam
+teclado: **Tab** dá foco, **Enter** abre ou confirma, as **setas** percorrem as
+opções e **Esc** fecha. Confirmações e erros de salvamento aparecem junto ao
+controle alterado. Durante uma operação com a chave, ações incompatíveis
+ficam indisponíveis até ela terminar.
 
 ## Models
 

@@ -49,6 +49,7 @@ pub enum DictationPhase {
     Transcribing,
     Pasted,
     Repasted,
+    ReadyToPaste,
     Failed(String),
 }
 

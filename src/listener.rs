@@ -2,6 +2,7 @@
 //! microphone timeline, and the transcription pipeline, wired together on one
 //! control loop. Capture never waits on transcription or paste.
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
@@ -11,13 +12,21 @@ use color_eyre::Result;
 use crate::audio::CaptureInstant;
 use crate::context::{ContextMonitor, ContextSnapshot};
 use crate::dictation::Finish;
-use crate::dictation_audio::{DictationAudio, DictationAudioEvent};
+use crate::dictation_audio::{CaptureStart, DictationAudio, DictationAudioEvent};
 use crate::dictation_indicator::{DictationIndicatorEvent, DictationIndicatorSender};
 use crate::events::{DictationPhase, EventLog, VoiceEvent, VoiceState, now_ms};
 use crate::feedback::{self, Tone};
 use crate::pipeline::{DictationWorker, WorkerEvent};
 use crate::recording_environment::RecordingEnvironmentController;
 use crate::suppression::{DictationHotkey, HotkeyAction, InputMonitor};
+
+fn capture_start_event(start: CaptureStart) -> Option<DictationIndicatorEvent> {
+    match start {
+        CaptureStart::Rejected => None,
+        CaptureStart::Opening => Some(DictationIndicatorEvent::Preparing),
+        CaptureStart::Ready => Some(DictationIndicatorEvent::Started),
+    }
+}
 
 #[derive(Debug)]
 pub enum ListenerControl {
@@ -30,6 +39,7 @@ struct Session<'a> {
     worker: &'a DictationWorker,
     events: &'a EventLog,
     indicator: Option<&'a DictationIndicatorSender>,
+    recording_context: RefCell<Option<ContextSnapshot>>,
 }
 
 impl Session<'_> {
@@ -60,28 +70,26 @@ impl Session<'_> {
 
     /// Applies one shortcut action. Returns `false` when a start was refused
     /// so the caller can suspend the shortcut machine.
-    fn handle_hotkey(
-        &self,
-        action: HotkeyAction,
-        at: CaptureInstant,
-        context: &ContextSnapshot,
-    ) -> Result<bool> {
+    fn handle_hotkey(&self, action: HotkeyAction, at: CaptureInstant) -> Result<bool> {
         match action {
             HotkeyAction::Start => {
-                if !self.input.start(at)? {
+                let target = ContextSnapshot::capture().unwrap_or_default();
+                let start = self.input.start(at)?;
+                let Some(indicator_event) = capture_start_event(start) else {
                     return Ok(false);
-                }
+                };
+                *self.recording_context.borrow_mut() = Some(target);
                 self.input.invalidate_recognition()?;
                 self.worker.prepare_paste();
                 self.events.dictation(DictationPhase::Started, "")?;
-                self.indicate(DictationIndicatorEvent::Started);
+                self.indicate(indicator_event);
                 self.emit_state(true)?;
             }
             HotkeyAction::Finish => {
                 if self.input.become_intentional(at)? {
                     feedback::play(Tone::DictationStart);
                 }
-                self.finish(at, context)?;
+                self.finish(at)?;
             }
             HotkeyAction::Discard => self.end(CaptureEnd::Discarded)?,
             HotkeyAction::Cancel => self.end(CaptureEnd::Cancelled)?,
@@ -91,10 +99,11 @@ impl Session<'_> {
     }
 
     fn paste_last(&self) -> Result<()> {
+        let target = ContextSnapshot::capture().unwrap_or_default();
         // A repaste ends any capture, including a double-tap lock. Keep the
         // HUD in sync with the audio owner before queueing the previous text.
         self.end(CaptureEnd::Discarded)?;
-        if let Err(error) = self.worker.paste_last() {
+        if let Err(error) = self.worker.paste_last(target) {
             feedback::play(Tone::Error);
             self.events
                 .dictation(DictationPhase::Failed(error.into()), "")?;
@@ -102,7 +111,12 @@ impl Session<'_> {
         self.emit_state(false)
     }
 
-    fn finish(&self, at: CaptureInstant, context: &ContextSnapshot) -> Result<()> {
+    fn finish(&self, at: CaptureInstant) -> Result<()> {
+        let context = self
+            .recording_context
+            .borrow_mut()
+            .take()
+            .unwrap_or_default();
         let Finish::Transcribe(clip) = self.input.finish(at)? else {
             self.events.dictation(DictationPhase::Discarded, "")?;
             self.indicate(DictationIndicatorEvent::Discarded);
@@ -110,7 +124,7 @@ impl Session<'_> {
         };
         feedback::play(Tone::DictationStop);
         self.events.dictation(DictationPhase::Transcribing, "")?;
-        match self.worker.transcribe(clip, context.clone()) {
+        match self.worker.transcribe(clip, context) {
             Ok(job_id) => self.indicate(DictationIndicatorEvent::Submitted {
                 job_id: job_id.value(),
             }),
@@ -126,6 +140,7 @@ impl Session<'_> {
 
     fn end(&self, end: CaptureEnd) -> Result<()> {
         self.input.cancel()?;
+        self.recording_context.borrow_mut().take();
         let (phase, indicator_event) = match end {
             CaptureEnd::Discarded => (
                 DictationPhase::Discarded,
@@ -145,6 +160,7 @@ impl Session<'_> {
     }
 
     fn fail(&self, message: String) -> Result<()> {
+        self.recording_context.borrow_mut().take();
         feedback::play(Tone::Error);
         self.events.dictation(DictationPhase::Failed(message), "")?;
         self.indicate(DictationIndicatorEvent::Failed);
@@ -153,6 +169,15 @@ impl Session<'_> {
 
     fn worker_event(&self, event: WorkerEvent) -> Result<()> {
         match event {
+            WorkerEvent::ReadyToPaste { job_id } => {
+                self.events.dictation(DictationPhase::ReadyToPaste, "")?;
+                self.indicate(match job_id {
+                    Some(job_id) => DictationIndicatorEvent::JobReadyToPaste {
+                        job_id: job_id.value(),
+                    },
+                    None => DictationIndicatorEvent::ReadyToPaste,
+                });
+            }
             WorkerEvent::Completed {
                 job_id,
                 result: Ok(text),
@@ -160,6 +185,7 @@ impl Session<'_> {
                 let phase = if text.trim().is_empty() {
                     DictationPhase::Discarded
                 } else {
+                    self.indicate(DictationIndicatorEvent::PasteCommitted);
                     DictationPhase::Pasted
                 };
                 self.events.dictation(phase, text)?;
@@ -185,6 +211,7 @@ impl Session<'_> {
             }
             WorkerEvent::Cancelled { .. } => {}
             WorkerEvent::Pasted { result: Ok(text) } => {
+                self.indicate(DictationIndicatorEvent::PasteCommitted);
                 self.events.dictation(DictationPhase::Repasted, text)?;
             }
             WorkerEvent::Pasted { result: Err(error) } => {
@@ -254,6 +281,7 @@ pub fn listen(
         worker: &worker,
         events: &events,
         indicator: indicator.as_ref(),
+        recording_context: RefCell::new(None),
     };
 
     events.emit(&VoiceEvent::SessionStarted {
@@ -263,9 +291,13 @@ pub fn listen(
         hotkey.suspend();
     }
     if hotkey.is_recording() {
-        if input.start(capture_boundary(&input, release_while_idle))? {
+        let target = ContextSnapshot::capture().unwrap_or_default();
+        if let Some(indicator_event) =
+            capture_start_event(input.start(capture_boundary(&input, release_while_idle))?)
+        {
+            *session.recording_context.borrow_mut() = Some(target);
             events.dictation(DictationPhase::Started, "")?;
-            session.indicate(DictationIndicatorEvent::Started);
+            session.indicate(indicator_event);
         } else {
             hotkey.suspend();
         }
@@ -332,7 +364,7 @@ pub fn listen(
                 continue;
             }
             if let Some(action) = hotkey.process(input_event, observed.capture_at)
-                && !session.handle_hotkey(action, observed.capture_at, &context)?
+                && !session.handle_hotkey(action, observed.capture_at)?
             {
                 hotkey.suspend();
             }
@@ -358,6 +390,11 @@ pub fn listen(
 
         while let Some(audio_event) = input.try_recv_event() {
             match audio_event {
+                DictationAudioEvent::CaptureReady { .. } => {
+                    if input.is_recording() {
+                        session.indicate(DictationIndicatorEvent::Started);
+                    }
+                }
                 DictationAudioEvent::ReadyIntentional { .. } => {
                     if input.is_recording() {
                         feedback::play(Tone::DictationStart);

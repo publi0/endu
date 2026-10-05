@@ -27,7 +27,7 @@ struct Uniforms {
     float sphere_outline;
     float completion;
     float recording_flash;
-    float _padding;
+    float preparing;
 };
 
 struct VertexOutput {
@@ -88,6 +88,15 @@ fragment float4 indicator_fragment(
     float shape = coverage(distance, edge);
     float detail_clarity = exp2(-lifecycle_softness * 0.34);
     float4 result = 0.0;
+
+    // Opening uses the same capsule geometry, without a beam, audio reaction,
+    // flash, or animated light. Recording and transcription keep their shader.
+    if (uniforms.preparing > 0.5) {
+        composite(result, float3(0.36, 0.37, 0.39), shape * 0.56);
+        float rim = coverage(abs(distance) - 0.3, edge);
+        composite(result, float3(0.55, 0.57, 0.60), rim * 0.22 * detail_clarity);
+        return result * uniforms.opacity;
+    }
 
     float processing = clamp(uniforms.processing, 0.0, 1.0);
     float post_processing = clamp(uniforms.post_processing, 0.0, 1.0);

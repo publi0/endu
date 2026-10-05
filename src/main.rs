@@ -41,6 +41,8 @@ mod openrouter;
 #[cfg(target_os = "macos")]
 mod paste;
 #[cfg(target_os = "macos")]
+mod paste_notice;
+#[cfg(target_os = "macos")]
 mod permission_guide;
 #[cfg(target_os = "macos")]
 mod pipeline;
@@ -102,6 +104,7 @@ enum Command {
 #[derive(Clone, Copy, ValueEnum)]
 enum AppPreviewTarget {
     DictationHud,
+    PasteNotice,
     Onboarding,
     Settings,
     Models,
@@ -139,6 +142,9 @@ fn main() -> Result<()> {
             let pane = match target {
                 AppPreviewTarget::DictationHud => {
                     return desktop::run(&SHUTDOWN, desktop::Launch::DictationHudPreview);
+                }
+                AppPreviewTarget::PasteNotice => {
+                    return desktop::run(&SHUTDOWN, desktop::Launch::PasteNoticePreview);
                 }
                 AppPreviewTarget::Onboarding | AppPreviewTarget::Settings => {
                     app_window::PreviewPane::Settings
@@ -184,6 +190,7 @@ mod tests {
             })
         ));
         assert!(Cli::try_parse_from(["hex", "preview", "statistics"]).is_ok());
+        assert!(Cli::try_parse_from(["hex", "preview", "paste-notice"]).is_ok());
         assert!(matches!(
             Cli::try_parse_from(["hex", "preview", "models"])
                 .unwrap()

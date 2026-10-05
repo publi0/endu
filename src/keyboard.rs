@@ -9,7 +9,6 @@ type EventRef = *mut c_void;
 
 const KEY_ACTION_DISPLAY: u16 = 3;
 const NO_DEAD_KEYS: isize = 0;
-const HID_EVENT_TAP: u32 = 0;
 const COMMAND_KEY_CODE: u16 = 55;
 const COMMAND_FLAG: u64 = 1 << 20;
 const EVENT_SOURCE_USER_DATA: u32 = 42;
@@ -55,7 +54,7 @@ unsafe extern "C" {
     fn CGEventCreateKeyboardEvent(source: *mut c_void, key: u16, down: bool) -> EventRef;
     fn CGEventSetFlags(event: EventRef, flags: u64);
     fn CGEventSetIntegerValueField(event: EventRef, field: u32, value: i64);
-    fn CGEventPost(tap: u32, event: EventRef);
+    fn CGEventPostToPid(pid: i32, event: EventRef);
 }
 
 pub fn key_code_for(character: char) -> Result<u16> {
@@ -174,19 +173,23 @@ fn collect_key_codes(entries: impl IntoIterator<Item = (char, u16)>) -> HashMap<
 }
 
 /// Posts Command plus the key that types `character` in the current layout.
-pub fn post_command(character: char) -> Result<()> {
+pub fn post_command_to_pid(character: char, pid: i32) -> Result<()> {
+    if pid <= 0 {
+        return Err(eyre!("paste target is unavailable"));
+    }
     post_key_code(
         key_code_for(character)?,
         &[(COMMAND_FLAG, COMMAND_KEY_CODE)],
         1,
+        pid,
     )
 }
 
-fn post_key_code(key_code: u16, modifiers: &[(u64, u16)], count: u8) -> Result<()> {
+fn post_key_code(key_code: u16, modifiers: &[(u64, u16)], count: u8, pid: i32) -> Result<()> {
     let specs = shortcut_event_specs(key_code, modifiers, count);
     let events = specs.map(KeyboardEvent::new).collect::<Result<Vec<_>>>()?;
     for event in events {
-        event.post();
+        event.post(pid);
     }
     Ok(())
 }
@@ -228,9 +231,11 @@ impl KeyboardEvent {
         Ok(Self(event))
     }
 
-    fn post(&self) {
-        // SAFETY: This value owns a valid CoreGraphics keyboard event.
-        unsafe { CGEventPost(HID_EVENT_TAP, self.0) };
+    fn post(&self, pid: i32) {
+        // SAFETY: This owns a valid event and the caller verified the target.
+        // Routing to that process prevents a focus switch from sending Cmd+V
+        // into another application after the final foreground check.
+        unsafe { CGEventPostToPid(pid, self.0) };
     }
 }
 

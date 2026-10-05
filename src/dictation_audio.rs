@@ -36,7 +36,18 @@ impl Drop for RecognitionAudio {
     }
 }
 
+/// Readiness returned by the owner at the accepted shortcut boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureStart {
+    Rejected,
+    Opening,
+    Ready,
+}
+
 pub enum DictationAudioEvent {
+    CaptureReady {
+        capture_generation: u64,
+    },
     OpenFailed {
         capture_generation: u64,
         error: String,
@@ -81,7 +92,7 @@ struct State {
 enum Command {
     Start {
         at: CaptureInstant,
-        reply: SyncSender<bool>,
+        reply: SyncSender<CaptureStart>,
     },
     BecomeIntentional {
         at: CaptureInstant,
@@ -282,7 +293,7 @@ impl DictationAudio {
         while self.recognition.try_recv().is_ok() {}
     }
 
-    pub fn start(&self, at: CaptureInstant) -> Result<bool> {
+    pub fn start(&self, at: CaptureInstant) -> Result<CaptureStart> {
         self.call(|reply| Command::Start { at, reply })
     }
 
@@ -312,6 +323,7 @@ impl DictationAudio {
                 DictationAudioEvent::OpenFailed {
                     capture_generation, ..
                 }
+                | DictationAudioEvent::CaptureReady { capture_generation }
                 | DictationAudioEvent::ReadyIntentional { capture_generation }
                 | DictationAudioEvent::Interrupted {
                     capture_generation, ..
@@ -402,21 +414,23 @@ impl Owner {
                     self.drain_through(at);
                 }
                 if self.input.is_recovering() {
-                    let _ = reply.send(false);
+                    let _ = reply.send(CaptureStart::Rejected);
                     return true;
                 }
                 self.state.capture_generation.fetch_add(1, Ordering::AcqRel);
-                if self.input.is_open() {
+                let readiness = if self.input.is_open() {
                     self.capture.start_at(at);
+                    CaptureStart::Ready
                 } else {
                     self.pending_capture = Some(PendingCapture {
                         at,
                         intentional_at: None,
                     });
                     self.input.request_open();
-                }
+                    CaptureStart::Opening
+                };
                 self.state.recording.store(true, Ordering::Release);
-                let _ = reply.send(true);
+                let _ = reply.send(readiness);
             }
             Command::BecomeIntentional { at, reply } => {
                 let became_intentional = if let Some(pending) = &mut self.pending_capture {
@@ -561,6 +575,9 @@ impl Owner {
                 self.state.recovering.store(false, Ordering::Release);
                 if let Some(pending) = self.pending_capture.take() {
                     self.capture.start_at(pending.at);
+                    let _ = self.events.send(DictationAudioEvent::CaptureReady {
+                        capture_generation: self.state.capture_generation.load(Ordering::Acquire),
+                    });
                     if let Some(at) = pending.intentional_at {
                         let _ = self.capture.become_intentional(at);
                         let _ = self.events.send(DictationAudioEvent::ReadyIntentional {
@@ -757,7 +774,10 @@ mod tests {
     }
 
     fn start(owner: &mut Owner, at: CaptureInstant) {
-        assert!(control(owner, |reply| Command::Start { at, reply }));
+        assert_ne!(
+            control(owner, |reply| Command::Start { at, reply }),
+            CaptureStart::Rejected
+        );
     }
 
     #[test]
@@ -816,6 +836,47 @@ mod tests {
     }
 
     #[test]
+    fn readiness_does_not_wait_for_the_intentional_hold_threshold() {
+        let at = capture_time();
+        let (mut warm, warm_input, _samples) = owner_for_test(true);
+        assert_eq!(
+            control(&mut warm, |reply| Command::Start { at, reply }),
+            CaptureStart::Ready
+        );
+        assert!(warm_input.try_recv_event().is_none());
+
+        let (mut cold, cold_input, _samples) = owner_for_test(false);
+        assert_eq!(
+            control(&mut cold, |reply| Command::Start { at, reply }),
+            CaptureStart::Opening
+        );
+        assert!(cold_input.try_recv_event().is_none());
+        let event = cold.input.recv_timeout(Duration::ZERO, false);
+        cold.handle_input(event);
+        assert!(
+            matches!(cold_input.try_recv_event(), Some(DictationAudioEvent::CaptureReady { capture_generation })
+            if capture_generation == cold_input.capture_generation())
+        );
+        assert!(matches!(
+            cold_input.try_recv_event(),
+            Some(DictationAudioEvent::Reopened)
+        ));
+        assert!(
+            cold_input.try_recv_event().is_none(),
+            "readiness must not also play the start tone before the hold threshold"
+        );
+        let intentional_at = at + crate::dictation::MINIMUM_HOLD_DURATION;
+        assert!(control(&mut cold, |reply| Command::BecomeIntentional {
+            at: intentional_at,
+            reply
+        }));
+        assert!(!control(&mut cold, |reply| Command::BecomeIntentional {
+            at: intentional_at,
+            reply
+        }));
+    }
+
+    #[test]
     fn pending_capture_notifications_follow_control_boundaries() {
         for ready in [false, true] {
             for boundary in ["current", "finish", "cancel", "start"] {
@@ -842,6 +903,12 @@ mod tests {
                     _ => {}
                 }
                 if boundary != "start" {
+                    if ready {
+                        assert!(matches!(
+                            input.try_recv_event(),
+                            Some(DictationAudioEvent::CaptureReady { .. })
+                        ));
+                    }
                     assert!(matches!(
                         (ready, input.try_recv_event()),
                         (true, Some(DictationAudioEvent::ReadyIntentional { .. }))
@@ -923,6 +990,10 @@ mod tests {
             owner.reconcile_input();
             assert!(owner.input.is_open());
             assert!(input.is_recording());
+            assert!(
+                matches!(input.try_recv_event(), Some(DictationAudioEvent::CaptureReady { capture_generation })
+                if capture_generation == second_generation)
+            );
             assert!(matches!(
                 input.try_recv_event(),
                 Some(DictationAudioEvent::ReadyIntentional { capture_generation })
@@ -1014,10 +1085,13 @@ mod tests {
         let boundary = at + Duration::from_millis(110);
         drop(samples);
         let generation = input.capture_generation();
-        assert!(!control(&mut owner, |reply| Command::Start {
-            at: boundary,
-            reply,
-        }));
+        assert_eq!(
+            control(&mut owner, |reply| Command::Start {
+                at: boundary,
+                reply,
+            }),
+            CaptureStart::Rejected
+        );
         assert_eq!(input.capture_generation(), generation);
         assert!(!input.is_recording());
         assert!(input.try_recv_event().is_some());
@@ -1065,7 +1139,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(input.capture_generation(), 0);
-        assert!(!input.start(capture_time()).unwrap());
+        assert_eq!(input.start(capture_time()).unwrap(), CaptureStart::Rejected);
         assert!(!input.is_recording());
         assert!(matches!(
             input.finish(capture_time()).unwrap(),
@@ -1096,7 +1170,7 @@ mod tests {
                 false,
             )
             .unwrap();
-            assert!(input.start(capture_time()).unwrap());
+            assert_eq!(input.start(capture_time()).unwrap(), CaptureStart::Opening);
             assert!(input.is_recording());
             input.set_release_while_idle(true);
             input.invalidate_recognition().unwrap();
@@ -1133,7 +1207,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(!input.start(capture_time()).unwrap());
+        assert_eq!(input.start(capture_time()).unwrap(), CaptureStart::Rejected);
         let (replacement, samples) = crate::audio::AudioInput::channel_for_test();
         opened.send((0, Ok(replacement))).unwrap();
         assert!(matches!(
@@ -1148,7 +1222,7 @@ mod tests {
         assert_eq!(audio.samples, vec![0.25; 480]);
         assert!(audio.is_current(input.recognition_generation()));
         assert_eq!(input.captured_through(), capture_time());
-        assert!(input.start(capture_time()).unwrap());
+        assert_eq!(input.start(capture_time()).unwrap(), CaptureStart::Ready);
         assert!(input.is_recording());
         input.cancel().unwrap();
         assert!(!input.is_recording());

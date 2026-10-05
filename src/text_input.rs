@@ -277,7 +277,7 @@ impl TextInput {
         let content: SharedString = normalize(initial, multiline).into();
         let cursor = content.len();
         Self {
-            focus_handle: cx.focus_handle(),
+            focus_handle: cx.focus_handle().tab_stop(!picker),
             content,
             placeholder: placeholder.into(),
             selected_range: cursor..cursor,
@@ -448,13 +448,17 @@ impl TextInput {
             self.replace_text_in_range(None, "\n", window, cx);
         } else {
             cx.emit(Submitted);
-            window.blur();
+            if !self.picker {
+                window.blur();
+            }
         }
     }
 
     fn escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
         cx.emit(Dismissed);
-        window.blur();
+        if !self.picker {
+            window.blur();
+        }
     }
 
     fn show_character_palette(

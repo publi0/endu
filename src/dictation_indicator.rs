@@ -38,6 +38,7 @@ const RECORDING_FLASH_HALF_LIFE: Duration = Duration::from_millis(280);
 
 #[derive(Clone, Copy, Debug)]
 pub enum DictationIndicatorEvent {
+    Preparing,
     Started,
     Meter { average: f32, peak: f32 },
     Submitted { job_id: u64 },
@@ -47,6 +48,9 @@ pub enum DictationIndicatorEvent {
     JobCompleted { job_id: u64 },
     JobCancelled { job_id: u64 },
     JobFailed { job_id: u64 },
+    JobReadyToPaste { job_id: u64 },
+    ReadyToPaste,
+    PasteCommitted,
     Failed,
 }
 
@@ -134,7 +138,12 @@ impl DictationIndicatorUi {
     }
 
     pub fn handle(&mut self, event: DictationIndicatorEvent, _cx: &mut App) {
-        if self.indicator.is_none() && matches!(event, DictationIndicatorEvent::Started) {
+        if self.indicator.is_none()
+            && matches!(
+                event,
+                DictationIndicatorEvent::Preparing | DictationIndicatorEvent::Started
+            )
+        {
             match MetalIndicator::new() {
                 Ok(indicator) => self.indicator = Some(indicator),
                 Err(error) => {
@@ -228,7 +237,10 @@ impl MetalIndicator {
 
     fn handle(&mut self, event: DictationIndicatorEvent) {
         self.renderer.handle(event);
-        if matches!(event, DictationIndicatorEvent::Started) {
+        if matches!(
+            event,
+            DictationIndicatorEvent::Preparing | DictationIndicatorEvent::Started
+        ) {
             self.position_on_pointer_screen();
             self.window.orderFrontRegardless();
             self.ordered = true;
@@ -361,6 +373,7 @@ impl SharedRenderer {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {
     Hidden,
+    Preparing,
     Recording,
     Transcribing,
     Completed,
@@ -368,9 +381,18 @@ enum Phase {
     Failed,
 }
 
-fn active_phase(capturing: bool, pending_jobs: usize) -> Option<Phase> {
-    if capturing {
-        Some(Phase::Recording)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CapturePhase {
+    Preparing,
+    Recording,
+}
+
+fn active_phase(capture: Option<CapturePhase>, pending_jobs: usize) -> Option<Phase> {
+    if let Some(capture) = capture {
+        Some(match capture {
+            CapturePhase::Preparing => Phase::Preparing,
+            CapturePhase::Recording => Phase::Recording,
+        })
     } else if pending_jobs > 0 {
         Some(Phase::Transcribing)
     } else {
@@ -423,7 +445,7 @@ struct Uniforms {
     sphere_outline: f32,
     completion: f32,
     recording_flash: f32,
-    _padding: f32,
+    preparing: f32,
 }
 
 const _: () = assert!(std::mem::size_of::<Uniforms>() == 112);
@@ -445,7 +467,8 @@ struct MetalRenderer {
     command_queue: CommandQueue,
     pipeline: RenderPipelineState,
     phase: Phase,
-    capturing: bool,
+    capture_phase: Option<CapturePhase>,
+    preparing: f32,
     jobs: BTreeMap<u64, JobPhase>,
     phase_started: Instant,
     render_started: Instant,
@@ -509,7 +532,8 @@ impl MetalRenderer {
             layer,
             pipeline,
             phase: Phase::Hidden,
-            capturing: false,
+            capture_phase: None,
+            preparing: 0.0,
             jobs: BTreeMap::new(),
             phase_started: now,
             render_started: now,
@@ -533,9 +557,27 @@ impl MetalRenderer {
     fn handle(&mut self, event: DictationIndicatorEvent) {
         let now = Instant::now();
         match event {
-            DictationIndicatorEvent::Started => {
-                self.capturing = true;
-                self.phase = Phase::Recording;
+            DictationIndicatorEvent::Preparing | DictationIndicatorEvent::Started => {
+                let preparing = matches!(event, DictationIndicatorEvent::Preparing);
+                let was_preparing = self.capture_phase == Some(CapturePhase::Preparing);
+                self.capture_phase = Some(if preparing {
+                    CapturePhase::Preparing
+                } else {
+                    CapturePhase::Recording
+                });
+                self.preparing = if preparing { 1.0 } else { 0.0 };
+                self.phase = if preparing {
+                    Phase::Preparing
+                } else {
+                    Phase::Recording
+                };
+                // The microphone opened during this same capture. Light the existing
+                // capsule without restarting its entrance or briefly hiding it.
+                if was_preparing && !preparing {
+                    self.phase_started = now;
+                    self.render_started = now;
+                    return;
+                }
                 self.phase_started = now;
                 self.render_started = now;
                 self.last_frame = now;
@@ -556,7 +598,7 @@ impl MetalRenderer {
                 self.target_peak = (peak * 3.0).clamp(0.0, 1.0);
             }
             DictationIndicatorEvent::Submitted { job_id } => {
-                self.capturing = false;
+                self.capture_phase = None;
                 self.jobs.insert(job_id, JobPhase::Queued);
                 self.show_pipeline(now);
             }
@@ -567,7 +609,7 @@ impl MetalRenderer {
                 }
             }
             DictationIndicatorEvent::Discarded => {
-                self.capturing = false;
+                self.capture_phase = None;
                 self.completion_pending = false;
                 self.freeze_visual_state();
                 if self.jobs.is_empty() {
@@ -577,7 +619,7 @@ impl MetalRenderer {
                 }
             }
             DictationIndicatorEvent::Cancelled => {
-                self.capturing = false;
+                self.capture_phase = None;
                 self.phase_started = now;
                 self.completion_pending = false;
                 self.freeze_visual_state();
@@ -596,8 +638,12 @@ impl MetalRenderer {
             DictationIndicatorEvent::JobFailed { job_id } => {
                 self.finish_job(job_id, now, Phase::Failed);
             }
+            DictationIndicatorEvent::JobReadyToPaste { job_id } => {
+                self.finish_job(job_id, now, Phase::Hidden);
+            }
+            DictationIndicatorEvent::ReadyToPaste | DictationIndicatorEvent::PasteCommitted => {}
             DictationIndicatorEvent::Failed => {
-                self.capturing = false;
+                self.capture_phase = None;
                 self.phase_started = now;
                 self.completion_pending = false;
                 self.freeze_visual_state();
@@ -611,13 +657,14 @@ impl MetalRenderer {
     }
 
     fn show_pipeline(&mut self, now: Instant) {
-        let Some(phase) = active_phase(self.capturing, self.jobs.len()) else {
+        let Some(phase) = active_phase(self.capture_phase, self.jobs.len()) else {
             return;
         };
         self.phase = phase;
-        if matches!(phase, Phase::Recording) {
+        if matches!(phase, Phase::Preparing | Phase::Recording) {
             return;
         }
+        self.preparing = 0.0;
         self.phase_started = now;
         self.completion_pending = false;
         self.target_average = 0.0;
@@ -628,7 +675,7 @@ impl MetalRenderer {
         if self.jobs.remove(&job_id).is_none() {
             return;
         }
-        if active_phase(self.capturing, self.jobs.len()).is_some() {
+        if active_phase(self.capture_phase, self.jobs.len()).is_some() {
             self.show_pipeline(now);
             return;
         }
@@ -696,12 +743,12 @@ impl MetalRenderer {
             self.exiting = true;
         }
         let target_width = match self.phase {
-            Phase::Recording => CAPSULE_WIDTH,
+            Phase::Preparing | Phase::Recording => CAPSULE_WIDTH,
             Phase::Transcribing => CAPSULE_HEIGHT,
             Phase::Hidden | Phase::Completed | Phase::Cancelled | Phase::Failed => self.width.value,
         };
         let target_processing = match self.phase {
-            Phase::Recording => 0.0,
+            Phase::Preparing | Phase::Recording => 0.0,
             Phase::Transcribing => 1.0,
             Phase::Hidden | Phase::Completed | Phase::Cancelled | Phase::Failed => {
                 self.processing.value
@@ -758,9 +805,13 @@ impl MetalRenderer {
             peak: self.peak.value.clamp(0.0, 1.0),
             processing: self.processing.value.clamp(0.0, 1.0),
             post_processing: 0.0,
-            capturing: if self.capturing { 1.0 } else { 0.0 },
+            capturing: if self.capture_phase.is_some() {
+                1.0
+            } else {
+                0.0
+            },
             editing: 0.0,
-            queued_count: if self.capturing {
+            queued_count: if self.capture_phase.is_some() {
                 self.jobs.len() as f32
             } else {
                 self.jobs.len().saturating_sub(1) as f32
@@ -780,7 +831,7 @@ impl MetalRenderer {
                 0.0
             },
             recording_flash: recording_flash_for(self.phase, elapsed),
-            _padding: 0.0,
+            preparing: self.preparing,
         };
         encoder.set_fragment_bytes(
             0,
@@ -923,6 +974,7 @@ mod tests {
     #[test]
     fn only_recording_flashes() {
         assert_eq!(recording_flash_for(Phase::Recording, Duration::ZERO), 1.0);
+        assert_eq!(recording_flash_for(Phase::Preparing, Duration::ZERO), 0.0);
         assert_eq!(
             recording_flash_for(Phase::Transcribing, Duration::ZERO),
             0.0
@@ -935,15 +987,53 @@ mod tests {
         assert_eq!(std::mem::align_of::<Uniforms>(), 8);
         assert_eq!(std::mem::offset_of!(Uniforms, sphere_outline), 92);
         assert_eq!(std::mem::offset_of!(Uniforms, recording_flash), 100);
-        assert_eq!(std::mem::offset_of!(Uniforms, _padding), 104);
+        assert_eq!(std::mem::offset_of!(Uniforms, preparing), 104);
     }
 
     #[test]
     fn pending_completion_cannot_replace_a_new_recording_phase() {
-        assert_eq!(active_phase(true, 0), Some(Phase::Recording));
-        assert_eq!(active_phase(true, 2), Some(Phase::Recording));
-        assert_eq!(active_phase(false, 2), Some(Phase::Transcribing));
-        assert_eq!(active_phase(false, 0), None);
+        assert_eq!(
+            active_phase(Some(CapturePhase::Recording), 0),
+            Some(Phase::Recording)
+        );
+        assert_eq!(
+            active_phase(Some(CapturePhase::Recording), 2),
+            Some(Phase::Recording)
+        );
+        assert_eq!(
+            active_phase(Some(CapturePhase::Preparing), 2),
+            Some(Phase::Preparing)
+        );
+        assert_eq!(active_phase(None, 2), Some(Phase::Transcribing));
+        assert_eq!(active_phase(None, 0), None);
+    }
+
+    #[test]
+    fn ready_lights_the_opening_capsule_without_replaying_its_entrance() {
+        let mut renderer = MetalRenderer::new().expect("local macOS checks require Metal");
+        renderer.handle(DictationIndicatorEvent::Started);
+        renderer.handle(DictationIndicatorEvent::Submitted { job_id: 7 });
+        renderer.handle(DictationIndicatorEvent::Preparing);
+        renderer.opacity.reset(0.8);
+        renderer.visual_scale.reset(0.96);
+        renderer.handle(DictationIndicatorEvent::JobCompleted { job_id: 7 });
+        assert_eq!(renderer.phase, Phase::Preparing);
+        assert_eq!(renderer.preparing, 1.0);
+        assert!(!renderer.completion_pending);
+        renderer.handle(DictationIndicatorEvent::Started);
+        assert_eq!(renderer.phase, Phase::Recording);
+        assert_eq!(renderer.preparing, 0.0);
+        assert_eq!(renderer.opacity.value, 0.8);
+        assert_eq!(renderer.visual_scale.value, 0.96);
+        assert_eq!(renderer.width.value, CAPSULE_WIDTH);
+
+        renderer.handle(DictationIndicatorEvent::Preparing);
+        renderer.handle(DictationIndicatorEvent::Cancelled);
+        assert_eq!(
+            renderer.preparing, 1.0,
+            "cancel must not flash red while the gray capsule exits"
+        );
+        assert_eq!(renderer.capture_phase, None);
     }
 
     #[test]

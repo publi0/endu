@@ -10,20 +10,20 @@ use gpui::{
     AnyElement, App, Bounds, Context, Div, Entity, FocusHandle, FontWeight, IntoElement,
     KeyDownEvent, Modifiers as GpuiModifiers, ModifiersChangedEvent, MouseDownEvent, Render,
     SharedString, Subscription, Timer, TitlebarOptions, Window, WindowBounds, WindowHandle,
-    WindowOptions, actions, deferred, div, prelude::*, px, rgb, rgba, size,
+    WindowOptions, actions, div, prelude::*, px, rgb, rgba, size,
 };
 
 use crate::app_settings::{
     AppSettings, HotkeyBinding, HotkeyKey, HotkeyModifiers, ModifierSide, RecordingAudioBehavior,
 };
 use crate::desktop_ui::{
-    ACCENT, CANVAS, CONTROL_HEIGHT, FAINT, LINE, MUTED, NEGATIVE, NavigationIcon,
-    PANE_CONTENT_WIDTH, PANE_LIST_WIDTH, PANEL_RADIUS, SIDEBAR_WIDTH, SURFACE, SURFACE_HOVER,
+    ACCENT, CANVAS, FAINT, LINE, MUTED, NEGATIVE, NavigationIcon, PANE_CONTENT_WIDTH,
+    PANE_LIST_WIDTH, PANEL_RADIUS, PickerState, SIDEBAR_WIDTH, SURFACE, SURFACE_HOVER,
     SURFACE_SELECTED, TEXT, TEXT_SOFT, compact_button, compact_panel, disclosure_button,
     error_message, header_button, hotkey_keycaps, mix_color, navigation_item, pane_body,
-    pane_content, pane_header, pane_header_with_action, pane_list, section_label, settings_copy,
-    settings_panel, settings_row, settings_section_label, sidebar_frame, sliding_segmented_control,
-    sliding_segmented_item, toggle, window_frame,
+    pane_content, pane_header, pane_header_with_action, pane_list, picker_open_key, picker_popup,
+    section_label, settings_copy, settings_panel, settings_row, settings_section_label,
+    sidebar_frame, sliding_segmented_control, sliding_segmented_item, toggle, window_frame,
 };
 use crate::history::{History, HistoryEntry, HistoryRetention};
 use crate::login_item::{LoginItemRequest, LoginItemResponse, LoginItemStatus, LoginItemWorker};
@@ -62,23 +62,54 @@ actions!(
 /// controls under the menu. A mouse-down anywhere else dismisses it.
 fn selection_picker_menu<T: Clone + PartialEq + 'static>(
     picker_id: &'static str,
+    picker: &PickerState,
     choices: Vec<T>,
     selected: T,
     label: impl Fn(&T) -> String,
     error: Option<String>,
-    choose: impl Fn(&T, &mut Window, &mut App) + 'static,
-    dismiss: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    handlers: (
+        impl Fn(&T, &mut Window, &mut App) + 'static,
+        impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+        impl Fn(&KeyDownEvent, &mut Window, &mut App) + 'static,
+    ),
 ) -> gpui::Stateful<Div> {
+    let (choose, dismiss, keys) = handlers;
     let choose = Rc::new(choose);
+    let rows = choices.into_iter().enumerate().map(|(index, device)| {
+        let is_selected = selected == device;
+        let label = label(&device);
+        let choose = choose.clone();
+        div()
+            .id((picker_id, index))
+            .w_full()
+            .h(px(34.0))
+            .flex_none()
+            .px_3()
+            .flex()
+            .items_center()
+            .justify_between()
+            .rounded_sm()
+            .text_size(px(12.0))
+            .text_color(rgb(if is_selected { TEXT } else { TEXT_SOFT }))
+            .when(index == picker.highlight, |row| {
+                row.bg(rgb(SURFACE_SELECTED))
+            })
+            .hover(|row| row.bg(rgb(SURFACE_HOVER)))
+            .child(label)
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                choose(&device, window, cx);
+            })
+    });
     div()
         .id(picker_id)
-        .absolute()
-        .top(px(CONTROL_HEIGHT + 4.0))
-        .right_0()
+        .debug_selector(move || picker_id.into())
+        .track_focus(&picker.menu)
         .w(px(220.0))
-        .max_h(px(240.0))
+        .max_h(px(300.0))
         .p_2()
-        .overflow_y_scroll()
+        .flex()
+        .flex_col()
         .rounded_sm()
         .border_1()
         .border_color(rgb(LINE))
@@ -86,36 +117,24 @@ fn selection_picker_menu<T: Clone + PartialEq + 'static>(
         .shadow_lg()
         .occlude()
         .on_mouse_down_out(dismiss)
-        .children(choices.into_iter().enumerate().map(|(index, device)| {
-            let is_selected = selected == device;
-            let label = label(&device);
-            let choose = choose.clone();
+        .on_key_down(keys)
+        .child(
             div()
-                .id((picker_id, index))
-                .w_full()
-                .h(px(34.0))
-                .px_3()
+                .id("picker-choices")
+                .min_h_0()
+                .max_h(px(240.0))
+                .track_scroll(&picker.scroll)
+                .overflow_y_scroll()
                 .flex()
-                .items_center()
-                .justify_between()
-                .rounded_sm()
-                .text_size(px(12.0))
-                .text_color(if is_selected {
-                    rgb(TEXT)
-                } else {
-                    rgb(TEXT_SOFT)
-                })
-                .when(is_selected, |row| row.bg(rgb(SURFACE_SELECTED)))
-                .hover(|row| row.bg(rgb(SURFACE_HOVER)))
-                .child(label)
-                .on_click(move |_, window, cx| {
-                    cx.stop_propagation();
-                    choose(&device, window, cx);
-                })
-        }))
+                .flex_col()
+                .children(rows),
+        )
         .when_some(error, |picker, error| {
             picker.child(
                 div()
+                    .id("picker-feedback")
+                    .debug_selector(|| "picker-feedback".into())
+                    .flex_none()
                     .px_3()
                     .pt_2()
                     .text_size(px(11.0))
@@ -383,6 +402,35 @@ impl ToggleSpring {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettingControl {
+    Dictation,
+    PasteLast,
+    DoubleTap,
+    DoubleTapOnly,
+    Microphone,
+    Channel,
+    MicrophoneMode,
+    AudioBehavior,
+    Dock,
+    Sound,
+    Retention,
+    Trim,
+}
+
+struct SettingsFeedback {
+    control: SettingControl,
+    success: bool,
+    message: String,
+}
+
+fn hotkey_feedback_scope(kind: HotkeyKind) -> SettingControl {
+    match kind {
+        HotkeyKind::Dictation => SettingControl::Dictation,
+        HotkeyKind::PasteLast => SettingControl::PasteLast,
+    }
+}
+
 pub struct AppWindow {
     preview: bool,
     pane: Pane,
@@ -393,10 +441,13 @@ pub struct AppWindow {
     permission_refresh_at: Instant,
     settings: AppSettings,
     settings_error: Option<String>,
+    settings_feedback: Option<SettingsFeedback>,
     microphone_devices: Vec<String>,
     microphone_picker_open: bool,
+    microphone_picker_state: PickerState,
     microphone_picker_error: Option<String>,
     microphone_channel_picker_open: bool,
+    microphone_channel_picker_state: PickerState,
     microphone_description: Option<crate::microphone::InputDescription>,
     microphone_description_error: Option<String>,
     microphone_refresh_at: Instant,
@@ -429,6 +480,7 @@ pub struct AppWindow {
     history_error: Option<String>,
     history_clear_armed: bool,
     history_retention_open: bool,
+    history_retention_picker_state: PickerState,
     history_copied: Option<u64>,
 }
 
@@ -604,8 +656,10 @@ impl AppWindow {
             permission_refresh_at: Instant::now() + PERMISSION_REFRESH_INTERVAL,
             microphone_devices,
             microphone_picker_open: false,
+            microphone_picker_state: PickerState::new(cx),
             microphone_picker_error: None,
             microphone_channel_picker_open: false,
+            microphone_channel_picker_state: PickerState::new(cx),
             microphone_description,
             microphone_description_error,
             microphone_refresh_at: Instant::now() + Duration::from_secs(5),
@@ -650,6 +704,7 @@ impl AppWindow {
             _subscriptions: subscriptions,
             settings,
             settings_error,
+            settings_feedback: None,
             history,
             history_search,
             history_entries: Vec::new(),
@@ -659,8 +714,13 @@ impl AppWindow {
             history_retention_open: preview
                 .as_ref()
                 .is_some_and(|preview| preview.open_history_retention),
+            history_retention_picker_state: PickerState::new(cx),
             history_copied: None,
         };
+        window.history_retention_picker_state.highlight = HistoryRetention::ALL
+            .iter()
+            .position(|value| *value == window.settings.history_retention)
+            .unwrap_or(0);
         window.reload_history(cx);
         if window.preview {
             window.selected_history = window.history_entries.first().map(|entry| entry.id);
@@ -685,6 +745,9 @@ impl AppWindow {
     }
 
     fn select_pane(&mut self, pane: Pane, cx: &mut Context<Self>) {
+        self.cancel_hotkey_capture(cx);
+        self.openrouter_settings
+            .update(cx, |view, cx| view.close_pickers(cx));
         self.pane = pane;
         self.history_retention_open = false;
         self.microphone_picker_open = false;
@@ -698,6 +761,10 @@ impl AppWindow {
             Pane::Settings | Pane::Models => self.permission_refresh_at = Instant::now(),
         }
         cx.notify();
+    }
+
+    pub(crate) fn focus_pane(&self, window: &mut Window) {
+        self.window_focus.focus(window);
     }
 
     pub(crate) fn show_settings(&mut self, cx: &mut Context<Self>) {
@@ -845,6 +912,7 @@ impl AppWindow {
     /// untouched. Returns whether the change was saved.
     fn update_settings(
         &mut self,
+        control: SettingControl,
         cx: &mut Context<Self>,
         update: impl FnOnce(&mut AppSettings),
     ) -> bool {
@@ -858,16 +926,74 @@ impl AppWindow {
                     if preview { Ok(()) } else { candidate.save() }
                 },
             );
-        self.settings_error = result
-            .as_ref()
-            .err()
-            .map(|error| format!("Could not save settings: {error:#}"));
+        self.settings_feedback = Some(SettingsFeedback {
+            control,
+            success: result.is_ok(),
+            message: result
+                .as_ref()
+                .err()
+                .map(|error| format!("Could not save settings: {error:#}"))
+                .unwrap_or_else(|| "Saved.".into()),
+        });
+        if result.is_ok() {
+            self.settings_error = None;
+        }
         cx.notify();
         result.is_ok()
     }
 
+    fn feedback_error(&self, control: SettingControl) -> Option<String> {
+        self.settings_feedback
+            .as_ref()
+            .filter(|feedback| feedback.control == control && !feedback.success)
+            .map(|feedback| feedback.message.clone())
+    }
+
+    fn setting_feedback(&self, control: SettingControl) -> Option<AnyElement> {
+        let feedback = self
+            .settings_feedback
+            .as_ref()
+            .filter(|feedback| feedback.control == control)?;
+        Some(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(if feedback.success {
+                    TEXT_SOFT
+                } else {
+                    NEGATIVE
+                }))
+                .child(feedback.message.clone())
+                .into_any_element(),
+        )
+    }
+
+    fn setting_row(
+        &self,
+        control: SettingControl,
+        title: &'static str,
+        description: impl Into<SharedString>,
+        content: impl IntoElement,
+    ) -> gpui::Div {
+        let popup = match control {
+            SettingControl::Microphone => self.microphone_picker_open,
+            SettingControl::Channel => self.microphone_channel_picker_open,
+            SettingControl::Retention => self.history_retention_open,
+            _ => false,
+        };
+        div()
+            .border_b_1()
+            .border_color(rgb(LINE))
+            .child(settings_row(title, description, content).border_b_0())
+            .when(!popup, |row| {
+                row.children(
+                    self.setting_feedback(control)
+                        .map(|message| div().px_4().pb_3().child(message)),
+                )
+            })
+    }
+
     fn set_double_tap_lock(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        if self.update_settings(cx, |settings| {
+        if self.update_settings(SettingControl::DoubleTap, cx, |settings| {
             settings.double_tap_lock = enabled;
             if !enabled {
                 settings.double_tap_only = false;
@@ -878,7 +1004,7 @@ impl AppWindow {
     }
 
     fn set_double_tap_only(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.update_settings(cx, |settings| {
+        self.update_settings(SettingControl::DoubleTapOnly, cx, |settings| {
             settings.double_tap_only =
                 enabled && settings.double_tap_lock && settings.dictation_hotkey.key.is_some();
         });
@@ -912,12 +1038,18 @@ impl AppWindow {
         self.history_entries != previous
     }
 
-    fn set_history_retention(&mut self, retention: HistoryRetention, cx: &mut Context<Self>) {
+    fn set_history_retention(
+        &mut self,
+        retention: HistoryRetention,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.settings.history_retention == retention {
-            return;
+            return true;
         }
-        if !self.update_settings(cx, |settings| settings.history_retention = retention) {
-            return;
+        if !self.update_settings(SettingControl::Retention, cx, |settings| {
+            settings.history_retention = retention
+        }) {
+            return false;
         }
         if let Some(history) = &self.history
             && let Err(error) = history.set_retention(retention)
@@ -925,6 +1057,62 @@ impl AppWindow {
             self.history_error = Some(error.to_string());
         }
         self.reload_history(cx);
+        cx.notify();
+        true
+    }
+
+    fn toggle_retention_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.history_retention_open = !self.history_retention_open;
+        if self.history_retention_open {
+            let selected = HistoryRetention::ALL
+                .iter()
+                .position(|value| *value == self.settings.history_retention)
+                .unwrap_or(0);
+            self.history_retention_picker_state
+                .open(selected, HistoryRetention::ALL.len(), window);
+        } else {
+            self.history_retention_picker_state.trigger.focus(window);
+        }
+        cx.notify();
+    }
+
+    fn choose_retention(
+        &mut self,
+        choice: HistoryRetention,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.set_history_retention(choice, cx) {
+            self.history_retention_open = false;
+            self.history_retention_picker_state.trigger.focus(window);
+        }
+        cx.notify();
+    }
+
+    fn retention_picker_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        if self
+            .history_retention_picker_state
+            .navigate(key, HistoryRetention::ALL.len())
+        {
+        } else if matches!(key, "enter" | "space") {
+            if let Some(choice) =
+                HistoryRetention::ALL.get(self.history_retention_picker_state.highlight)
+            {
+                self.choose_retention(*choice, window, cx);
+            }
+        } else if matches!(key, "escape" | "tab") {
+            self.history_retention_open = false;
+            self.history_retention_picker_state.close(event, window);
+        } else {
+            return;
+        }
+        cx.stop_propagation();
         cx.notify();
     }
 
@@ -975,48 +1163,50 @@ impl AppWindow {
         let search = div().w(px(220.0)).child(self.history_search.clone());
         let retention_control = header_button(format!("Keep: {}", retention.label()))
             .id("history-retention")
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.history_retention_open = true;
-                cx.notify();
+            .track_focus(&self.history_retention_picker_state.trigger)
+            .focus(|style| style.border_color(rgb(ACCENT)))
+            .on_click(cx.listener(|this, event, window, cx| {
+                if matches!(event, gpui::ClickEvent::Mouse(_)) {
+                    this.toggle_retention_picker(window, cx);
+                }
+            }))
+            .on_key_down(cx.listener(|this, event, window, cx| {
+                if picker_open_key(event) {
+                    this.toggle_retention_picker(window, cx);
+                    cx.stop_propagation();
+                }
             }));
         let retention_control = div().relative().child(retention_control).when(
             self.history_retention_open,
             |control| {
-                control.child(deferred(
-                    div()
-                        .id("history-retention-menu")
-                        .absolute()
-                        .top(px(36.0))
-                        .right_0()
-                        .w(px(160.0))
-                        .p_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(rgb(LINE))
-                        .bg(rgb(SURFACE))
-                        .occlude()
-                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                control.child(picker_popup(selection_picker_menu(
+                    "history-retention-menu",
+                    &self.history_retention_picker_state,
+                    HistoryRetention::ALL.to_vec(),
+                    retention,
+                    |choice| choice.label().to_owned(),
+                    self.feedback_error(SettingControl::Retention),
+                    (
+                        cx.listener(|this, choice: &HistoryRetention, window, cx| {
+                            this.choose_retention(*choice, window, cx);
+                        }),
+                        cx.listener(|this, _, _, cx| {
                             this.history_retention_open = false;
                             cx.notify();
-                        }))
-                        .children(HistoryRetention::ALL.into_iter().enumerate().map(
-                            |(index, choice)| {
-                                compact_button(choice.label())
-                                    .id(("history-retention-choice", index))
-                                    .w_full()
-                                    .when(choice == retention, |item| {
-                                        item.bg(rgb(SURFACE_SELECTED))
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.history_retention_open = false;
-                                        this.set_history_retention(choice, cx);
-                                    }))
-                            },
-                        )),
-                ))
+                        }),
+                        cx.listener(Self::retention_picker_key),
+                    ),
+                )))
             },
         );
+        let retention_control = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(retention_control)
+            .when(!self.history_retention_open, |control| {
+                control.children(self.setting_feedback(SettingControl::Retention))
+            });
         let clear = header_button(if self.history_clear_armed {
             "Really clear all?"
         } else {
@@ -1296,7 +1486,10 @@ impl AppWindow {
             navigation_item(pane.icon(), self.pane == pane)
                 .id(("app-nav", index))
                 .child(pane.label())
-                .on_click(cx.listener(move |this, _, _, cx| this.select_pane(pane, cx)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.select_pane(pane, cx);
+                    this.focus_pane(window);
+                }))
         });
         sidebar_frame()
             .w(px(SIDEBAR_WIDTH))
@@ -1568,9 +1761,13 @@ impl AppWindow {
                                     else {
                                         return;
                                     };
-                                    if this.update_settings(cx, |settings| {
-                                        set_hotkey_binding(settings, kind, candidate);
-                                    }) {
+                                    if this.update_settings(
+                                        hotkey_feedback_scope(kind),
+                                        cx,
+                                        |settings| {
+                                            set_hotkey_binding(settings, kind, candidate);
+                                        },
+                                    ) {
                                         this.hotkey_side_selection_springs[hotkey_kind_index(kind)]
                                             .set_target(index as f32);
                                     }
@@ -1724,7 +1921,9 @@ impl AppWindow {
             return;
         }
         let keycap_count = binding.keycaps().len();
-        if !self.update_settings(cx, |settings| set_hotkey_binding(settings, kind, binding)) {
+        if !self.update_settings(hotkey_feedback_scope(kind), cx, |settings| {
+            set_hotkey_binding(settings, kind, binding)
+        }) {
             self.set_hotkey_capture_message("Could not save shortcut. Try again.", cx);
             return;
         }
@@ -1742,33 +1941,81 @@ impl AppWindow {
 
     // ---- Settings --------------------------------------------------------------
 
-    fn render_microphone_picker(&self, cx: &mut Context<Self>) -> AnyElement {
-        let choices = std::iter::once(None)
+    fn microphone_choices(&self) -> Vec<Option<String>> {
+        std::iter::once(None)
             .chain(self.microphone_devices.iter().cloned().map(Some))
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    fn choose_microphone(&mut self, device: Option<String>, cx: &mut Context<Self>) -> bool {
+        if !self.update_settings(SettingControl::Microphone, cx, |settings| {
+            settings.microphone = device
+        }) {
+            self.microphone_picker_error = self
+                .feedback_error(SettingControl::Microphone)
+                .or_else(|| self.settings_error.take());
+            return false;
+        }
+        self.microphone_picker_open = false;
+        self.microphone_picker_error = None;
+        self.refresh_microphone_description();
+        true
+    }
+
+    fn render_microphone_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let choices = self.microphone_choices();
         selection_picker_menu(
             "microphone-picker",
+            &self.microphone_picker_state,
             choices,
             self.settings.microphone.clone(),
             |device| device.clone().unwrap_or_else(|| "Automatic".into()),
-            self.microphone_picker_error.clone(),
-            cx.listener(|this, device: &Option<String>, _, cx| {
-                if this.update_settings(cx, |settings| settings.microphone = device.clone()) {
+            self.microphone_picker_error
+                .clone()
+                .or_else(|| self.feedback_error(SettingControl::Microphone)),
+            (
+                cx.listener(|this, device: &Option<String>, window, cx| {
+                    if this.choose_microphone(device.clone(), cx) {
+                        this.microphone_picker_state.trigger.focus(window);
+                    }
+                }),
+                cx.listener(|this, _, _, cx| {
                     this.microphone_picker_open = false;
                     this.microphone_picker_error = None;
-                    this.refresh_microphone_description();
-                }
-            }),
-            cx.listener(|this, _, _, cx| {
-                this.microphone_picker_open = false;
-                this.microphone_picker_error = None;
-                cx.notify();
-            }),
+                    cx.notify();
+                }),
+                cx.listener(Self::microphone_picker_key),
+            ),
         )
         .into_any_element()
     }
 
-    fn toggle_microphone_picker(&mut self, cx: &mut Context<Self>) {
+    fn microphone_picker_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let choices = self.microphone_choices();
+        let key = event.keystroke.key.as_str();
+        if self.microphone_picker_state.navigate(key, choices.len()) {
+        } else if matches!(key, "enter" | "space") {
+            if let Some(device) = choices.get(self.microphone_picker_state.highlight)
+                && self.choose_microphone(device.clone(), cx)
+            {
+                self.microphone_picker_state.trigger.focus(window);
+            }
+        } else if matches!(key, "escape" | "tab") {
+            self.microphone_picker_open = false;
+            self.microphone_picker_state.close(event, window);
+        } else {
+            return;
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn toggle_microphone_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.microphone_channel_picker_open = false;
         self.microphone_picker_open = !self.microphone_picker_open;
         if self.microphone_picker_open && !self.preview {
@@ -1779,6 +2026,17 @@ impl AppWindow {
                 }
                 Err(error) => self.microphone_picker_error = Some(error.to_string()),
             }
+        }
+        if self.microphone_picker_open {
+            let choices = self.microphone_choices();
+            let index = choices
+                .iter()
+                .position(|device| *device == self.settings.microphone)
+                .unwrap_or(0);
+            self.microphone_picker_state
+                .open(index, choices.len(), window);
+        } else {
+            self.microphone_picker_state.trigger.focus(window);
         }
         cx.notify();
     }
@@ -1835,24 +2093,27 @@ impl AppWindow {
         device: &crate::microphone::InputDescription,
         channel: Option<u16>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         self.refresh_microphone_description();
-        self.microphone_channel_picker_open = false;
         let Some(current) = &self.microphone_description else {
             cx.notify();
-            return;
+            return false;
         };
         if current.device_id != device.device_id
             || channel.is_some_and(|channel| {
                 crate::microphone::resolve_channel(Some(channel), current.channels).is_none()
             })
         {
-            self.settings_error = Some("Microphone changed. Open the channel picker again.".into());
+            self.settings_feedback = Some(SettingsFeedback {
+                control: SettingControl::Channel,
+                success: false,
+                message: "Microphone changed. The channel choice was not applied.".into(),
+            });
             cx.notify();
-            return;
+            return false;
         }
         let Some(device_id) = &current.device_id else {
-            return;
+            return false;
         };
         let selection = channel.map(|channel| crate::microphone::ChannelSelection {
             device_id: device_id.clone(),
@@ -1860,7 +2121,7 @@ impl AppWindow {
             channel,
         });
         let device_id = device_id.clone();
-        if self.update_settings(cx, |settings| {
+        let saved = self.update_settings(SettingControl::Channel, cx, |settings| {
             if selection.is_some()
                 || settings
                     .microphone_channel
@@ -1869,25 +2130,80 @@ impl AppWindow {
             {
                 settings.microphone_channel = selection;
             }
-        }) {
+        });
+        if saved {
+            self.microphone_channel_picker_open = false;
             self.refresh_microphone_description();
         }
+        cx.notify();
+        saved
+    }
+
+    fn toggle_microphone_channel_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.microphone_picker_open = false;
+        self.refresh_microphone_description();
+        self.microphone_channel_picker_open = !self.microphone_channel_picker_open;
+        if self.microphone_channel_picker_open {
+            if let Some(source) = &self.microphone_description {
+                self.microphone_channel_picker_state.open(
+                    usize::from(source.channel.unwrap_or(0)),
+                    usize::from(source.channels) + 1,
+                    window,
+                );
+            }
+        } else {
+            self.microphone_channel_picker_state.trigger.focus(window);
+        }
+        cx.notify();
+    }
+
+    fn microphone_channel_picker_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(source) = self.microphone_description.clone() else {
+            return;
+        };
+        let key = event.keystroke.key.as_str();
+        if self
+            .microphone_channel_picker_state
+            .navigate(key, usize::from(source.channels) + 1)
+        {
+        } else if matches!(key, "enter" | "space") {
+            let index = self.microphone_channel_picker_state.highlight;
+            let selected = (index > 0).then_some(index as u16);
+            if self.select_microphone_channel(&source, selected, cx)
+                || !self.microphone_channel_picker_open
+            {
+                self.microphone_channel_picker_state.trigger.focus(window);
+            }
+        } else if matches!(key, "escape" | "tab") {
+            self.microphone_channel_picker_open = false;
+            self.microphone_channel_picker_state.close(event, window);
+        } else {
+            return;
+        }
+        cx.stop_propagation();
         cx.notify();
     }
 
     fn render_microphone_channel(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(description) = self.microphone_description.clone() else {
-            return settings_row(
-                "Input channel",
-                self.microphone_description_error
-                    .clone()
-                    .unwrap_or_else(|| "Input metadata is unavailable".into()),
-                div()
-                    .text_size(px(11.0))
-                    .text_color(rgb(MUTED))
-                    .child("Unavailable"),
-            )
-            .into_any_element();
+            return self
+                .setting_row(
+                    SettingControl::Channel,
+                    "Input channel",
+                    self.microphone_description_error
+                        .clone()
+                        .unwrap_or_else(|| "Input metadata is unavailable".into()),
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(MUTED))
+                        .child("Unavailable"),
+                )
+                .into_any_element();
         };
         let note = if description.channel_unavailable() {
             format!(
@@ -1911,6 +2227,7 @@ impl AppWindow {
             let source = description.clone();
             selection_picker_menu(
                 "microphone-channel-picker",
+                &self.microphone_channel_picker_state,
                 std::iter::once(None)
                     .chain((1..=source.channels).map(Some))
                     .collect(),
@@ -1921,30 +2238,40 @@ impl AppWindow {
                         |channel| format!("Channel {channel}"),
                     )
                 },
-                None,
-                cx.listener(move |this, channel: &Option<u16>, _, cx| {
-                    this.select_microphone_channel(&source, *channel, cx)
-                }),
-                cx.listener(|this, _, _, cx| {
-                    this.microphone_channel_picker_open = false;
-                    cx.notify();
-                }),
+                self.feedback_error(SettingControl::Channel),
+                (
+                    cx.listener(move |this, channel: &Option<u16>, window, cx| {
+                        if this.select_microphone_channel(&source, *channel, cx)
+                            || !this.microphone_channel_picker_open
+                        {
+                            this.microphone_channel_picker_state.trigger.focus(window);
+                        }
+                    }),
+                    cx.listener(|this, _, _, cx| {
+                        this.microphone_channel_picker_open = false;
+                        cx.notify();
+                    }),
+                    cx.listener(Self::microphone_channel_picker_key),
+                ),
             )
         });
         let selectable = description.device_id.is_some()
             && (description.channels > 1 || description.requested_channel.is_some());
         if !selectable {
-            return settings_row(
-                "Input channel",
-                note,
-                div()
-                    .text_size(px(11.0))
-                    .text_color(rgb(MUTED))
-                    .child(description.channel_label()),
-            )
-            .into_any_element();
+            return self
+                .setting_row(
+                    SettingControl::Channel,
+                    "Input channel",
+                    note,
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(MUTED))
+                        .child(description.channel_label()),
+                )
+                .into_any_element();
         }
-        settings_row(
+        self.setting_row(
+            SettingControl::Channel,
             "Input channel",
             note,
             div()
@@ -1953,17 +2280,24 @@ impl AppWindow {
                 .child(
                     disclosure_button(description.channel_label())
                         .id("microphone-channel")
+                        .track_focus(&self.microphone_channel_picker_state.trigger)
+                        .focus(|style| style.border_color(rgb(ACCENT)))
                         .when(selectable, |button| {
-                            button.on_click(cx.listener(|this, _, _, cx| {
-                                this.microphone_picker_open = false;
-                                this.refresh_microphone_description();
-                                this.microphone_channel_picker_open =
-                                    !this.microphone_channel_picker_open;
-                                cx.notify();
-                            }))
+                            button
+                                .on_click(cx.listener(|this, event, window, cx| {
+                                    if matches!(event, gpui::ClickEvent::Mouse(_)) {
+                                        this.toggle_microphone_channel_picker(window, cx);
+                                    }
+                                }))
+                                .on_key_down(cx.listener(|this, event, window, cx| {
+                                    if picker_open_key(event) {
+                                        this.toggle_microphone_channel_picker(window, cx);
+                                        cx.stop_propagation();
+                                    }
+                                }))
                         }),
                 )
-                .children(menu.map(deferred)),
+                .children(menu.map(picker_popup)),
         )
         .into_any_element()
     }
@@ -2089,8 +2423,9 @@ impl AppWindow {
                                 .flex_none()
                                 .bg(rgb(ACCENT))
                                 .text_color(rgb(TEXT))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.select_pane(Pane::Models, cx)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.select_pane(Pane::Models, cx);
+                                    this.focus_pane(window);
                                 })),
                         ),
                 )
@@ -2121,7 +2456,11 @@ impl AppWindow {
         let result = self
             .openrouter_settings
             .update(cx, |settings, cx| settings.toggle_trim(cx));
-        self.settings_error = result.err();
+        self.settings_feedback = Some(SettingsFeedback {
+            control: SettingControl::Trim,
+            success: result.is_ok(),
+            message: result.err().unwrap_or_else(|| "Saved.".into()),
+        });
         cx.notify();
     }
 
@@ -2189,7 +2528,7 @@ impl AppWindow {
                     .text_size(px(9.0))
                     .child(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.update_settings(cx, |settings| {
+                        if !this.update_settings(SettingControl::Sound, cx, |settings| {
                             settings.sound_effects = volume > 0.0;
                             if volume > 0.0 {
                                 settings.sound_effect_volume = volume;
@@ -2243,9 +2582,11 @@ impl AppWindow {
                         .child(behavior.label())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if this.settings.recording_audio_behavior != behavior
-                                && this.update_settings(cx, |settings| {
-                                    settings.recording_audio_behavior = behavior
-                                })
+                                && this.update_settings(
+                                    SettingControl::AudioBehavior,
+                                    cx,
+                                    |settings| settings.recording_audio_behavior = behavior,
+                                )
                             {
                                 this.recording_audio_spring.set_target(index as f32);
                             }
@@ -2266,9 +2607,11 @@ impl AppWindow {
                         .child(label)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if this.settings.release_microphone_while_idle != release
-                                && this.update_settings(cx, |settings| {
-                                    settings.release_microphone_while_idle = release
-                                })
+                                && this.update_settings(
+                                    SettingControl::MicrophoneMode,
+                                    cx,
+                                    |settings| settings.release_microphone_while_idle = release,
+                                )
                             {
                                 this.release_microphone_toggle.set_enabled(release);
                             }
@@ -2283,13 +2626,13 @@ impl AppWindow {
                 .child(settings_section_label("DICTATION"))
                 .child(
                     settings_panel()
-                        .child(settings_row(
+                        .child(self.setting_row(SettingControl::Dictation,
                             "Dictation shortcut",
                             "Hold to dictate, release to transcribe and paste",
                             hotkey_control,
                         ))
                         .child(
-                            settings_row(
+                            self.setting_row(SettingControl::DoubleTap,
                                 "Double-tap to lock",
                                 "Double-tap the shortcut for hands-free dictation; press it again to finish",
                                 toggle(double_tap_position),
@@ -2307,7 +2650,7 @@ impl AppWindow {
                                 .overflow_hidden()
                                 .opacity(double_tap_only_visibility)
                                 .child(
-                                    settings_row(
+                                    self.setting_row(SettingControl::DoubleTapOnly,
                                         "Double-tap only",
                                         "Wait for two complete shortcut taps before recording",
                                         toggle(if self.settings.double_tap_only { 1.0 } else { 0.0 }),
@@ -2324,7 +2667,7 @@ impl AppWindow {
                 .child(settings_section_label("PASTE LAST"))
                 .child(
                     settings_panel().child(
-                        settings_row(
+                        self.setting_row(SettingControl::PasteLast,
                             "Paste last dictation",
                             "Pastes the most recent transcript again; also in the menu bar",
                             div()
@@ -2337,7 +2680,7 @@ impl AppWindow {
                                         compact_button("Disable")
                                             .id("disable-paste-last-hotkey")
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                this.update_settings(cx, |settings| {
+                                                this.update_settings(SettingControl::PasteLast, cx, |settings| {
                                                     settings.paste_last_hotkey = None
                                                 });
                                             })),
@@ -2350,7 +2693,7 @@ impl AppWindow {
                 .child(settings_section_label("MICROPHONE"))
                 .child(
                     settings_panel()
-                        .child(settings_row(
+                        .child(self.setting_row(SettingControl::Microphone,
                             "Input device",
                             "Automatic picks the preferred available microphone",
                             div()
@@ -2359,15 +2702,25 @@ impl AppWindow {
                                 .child(
                                     disclosure_button(microphone_label)
                                         .id("microphone-setting")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.toggle_microphone_picker(cx)
+                                        .track_focus(&self.microphone_picker_state.trigger)
+                                        .focus(|style| style.border_color(rgb(ACCENT)))
+                                        .on_click(cx.listener(|this, event, window, cx| {
+                if matches!(event, gpui::ClickEvent::Mouse(_)) {
+                    this.toggle_microphone_picker(window, cx);
+                }
+            }))
+                                        .on_key_down(cx.listener(|this, event, window, cx| {
+                                            if picker_open_key(event) {
+                                                this.toggle_microphone_picker(window, cx);
+                                                cx.stop_propagation();
+                                            }
                                         })),
                                 )
-                                .children(microphone_picker.map(deferred)),
+                                .children(microphone_picker.map(picker_popup)),
                         ))
                         .child(microphone_channel)
                         .child(microphone_diagnostic)
-                        .child(settings_row(
+                        .child(self.setting_row(SettingControl::MicrophoneMode,
                             "Microphone mode",
                             if self.settings.release_microphone_while_idle {
                                 "Opens on the shortcut: the orange indicator only shows while dictating, but the first syllable can be lost"
@@ -2376,13 +2729,13 @@ impl AppWindow {
                             },
                             microphone_mode,
                         ))
-                        .child(settings_row(
+                        .child(self.setting_row(SettingControl::Trim,
                             "Trim silence",
                             "Cuts silence and long pauses before sending, so less audio is billed. Recordings with no speech are not sent",
                             trim_control,
                         ))
                         .child(
-                            settings_row(
+                            self.setting_row(SettingControl::AudioBehavior,
                                 "While dictating",
                                 if self.settings.recording_audio_behavior == RecordingAudioBehavior::Mute {
                                     "Fades system audio out and back in quickly; preserves detected manual volume changes"
@@ -2426,14 +2779,14 @@ impl AppWindow {
                             )
                         })
                         .child(
-                            settings_row(
+                            self.setting_row(SettingControl::Dock,
                                 "Show Dock icon",
                                 "When off, Hex lives in the menu bar while this window is closed",
                                 toggle(dock_icon_position),
                             )
                             .id("dock-icon-setting")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                if this.update_settings(cx, |settings| {
+                                if this.update_settings(SettingControl::Dock, cx, |settings| {
                                     settings.show_dock_icon = !settings.show_dock_icon
                                 }) {
                                     this.dock_icon_toggle
@@ -2442,7 +2795,7 @@ impl AppWindow {
                             })),
                         )
                         .child(
-                            settings_row(
+                            self.setting_row(SettingControl::Sound,
                                 "Sound volume",
                                 "Recording, cancellation, and error tones",
                                 sound_volume,
@@ -2607,16 +2960,31 @@ impl Drop for AppWindow {
 impl Render for AppWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let notice = self.render_key_notice(cx);
-        let content = match self.pane {
-            Pane::Settings => self.render_settings(window, cx),
-            Pane::Models => self.render_models(),
-            Pane::History => self.render_history(cx),
-            Pane::Statistics => self.statistics.clone().into_any_element(),
+        let content = if self.setup_visible {
+            div().into_any_element()
+        } else {
+            match self.pane {
+                Pane::Settings => self.render_settings(window, cx),
+                Pane::Models => self.render_models(),
+                Pane::History => self.render_history(cx),
+                Pane::Statistics => self.statistics.clone().into_any_element(),
+            }
         };
         let setup = self.setup_visible.then(|| self.render_setup(cx));
         window_frame()
             .track_focus(&self.window_focus)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "tab"
+                    && matches!(this.hotkey_capture, HotkeyCaptureState::Idle)
+                {
+                    if event.keystroke.modifiers.shift {
+                        window.focus_prev();
+                    } else {
+                        window.focus_next();
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
                 if event.keystroke.key != "escape" {
                     return;
                 }
@@ -2636,18 +3004,22 @@ impl Render for AppWindow {
             .on_action(|_: &ToggleFullscreen, window, _| window.toggle_fullscreen())
             .on_action(cx.listener(|this, _: &ShowSettings, window, cx| {
                 this.select_pane(Pane::Settings, cx);
+                this.focus_pane(window);
                 window.activate_window();
             }))
             .on_action(cx.listener(|this, _: &ShowModels, window, cx| {
                 this.select_pane(Pane::Models, cx);
+                this.focus_pane(window);
                 window.activate_window();
             }))
             .on_action(cx.listener(|this, _: &ShowHistory, window, cx| {
                 this.select_pane(Pane::History, cx);
+                this.focus_pane(window);
                 window.activate_window();
             }))
             .on_action(cx.listener(|this, _: &ShowStatistics, window, cx| {
                 this.select_pane(Pane::Statistics, cx);
+                this.focus_pane(window);
                 window.activate_window();
             }))
             .child(self.render_navigation(cx))
@@ -3105,6 +3477,137 @@ mod tests {
     }
 
     #[gpui::test]
+    fn microphone_and_channel_choices_are_keyboard_accessible(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(preview_fixture);
+        cx.simulate_keystrokes("tab enter down enter");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+        });
+        cx.update(|window, cx| {
+            let view = view.read(cx);
+            assert!(!view.microphone_picker_open);
+            assert_eq!(
+                view.settings.microphone,
+                view.microphone_devices.first().cloned()
+            );
+            assert!(view.microphone_picker_state.trigger.is_focused(window));
+            assert!(view.setting_feedback(SettingControl::Microphone).is_some());
+        });
+        cx.simulate_keystrokes("tab enter end enter");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+        });
+        cx.update(|window, cx| {
+            let view = view.read(cx);
+            assert_eq!(
+                view.settings.microphone_channel.as_ref().unwrap().channel,
+                2
+            );
+            assert!(
+                view.microphone_channel_picker_state
+                    .trigger
+                    .is_focused(window)
+            );
+        });
+        cx.simulate_keystrokes("enter escape");
+        cx.update(|window, cx| {
+            let view = view.read(cx);
+            assert!(!view.microphone_channel_picker_open);
+            assert!(
+                view.microphone_channel_picker_state
+                    .trigger
+                    .is_focused(window)
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn retention_keyboard_selection_restores_focus(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(preview_fixture);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.select_pane(Pane::History, cx);
+                view.history_retention_picker_state.trigger.focus(window);
+            })
+        });
+        cx.simulate_keystrokes("enter home enter");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+        });
+        cx.update(|window, cx| {
+            let view = view.read(cx);
+            assert_eq!(view.settings.history_retention, HistoryRetention::ALL[0]);
+            assert!(!view.history_retention_open);
+            assert!(
+                view.history_retention_picker_state
+                    .trigger
+                    .is_focused(window)
+            );
+        });
+        cx.simulate_keystrokes("enter escape");
+        cx.update(|window, cx| {
+            let view = view.read(cx);
+            assert!(!view.history_retention_open);
+            assert!(
+                view.history_retention_picker_state
+                    .trigger
+                    .is_focused(window)
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn setup_keyboard_focus_cannot_reach_hidden_settings(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = preview_fixture(window, cx);
+            view.setup_visible = true;
+            view
+        });
+        for _ in 0..12 {
+            cx.simulate_keystrokes("tab");
+            cx.update(|window, cx| {
+                let view = view.read(cx);
+                assert!(!view.microphone_picker_state.trigger.is_focused(window));
+                assert!(
+                    !view
+                        .microphone_channel_picker_state
+                        .trigger
+                        .is_focused(window)
+                );
+                assert!(
+                    !view
+                        .history_retention_picker_state
+                        .trigger
+                        .is_focused(window)
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn microphone_errors_stay_visible_outside_the_scrolling_choices(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(preview_fixture);
+        cx.simulate_resize(gpui::size(px(1040.0), px(720.0)));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.microphone_devices =
+                    (0..30).map(|index| format!("Microphone {index}")).collect();
+                view.toggle_microphone_picker(window, cx);
+                view.microphone_picker_error = Some("Could not save the microphone choice.".into());
+            })
+        });
+        cx.run_until_parked();
+        let before = cx.debug_bounds("picker-feedback").unwrap();
+        cx.simulate_keystrokes("end");
+        let after = cx.debug_bounds("picker-feedback").unwrap();
+        let menu = cx.debug_bounds("microphone-picker").unwrap();
+        assert_eq!(before, after, "feedback must not scroll with choices");
+        assert!(after.top() >= menu.top() && after.bottom() <= menu.bottom());
+        assert!(menu.left() >= px(0.0) && menu.right() <= px(1040.0));
+        assert!(menu.top() >= px(0.0) && menu.bottom() <= px(720.0));
+    }
+
+    #[gpui::test]
     fn login_item_response_reconciles_optimistic_toggle_and_unknown_state(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -3221,7 +3724,7 @@ mod tests {
                 stale.device_id = Some("different-device".into());
                 view.select_microphone_channel(&stale, Some(1), cx);
                 assert_eq!(view.settings.microphone_channel, saved);
-                assert!(view.settings_error.is_some());
+                assert!(view.feedback_error(SettingControl::Channel).is_some());
                 view.select_microphone_channel(&device, None, cx);
                 assert_eq!(view.settings.microphone_channel, None);
                 assert_eq!(view.microphone_description.as_ref().unwrap().channel, None);

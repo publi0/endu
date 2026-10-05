@@ -7,12 +7,56 @@ use std::thread;
 use std::time::Duration;
 
 use color_eyre::eyre::{Result, eyre};
-use objc2::rc::autoreleasepool;
-use objc2_app_kit::NSWorkspace;
+use objc2::rc::{Retained, autoreleasepool};
+use objc2_app_kit::{NSRunningApplication, NSWorkspace};
+
+/// A retained application instance, not just a display name or reusable PID.
+/// NSRunningApplication's equality is the SDK's supported identity comparison.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ForegroundApplication {
+    Native(Retained<NSRunningApplication>),
+    #[cfg(test)]
+    Test(u64),
+}
+
+impl ForegroundApplication {
+    fn capture() -> Result<Self> {
+        autoreleasepool(|_| {
+            NSWorkspace::sharedWorkspace()
+                .frontmostApplication()
+                .map(Self::Native)
+                .ok_or_else(|| eyre!("macOS did not report a foreground application"))
+        })
+    }
+
+    pub fn current_process_id(&self) -> Option<i32> {
+        autoreleasepool(|_| {
+            if Self::capture().ok().as_ref() != Some(self) {
+                return None;
+            }
+            match self {
+                Self::Native(application) if !application.isTerminated() => {
+                    let pid = application.processIdentifier();
+                    (pid > 0).then_some(pid)
+                }
+                _ => None,
+            }
+        })
+    }
+
+    fn name(&self) -> Option<String> {
+        match self {
+            Self::Native(application) => application.localizedName().map(|name| name.to_string()),
+            #[cfg(test)]
+            Self::Test(_) => Some("Test application".into()),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ContextSnapshot {
     pub application: Option<String>,
+    pub target: Option<ForegroundApplication>,
 }
 
 pub struct ContextMonitor {
@@ -84,17 +128,12 @@ impl Drop for ContextMonitor {
 
 impl ContextSnapshot {
     pub fn capture() -> Result<Self> {
-        let application = autoreleasepool(|_| {
-            let application = NSWorkspace::sharedWorkspace()
-                .frontmostApplication()
-                .ok_or_else(|| eyre!("macOS did not report a foreground application"))?;
-            application
-                .localizedName()
-                .map(|name| name.to_string())
-                .ok_or_else(|| eyre!("the foreground application has no display name"))
-        })?;
-        Ok(Self {
-            application: Some(application),
+        autoreleasepool(|_| {
+            let target = ForegroundApplication::capture()?;
+            Ok(Self {
+                application: target.name(),
+                target: Some(target),
+            })
         })
     }
 }
@@ -108,6 +147,7 @@ mod tests {
     fn monitor_invalidates_stale_context_after_capture_failure() {
         let captured = ContextSnapshot {
             application: Some("Zed".into()),
+            target: Some(ForegroundApplication::Test(1)),
         };
         let calls = Arc::new(AtomicUsize::new(0));
         let capture_calls = calls.clone();

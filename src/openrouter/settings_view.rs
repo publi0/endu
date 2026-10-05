@@ -7,17 +7,18 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, Focusable, FontWeight, IntoElement,
-    MouseDownEvent, Render, SharedString, Subscription, Window, deferred, div, prelude::*, px, rgb,
+    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
+    IntoElement, KeyDownEvent, MouseDownEvent, Render, ScrollHandle, SharedString, Subscription,
+    Window, div, prelude::*, px, rgb,
 };
 
 use super::catalog::{self, CatalogModel};
 use super::form::{self, AdvancedForm, MAX_FALLBACKS};
 use super::{Config, KeyStatus};
 use crate::desktop_ui::{
-    ACCENT, CONTROL_HEIGHT, FAINT, LINE, MUTED, NEGATIVE, SURFACE, SURFACE_HOVER, SURFACE_SELECTED,
-    TEXT, TEXT_SOFT, compact_button, disclosure_button, settings_panel, settings_row,
-    settings_section_label,
+    ACCENT, FAINT, LINE, MUTED, NEGATIVE, PickerState, SURFACE, SURFACE_HOVER, SURFACE_SELECTED,
+    TEXT, TEXT_SOFT, compact_button, disclosure_button, picker_open_key, picker_popup,
+    settings_panel, settings_row, settings_section_label,
 };
 use crate::text_input::{Changed, Dismissed, Navigate, Submitted, TextInput};
 
@@ -42,10 +43,33 @@ pub struct KeyChanged(pub KeyStatus);
 /// Where the last action's outcome is shown.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Scope {
+    Configuration,
     Key,
-    Models,
+    Language,
+    Model(usize),
     Microphone,
     Advanced,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum KeyOperation {
+    Refresh,
+    Save,
+    Test,
+    Remove,
+    Move,
+}
+
+impl KeyOperation {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Refresh => "Checking key",
+            Self::Save => "Saving key",
+            Self::Test => "Testing key",
+            Self::Remove => "Removing key",
+            Self::Move => "Moving key",
+        }
+    }
 }
 
 enum CatalogState {
@@ -68,6 +92,7 @@ struct ModelPicker {
     slot: usize,
     search: Entity<TextInput>,
     highlight: usize,
+    scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -107,12 +132,14 @@ pub struct OpenRouterSettings {
     key_input: Entity<TextInput>,
     catalog: CatalogState,
     picker: Option<ModelPicker>,
+    model_focus: [FocusHandle; MAX_FALLBACKS + 1],
     language_picker_open: bool,
+    language_picker_state: PickerState,
     advanced_open: bool,
     advanced: AdvancedInputs,
     advanced_saved: AdvancedForm,
     advanced_dirty: bool,
-    busy: bool,
+    key_operation: Option<KeyOperation>,
     message: Option<(Scope, bool, String)>,
     _subscriptions: Vec<Subscription>,
 }
@@ -131,7 +158,7 @@ impl OpenRouterSettings {
             Err(error) => (
                 Config::default(),
                 Some((
-                    Scope::Models,
+                    Scope::Configuration,
                     false,
                     format!("{error:#}. Fix the file before saving settings."),
                 )),
@@ -175,12 +202,14 @@ impl OpenRouterSettings {
             key_input,
             catalog: CatalogState::Idle,
             picker: None,
+            model_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             language_picker_open: false,
+            language_picker_state: PickerState::new(cx),
             advanced_open: false,
             advanced,
             advanced_saved: form,
             advanced_dirty: false,
-            busy: false,
+            key_operation: None,
             message,
             _subscriptions: subscriptions,
         };
@@ -216,7 +245,7 @@ impl OpenRouterSettings {
         edit: impl FnOnce(&Config) -> Result<Config, String>,
         success: &str,
     ) -> bool {
-        if self.busy {
+        if self.busy() {
             self.report(
                 scope,
                 Err("Wait for the key operation to finish, then try again.".into()),
@@ -244,22 +273,35 @@ impl OpenRouterSettings {
         }
     }
 
+    fn busy(&self) -> bool {
+        self.key_operation.is_some()
+    }
+
+    fn action_label(&self, operation: KeyOperation, idle: &'static str) -> &'static str {
+        if self.key_operation == Some(operation) {
+            operation.label()
+        } else {
+            idle
+        }
+    }
+
     /// Run blocking work (Keychain, network) off the UI thread.
     fn run<R: Send + 'static>(
         &mut self,
         cx: &mut Context<Self>,
+        operation: KeyOperation,
         work: impl FnOnce() -> R + Send + 'static,
         done: impl FnOnce(&mut Self, R, &mut Context<Self>) + 'static,
     ) {
-        if self.busy || self.preview {
+        if self.busy() || self.preview {
             return;
         }
-        self.busy = true;
+        self.key_operation = Some(operation);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx.background_executor().spawn(async move { work() }).await;
             let _ = this.update(cx, |this, cx| {
-                this.busy = false;
+                this.key_operation = None;
                 done(this, result, cx);
                 cx.notify();
             });
@@ -295,6 +337,7 @@ impl OpenRouterSettings {
         let revision = self.key_revision;
         self.run(
             cx,
+            KeyOperation::Refresh,
             move || super::key_status(&config),
             move |this, status, cx| {
                 if this.key_revision == revision {
@@ -305,6 +348,9 @@ impl OpenRouterSettings {
     }
 
     fn begin_key_replacement(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy() {
+            return;
+        }
         self.key_editing = true;
         self.key_remove_armed = false;
         self.clear_message(Scope::Key);
@@ -315,6 +361,9 @@ impl OpenRouterSettings {
     }
 
     fn cancel_key_replacement(&mut self, cx: &mut Context<Self>) {
+        if self.busy() {
+            return;
+        }
         self.key_editing = matches!(self.key_status, Some(KeyStatus::Missing) | None);
         self.key_input
             .update(cx, |input, cx| input.set_text("", cx));
@@ -323,6 +372,9 @@ impl OpenRouterSettings {
     }
 
     fn save_key(&mut self, cx: &mut Context<Self>) {
+        if self.busy() {
+            return;
+        }
         let key = self.key_input.read(cx).text().trim().to_owned();
         if let Err(error) = super::validate_key(&key) {
             self.report(Scope::Key, Err(error.to_string()));
@@ -336,6 +388,7 @@ impl OpenRouterSettings {
         }
         self.run(
             cx,
+            KeyOperation::Save,
             move || {
                 super::store_keychain_key(&key)?;
                 let config = super::load_config()?;
@@ -360,6 +413,9 @@ impl OpenRouterSettings {
     }
 
     fn test_key(&mut self, cx: &mut Context<Self>) {
+        if self.busy() {
+            return;
+        }
         if self.preview {
             self.report(
                 Scope::Key,
@@ -370,6 +426,7 @@ impl OpenRouterSettings {
         }
         self.run(
             cx,
+            KeyOperation::Test,
             move || super::load_config().and_then(|config| super::check_key(&config)),
             |this, result, _| {
                 this.report(Scope::Key, result.map_err(|error| format!("{error:#}")));
@@ -378,6 +435,9 @@ impl OpenRouterSettings {
     }
 
     fn remove_key(&mut self, cx: &mut Context<Self>) {
+        if self.busy() {
+            return;
+        }
         if !self.key_remove_armed {
             self.key_remove_armed = true;
             cx.notify();
@@ -391,6 +451,7 @@ impl OpenRouterSettings {
         }
         self.run(
             cx,
+            KeyOperation::Remove,
             move || {
                 super::delete_keychain_key()?;
                 super::load_config().map(|config| super::key_status(&config))
@@ -407,6 +468,9 @@ impl OpenRouterSettings {
 
     /// Moves a plaintext key from `openrouter.json` into the Keychain.
     fn move_key_to_keychain(&mut self, cx: &mut Context<Self>) {
+        if self.busy() {
+            return;
+        }
         if self.preview {
             self.config.api_key = None;
             self.key_changed(KeyStatus::Keychain("demo".into()), cx);
@@ -415,6 +479,7 @@ impl OpenRouterSettings {
         }
         self.run(
             cx,
+            KeyOperation::Move,
             move || {
                 let key = super::load_config()?.api_key.ok_or_else(|| {
                     color_eyre::eyre::eyre!("The file no longer contains an API key.")
@@ -443,6 +508,12 @@ impl OpenRouterSettings {
     // ---- Models ----------------------------------------------------------
 
     fn ensure_catalog(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.catalog,
+            CatalogState::Loading | CatalogState::Loaded(_)
+        ) {
+            return;
+        }
         if self.preview {
             self.catalog = CatalogState::Loaded(
                 self.config
@@ -458,12 +529,6 @@ impl OpenRouterSettings {
             );
             return;
         }
-        if matches!(
-            self.catalog,
-            CatalogState::Loading | CatalogState::Loaded(_)
-        ) {
-            return;
-        }
         self.catalog = CatalogState::Loading;
         let config = self.config.clone();
         cx.spawn(async move |this, cx| {
@@ -476,6 +541,7 @@ impl OpenRouterSettings {
                     Ok(models) => CatalogState::Loaded(models),
                     Err(error) => CatalogState::Failed(format!("{error:#}")),
                 };
+                this.highlight_current_model(cx);
                 cx.notify();
             });
         })
@@ -483,6 +549,9 @@ impl OpenRouterSettings {
     }
 
     fn open_picker(&mut self, slot: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy() {
+            return;
+        }
         self.language_picker_open = false;
         self.ensure_catalog(cx);
         let search = cx.new(|cx| TextInput::picker(cx, "Search models or paste an id", ""));
@@ -490,6 +559,7 @@ impl OpenRouterSettings {
             cx.subscribe(&search, |this, _, _: &Changed, cx| {
                 if let Some(picker) = &mut this.picker {
                     picker.highlight = 0;
+                    picker.scroll.scroll_to_item(0);
                 }
                 cx.notify();
             }),
@@ -503,21 +573,24 @@ impl OpenRouterSettings {
                     } else {
                         (picker.highlight + 1).min(count - 1)
                     };
+                    picker.scroll.scroll_to_item(picker.highlight);
                 }
                 cx.notify();
             }),
-            cx.subscribe(&search, |this, _, _: &Submitted, cx| {
+            cx.subscribe_in(&search, window, |this, _, _: &Submitted, window, cx| {
                 let choices = this.picker_choices(cx);
                 if let Some(picker) = &this.picker
                     && let Some(choice) = choices.get(picker.highlight)
                 {
                     let slot = picker.slot;
                     let id = choice.id().to_owned();
-                    this.choose_model(slot, Some(id), cx);
+                    if this.choose_model(slot, Some(id), cx) {
+                        this.model_focus[slot].focus(window);
+                    }
                 }
             }),
-            cx.subscribe(&search, |this, _, _: &Dismissed, cx| {
-                this.picker = None;
+            cx.subscribe_in(&search, window, |this, _, _: &Dismissed, window, cx| {
+                this.close_model_picker(window);
                 cx.notify();
             }),
         ];
@@ -526,52 +599,160 @@ impl OpenRouterSettings {
             slot,
             search,
             highlight: 0,
+            scroll: ScrollHandle::new(),
             _subscriptions: subscriptions,
         });
+        self.highlight_current_model(cx);
         cx.notify();
+    }
+
+    fn close_model_picker(&mut self, window: &mut Window) {
+        if let Some(picker) = self.picker.take() {
+            self.model_focus[picker.slot].focus(window);
+        }
+    }
+
+    pub fn close_pickers(&mut self, cx: &mut Context<Self>) {
+        if self.picker.take().is_some() || self.language_picker_open {
+            self.language_picker_open = false;
+            cx.notify();
+        }
+    }
+
+    fn toggle_model_picker(&mut self, slot: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy() {
+            return;
+        }
+        if self
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.slot == slot)
+        {
+            self.close_model_picker(window);
+            cx.notify();
+        } else {
+            self.open_picker(slot, window, cx);
+        }
+    }
+
+    fn highlight_current_model(&mut self, cx: &App) {
+        let Some(picker) = &self.picker else {
+            return;
+        };
+        if !picker.search.read(cx).text().is_empty() {
+            return;
+        }
+        let current = self.config.transcription.models.get(picker.slot);
+        let choices = self.picker_choices(cx);
+        let index = choices
+            .iter()
+            .position(|choice| current.is_some_and(|id| id == choice.id()))
+            .unwrap_or(0);
+        if let Some(picker) = &mut self.picker {
+            picker.highlight = index;
+            picker.scroll.scroll_to_item(index);
+        }
     }
 
     fn picker_choices(&self, cx: &App) -> Vec<PickerChoice> {
         let Some(picker) = &self.picker else {
             return Vec::new();
         };
-        picker_choices(self.catalog.models(), picker.search.read(cx).text())
+        let query = picker.search.read(cx).text();
+        let mut choices = picker_choices(self.catalog.models(), query);
+        if query.is_empty()
+            && let Some(current) = self.config.transcription.models.get(picker.slot)
+            && !choices.iter().any(|choice| choice.id() == current)
+        {
+            choices.insert(0, PickerChoice::Custom(current.clone()));
+        }
+        choices
     }
 
-    fn choose_model(&mut self, slot: usize, model: Option<String>, cx: &mut Context<Self>) {
+    fn choose_model(&mut self, slot: usize, model: Option<String>, cx: &mut Context<Self>) -> bool {
         let success = match (&model, slot) {
             (None, _) => "Fallback removed.".to_owned(),
             (Some(model), 0) => format!("{model} is now the primary model."),
             (Some(model), slot) => format!("{model} is fallback {slot}."),
         };
-        if self.commit(
-            Scope::Models,
+        let saved = self.commit(
+            Scope::Model(slot),
             |config| form::set_model(config, slot, model.as_deref()),
             &success,
-        ) {
+        );
+        if saved {
             self.picker = None;
         }
         cx.notify();
+        saved
     }
 
     fn promote_model(&mut self, slot: usize, cx: &mut Context<Self>) {
         self.commit(
-            Scope::Models,
+            Scope::Model(slot),
             |config| Ok(form::promote_model(config, slot)),
             "Order updated.",
         );
         cx.notify();
     }
 
-    fn choose_language(&mut self, language: &str, cx: &mut Context<Self>) {
+    fn choose_language(&mut self, language: &str, cx: &mut Context<Self>) -> bool {
         let success = format!("Language: {}.", super::language_name(language));
-        if self.commit(
-            Scope::Models,
+        let saved = self.commit(
+            Scope::Language,
             |config| form::set_language(config, language),
             &success,
-        ) {
+        );
+        if saved {
             self.language_picker_open = false;
         }
+        cx.notify();
+        saved
+    }
+
+    fn toggle_language_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy() {
+            return;
+        }
+        self.picker = None;
+        self.language_picker_open = !self.language_picker_open;
+        if self.language_picker_open {
+            let index = super::LANGUAGES
+                .iter()
+                .position(|(code, _)| *code == self.config.transcription.language)
+                .unwrap_or(0);
+            self.language_picker_state
+                .open(index, super::LANGUAGES.len(), window);
+        } else {
+            self.language_picker_state.trigger.focus(window);
+        }
+        cx.notify();
+    }
+
+    fn language_picker_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        if self
+            .language_picker_state
+            .navigate(key, super::LANGUAGES.len())
+        {
+        } else if matches!(key, "enter" | "space") {
+            if let Some((code, _)) = super::LANGUAGES.get(self.language_picker_state.highlight)
+                && self.choose_language(code, cx)
+            {
+                self.language_picker_state.trigger.focus(window);
+            }
+        } else if matches!(key, "escape" | "tab") {
+            self.language_picker_open = false;
+            self.language_picker_state.close(event, window);
+        } else {
+            return;
+        }
+        cx.stop_propagation();
         cx.notify();
     }
 
@@ -646,6 +827,9 @@ impl OpenRouterSettings {
     }
 
     fn save_advanced(&mut self, cx: &mut Context<Self>) {
+        if !self.advanced_dirty {
+            return;
+        }
         let form = self.advanced_form(cx);
         let original = self.advanced_saved.clone();
         if self.commit(
@@ -703,9 +887,10 @@ impl OpenRouterSettings {
     // ---- Rendering -------------------------------------------------------
 
     fn render_message(&self, scope: Scope) -> Option<AnyElement> {
-        let (ok, text) = if self.busy && scope == Scope::Key {
-            (true, "Working…".to_owned())
-        } else {
+        if self.busy() && scope == Scope::Key {
+            return None;
+        }
+        let (ok, text) = {
             let (current, ok, text) = self.message.as_ref()?;
             if *current != scope {
                 return None;
@@ -714,6 +899,9 @@ impl OpenRouterSettings {
         };
         Some(
             div()
+                .w_full()
+                .min_w_0()
+                .whitespace_normal()
                 .px_1()
                 .pt_2()
                 .text_size(px(11.0))
@@ -722,6 +910,13 @@ impl OpenRouterSettings {
                 .child(text)
                 .into_any_element(),
         )
+    }
+
+    fn render_error(&self, scope: Scope) -> Option<AnyElement> {
+        self.message
+            .as_ref()
+            .filter(|(current, ok, _)| *current == scope && !ok)?;
+        self.render_message(scope)
     }
 
     fn render_key_control(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -737,7 +932,19 @@ impl OpenRouterSettings {
                 .flex()
                 .flex_col()
                 .gap_2()
-                .child(self.key_input.clone())
+                .when(!self.busy(), |column| column.child(self.key_input.clone()))
+                .when(self.busy(), |column| {
+                    column.child(
+                        div()
+                            .h(px(crate::desktop_ui::TEXT_INPUT_HEIGHT))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .text_size(px(12.0))
+                            .text_color(rgb(MUTED))
+                            .child("••••••••••••"),
+                    )
+                })
                 .child(
                     div()
                         .flex()
@@ -766,14 +973,16 @@ impl OpenRouterSettings {
                                     buttons.child(
                                         button("Cancel", false)
                                             .id("openrouter-cancel-key")
+                                            .when(self.busy(), |button| button.opacity(0.45))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.cancel_key_replacement(cx)
                                             })),
                                     )
                                 })
                                 .child(
-                                    button("Save key", true)
+                                    button(self.action_label(KeyOperation::Save, "Save key"), true)
                                         .id("openrouter-save-key")
+                                        .when(self.busy(), |button| button.opacity(0.45))
                                         .on_click(cx.listener(|this, _, _, cx| this.save_key(cx))),
                                 ),
                         ),
@@ -786,18 +995,22 @@ impl OpenRouterSettings {
                 Some(KeyStatus::Keychain(suffix)) => (
                     format!("Key saved · …{suffix}"),
                     vec![
-                        button("Test", false)
+                        button(self.action_label(KeyOperation::Test, "Test"), false)
                             .id("openrouter-test-key")
+                            .when(self.busy(), |button| button.opacity(0.45))
                             .on_click(cx.listener(|this, _, _, cx| this.test_key(cx)))
                             .into_any_element(),
                         button("Replace", false)
                             .id("openrouter-replace-key")
+                            .when(self.busy(), |button| button.opacity(0.45))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.begin_key_replacement(window, cx)
                             }))
                             .into_any_element(),
                         button(
-                            if self.key_remove_armed {
+                            if self.key_operation == Some(KeyOperation::Remove) {
+                                KeyOperation::Remove.label()
+                            } else if self.key_remove_armed {
                                 "Really remove?"
                             } else {
                                 "Remove"
@@ -805,6 +1018,7 @@ impl OpenRouterSettings {
                             false,
                         )
                         .id("openrouter-remove-key")
+                        .when(self.busy(), |button| button.opacity(0.45))
                         .when(self.key_remove_armed, |button| {
                             button.text_color(rgb(NEGATIVE))
                         })
@@ -815,21 +1029,27 @@ impl OpenRouterSettings {
                 Some(KeyStatus::ConfigFile) => (
                     "Key in openrouter.json".into(),
                     vec![
-                        button("Test", false)
+                        button(self.action_label(KeyOperation::Test, "Test"), false)
                             .id("openrouter-test-key")
+                            .when(self.busy(), |button| button.opacity(0.45))
                             .on_click(cx.listener(|this, _, _, cx| this.test_key(cx)))
                             .into_any_element(),
-                        button("Move to Keychain", true)
-                            .id("openrouter-move-key")
-                            .on_click(cx.listener(|this, _, _, cx| this.move_key_to_keychain(cx)))
-                            .into_any_element(),
+                        button(
+                            self.action_label(KeyOperation::Move, "Move to Keychain"),
+                            true,
+                        )
+                        .id("openrouter-move-key")
+                        .when(self.busy(), |button| button.opacity(0.45))
+                        .on_click(cx.listener(|this, _, _, cx| this.move_key_to_keychain(cx)))
+                        .into_any_element(),
                     ],
                 ),
                 Some(KeyStatus::Environment) => (
                     "Key from OPENROUTER_API_KEY".into(),
                     vec![
-                        button("Test", false)
+                        button(self.action_label(KeyOperation::Test, "Test"), false)
                             .id("openrouter-test-key")
+                            .when(self.busy(), |button| button.opacity(0.45))
                             .on_click(cx.listener(|this, _, _, cx| this.test_key(cx)))
                             .into_any_element(),
                     ],
@@ -875,7 +1095,25 @@ impl OpenRouterSettings {
     fn render_key_row(&mut self, cx: &mut Context<Self>) -> gpui::Div {
         let description = self.key_description();
         let control = self.render_key_control(cx);
-        settings_row("OpenRouter API key", description, control)
+        self.row_message(
+            settings_row("OpenRouter API key", description, control)
+                .when(self.key_only, |row| row.px_0()),
+            Scope::Key,
+            true,
+        )
+    }
+
+    fn row_message(&self, row: gpui::Div, scope: Scope, show: bool) -> gpui::Div {
+        div()
+            .border_b_1()
+            .border_color(rgb(LINE))
+            .child(row.border_b_0())
+            .when(show, |panel| {
+                panel.children(
+                    self.render_message(scope)
+                        .map(|message| div().px_4().pb_3().child(message)),
+                )
+            })
     }
 
     fn render_model_button(
@@ -918,20 +1156,22 @@ impl OpenRouterSettings {
                 )
                 .w(px(MODEL_BUTTON_WIDTH))
                 .id(("openrouter-model", slot))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    if this
-                        .picker
-                        .as_ref()
-                        .is_some_and(|picker| picker.slot == slot)
-                    {
-                        this.picker = None;
-                        cx.notify();
-                    } else {
-                        this.open_picker(slot, window, cx);
+                .track_focus(&self.model_focus[slot].clone().tab_stop(!self.busy()))
+                .focus(|style| style.border_color(rgb(ACCENT)))
+                .when(self.busy(), |button| button.opacity(0.5))
+                .on_click(cx.listener(move |this, event, window, cx| {
+                    if matches!(event, gpui::ClickEvent::Mouse(_)) {
+                        this.toggle_model_picker(slot, window, cx);
+                    }
+                }))
+                .on_key_down(cx.listener(move |this, event, window, cx| {
+                    if picker_open_key(event) {
+                        this.toggle_model_picker(slot, window, cx);
+                        cx.stop_propagation();
                     }
                 })),
             )
-            .children(menu.map(deferred))
+            .children(menu.map(picker_popup))
             .into_any_element()
     }
 
@@ -944,7 +1184,7 @@ impl OpenRouterSettings {
         let Some(picker) = &self.picker else {
             return div().into_any_element();
         };
-        let choices = picker_choices(self.catalog.models(), picker.search.read(cx).text());
+        let choices = self.picker_choices(cx);
         let highlight = picker.highlight.min(choices.len().saturating_sub(1));
         let status: Option<AnyElement> = match &self.catalog {
             CatalogState::Idle | CatalogState::Loading => {
@@ -1042,17 +1282,19 @@ impl OpenRouterSettings {
                             .child("✓"),
                     )
                 })
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
-                    this.choose_model(slot, Some(id.clone()), cx);
+                    if this.choose_model(slot, Some(id.clone()), cx) {
+                        this.model_focus[slot].focus(window);
+                    }
                 }))
         });
         div()
             .id("openrouter-model-picker")
-            .absolute()
-            .top(px(CONTROL_HEIGHT + 4.0))
-            .right_0()
+            .max_h(px(420.0))
+            .debug_selector(|| "openrouter-model-picker".into())
             .w(px(PICKER_WIDTH))
+            .whitespace_normal()
             .p_2()
             .flex()
             .flex_col()
@@ -1067,11 +1309,17 @@ impl OpenRouterSettings {
                 this.picker = None;
                 cx.notify();
             }))
-            .child(picker.search.clone())
+            .child(div().flex_none().child(picker.search.clone()))
+            .children(
+                self.render_error(Scope::Model(slot))
+                    .map(|message| div().w_full().min_w_0().flex_none().child(message)),
+            )
             .children(status)
             .child(
                 div()
                     .id("openrouter-model-choices")
+                    .track_scroll(&picker.scroll)
+                    .min_h_0()
                     .max_h(px(280.0))
                     .overflow_y_scroll()
                     .flex()
@@ -1084,18 +1332,21 @@ impl OpenRouterSettings {
     fn render_language_control(&self, cx: &mut Context<Self>) -> AnyElement {
         let current = self.config.transcription.language.clone();
         let menu = self.language_picker_open.then(|| {
-            let choose = Rc::new(cx.listener(|this, code: &&'static str, _, cx| {
-                this.choose_language(code, cx);
+            let choose = Rc::new(cx.listener(|this, code: &&'static str, window, cx| {
+                if this.choose_language(code, cx) {
+                    this.language_picker_state.trigger.focus(window);
+                }
             }));
             div()
                 .id("openrouter-language-picker")
-                .absolute()
-                .top(px(CONTROL_HEIGHT + 4.0))
-                .right_0()
+                .track_focus(&self.language_picker_state.menu)
+                .on_key_down(cx.listener(Self::language_picker_key))
+                .debug_selector(|| "openrouter-language-picker".into())
                 .w(px(220.0))
                 .max_h(px(300.0))
                 .p_2()
-                .overflow_y_scroll()
+                .flex()
+                .flex_col()
                 .rounded_md()
                 .border_1()
                 .border_color(rgb(LINE))
@@ -1106,42 +1357,59 @@ impl OpenRouterSettings {
                     this.language_picker_open = false;
                     cx.notify();
                 }))
-                .children(
-                    super::LANGUAGES
-                        .iter()
-                        .enumerate()
-                        .map(|(index, (code, name))| {
-                            let selected = *code == current;
-                            let choose = choose.clone();
-                            let code: &'static str = code;
-                            div()
-                                .id(("openrouter-language", index))
-                                .w_full()
-                                .h(px(30.0))
-                                .px_3()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .rounded_sm()
-                                .text_size(px(12.0))
-                                .text_color(rgb(if selected { TEXT } else { TEXT_SOFT }))
-                                .when(selected, |row| row.bg(rgb(SURFACE_SELECTED)))
-                                .hover(|row| row.bg(rgb(SURFACE_HOVER)))
-                                .child(*name)
-                                .when(code != super::AUTO_LANGUAGE, |row| {
-                                    row.child(
-                                        div()
-                                            .text_size(px(10.0))
-                                            .text_color(rgb(FAINT))
-                                            .child(code),
-                                    )
-                                })
-                                .on_click(move |_, window, cx| {
-                                    cx.stop_propagation();
-                                    choose(&code, window, cx);
-                                })
-                        }),
+                .child(
+                    div()
+                        .id("language-choices")
+                        .min_h_0()
+                        .max_h(px(260.0))
+                        .track_scroll(&self.language_picker_state.scroll)
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .children(super::LANGUAGES.iter().enumerate().map(
+                            |(index, (code, name))| {
+                                let selected = *code == current;
+                                let choose = choose.clone();
+                                let code: &'static str = code;
+                                div()
+                                    .id(("openrouter-language", index))
+                                    .w_full()
+                                    .h(px(30.0))
+                                    .flex_none()
+                                    .px_3()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .rounded_sm()
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(if selected { TEXT } else { TEXT_SOFT }))
+                                    .when(index == self.language_picker_state.highlight, |row| {
+                                        row.bg(rgb(SURFACE_SELECTED))
+                                    })
+                                    .hover(|row| row.bg(rgb(SURFACE_HOVER)))
+                                    .child(*name)
+                                    .when(code != super::AUTO_LANGUAGE, |row| {
+                                        row.child(
+                                            div()
+                                                .text_size(px(10.0))
+                                                .text_color(rgb(FAINT))
+                                                .child(code),
+                                        )
+                                    })
+                                    .on_click(move |_, window, cx| {
+                                        cx.stop_propagation();
+                                        choose(&code, window, cx);
+                                    })
+                            },
+                        )),
                 )
+                .children(self.render_error(Scope::Language).map(|message| {
+                    div()
+                        .id("language-feedback")
+                        .debug_selector(|| "language-feedback".into())
+                        .flex_none()
+                        .child(message)
+                }))
         });
         div()
             .relative()
@@ -1149,13 +1417,28 @@ impl OpenRouterSettings {
             .child(
                 disclosure_button(super::language_name(&current).to_owned())
                     .id("openrouter-language")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.picker = None;
-                        this.language_picker_open = !this.language_picker_open;
-                        cx.notify();
+                    .track_focus(
+                        &self
+                            .language_picker_state
+                            .trigger
+                            .clone()
+                            .tab_stop(!self.busy()),
+                    )
+                    .focus(|style| style.border_color(rgb(ACCENT)))
+                    .when(self.busy(), |button| button.opacity(0.5))
+                    .on_click(cx.listener(|this, event, window, cx| {
+                        if matches!(event, gpui::ClickEvent::Mouse(_)) {
+                            this.toggle_language_picker(window, cx);
+                        }
+                    }))
+                    .on_key_down(cx.listener(|this, event, window, cx| {
+                        if picker_open_key(event) {
+                            this.toggle_language_picker(window, cx);
+                            cx.stop_propagation();
+                        }
                     })),
             )
-            .children(menu.map(deferred))
+            .children(menu.map(picker_popup))
             .into_any_element()
     }
 
@@ -1163,10 +1446,10 @@ impl OpenRouterSettings {
         let models = self.config.transcription.models.clone();
         let mut panel = settings_panel();
         let primary = self.render_model_button(0, models.first().map(String::as_str), cx);
-        panel = panel.child(settings_row(
-            "Primary model",
-            "Transcribes every dictation",
-            primary,
+        panel = panel.child(self.row_message(
+            settings_row("Primary model", "Transcribes every dictation", primary),
+            Scope::Model(0),
+            self.picker.as_ref().is_none_or(|picker| picker.slot != 0),
         ));
         let fallbacks = models.len().saturating_sub(1).min(MAX_FALLBACKS);
         for (slot, model) in models.iter().enumerate().skip(1).take(fallbacks) {
@@ -1179,29 +1462,39 @@ impl OpenRouterSettings {
                 .child(
                     icon_button("↑", "Move up")
                         .id(("openrouter-promote", slot))
+                        .when(self.busy(), |button| button.opacity(0.5))
                         .on_click(cx.listener(move |this, _, _, cx| this.promote_model(slot, cx))),
                 )
                 .child(
                     icon_button("✕", "Remove")
                         .id(("openrouter-remove-model", slot))
-                        .on_click(
-                            cx.listener(move |this, _, _, cx| this.choose_model(slot, None, cx)),
-                        ),
+                        .when(self.busy(), |button| button.opacity(0.5))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.choose_model(slot, None, cx);
+                        })),
                 )
                 .child(button);
-            panel = panel.child(settings_row(
-                if slot == 1 {
-                    "Fallback 1"
-                } else {
-                    "Fallback 2"
-                },
-                if slot == 1 {
-                    "Used when the primary model fails"
-                } else {
-                    "Used when fallback 1 also fails"
-                },
-                control,
-            ));
+            panel = panel.child(
+                self.row_message(
+                    settings_row(
+                        if slot == 1 {
+                            "Fallback 1"
+                        } else {
+                            "Fallback 2"
+                        },
+                        if slot == 1 {
+                            "Used when the primary model fails"
+                        } else {
+                            "Used when fallback 1 also fails"
+                        },
+                        control,
+                    ),
+                    Scope::Model(slot),
+                    self.picker
+                        .as_ref()
+                        .is_none_or(|picker| picker.slot != slot),
+                ),
+            );
         }
         if fallbacks < MAX_FALLBACKS && !models.is_empty() {
             let slot = models.len().min(MAX_FALLBACKS);
@@ -1210,7 +1503,7 @@ impl OpenRouterSettings {
                 .as_ref()
                 .is_some_and(|picker| picker.slot == slot);
             let menu = open.then(|| self.render_picker(slot, None, cx));
-            panel = panel.child(
+            panel = panel.child(self.row_message(
                 div()
                     .w_full()
                     .px_4()
@@ -1235,18 +1528,26 @@ impl OpenRouterSettings {
                             .child(
                                 button("+ Add fallback", false)
                                     .id("openrouter-add-fallback")
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        if this.picker.as_ref().is_some_and(|picker| picker.slot == slot) {
-                                            this.picker = None;
-                                            cx.notify();
-                                        } else {
-                                            this.open_picker(slot, window, cx);
+                                    .track_focus(&self.model_focus[slot].clone().tab_stop(!self.busy()))
+                                    .focus(|style| style.border_color(rgb(ACCENT)))
+                                    .when(self.busy(), |button| button.opacity(0.5))
+                                    .on_click(cx.listener(move |this, event, window, cx| {
+                                        if matches!(event, gpui::ClickEvent::Mouse(_)) {
+                                            this.toggle_model_picker(slot, window, cx);
+                                        }
+                                    }))
+                                    .on_key_down(cx.listener(move |this, event, window, cx| {
+                                        if picker_open_key(event) {
+                                            this.toggle_model_picker(slot, window, cx);
+                                            cx.stop_propagation();
                                         }
                                     })),
                             )
-                            .children(menu.map(deferred)),
+                            .children(menu.map(picker_popup)),
                     ),
-            );
+                Scope::Model(slot),
+                !open,
+            ));
         }
         let extra = models.len().saturating_sub(MAX_FALLBACKS + 1);
         if extra > 0 {
@@ -1265,7 +1566,6 @@ impl OpenRouterSettings {
         div()
             .child(settings_section_label("MODELS"))
             .child(panel)
-            .children(self.render_message(Scope::Models))
             .into_any_element()
     }
 
@@ -1323,6 +1623,7 @@ impl OpenRouterSettings {
                     .child(
                         button("Defaults", false)
                             .id("openrouter-defaults")
+                            .when(self.busy(), |button| button.opacity(0.45))
                             .on_click(
                                 cx.listener(|this, _, _, cx| this.restore_advanced_defaults(cx)),
                             ),
@@ -1330,6 +1631,9 @@ impl OpenRouterSettings {
                     .child(
                         button("Save", self.advanced_dirty)
                             .id("openrouter-save-advanced")
+                            .when(self.busy() || !self.advanced_dirty, |button| {
+                                button.opacity(0.45)
+                            })
                             .on_click(cx.listener(|this, _, _, cx| this.save_advanced(cx))),
                     ),
             );
@@ -1440,7 +1744,6 @@ impl Render for OpenRouterSettings {
             let key_row = self.render_key_row(cx).px_0().border_b_0();
             return div()
                 .child(div().border_t_1().border_color(rgb(LINE)).child(key_row))
-                .children(self.render_message(Scope::Key))
                 .into_any_element();
         }
         let key_row = self.render_key_row(cx);
@@ -1448,20 +1751,29 @@ impl Render for OpenRouterSettings {
         let models = self.render_models_panel(cx);
         let advanced = self.render_advanced(cx);
         div()
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "tab" {
+                    if this.picker.is_some() { this.close_model_picker(window); }
+                    if event.keystroke.modifiers.shift { window.focus_prev(); }
+                    else { window.focus_next(); }
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .child(settings_section_label("OPENROUTER"))
+            .children(self.render_message(Scope::Configuration))
             .child(
                 settings_panel()
                     .child(key_row)
                     .child(
-                        settings_row(
+                        self.row_message(settings_row(
                             "Language",
                             "Spoken language hint; Auto-detect lets the model decide",
                             language,
-                        )
+                        ), Scope::Language, !self.language_picker_open)
                         .border_b_0(),
                     ),
             )
-            .children(self.render_message(Scope::Key))
             .child(models)
             .child(advanced)
             .child(
@@ -1479,6 +1791,121 @@ impl Render for OpenRouterSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn keyboard_reaches_selectors_and_returns_focus_after_selection(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.bind_keys(crate::text_input::key_bindings()));
+        let (view, cx) = cx.add_window_view(|_, cx| OpenRouterSettings::new(false, true, cx));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.key_input.focus_handle(cx).focus(window))
+        });
+        cx.simulate_keystrokes("tab");
+        cx.update(|window, cx| {
+            assert!(
+                view.read(cx)
+                    .language_picker_state
+                    .trigger
+                    .is_focused(window)
+            )
+        });
+        cx.simulate_keystrokes("enter down enter");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+        });
+        cx.update(|window, cx| {
+            let view = view.read(cx);
+            assert_eq!(
+                view.config.transcription.language,
+                super::super::LANGUAGES[1].0
+            );
+            assert!(!view.language_picker_open);
+            assert!(view.language_picker_state.trigger.is_focused(window));
+            assert!(matches!(view.message, Some((Scope::Language, true, _))));
+        });
+        cx.simulate_keystrokes("tab enter escape");
+        cx.update(|window, cx| {
+            let view = view.read(cx);
+            assert!(view.picker.is_none());
+            assert!(view.model_focus[0].is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    fn a_rejected_model_keeps_the_picker_and_keyboard_focus(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.bind_keys(crate::text_input::key_bindings()));
+        let (view, cx) = cx.add_window_view(|_, cx| OpenRouterSettings::new(false, true, cx));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.config.transcription.models = vec!["test/one".into(), "test/two".into()];
+                view.catalog =
+                    CatalogState::Loaded(vec![model("test/one", "One"), model("test/two", "Two")]);
+                view.open_picker(1, window, cx);
+            })
+        });
+        cx.simulate_input("test/one");
+        cx.simulate_keystrokes("enter");
+        cx.update(|window, cx| {
+            let view = view.read(cx);
+            let picker = view
+                .picker
+                .as_ref()
+                .expect("invalid duplicate must leave the menu open");
+            assert!(picker.search.focus_handle(cx).is_focused(window));
+            assert_eq!(view.config.transcription.models[1], "test/two");
+            assert!(matches!(view.message, Some((Scope::Model(1), false, _))));
+        });
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| assert!(view.read(cx).model_focus[1].is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn selected_models_beyond_the_first_page_are_scrolled_into_view(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.bind_keys(crate::text_input::key_bindings()));
+        let (view, cx) = cx.add_window_view(|_, cx| OpenRouterSettings::new(false, true, cx));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.config.transcription.models = vec!["test/29".into()];
+                view.catalog = CatalogState::Loaded(
+                    (0..30)
+                        .map(|index| model(&format!("test/{index}"), &format!("Model {index:02}")))
+                        .collect(),
+                );
+                view.open_picker(0, window, cx);
+            })
+        });
+        cx.simulate_keystrokes("up");
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            let picker = view.picker.as_ref().unwrap();
+            assert_eq!(picker.highlight, 28);
+            assert!(picker.scroll.offset().y < px(0.0));
+        });
+    }
+
+    #[gpui::test]
+    fn pending_key_operations_cannot_replace_or_clear_the_editor(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| OpenRouterSettings::new(false, true, cx));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.key_input
+                    .update(cx, |input, cx| input.set_text("sk-or-v1-fixture", cx));
+                view.key_editing = true;
+                view.key_operation = Some(KeyOperation::Save);
+                view.begin_key_replacement(window, cx);
+                view.cancel_key_replacement(cx);
+                view.remove_key(cx);
+                view.test_key(cx);
+                assert_eq!(view.key_input.read(cx).text(), "sk-or-v1-fixture");
+                assert!(view.key_editing);
+                assert!(!view.key_remove_armed);
+                assert_eq!(
+                    view.action_label(KeyOperation::Save, "Save key"),
+                    "Saving key"
+                );
+                assert!(view.message.is_none());
+            })
+        });
+    }
 
     #[gpui::test]
     fn preview_edits_and_key_actions_stay_in_memory(cx: &mut gpui::TestAppContext) {
@@ -1505,8 +1932,13 @@ mod tests {
                 assert_eq!(view.key_status(), Some(&KeyStatus::Missing));
                 view.move_key_to_keychain(cx);
                 view.reveal_config(cx);
-                view.run(cx, || panic!("preview ran external work"), |_, (), _| {});
-                assert!(!view.busy);
+                view.run(
+                    cx,
+                    KeyOperation::Refresh,
+                    || panic!("preview ran external work"),
+                    |_, (), _| {},
+                );
+                assert!(!view.busy());
             });
         });
         cx.run_until_parked();
@@ -1518,13 +1950,13 @@ mod tests {
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 let original = view.config.clone();
-                view.busy = true;
+                view.key_operation = Some(KeyOperation::Refresh);
                 view.choose_language("pt", cx);
                 view.choose_model(0, Some("preview/model".into()), cx);
                 assert!(view.toggle_trim(cx).is_err());
                 view.restore_advanced_defaults(cx);
                 assert_eq!(view.config, original);
-                view.busy = false;
+                view.key_operation = None;
                 view.choose_language("pt", cx);
                 assert_eq!(view.config.transcription.language, "pt");
             });

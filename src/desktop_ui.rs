@@ -1,7 +1,93 @@
 use gpui::{
-    AnyElement, Div, ElementId, FontWeight, IntoElement, Rgba, SharedString, Stateful, div,
-    prelude::*, px, rgb, rgba,
+    AnyElement, App, Corner, Div, ElementId, FocusHandle, FontWeight, IntoElement, KeyDownEvent,
+    Rgba, ScrollHandle, SharedString, Stateful, Window, anchored, deferred, div, point, prelude::*,
+    px, rgb, rgba,
 };
+
+/// Keyboard state shared by the small choice menus. Domain edits remain with
+/// their owner, so a failed save can leave the menu and its focus intact.
+pub(crate) struct PickerState {
+    pub trigger: FocusHandle,
+    pub menu: FocusHandle,
+    pub scroll: ScrollHandle,
+    pub highlight: usize,
+}
+
+impl PickerState {
+    pub fn new(cx: &App) -> Self {
+        Self {
+            trigger: cx.focus_handle().tab_stop(true),
+            menu: cx.focus_handle(),
+            scroll: ScrollHandle::new(),
+            highlight: 0,
+        }
+    }
+
+    pub fn open(&mut self, selected: usize, count: usize, window: &mut Window) {
+        self.highlight = selected.min(count.saturating_sub(1));
+        self.scroll.scroll_to_item(self.highlight);
+        self.menu.focus(window);
+    }
+
+    pub fn navigate(&mut self, key: &str, count: usize) -> bool {
+        let last = count.saturating_sub(1);
+        self.highlight = match key {
+            "up" => self.highlight.saturating_sub(1).min(last),
+            "down" => self.highlight.saturating_add(1).min(last),
+            "home" => 0,
+            "end" => last,
+            _ => return false,
+        };
+        self.scroll.scroll_to_item(self.highlight);
+        true
+    }
+
+    pub fn close(&self, event: &KeyDownEvent, window: &mut Window) {
+        self.trigger.focus(window);
+        if event.keystroke.key == "tab" {
+            if event.keystroke.modifiers.shift {
+                window.focus_prev();
+            } else {
+                window.focus_next();
+            }
+        }
+    }
+}
+
+// Picker triggers handle activation on key-down. Their on_click handlers must
+// ignore ClickEvent::Keyboard: GPUI emits it on key-up, which could otherwise
+// reopen a menu after selection has restored focus to its trigger.
+pub(crate) fn picker_open_key(event: &KeyDownEvent) -> bool {
+    let modifiers = event.keystroke.modifiers;
+    !modifiers.control
+        && !modifiers.alt
+        && !modifiers.platform
+        && matches!(
+            event.keystroke.key.as_str(),
+            "enter" | "space" | "down" | "up"
+        )
+}
+
+/// Anchor at the trigger's right edge; GPUI flips above or fits the window
+/// when there is not enough room below. The zero-sized wrapper supplies the
+/// actual window-space anchor even for buttons with intrinsic widths.
+pub(crate) fn picker_popup(menu: impl IntoElement) -> AnyElement {
+    deferred(
+        div()
+            .absolute()
+            .top_0()
+            .right_0()
+            .w(px(0.0))
+            .h(px(0.0))
+            .child(
+                anchored()
+                    .anchor(Corner::TopRight)
+                    .offset(point(px(0.0), px(CONTROL_HEIGHT + 4.0)))
+                    .child(menu),
+            ),
+    )
+    .into_any_element()
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum NavigationIcon {
@@ -587,6 +673,46 @@ mod layout_tests {
                 )
                 .debug_selector(|| "settings-row".into()),
             )
+        }
+    }
+
+    struct EdgePicker;
+
+    impl Render for EdgePicker {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().relative().child(
+                div()
+                    .absolute()
+                    .right_0()
+                    .bottom_0()
+                    .w(px(100.0))
+                    .h(px(CONTROL_HEIGHT))
+                    .relative()
+                    .child(picker_popup(
+                        div()
+                            .w(px(220.0))
+                            .h(px(300.0))
+                            .debug_selector(|| "edge-popup".into()),
+                    )),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn picker_near_the_window_edge_fits_inside_the_viewport(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| EdgePicker);
+        for (width, height) in [(1040.0, 720.0), (800.0, 600.0)] {
+            cx.simulate_resize(size(px(width), px(height)));
+            cx.run_until_parked();
+            let popup = cx.debug_bounds("edge-popup").unwrap();
+            assert!(
+                popup.left() >= px(0.0) && popup.right() <= px(width),
+                "{popup:?}"
+            );
+            assert!(
+                popup.top() >= px(0.0) && popup.bottom() <= px(height),
+                "{popup:?}"
+            );
         }
     }
 
