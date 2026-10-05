@@ -185,6 +185,13 @@ pub fn post_command_to_pid(character: char, pid: i32) -> Result<()> {
     )
 }
 
+pub fn post_return_to_pid(pid: i32) -> Result<()> {
+    if pid <= 0 {
+        return Err(eyre!("submit target is unavailable"));
+    }
+    post_key_code(36, &[], 1, pid)
+}
+
 fn post_key_code(key_code: u16, modifiers: &[(u64, u16)], count: u8, pid: i32) -> Result<()> {
     let specs = shortcut_event_specs(key_code, modifiers, count);
     let events = specs.map(KeyboardEvent::new).collect::<Result<Vec<_>>>()?;

@@ -70,7 +70,12 @@ impl Session<'_> {
 
     /// Applies one shortcut action. Returns `false` when a start was refused
     /// so the caller can suspend the shortcut machine.
-    fn handle_hotkey(&self, action: HotkeyAction, at: CaptureInstant) -> Result<bool> {
+    fn handle_hotkey(
+        &self,
+        action: HotkeyAction,
+        at: CaptureInstant,
+        submit: Option<u64>,
+    ) -> Result<bool> {
         match action {
             HotkeyAction::Start => {
                 let target = ContextSnapshot::capture().unwrap_or_default();
@@ -89,7 +94,13 @@ impl Session<'_> {
                 if self.input.become_intentional(at)? {
                     feedback::play(Tone::DictationStart);
                 }
-                self.finish(at)?;
+                self.finish(at, None)?;
+            }
+            HotkeyAction::FinishAndSubmit => {
+                if self.input.become_intentional(at)? {
+                    feedback::play(Tone::DictationStart);
+                }
+                self.finish(at, submit)?;
             }
             HotkeyAction::Discard => self.end(CaptureEnd::Discarded)?,
             HotkeyAction::Cancel => self.end(CaptureEnd::Cancelled)?,
@@ -111,7 +122,7 @@ impl Session<'_> {
         self.emit_state(false)
     }
 
-    fn finish(&self, at: CaptureInstant) -> Result<()> {
+    fn finish(&self, at: CaptureInstant, submit: Option<u64>) -> Result<()> {
         let context = self
             .recording_context
             .borrow_mut()
@@ -124,7 +135,7 @@ impl Session<'_> {
         };
         feedback::play(Tone::DictationStop);
         self.events.dictation(DictationPhase::Transcribing, "")?;
-        match self.worker.transcribe(clip, context) {
+        match self.worker.transcribe(clip, context, submit) {
             Ok(job_id) => self.indicate(DictationIndicatorEvent::Submitted {
                 job_id: job_id.value(),
             }),
@@ -169,13 +180,26 @@ impl Session<'_> {
 
     fn worker_event(&self, event: WorkerEvent) -> Result<()> {
         match event {
-            WorkerEvent::ReadyToPaste { job_id } => {
-                self.events.dictation(DictationPhase::ReadyToPaste, "")?;
+            WorkerEvent::ReadyToPaste {
+                job_id,
+                copied_to_clipboard,
+            } => {
+                self.events.dictation(
+                    if copied_to_clipboard {
+                        DictationPhase::CopiedToClipboard
+                    } else {
+                        DictationPhase::ReadyToPaste
+                    },
+                    "",
+                )?;
                 self.indicate(match job_id {
                     Some(job_id) => DictationIndicatorEvent::JobReadyToPaste {
                         job_id: job_id.value(),
+                        copied_to_clipboard,
                     },
-                    None => DictationIndicatorEvent::ReadyToPaste,
+                    None => DictationIndicatorEvent::ReadyToPaste {
+                        copied_to_clipboard,
+                    },
                 });
             }
             WorkerEvent::Completed {
@@ -248,6 +272,7 @@ pub fn listen(
     indicator: Option<DictationIndicatorSender>,
     history: Option<crate::history::History>,
     controls: Option<Receiver<ListenerControl>>,
+    recovery: crate::recording_recovery::RecordingRecovery,
 ) -> Result<()> {
     shutdown.store(false, Ordering::Relaxed);
     // Feedback admission is advisory: a cold audio stack can exceed the
@@ -261,21 +286,24 @@ pub fn listen(
     let mut context = ContextSnapshot::default();
     let mut hotkey = DictationHotkey::new(
         CaptureInstant::now(),
-        crate::app_settings::double_tap_lock(),
+        crate::app_settings::dictation_mode(),
         crate::app_settings::dictation_hotkey(),
     );
     hotkey.set_double_tap_only(crate::app_settings::double_tap_only());
+    hotkey.set_double_tap_sensitivity(crate::app_settings::double_tap_sensitivity());
     let recording_environment = RecordingEnvironmentController::start();
-    let (mut microphone_revision, microphone) = crate::app_settings::microphone_selection();
+    let (mut microphone_revision, microphone, priority) =
+        crate::app_settings::microphone_selection();
     let input = DictationAudio::open(
         device_override,
         microphone_revision,
         microphone.as_deref(),
+        &priority,
         recording_environment,
         input_monitor.pending_events(),
         release_while_idle,
     )?;
-    let worker = DictationWorker::start(input_monitor.activity.clone(), history);
+    let worker = DictationWorker::start(input_monitor.activity.clone(), history, recovery);
     let session = Session {
         input: &input,
         worker: &worker,
@@ -289,6 +317,7 @@ pub fn listen(
     })?;
     if input.is_recovering() {
         hotkey.suspend();
+        input_monitor.reset_submit_guard(false);
     }
     if hotkey.is_recording() {
         let target = ContextSnapshot::capture().unwrap_or_default();
@@ -300,6 +329,7 @@ pub fn listen(
             session.indicate(indicator_event);
         } else {
             hotkey.suspend();
+            input_monitor.reset_submit_guard(false);
         }
     }
     session.emit_state(hotkey.is_recording())?;
@@ -311,6 +341,7 @@ pub fn listen(
                 match control {
                     ListenerControl::PasteLast => {
                         hotkey.suspend();
+                        input_monitor.reset_submit_guard(false);
                         session.paste_last()?;
                     }
                 }
@@ -332,17 +363,17 @@ pub fn listen(
             input.set_release_while_idle(next_release_while_idle);
             release_while_idle = next_release_while_idle;
         }
-        hotkey.set_double_tap_enabled(crate::app_settings::double_tap_lock());
-        hotkey.set_double_tap_only(crate::app_settings::double_tap_only());
-        hotkey.set_binding(crate::app_settings::dictation_hotkey());
-        let (next_microphone_revision, microphone) = crate::app_settings::microphone_selection();
+        refresh_hotkey_settings(&mut hotkey);
+        let (next_microphone_revision, microphone, priority) =
+            crate::app_settings::microphone_selection();
         if next_microphone_revision != microphone_revision {
-            input.request_selection(next_microphone_revision, microphone.as_deref());
+            input.request_selection(next_microphone_revision, microphone.as_deref(), &priority);
             microphone_revision = next_microphone_revision;
         }
 
         let suspended = crate::app_settings::hotkey_capture_active() || input.is_recovering();
         if suspended && hotkey.suspend().is_some() {
+            input_monitor.reset_submit_guard(false);
             session.end(CaptureEnd::Cancelled)?;
         }
         while let Ok(observed) = input_monitor.events.try_recv() {
@@ -351,6 +382,10 @@ pub fn listen(
                 hotkey.track_key_state(observed.event, observed.capture_at);
                 continue;
             }
+            // A prior edge in this batch may have finished a capture whose old
+            // mode/binding was intentionally retained. Match the predictor before
+            // interpreting the next edge under the newly saved preferences.
+            refresh_hotkey_settings(&mut hotkey);
             let input_event = observed.event;
             if !hotkey.is_recording()
                 && input_event.is_escape_down()
@@ -363,14 +398,27 @@ pub fn listen(
                 });
                 continue;
             }
-            if let Some(action) = hotkey.process(input_event, observed.capture_at)
-                && !session.handle_hotkey(action, observed.capture_at)?
+            let mut action = hotkey.process(input_event, observed.capture_at);
+            if observed.submit_epoch == Some(input_monitor.submit_epoch()) && hotkey.finish_locked()
+            {
+                action = Some(HotkeyAction::FinishAndSubmit);
+            }
+            if let Some(action) = action
+                && !session.handle_hotkey(
+                    action,
+                    observed.capture_at,
+                    observed.submit_epoch.map(|_| observed.interaction_revision),
+                )?
             {
                 hotkey.suspend();
+                input_monitor.reset_submit_guard(false);
             }
         }
-        if !suspended && input_monitor.pending_events().oldest().is_none() {
-            hotkey.recover_stale_keys();
+        if !suspended
+            && input_monitor.pending_events().oldest().is_none()
+            && hotkey.recover_stale_keys()
+        {
+            input_monitor.reset_submit_guard(hotkey.is_locked());
         }
         if hotkey.is_recording()
             && input.become_intentional(capture_boundary(&input, release_while_idle))?
@@ -402,6 +450,7 @@ pub fn listen(
                 }
                 DictationAudioEvent::OpenFailed { error, .. } => {
                     hotkey.suspend();
+                    input_monitor.reset_submit_guard(false);
                     session.fail(format!("Could not open microphone: {error}"))?;
                 }
                 DictationAudioEvent::RecognitionDiscontinuity { dropped_frames } => {
@@ -415,6 +464,7 @@ pub fn listen(
                     input.discard_recognition_backlog();
                     if was_recording {
                         hotkey.suspend();
+                        input_monitor.reset_submit_guard(false);
                         session
                             .fail(format!("Microphone audio was interrupted for {gap_ms} ms."))?;
                     }
@@ -427,6 +477,7 @@ pub fn listen(
                 }
                 DictationAudioEvent::Interrupted { was_recording, .. } => {
                     hotkey.suspend();
+                    input_monitor.reset_submit_guard(false);
                     input.discard_recognition_backlog();
                     if was_recording {
                         session.fail("Microphone capture was interrupted; reconnecting.".into())?;
@@ -453,4 +504,11 @@ pub fn listen(
     events.flush()?;
     session.indicate(DictationIndicatorEvent::Discarded);
     Ok(())
+}
+
+fn refresh_hotkey_settings(hotkey: &mut DictationHotkey) {
+    hotkey.set_mode(crate::app_settings::dictation_mode());
+    hotkey.set_binding(crate::app_settings::dictation_hotkey());
+    hotkey.set_double_tap_only(crate::app_settings::double_tap_only());
+    hotkey.set_double_tap_sensitivity(crate::app_settings::double_tap_sensitivity());
 }

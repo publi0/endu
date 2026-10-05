@@ -5,17 +5,33 @@ use std::time::{Duration, Instant};
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSEvent, NSFont, NSPanel, NSScreen, NSStatusWindowLevel,
-    NSTextAlignment, NSTextField, NSView, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSBackingStoreType, NSColor, NSFont, NSPanel, NSStatusWindowLevel, NSTextAlignment,
+    NSTextField, NSView, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
 const WIDTH: f64 = 340.0;
 const HEIGHT: f64 = 76.0;
 
+fn notice_copy(copied_to_clipboard: bool) -> (&'static str, &'static str) {
+    if copied_to_clipboard {
+        (
+            "Dictation copied",
+            "Auto-paste did not complete. Press ⌘V\nto paste the text in the app you choose.",
+        )
+    } else {
+        (
+            "Dictation ready",
+            "Auto-paste paused. Use Paste Last Dictation\nto insert the text in the app you choose.",
+        )
+    }
+}
+
 pub struct PasteNotice {
     window: Retained<NSPanel>,
     until: Option<Instant>,
+    title: Retained<NSTextField>,
+    detail: Retained<NSTextField>,
 }
 
 impl PasteNotice {
@@ -86,28 +102,43 @@ impl PasteNotice {
         Ok(Self {
             window,
             until: None,
+            title,
+            detail,
         })
     }
 
-    pub fn show(&mut self) {
-        if let Some(mtm) = MainThreadMarker::new() {
-            let pointer = NSEvent::mouseLocation();
-            if let Some(screen) = NSScreen::screens(mtm).iter().find(|screen| {
-                let frame = screen.frame();
-                pointer.x >= frame.origin.x
-                    && pointer.x < frame.origin.x + frame.size.width
-                    && pointer.y >= frame.origin.y
-                    && pointer.y < frame.origin.y + frame.size.height
-            }) {
-                let frame = screen.visibleFrame();
-                self.window.setFrameTopLeftPoint(NSPoint::new(
-                    frame.origin.x + (frame.size.width - WIDTH) / 2.0,
-                    frame.origin.y + frame.size.height - 44.0,
-                ));
-            }
-        }
+    pub fn show(&mut self, copied_to_clipboard: bool) {
+        let (title, detail) = notice_copy(copied_to_clipboard);
+        self.title.setStringValue(&NSString::from_str(title));
+        self.detail.setStringValue(&NSString::from_str(detail));
+        self.position_on_selected_screen();
         self.until = Some(Instant::now() + Duration::from_secs(5));
         self.window.orderFrontRegardless();
+    }
+
+    fn position_on_selected_screen(&self) {
+        let preferences = crate::hud_settings::current();
+        let Some(screen) = crate::hud_screen::resolve(preferences) else {
+            return;
+        };
+        let frame = screen.visible_frame;
+        // Leave 16 points between the visible HUD and the notice at either edge.
+        // At Normal size and the default edge distance this is the original 44 pt.
+        let gap = f64::from(preferences.edge_distance)
+            + f64::from(16.0 * preferences.size.scale())
+            + 16.0;
+        let top_left = NSPoint::new(
+            frame.origin.x + (frame.size.width - WIDTH) / 2.0,
+            preferences
+                .position
+                .window_top(frame.origin.y, frame.size.height, HEIGHT, HEIGHT, gap),
+        );
+        let current = self.window.frame();
+        if (current.origin.x - top_left.x).abs() > 0.5
+            || (current.origin.y + current.size.height - top_left.y).abs() > 0.5
+        {
+            self.window.setFrameTopLeftPoint(top_left);
+        }
     }
 
     pub fn hide(&mut self) {
@@ -118,6 +149,8 @@ impl PasteNotice {
     pub fn maintain(&mut self) {
         if self.until.is_some_and(|until| Instant::now() >= until) {
             self.hide();
+        } else if self.until.is_some() {
+            self.position_on_selected_screen();
         }
     }
 }
@@ -125,5 +158,21 @@ impl PasteNotice {
 impl Drop for PasteNotice {
     fn drop(&mut self) {
         self.window.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notice_never_claims_the_clipboard_was_written_for_deferred_output() {
+        let copied = notice_copy(true);
+        let deferred = notice_copy(false);
+        assert_eq!(copied.0, "Dictation copied");
+        assert!(copied.1.contains("⌘V"));
+        assert_eq!(deferred.0, "Dictation ready");
+        assert!(deferred.1.contains("Paste Last Dictation"));
+        assert!(!deferred.1.contains("⌘V"));
     }
 }

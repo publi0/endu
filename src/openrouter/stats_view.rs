@@ -133,11 +133,18 @@ impl StatisticsView {
             .into(),
         );
         self.totals = totals;
-        self.daily = [820, 1_430, 990, 0, 1_870, 2_210, 2_092]
-            .into_iter()
-            .enumerate()
-            .map(|(index, words)| (format!("2026-09-{:02}", 28 + index), words))
-            .collect();
+        self.daily = [
+            ("2026-09-28", 820),
+            ("2026-09-29", 1_430),
+            ("2026-09-30", 990),
+            ("2026-10-01", 0),
+            ("2026-10-02", 1_870),
+            ("2026-10-03", 2_210),
+            ("2026-10-04", 2_092),
+        ]
+        .into_iter()
+        .map(|(day, words)| (day.to_owned(), words))
+        .collect();
     }
 
     fn render_header_action(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -268,7 +275,7 @@ impl StatisticsView {
             .unwrap_or(0);
         let first = self.daily.first().map(|(day, _)| short_day(day));
         let last = self.daily.last().map(|(day, _)| short_day(day));
-        let bars = self.daily.iter().map(|(_, words)| {
+        let bars = self.daily.iter().enumerate().map(|(index, (_, words))| {
             let height = if max == 0 {
                 0.0
             } else {
@@ -282,6 +289,7 @@ impl StatisticsView {
                 .items_end()
                 .child(
                     div()
+                        .debug_selector(move || format!("statistics-bar-{index}"))
                         .w_full()
                         .h(px(height.max(1.0)))
                         .rounded_t(px(3.0))
@@ -290,6 +298,8 @@ impl StatisticsView {
         });
         Some(
             compact_panel()
+                .debug_selector(|| "statistics-chart".into())
+                .flex_none()
                 .child(compact_panel_header(
                     "Words per day",
                     Some(
@@ -307,6 +317,7 @@ impl StatisticsView {
                         .pb_3()
                         .child(
                             div()
+                                .debug_selector(|| "statistics-chart-plot".into())
                                 .h(px(CHART_HEIGHT))
                                 .flex()
                                 .items_end()
@@ -510,6 +521,9 @@ impl Render for StatisticsView {
                     .pt_5()
                     .pb_7()
                     .flex()
+                    // Let the content keep its natural height and scroll. A
+                    // stretched flex column shrinks overflow-hidden panels.
+                    .items_start()
                     .justify_center()
                     .child(content),
             ),
@@ -642,6 +656,70 @@ fn short_day(day: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn chart_keeps_its_plot_and_bars_when_statistics_overflow_the_viewport(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, _| StatisticsView::new(true));
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                // A long model breakdown must scroll below the chart rather
+                // than consume the chart's allotted height.
+                for index in 0..30 {
+                    view.totals
+                        .models
+                        .insert(format!("fixture/model-{index}"), 1);
+                }
+                assert_eq!(view.daily.last().unwrap().0, "2026-10-04");
+                cx.notify();
+            });
+        });
+        for (width, height) in [(1040.0, 720.0), (860.0, 560.0)] {
+            cx.simulate_resize(gpui::size(
+                px(width - crate::desktop_ui::SIDEBAR_WIDTH),
+                px(height),
+            ));
+            cx.run_until_parked();
+            let chart = cx.debug_bounds("statistics-chart").unwrap();
+            let plot = cx.debug_bounds("statistics-chart-plot").unwrap();
+            assert_eq!(
+                plot.size.height,
+                px(CHART_HEIGHT),
+                "{width}x{height}: {plot:?}"
+            );
+            assert!(chart.size.height > px(CHART_HEIGHT));
+            assert!(plot.top() >= chart.top() && plot.bottom() <= chart.bottom());
+            // Paint bounds snap to the pixel grid while the centered plot can
+            // retain half-pixel coordinates. Allow at most one pixel of drift.
+            let tolerance = px(1.0);
+            for (selector, words) in [
+                ("statistics-bar-0", 820),
+                ("statistics-bar-1", 1_430),
+                ("statistics-bar-2", 990),
+                ("statistics-bar-3", 0),
+                ("statistics-bar-4", 1_870),
+                ("statistics-bar-5", 2_210),
+                ("statistics-bar-6", 2_092),
+            ] {
+                let bar = cx.debug_bounds(selector).unwrap();
+                assert!(bar.size.width >= px(2.0));
+                assert!(
+                    bar.top() >= plot.top() - tolerance
+                        && bar.bottom() <= plot.bottom() + tolerance
+                        && bar.left() >= plot.left() - tolerance
+                        && bar.right() <= plot.right() + tolerance,
+                    "{bar:?} outside {plot:?}"
+                );
+                assert!((bar.bottom() - plot.bottom()).abs() <= tolerance);
+                if words > 0 {
+                    assert!(bar.size.height >= px(3.0));
+                }
+            }
+            let tallest = cx.debug_bounds("statistics-bar-5").unwrap();
+            assert!((tallest.size.height - px(CHART_HEIGHT)).abs() <= tolerance);
+        }
+    }
 
     #[test]
     fn model_latency_labels_distinguish_missing_data_from_zero() {

@@ -50,6 +50,7 @@ pub enum DictationPhase {
     Pasted,
     Repasted,
     ReadyToPaste,
+    CopiedToClipboard,
     Failed(String),
 }
 

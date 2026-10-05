@@ -311,6 +311,25 @@ impl OpenRouterSettings {
 
     // ---- API key -------------------------------------------------------
 
+    pub(crate) fn has_key_operation(&self) -> bool {
+        self.busy()
+    }
+
+    pub(crate) fn config_snapshot(&self) -> Config {
+        self.config.clone()
+    }
+
+    pub(crate) fn apply_imported_config(&mut self, config: Config, cx: &mut Context<Self>) {
+        self.config = config;
+        self.close_pickers(cx);
+        self.advanced_saved = AdvancedForm::from_config(&self.config);
+        self.load_advanced(&self.advanced_saved.clone(), cx);
+        self.advanced_dirty = false;
+        self.catalog = CatalogState::Idle;
+        self.message = None;
+        cx.notify();
+    }
+
     /// Reconcile another editor's key change without starting another lookup.
     pub fn sync_key_status(&mut self, status: KeyStatus, cx: &mut Context<Self>) {
         self.key_revision += 1;
@@ -383,7 +402,7 @@ impl OpenRouterSettings {
         }
         if self.preview {
             self.key_changed(KeyStatus::Keychain("demo".into()), cx);
-            self.report(Scope::Key, Ok("Preview: no key was stored or sent.".into()));
+            self.clear_message(Scope::Key);
             return;
         }
         self.run(
@@ -397,15 +416,15 @@ impl OpenRouterSettings {
             |this, result, cx| match result {
                 Ok((status, check)) => {
                     this.key_changed(status, cx);
-                    this.report(
-                        Scope::Key,
-                        match check {
-                            Ok(summary) => Ok(format!("Key saved in the Keychain. {summary}")),
-                            Err(error) => Err(format!(
+                    match check {
+                        Ok(_) => this.clear_message(Scope::Key),
+                        Err(error) => this.report(
+                            Scope::Key,
+                            Err(format!(
                                 "Key saved, but OpenRouter did not accept it: {error:#}"
                             )),
-                        },
-                    );
+                        ),
+                    }
                 }
                 Err(error) => this.report(Scope::Key, Err(format!("{error:#}"))),
             },
@@ -446,7 +465,7 @@ impl OpenRouterSettings {
         self.key_remove_armed = false;
         if self.preview {
             self.key_changed(KeyStatus::Missing, cx);
-            self.report(Scope::Key, Ok("Preview: no stored key was removed.".into()));
+            self.clear_message(Scope::Key);
             return;
         }
         self.run(
@@ -459,7 +478,7 @@ impl OpenRouterSettings {
             |this, result, cx| match result {
                 Ok(status) => {
                     this.key_changed(status, cx);
-                    this.report(Scope::Key, Ok("Key removed from the Keychain.".into()));
+                    this.clear_message(Scope::Key);
                 }
                 Err(error) => this.report(Scope::Key, Err(format!("{error:#}"))),
             },
@@ -474,7 +493,7 @@ impl OpenRouterSettings {
         if self.preview {
             self.config.api_key = None;
             self.key_changed(KeyStatus::Keychain("demo".into()), cx);
-            self.report(Scope::Key, Ok("Preview: no key was moved.".into()));
+            self.clear_message(Scope::Key);
             return;
         }
         self.run(
@@ -495,10 +514,7 @@ impl OpenRouterSettings {
                 Ok((status, config)) => {
                     this.config = config;
                     this.key_changed(status, cx);
-                    this.report(
-                        Scope::Key,
-                        Ok("Key moved to the Keychain and removed from openrouter.json.".into()),
-                    );
+                    this.clear_message(Scope::Key);
                 }
                 Err(error) => this.report(Scope::Key, Err(format!("{error:#}"))),
             },
@@ -897,6 +913,9 @@ impl OpenRouterSettings {
             }
             (*ok, text.clone())
         };
+        if ok && scope != Scope::Key {
+            return None;
+        }
         Some(
             div()
                 .w_full()
@@ -1608,7 +1627,7 @@ impl OpenRouterSettings {
                     .child(if self.advanced_dirty {
                         "Unsaved changes. Press Return or Save."
                     } else {
-                        "Saved in openrouter.json."
+                        ""
                     }),
             )
             .child(
@@ -1782,7 +1801,7 @@ impl Render for OpenRouterSettings {
                     .pt_3()
                     .text_size(px(11.0))
                     .text_color(rgb(FAINT))
-                    .child("Audio goes to OpenRouter and the model's provider for transcription. Hex never stores audio."),
+                    .child("Audio goes to OpenRouter and the model's provider. Failed recordings stay on this Mac for Retry in History."),
             )
             .into_any_element()
     }
@@ -1791,6 +1810,41 @@ impl Render for OpenRouterSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn importing_models_replaces_advanced_drafts_without_touching_key_edits(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, cx| OpenRouterSettings::new(false, true, cx));
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.advanced
+                    .attempt_timeout
+                    .update(cx, |input, cx| input.set_text("invalid", cx));
+                view.advanced_dirty = true;
+                view.key_input
+                    .update(cx, |input, cx| input.set_text("fixture-unsaved-key", cx));
+                let status = view.key_status.clone();
+                let mut imported = view.config.clone();
+                imported.transcription.models = vec!["fixture/imported".into()];
+                imported.transcription.language = "pt".into();
+                imported.transcription.attempt_timeout_seconds = 45;
+                view.apply_imported_config(imported.clone(), cx);
+                assert!(!view.advanced_dirty);
+                assert_eq!(view.advanced.attempt_timeout.read(cx).text(), "45");
+                assert_eq!(view.key_input.read(cx).text(), "fixture-unsaved-key");
+                assert_eq!(view.key_status, status);
+                view.advanced
+                    .temperature
+                    .update(cx, |input, cx| input.set_text("0.5", cx));
+                view.advanced_dirty = true;
+                view.save_advanced(cx);
+                imported.transcription.temperature = Some(0.5);
+                assert_eq!(view.config, imported);
+                assert!(view.render_message(Scope::Advanced).is_none());
+            });
+        });
+    }
 
     #[gpui::test]
     fn keyboard_reaches_selectors_and_returns_focus_after_selection(cx: &mut gpui::TestAppContext) {
@@ -1821,6 +1875,7 @@ mod tests {
             assert!(!view.language_picker_open);
             assert!(view.language_picker_state.trigger.is_focused(window));
             assert!(matches!(view.message, Some((Scope::Language, true, _))));
+            assert!(view.render_message(Scope::Language).is_none());
         });
         cx.simulate_keystrokes("tab enter escape");
         cx.update(|window, cx| {
@@ -1927,6 +1982,10 @@ mod tests {
                 assert!(!view.key_editing);
                 assert!(view.key_input.read(cx).text().is_empty());
                 view.test_key(cx);
+                assert!(
+                    view.render_message(Scope::Key).is_some(),
+                    "explicit key tests still report their result"
+                );
                 view.remove_key(cx);
                 view.remove_key(cx);
                 assert_eq!(view.key_status(), Some(&KeyStatus::Missing));

@@ -93,6 +93,7 @@ pub(crate) fn picker_popup(menu: impl IntoElement) -> AnyElement {
 pub(crate) enum NavigationIcon {
     Settings,
     Models,
+    Hud,
     History,
     Statistics,
 }
@@ -101,7 +102,8 @@ impl NavigationIcon {
     fn sf_symbol(self) -> &'static str {
         match self {
             Self::Settings => "slider.horizontal.3",
-            Self::Models => "square.stack.3d.up",
+            Self::Models => "sparkles",
+            Self::Hud => "capsule",
             Self::History => "clock.fill",
             Self::Statistics => "chart.bar.fill",
         }
@@ -664,7 +666,7 @@ mod layout_tests {
             div().w_full().child(
                 settings_row(
                     "Microphone mode",
-                    "Default: keeps the microphone open for the fastest start. A short pre-roll helps catch the beginning of speech. Audio is not saved by default.",
+                    "Default: keeps the microphone open for the fastest start. A short pre-roll helps catch the beginning of speech. Failed recordings are kept locally for recovery.",
                     div()
                         .debug_selector(|| "settings-control".into())
                         .w(px(220.0))

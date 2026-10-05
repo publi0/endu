@@ -33,6 +33,6 @@
   <key>NSInputMonitoringUsageDescription</key>
   <string>Hex uses Input Monitoring to detect your dictation shortcut in every app.</string>
   <key>NSMicrophoneUsageDescription</key>
-  <string>Hex records while you hold the shortcut and sends the recording to OpenRouter for transcription. Audio is never stored.</string>
+  <string>Hex records when you tap or hold the dictation shortcut and sends the recording to OpenRouter for transcription. Audio is saved temporarily; failed recordings remain locally for Retry in History.</string>
 </dict>
 </plist>

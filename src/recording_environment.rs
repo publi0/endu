@@ -83,15 +83,18 @@ struct RecordingEnvironment {
     sleep: Option<PreventSleep>,
     audio: AudioBehaviorGuard,
     behavior: RecordingAudioBehavior,
+    lower_volume_percent: u8,
 }
 
 impl RecordingEnvironment {
     pub fn start() -> Self {
         let behavior = app_settings::recording_audio_behavior();
+        let lower_volume_percent = app_settings::lower_volume_percent();
         Self {
             sleep: prevent_sleep(),
-            audio: AudioBehaviorGuard::start(behavior),
+            audio: AudioBehaviorGuard::start(behavior, lower_volume_percent),
             behavior,
+            lower_volume_percent,
         }
     }
 }
@@ -133,6 +136,8 @@ impl EnvironmentState for RecordingEnvironment {
     }
     fn can_reactivate(&mut self) -> bool {
         self.behavior == app_settings::recording_audio_behavior()
+            && (self.behavior != RecordingAudioBehavior::LowerVolume
+                || self.lower_volume_percent == app_settings::lower_volume_percent())
             && match &mut self.audio {
                 AudioBehaviorGuard::Faded(fade) => fade.can_reactivate(),
                 _ => true,
@@ -339,10 +344,19 @@ enum AudioBehaviorGuard {
 }
 
 impl AudioBehaviorGuard {
-    fn start(behavior: RecordingAudioBehavior) -> Self {
+    fn start(behavior: RecordingAudioBehavior, lower_volume_percent: u8) -> Self {
         match behavior {
             RecordingAudioBehavior::Mute => default_output_device()
                 .and_then(|device| VolumeFade::new(CoreAudioVolume(device), Instant::now()))
+                .map_or(Self::None, Self::Faded),
+            RecordingAudioBehavior::LowerVolume => default_output_device()
+                .and_then(|device| {
+                    VolumeFade::with_remaining_volume(
+                        CoreAudioVolume(device),
+                        f32::from(lower_volume_percent.min(100)) / 100.0,
+                        Instant::now(),
+                    )
+                })
                 .map_or(Self::None, Self::Faded),
             RecordingAudioBehavior::PauseMedia => {
                 let players = pause_media();
@@ -359,7 +373,7 @@ impl AudioBehaviorGuard {
 
     fn set_active(&mut self, active: bool, now: Instant) {
         match self {
-            Self::Faded(fade) => fade.set_muted(active, now),
+            Self::Faded(fade) => fade.set_active(active, now),
             Self::Paused { players } if !active => {
                 resume_media(players);
                 players.clear();

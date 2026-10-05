@@ -8,8 +8,12 @@ use objc2::MainThreadMarker;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use serde::{Deserialize, Serialize};
 
+static COPY_ON_PASTE_FAILURE: AtomicBool = AtomicBool::new(false);
 static RECORDING_AUDIO_BEHAVIOR: AtomicU8 = AtomicU8::new(0);
-static DOUBLE_TAP_LOCK: AtomicBool = AtomicBool::new(true);
+static DOUBLE_TAP_SENSITIVITY: AtomicU8 = AtomicU8::new(1);
+static LOWER_VOLUME_PERCENT: AtomicU8 = AtomicU8::new(80);
+static DICTATION_MODE: AtomicU8 = AtomicU8::new(0);
+static ENTER_TO_SUBMIT: AtomicBool = AtomicBool::new(false);
 static DOUBLE_TAP_ONLY: AtomicBool = AtomicBool::new(false);
 static RELEASE_MICROPHONE_WHILE_IDLE: AtomicBool = AtomicBool::new(false);
 static HOTKEYS: OnceLock<RwLock<RuntimeHotkeys>> = OnceLock::new();
@@ -23,6 +27,7 @@ struct RuntimeMicrophoneSelection {
     revision: u64,
     device: Option<String>,
     channel: Option<crate::microphone::ChannelSelection>,
+    priority: Vec<crate::microphone::DevicePreference>,
 }
 
 pub const SHIFT_KEY_MASK: u64 = 1 << 17;
@@ -357,6 +362,7 @@ impl Default for RuntimeHotkeys {
 #[serde(rename_all = "snake_case")]
 pub enum RecordingAudioBehavior {
     Mute,
+    LowerVolume,
     PauseMedia,
     #[default]
     DoNothing,
@@ -366,6 +372,7 @@ impl RecordingAudioBehavior {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Mute => "Mute",
+            Self::LowerVolume => "Lower volume",
             Self::PauseMedia => "Pause media",
             Self::DoNothing => "Do nothing",
         }
@@ -374,6 +381,7 @@ impl RecordingAudioBehavior {
     const fn encoded(self) -> u8 {
         match self {
             Self::Mute => 0,
+            Self::LowerVolume => 3,
             Self::PauseMedia => 1,
             Self::DoNothing => 2,
         }
@@ -383,7 +391,38 @@ impl RecordingAudioBehavior {
         match value {
             1 => Self::PauseMedia,
             2 => Self::DoNothing,
+            3 => Self::LowerVolume,
             _ => Self::Mute,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum DictationMode {
+    #[default]
+    TapOrHold,
+    Hold,
+    DoubleTap,
+}
+
+impl DictationMode {
+    pub const ALL: [Self; 3] = [Self::TapOrHold, Self::Hold, Self::DoubleTap];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TapOrHold => "Tap or hold",
+            Self::Hold => "Hold only",
+            Self::DoubleTap => "Double tap",
+        }
+    }
+
+    fn decode(value: u8) -> Self {
+        match value {
+            1 => Self::Hold,
+            2 => Self::DoubleTap,
+            _ => Self::TapOrHold,
         }
     }
 }
@@ -394,15 +433,23 @@ pub struct AppSettings {
     pub release_microphone_while_idle: bool,
     pub sound_effects: bool,
     pub sound_effect_volume: f32,
+    pub sound_volumes: Option<crate::interaction_settings::SoundVolumes>,
     pub microphone: Option<String>,
+    pub microphone_priority: Vec<crate::microphone::DevicePreference>,
     pub microphone_channel: Option<crate::microphone::ChannelSelection>,
     pub recording_audio_behavior: RecordingAudioBehavior,
+    pub lower_volume_percent: u8,
+    pub dictation_mode: DictationMode,
+    pub enter_to_submit: bool,
     pub double_tap_lock: bool,
     pub double_tap_only: bool,
+    pub double_tap_sensitivity: crate::interaction_settings::DoubleTapSensitivity,
     pub dictation_hotkey: HotkeyBinding,
     pub paste_last_hotkey: Option<HotkeyBinding>,
+    pub copy_on_paste_failure: bool,
     pub show_dock_icon: bool,
     pub history_retention: crate::history::HistoryRetention,
+    pub hud: crate::hud_settings::HudPreferences,
 }
 
 impl Default for AppSettings {
@@ -411,15 +458,23 @@ impl Default for AppSettings {
             release_microphone_while_idle: false,
             sound_effects: true,
             sound_effect_volume: 0.5,
+            sound_volumes: None,
             microphone: None,
+            microphone_priority: Vec::new(),
             microphone_channel: None,
             recording_audio_behavior: RecordingAudioBehavior::DoNothing,
-            double_tap_lock: true,
+            lower_volume_percent: 80,
+            dictation_mode: DictationMode::TapOrHold,
+            enter_to_submit: false,
+            double_tap_lock: false,
             double_tap_only: false,
+            double_tap_sensitivity: crate::interaction_settings::DoubleTapSensitivity::default(),
             dictation_hotkey: HotkeyBinding::default(),
             paste_last_hotkey: Some(HotkeyBinding::paste_last_default()),
+            copy_on_paste_failure: false,
             show_dock_icon: true,
             history_retention: crate::history::HistoryRetention::default(),
+            hud: crate::hud_settings::HudPreferences::default(),
         }
     }
 }
@@ -439,6 +494,7 @@ impl AppSettings {
     }
 
     fn normalize_double_tap_settings(&mut self) {
+        self.double_tap_lock = self.dictation_mode == DictationMode::DoubleTap;
         if !self.double_tap_lock || self.dictation_hotkey.key.is_none() {
             self.double_tap_only = false;
         }
@@ -455,7 +511,24 @@ impl AppSettings {
             Ok(data) => {
                 let mut settings: Self = serde_json::from_slice(&data)?;
                 let loaded = serde_json::to_value(&settings)?;
+                let raw: serde_json::Value = serde_json::from_slice(&data)?;
+                if raw.get("dictation_mode").is_none() {
+                    // The former default becomes tap-or-hold; keep explicit hold-only
+                    // and double-tap-only choices made in older versions.
+                    settings.dictation_mode = if raw
+                        .get("double_tap_lock")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(false)
+                    {
+                        DictationMode::Hold
+                    } else if settings.double_tap_only {
+                        DictationMode::DoubleTap
+                    } else {
+                        DictationMode::TapOrHold
+                    };
+                }
                 settings.normalize_double_tap_settings();
+                settings.lower_volume_percent = settings.lower_volume_percent.min(100);
                 if serde_json::to_value(&settings)? != loaded
                     && let Err(error) = settings.write_to(path)
                 {
@@ -475,7 +548,7 @@ impl AppSettings {
         Ok(())
     }
 
-    fn write_to(&self, path: &std::path::Path) -> Result<()> {
+    pub(crate) fn write_to(&self, path: &std::path::Path) -> Result<()> {
         let parent = path
             .parent()
             .ok_or_else(|| eyre!("settings path has no parent"))?;
@@ -490,21 +563,50 @@ impl AppSettings {
         Ok(())
     }
 
-    fn apply_runtime(&self) {
+    pub fn effective_sound_volumes(&self) -> crate::interaction_settings::SoundVolumes {
+        if !self.sound_effects {
+            return crate::interaction_settings::SoundVolumes::from_legacy(0.0);
+        }
+        self.sound_volumes
+            .unwrap_or_else(|| {
+                crate::interaction_settings::SoundVolumes::from_legacy(self.sound_effect_volume)
+            })
+            .normalized()
+    }
+
+    pub(crate) fn apply_runtime(&self) {
+        self.hud.apply_runtime();
+        COPY_ON_PASTE_FAILURE.store(self.copy_on_paste_failure, Ordering::Release);
         RELEASE_MICROPHONE_WHILE_IDLE.store(self.release_microphone_while_idle, Ordering::Release);
         crate::feedback::set_enabled(self.sound_effects);
-        crate::feedback::set_volume(self.sound_effect_volume.clamp(0.0, 1.0));
+        crate::feedback::set_volumes(self.effective_sound_volumes());
+        DOUBLE_TAP_SENSITIVITY.store(
+            match self.double_tap_sensitivity {
+                crate::interaction_settings::DoubleTapSensitivity::Short => 0,
+                crate::interaction_settings::DoubleTapSensitivity::Normal => 1,
+                crate::interaction_settings::DoubleTapSensitivity::Tolerant => 2,
+            },
+            Ordering::Relaxed,
+        );
         RECORDING_AUDIO_BEHAVIOR.store(self.recording_audio_behavior.encoded(), Ordering::Relaxed);
-        DOUBLE_TAP_LOCK.store(self.double_tap_lock, Ordering::Relaxed);
+        LOWER_VOLUME_PERCENT.store(self.lower_volume_percent.min(100), Ordering::Relaxed);
+        DICTATION_MODE.store(self.dictation_mode as u8, Ordering::Release);
+        ENTER_TO_SUBMIT.store(self.enter_to_submit, Ordering::Release);
         DOUBLE_TAP_ONLY.store(
-            self.double_tap_lock && self.double_tap_only && self.dictation_hotkey.key.is_some(),
+            self.dictation_mode == DictationMode::DoubleTap
+                && self.double_tap_only
+                && self.dictation_hotkey.key.is_some(),
             Ordering::Relaxed,
         );
         *HOTKEYS
             .get_or_init(Default::default)
             .write()
             .unwrap_or_else(|error| error.into_inner()) = self.runtime_hotkeys();
-        set_microphone_selection(self.microphone.as_deref(), self.microphone_channel.as_ref());
+        set_microphone_selection(
+            self.microphone.as_deref(),
+            self.microphone_channel.as_ref(),
+            &self.microphone_priority,
+        );
     }
 
     pub fn runtime_hotkeys(&self) -> RuntimeHotkeys {
@@ -532,6 +634,7 @@ pub fn hotkey_conflicts(
 fn set_microphone_selection(
     device: Option<&str>,
     channel: Option<&crate::microphone::ChannelSelection>,
+    priority: &[crate::microphone::DevicePreference],
 ) {
     let device = device
         .map(str::trim)
@@ -539,17 +642,22 @@ fn set_microphone_selection(
         .map(str::to_string);
     let state = MICROPHONE_SELECTION.get_or_init(Default::default);
     let mut state = state.write().unwrap_or_else(|error| error.into_inner());
-    if state.device != device || state.channel.as_ref() != channel {
+    if state.device != device || state.channel.as_ref() != channel || state.priority != priority {
         state.revision = state.revision.wrapping_add(1);
         state.device = device;
         state.channel = channel.cloned();
+        state.priority = priority.to_vec();
     }
 }
 
-pub fn microphone_selection() -> (u64, Option<String>) {
+pub fn microphone_selection() -> (
+    u64,
+    Option<String>,
+    Vec<crate::microphone::DevicePreference>,
+) {
     let state = MICROPHONE_SELECTION.get_or_init(Default::default);
     let state = state.read().unwrap_or_else(|error| error.into_inner());
-    (state.revision, state.device.clone())
+    (state.revision, state.device.clone(), state.priority.clone())
 }
 
 pub fn microphone_channel(device_id: Option<&str>) -> Option<u16> {
@@ -568,12 +676,33 @@ pub fn recording_audio_behavior() -> RecordingAudioBehavior {
     RecordingAudioBehavior::decode(RECORDING_AUDIO_BEHAVIOR.load(Ordering::Relaxed))
 }
 
+pub fn lower_volume_percent() -> u8 {
+    LOWER_VOLUME_PERCENT.load(Ordering::Relaxed).min(100)
+}
+
+pub fn copy_on_paste_failure() -> bool {
+    COPY_ON_PASTE_FAILURE.load(Ordering::Acquire)
+}
+
 pub fn release_microphone_while_idle() -> bool {
     RELEASE_MICROPHONE_WHILE_IDLE.load(Ordering::Acquire)
 }
 
-pub fn double_tap_lock() -> bool {
-    DOUBLE_TAP_LOCK.load(Ordering::Relaxed)
+pub fn dictation_mode() -> DictationMode {
+    DictationMode::decode(DICTATION_MODE.load(Ordering::Acquire))
+}
+
+pub fn enter_to_submit() -> bool {
+    ENTER_TO_SUBMIT.load(Ordering::Acquire)
+}
+
+pub fn double_tap_sensitivity() -> crate::interaction_settings::DoubleTapSensitivity {
+    use crate::interaction_settings::DoubleTapSensitivity;
+    match DOUBLE_TAP_SENSITIVITY.load(Ordering::Relaxed) {
+        0 => DoubleTapSensitivity::Short,
+        2 => DoubleTapSensitivity::Tolerant,
+        _ => DoubleTapSensitivity::Normal,
+    }
 }
 
 pub fn double_tap_only() -> bool {
@@ -630,7 +759,7 @@ pub fn hide_application() {
     NSApplication::sharedApplication(marker).hide(None);
 }
 
-fn path() -> Result<PathBuf> {
+pub(crate) fn path() -> Result<PathBuf> {
     Ok(crate::app_paths::support_dir()?.join("settings.json"))
 }
 
@@ -642,15 +771,19 @@ mod tests {
     fn missing_fields_receive_defaults() {
         let settings: AppSettings = serde_json::from_str("{}").unwrap();
         assert!(!settings.release_microphone_while_idle);
+        assert!(!settings.copy_on_paste_failure);
         assert!(settings.sound_effects);
         assert_eq!(settings.sound_effect_volume, 0.5);
+        assert_eq!(settings.lower_volume_percent, 80);
         assert_eq!(settings.microphone, None);
         assert_eq!(settings.microphone_channel, None);
         assert_eq!(
             settings.recording_audio_behavior,
             RecordingAudioBehavior::DoNothing
         );
-        assert!(settings.double_tap_lock);
+        assert_eq!(settings.dictation_mode, DictationMode::TapOrHold);
+        assert!(!settings.enter_to_submit);
+        assert!(!settings.double_tap_lock);
         assert!(!settings.double_tap_only);
         assert_eq!(settings.dictation_hotkey, HotkeyBinding::default());
         assert_eq!(
@@ -658,6 +791,7 @@ mod tests {
             Some(HotkeyBinding::paste_last_default())
         );
         assert!(settings.show_dock_icon);
+        assert_eq!(settings.hud, crate::hud_settings::HudPreferences::default());
     }
 
     #[test]
@@ -667,6 +801,30 @@ mod tests {
         )
         .unwrap();
         assert!(!settings.double_tap_lock);
+        assert_eq!(settings.lower_volume_percent, 80);
+    }
+
+    #[test]
+    fn lower_volume_choice_and_percentage_round_trip() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{"recording_audio_behavior":"lower_volume","lower_volume_percent":35}"#,
+        )
+        .unwrap();
+        let saved = serde_json::to_vec(&settings).unwrap();
+        let loaded: AppSettings = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(
+            loaded.recording_audio_behavior,
+            RecordingAudioBehavior::LowerVolume
+        );
+        assert_eq!(loaded.lower_volume_percent, 35);
+        for behavior in [
+            RecordingAudioBehavior::Mute,
+            RecordingAudioBehavior::LowerVolume,
+            RecordingAudioBehavior::PauseMedia,
+            RecordingAudioBehavior::DoNothing,
+        ] {
+            assert_eq!(RecordingAudioBehavior::decode(behavior.encoded()), behavior);
+        }
     }
 
     #[test]
@@ -688,6 +846,62 @@ mod tests {
             serde_json::from_str(r#"{"microphone":"USB interface"}"#).unwrap();
         assert_eq!(legacy.microphone.as_deref(), Some("USB interface"));
         assert_eq!(legacy.microphone_channel, None);
+    }
+
+    #[test]
+    fn hud_preferences_persist_without_overwriting_other_settings() {
+        use crate::hud_settings::{HudColor, HudPosition};
+        let directory = std::env::temp_dir().join(format!(
+            "hex-hud-settings-{}-{}",
+            std::process::id(),
+            SETTINGS_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("settings.json");
+        fs::write(&path, br#"{"sound_effects":false,"microphone":"Fixture microphone","hud":{"position":"bottom"}}"#).unwrap();
+        let mut settings = AppSettings::load_from(&path).unwrap();
+        assert_eq!(settings.hud.position, HudPosition::Bottom);
+        assert_eq!(settings.hud.recording_color, HudColor::Red);
+        assert_eq!(settings.hud.transcription_color, HudColor::Blue);
+        settings.hud.recording_color = HudColor::Teal;
+        settings.hud.transcription_color = HudColor::Purple;
+        settings.write_to(&path).unwrap();
+        let reloaded = AppSettings::load_from(&path).unwrap();
+        assert_eq!(reloaded.hud, settings.hud);
+        assert!(!reloaded.sound_effects);
+        assert_eq!(reloaded.microphone.as_deref(), Some("Fixture microphone"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn older_defaults_migrate_to_tap_or_hold_but_explicit_hold_is_preserved() {
+        let directory = std::env::temp_dir().join(format!(
+            "hex-gesture-migration-{}-{}",
+            std::process::id(),
+            SETTINGS_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("settings.json");
+        for (json, expected) in [
+            (r#"{}"#, DictationMode::TapOrHold),
+            (r#"{"double_tap_lock":true}"#, DictationMode::TapOrHold),
+            (r#"{"double_tap_lock":false}"#, DictationMode::Hold),
+            (
+                r#"{"dictation_mode":"double_tap","double_tap_lock":true}"#,
+                DictationMode::DoubleTap,
+            ),
+        ] {
+            fs::write(&path, json).unwrap();
+            let settings = AppSettings::load_from(&path).unwrap();
+            assert_eq!(settings.dictation_mode, expected);
+            assert!(!settings.enter_to_submit);
+            settings.write_to(&path).unwrap();
+            assert_eq!(
+                AppSettings::load_from(&path).unwrap().dictation_mode,
+                expected
+            );
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

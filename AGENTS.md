@@ -2,11 +2,13 @@
 
 ## Purpose
 
-A slim macOS fork of HEX: hold a shortcut to record, trim the silence, send
+A slim macOS fork of HEX: tap a shortcut to lock recording or hold and release,
+trim the silence, send
 the clip to OpenRouter with an ordered model fallback chain, and paste the
-transcript. Settings, Models, History, and Statistics are the only panes.
+transcript. Settings, Models, HUD, History, and Statistics are the only panes.
 OpenRouter key, language, models, and advanced limits belong in Models;
-silence trimming belongs in Settings under Microphone. Everything
+silence trimming belongs in Settings under Microphone. Indicator position and
+recording/transcription palettes belong in HUD. Everything
 else from upstream (local models, voice commands, Voice Action, Modes and
 OpenCode, meetings, the local API and SDK, Linux) was deleted on purpose; do
 not reintroduce seams for them.
@@ -49,6 +51,14 @@ not reintroduce seams for them.
 - `desktop`: the GPUI application, menus, menu bar item, HUD, and listener
   thread lifetime.
 - `dictation_indicator`: the click-through Metal HUD.
+- `hud_settings`, `hud_screen`, `hud_settings_view`: persisted HUD geometry,
+  palettes, size, brightness, monitor selection and coherent runtime snapshots.
+- `interaction_settings`, `sound_settings_view`: independent sound volumes and
+  double-tap sensitivity, preserving legacy audible levels and timing defaults.
+- `microphone_priority_view`: ordered Automatic input preferences; the audio
+  owner applies device changes only between clips.
+- `preferences_transfer`: a versioned, validated allowlist; never export keys,
+  endpoints, History/retention, audio, permissions or login registration.
 - `status_item`, `login_item`, `onboarding`, `permission_guide`, `instance`,
   `feedback`: menu bar, launch at login, setup gate, permission helper, single
   instance lock, and tones.
@@ -58,10 +68,26 @@ not reintroduce seams for them.
 - Capture never waits on transcription, paste, History, or statistics. Queues
   stay bounded. Starting a new capture never cancels accepted work, and output
   keeps submission order.
-- Hold to dictate, release to transcribe. Captures shorter than 300 ms
-  discard. A 450 ms pre-roll protects speech onset. A second tap within 300 ms
-  locks; the next press finishes and Escape cancels. Escape with no capture
-  cancels the newest unfinished job; cancelled jobs never paste.
+- Default TapOrHold locks on a clean release before 300 ms; the next press
+  finishes. Holding at least 300 ms finishes on release. Hold and DoubleTap
+  remain selectable legacy modes. DoubleTap uses the selected timing window
+  (200/300/450 ms, default 300 ms); TapOrHold keeps its 300 ms hold threshold.
+  A 450 ms pre-roll protects speech onset;
+  captures shorter than 300 ms still discard. Escape cancels capture or the
+  newest unfinished job, and cancelled jobs never paste.
+- Optional Enter-to-submit is off by default and applies only to locked
+  recording. Consume a bare Return/keypad Enter press and its repeat/release,
+  then transcribe, paste, wait for paste consumption and post an unmodified
+  Return to the same verified process. Never send it on failure, empty text,
+  cancellation, changed foreground or intervening user input. Its interaction
+  token belongs to one job; Paste Last must never replay it.
+- The event tap predicts only Enter suppression using the same gesture
+  machine as the listener, so a fast Enter cannot leak before a locking release
+  is processed. Audio ownership remains in the listener. Out-of-band suspend,
+  recovery and cancellation invalidate that prediction through a reset epoch.
+- Reset restores only the selected shortcut, re-enables a disabled Paste Last,
+  cancels any shortcut capture, and rejects conflicts with the other shortcut.
+  Use the existing default bindings and save-before-apply path.
 - Recording audio behavior and idle-sleep prevention begin only after the
   intentional-hold threshold.
 - Preserve the existing channel mix until the user explicitly selects a
@@ -91,32 +117,59 @@ not reintroduce seams for them.
   retried once on the same model.
 - Statistics record daily totals only, never text or audio, and recording
   them must never affect dictation.
-- History records only successful pasted output: text plus bounded metadata,
-  never audio. Retention defaults to seven days with hard entry and byte caps.
+- Normal History records only successful pasted output with seven-day default
+  retention and hard caps. The History pane also exposes separate recovery
+  entries, whose audio/text must not be pruned by those normal-history rules.
 - Capture the destination at recording start. Immediately before writing the
   clipboard, verify it is still the foreground application. Send the shortcut
   to that verified process, never globally. A different or missing target
-  defers insertion without touching the clipboard or continuation state.
+  defers insertion without touching the clipboard or continuation state by
+  default. The explicit copy-on-paste-failure option may copy the raw transcript
+  on detected failures/deferred output, never on cancellation/shutdown. This
+  invalidates pending clipboard restores and does not record History or count
+  as a paste. Silent recipient failures cannot be detected by CGEventPostToPid.
 - Deferred output releases the ordered output worker and retains only the
   latest result in memory for explicit Paste Last. That action captures a new
   destination. Record History only on its first successful paste; repeated
   pastes must not duplicate entries. Cancellation/shutdown must not retain or
   paste cancelled output. Do not treat the foreground monitor as authorization.
 - Destination protection is per application, not per window or text field.
-- Audio is never persisted.
+- Completed clips are privately persisted before the remote transcription
+  attempt for user-requested recovery. Failed/interrupted attempts remain in
+  recording-recovery until recovered or explicitly deleted; never expire them
+  via normal History retention or Clear dictations. Persist recovered text
+  before removing audio. Manual Retry must not auto-paste, must be single-flight,
+  and must use current Models settings. Keep the originating application from
+  the capture context through Retry; never replace it with the History window's
+  app. Persist safe error categories, HTTP status and timeout values, never raw
+  provider/transport payloads or credentials. A disk-write failure retains session
+  audio in memory with a visible warning, never a false durability claim.
+- `recording_recovery` owns WAV/metadata persistence and the isolated manual
+  retry worker. Preview retries must use fixtures, never network/credentials.
 - The HUD is observational and click-through. Its preparing capsule follows
   the audio owner's actual readiness, never a timer. A warm microphone starts
   directly in Recording; a cold open emits a generation-scoped CaptureReady.
   Ignore late readiness after cancellation or a newer capture. Preserve the
-  existing red recording and blue transcription shaders and tone threshold;
+  red recording and blue transcription defaults, animation, and tone threshold;
   transitioning from preparation must not restart the entrance animation.
+  HUD choices apply only after successful saves, with old settings defaulting
+  to Top/Red/Blue. Position uses visibleFrame to avoid the Dock; Paste Last's
+  notice follows the same screen and edge. Palette changes affect the entire
+  phase, including its glow and highlights, and never tint Preparing. Missing
+  fixed displays or active-window metadata fall back without permission prompts.
+- Imports validate all fields before writing, preserve local credentials and
+  endpoints, serialize Models readers/writers, and roll back a partial save.
+  Apply runtime only after both files succeed. Imports wait for key operations
+  to finish so their callbacks cannot overwrite the imported editor state.
 - Every pane renders the `desktop_ui` scaffold: `pane_header` or
   `pane_header_with_action`, then one column bounded by `PANE_CONTENT_WIDTH`.
 
 - Choice menus support Tab, arrows, Enter, and Escape, restore focus to their
   trigger, and keep errors visible outside scrollable choices. Setup must not
-  allow keyboard focus into hidden settings. Keep save/error feedback beside
-  its control and disable incompatible key operations while one is pending.
+  allow keyboard focus into hidden settings. Keep errors beside their control
+  and disable incompatible key operations while one is pending.
+  Across all panes, the selected option or updated field confirms a save: do
+  not add Saved/success rows. Keep errors and explicit key-test results visible.
 
 ## Mandatory local validation before every commit
 
@@ -170,16 +223,20 @@ the changes uncommitted. Do not move the checks into GitHub Actions.
 scripts/build-app.sh  # target/app/Hex-<version>.zip
 cargo run -- preview settings
 cargo run -- preview models
+cargo run -- preview hud
 cargo run -- preview history --open-history-retention
 cargo run -- preview statistics
 cargo run -- preview onboarding
 cargo run -- preview dictation-hud
+cargo run -- preview dictation-hud --hud-position bottom --recording-color green --transcription-color purple
 cargo run -- preview paste-notice
 ```
 
 Only macOS builds the app. Other platforms can run the portable modules'
 tests, but there is no Linux app. Previews must not access real configuration,
-credentials, or network services.
+credentials, or network services. The History preview includes a synthetic WAV
+in failed state; its Retry uses a fixed local response and updates through
+normal History polling.
 
 ## GitHub: releases only
 

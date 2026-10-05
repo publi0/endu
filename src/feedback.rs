@@ -10,6 +10,8 @@ use color_eyre::eyre::{Result, WrapErr, eyre};
 use rodio::buffer::SamplesBuffer;
 use rodio::{Decoder, DeviceSinkBuilder, Source};
 
+use crate::interaction_settings::SoundVolumes;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Tone {
     Error,
@@ -21,33 +23,49 @@ pub enum Tone {
 static DICTATION_PLAYER: OnceLock<SyncSender<Tone>> = OnceLock::new();
 static LOADER_STARTED: AtomicBool = AtomicBool::new(false);
 static ENABLED: AtomicBool = AtomicBool::new(true);
-static VOLUME: AtomicU32 = AtomicU32::new(0.5_f32.to_bits());
+static START_VOLUME: AtomicU32 = AtomicU32::new(0.75_f32.to_bits());
+static STOP_VOLUME: AtomicU32 = AtomicU32::new(0.5_f32.to_bits());
+static ERROR_CANCEL_VOLUME: AtomicU32 = AtomicU32::new(0.5_f32.to_bits());
 
 pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
 }
 
-pub fn set_volume(volume: f32) {
-    VOLUME.store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+pub fn set_volumes(volumes: SoundVolumes) {
+    let volumes = volumes.normalized();
+    START_VOLUME.store(volumes.start.to_bits(), Ordering::Relaxed);
+    STOP_VOLUME.store(volumes.stop.to_bits(), Ordering::Relaxed);
+    ERROR_CANCEL_VOLUME.store(volumes.error_cancel.to_bits(), Ordering::Relaxed);
 }
 
-fn volume() -> f32 {
-    f32::from_bits(VOLUME.load(Ordering::Relaxed))
+fn volumes() -> SoundVolumes {
+    SoundVolumes {
+        start: f32::from_bits(START_VOLUME.load(Ordering::Relaxed)),
+        stop: f32::from_bits(STOP_VOLUME.load(Ordering::Relaxed)),
+        error_cancel: f32::from_bits(ERROR_CANCEL_VOLUME.load(Ordering::Relaxed)),
+    }
 }
 
-fn playback_volume(tone: Tone, master_volume: f32) -> f32 {
-    // Emphasize capture onset (+3.5 dB) without amplifying a normalized clip
-    // above unity gain. The shared volume control still mutes every tone.
-    let gain = if tone == Tone::DictationStart {
-        1.5
-    } else {
-        1.0
-    };
-    (master_volume * gain).clamp(0.0, 1.0)
+fn playback_volume(tone: Tone, volumes: SoundVolumes) -> f32 {
+    match tone {
+        Tone::DictationStart => volumes.start,
+        Tone::DictationStop => volumes.stop,
+        Tone::Error | Tone::Cancel => volumes.error_cancel,
+    }
 }
 
 fn sounds_enabled() -> bool {
-    ENABLED.load(Ordering::Relaxed) && volume() > 0.0
+    let volumes = volumes();
+    ENABLED.load(Ordering::Relaxed)
+        && (volumes.start > 0.0 || volumes.stop > 0.0 || volumes.error_cancel > 0.0)
+}
+
+fn tone_volume(tone: Tone) -> f32 {
+    if ENABLED.load(Ordering::Relaxed) {
+        playback_volume(tone, volumes())
+    } else {
+        0.0
+    }
 }
 
 /// How long the output device stays open after the last tone finishes. Holding
@@ -179,7 +197,7 @@ pub fn preload() -> Result<()> {
             };
             let enabled = sounds_enabled();
             output.release_when_idle(enabled, Instant::now());
-            let Some(tone) = tone.filter(|_| enabled) else {
+            let Some(tone) = tone.filter(|tone| enabled && tone_volume(*tone) > 0.0) else {
                 continue;
             };
             let sound = match tone {
@@ -197,11 +215,14 @@ pub fn preload() -> Result<()> {
                 output.release_when_idle(false, Instant::now());
                 continue;
             }
+            let volume = tone_volume(tone);
+            if volume <= 0.0 {
+                continue;
+            }
             let Some(sink) = output.sink.as_ref() else {
                 continue;
             };
-            sink.mixer()
-                .add(sound.clone().amplify(playback_volume(tone, volume())));
+            sink.mixer().add(sound.clone().amplify(volume));
             output.mark_playing(
                 Instant::now(),
                 sound.total_duration().unwrap_or(Duration::ZERO),
@@ -214,7 +235,7 @@ pub fn preload() -> Result<()> {
 }
 
 pub fn play(tone: Tone) {
-    if !sounds_enabled() {
+    if tone_volume(tone) <= 0.0 {
         return;
     }
     match tone {
@@ -236,7 +257,11 @@ fn play_system_sound(tone: Tone) {
         Tone::Error => "Basso",
         Tone::DictationStart | Tone::DictationStop | Tone::Cancel => return,
     };
-    let volume = volume().to_string();
+    let volume = tone_volume(tone);
+    if volume <= 0.0 {
+        return;
+    }
+    let volume = volume.to_string();
     let child = Command::new("/usr/bin/afplay")
         .args([
             "-v",
@@ -272,12 +297,41 @@ mod tests {
     #[test]
     fn start_cue_is_emphasized_while_mute_and_other_tones_keep_their_levels() {
         for tone in [Tone::DictationStart, Tone::DictationStop, Tone::Cancel] {
-            assert_eq!(playback_volume(tone, 0.0), 0.0);
-            assert!(playback_volume(tone, 1.0) <= 1.0);
+            assert_eq!(playback_volume(tone, SoundVolumes::from_legacy(0.0)), 0.0);
+            assert!(playback_volume(tone, SoundVolumes::from_legacy(1.0)) <= 1.0);
         }
-        assert_eq!(playback_volume(Tone::DictationStart, 0.5), 0.75);
-        assert_eq!(playback_volume(Tone::DictationStop, 0.5), 0.5);
-        assert_eq!(playback_volume(Tone::Cancel, 0.5), 0.5);
+        assert_eq!(
+            playback_volume(Tone::DictationStart, SoundVolumes::default()),
+            0.75
+        );
+        assert_eq!(
+            playback_volume(Tone::DictationStop, SoundVolumes::default()),
+            0.5
+        );
+        assert_eq!(playback_volume(Tone::Cancel, SoundVolumes::default()), 0.5);
+    }
+
+    #[test]
+    fn each_volume_controls_only_its_tones_without_an_extra_start_multiplier() {
+        let volumes = SoundVolumes {
+            start: 0.2,
+            stop: 0.6,
+            error_cancel: 0.0,
+        };
+        assert_eq!(playback_volume(Tone::DictationStart, volumes), 0.2);
+        assert_eq!(playback_volume(Tone::DictationStop, volumes), 0.6);
+        assert_eq!(playback_volume(Tone::Cancel, volumes), 0.0);
+        assert_eq!(playback_volume(Tone::Error, volumes), 0.0);
+
+        let volumes = SoundVolumes {
+            start: 0.0,
+            error_cancel: 0.4,
+            ..volumes
+        };
+        assert_eq!(playback_volume(Tone::DictationStart, volumes), 0.0);
+        assert_eq!(playback_volume(Tone::DictationStop, volumes), 0.6);
+        assert_eq!(playback_volume(Tone::Cancel, volumes), 0.4);
+        assert_eq!(playback_volume(Tone::Error, volumes), 0.4);
     }
 
     #[test]
@@ -288,12 +342,18 @@ mod tests {
         let after = peak(
             sound
                 .clone()
-                .amplify(playback_volume(Tone::DictationStart, 0.5))
+                .amplify(playback_volume(
+                    Tone::DictationStart,
+                    SoundVolumes::default(),
+                ))
                 .collect(),
         );
         let maximum = peak(
             sound
-                .amplify(playback_volume(Tone::DictationStart, 1.0))
+                .amplify(playback_volume(
+                    Tone::DictationStart,
+                    SoundVolumes::from_legacy(1.0),
+                ))
                 .collect(),
         );
         assert!(before > 0.0);

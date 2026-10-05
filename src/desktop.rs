@@ -28,7 +28,7 @@ pub enum Launch {
     /// The production app.
     App(ListenerConfig),
     /// The dictation HUD driven by a synthetic capture loop.
-    DictationHudPreview,
+    DictationHudPreview(crate::hud_settings::HudPreferences),
     PasteNoticePreview,
     /// One isolated, deterministic window without app services.
     Shell(AppWindowPreview),
@@ -91,7 +91,11 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
     let notice_preview = matches!(&launch, Launch::PasteNoticePreview);
     let (listener, hud_preview, preview) = match launch {
         Launch::App(listener) => (Some(listener), false, None),
-        Launch::DictationHudPreview | Launch::PasteNoticePreview => (None, true, None),
+        Launch::DictationHudPreview(preferences) => {
+            preferences.apply_runtime();
+            (None, true, None)
+        }
+        Launch::PasteNoticePreview => (None, true, None),
         Launch::Shell(preview) => (None, false, Some(preview)),
     };
     shutdown.store(false, Ordering::Relaxed);
@@ -109,12 +113,18 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
             .inspect_err(|error| tracing::warn!(%error, "dictation history is unavailable"))
             .ok()
     });
+    let recovery = listener
+        .as_ref()
+        .map(|_| crate::recording_recovery::RecordingRecovery::open_default())
+        .transpose()?;
     let (indicator_sender, indicator_receiver) = dictation_indicator::channel();
     if notice_preview {
         let sender = indicator_sender.clone();
         thread::spawn(move || {
             while !shutdown.load(Ordering::Relaxed) {
-                sender.send(DictationIndicatorEvent::ReadyToPaste);
+                sender.send(DictationIndicatorEvent::ReadyToPaste {
+                    copied_to_clipboard: false,
+                });
                 thread::sleep(Duration::from_secs(1));
             }
         });
@@ -128,6 +138,7 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
             let (start_sender, start) = mpsc::sync_channel(1);
             let indicator = indicator_sender.clone();
             let worker_history = history.clone();
+            let worker_recovery = recovery.clone().expect("production recovery store");
             let worker = thread::spawn(move || {
                 if !setup_ready && !wait_for_start(&start, shutdown) {
                     return;
@@ -139,6 +150,7 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
                     Some(indicator.clone()),
                     worker_history,
                     Some(control_receiver),
+                    worker_recovery,
                 ) {
                     tracing::error!(%error, "dictation listener stopped");
                     indicator.send(DictationIndicatorEvent::Failed);
@@ -184,6 +196,9 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
     }
     let quit_worker = listener_worker.clone();
     application.run(move |cx| {
+        if let Some(recovery) = recovery {
+            cx.set_global(recovery);
+        }
         let status_actions = if preview.is_none() && !hud_preview {
             crate::status_item::install()
                 .inspect_err(|error| tracing::error!(%error, "could not install the menu bar item"))
@@ -255,8 +270,8 @@ fn join_listener(worker: &Rc<RefCell<Option<JoinHandle<()>>>>) {
 
 fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
     use crate::app_window::{
-        CloseWindow, HideApplication, MinimizeWindow, QuitApplication, ShowHistory, ShowModels,
-        ShowSettings, ShowStatistics, ToggleFullscreen,
+        CloseWindow, HideApplication, MinimizeWindow, QuitApplication, ShowHistory, ShowHud,
+        ShowModels, ShowSettings, ShowStatistics, ToggleFullscreen,
     };
     cx.bind_keys([
         KeyBinding::new("cmd-w", CloseWindow, None),
@@ -269,6 +284,7 @@ fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
         KeyBinding::new("cmd-2", ShowHistory, None),
         KeyBinding::new("cmd-3", ShowStatistics, None),
         KeyBinding::new("cmd-4", ShowModels, None),
+        KeyBinding::new("cmd-5", ShowHud, None),
     ]);
     cx.bind_keys(crate::text_input::key_bindings());
     let settings_ui = ui.clone();
@@ -278,6 +294,10 @@ fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
     let models_ui = ui.clone();
     cx.on_action(move |_: &ShowModels, cx| {
         models_ui.open_pane(cx, |window, cx| window.show_models(cx));
+    });
+    let hud_ui = ui.clone();
+    cx.on_action(move |_: &ShowHud, cx| {
+        hud_ui.open_pane(cx, |window, cx| window.show_hud(cx));
     });
     let history_ui = ui.clone();
     cx.on_action(move |_: &ShowHistory, cx| {
@@ -301,6 +321,7 @@ fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
             items: vec![
                 MenuItem::action("Settings", ShowSettings),
                 MenuItem::action("Models", ShowModels),
+                MenuItem::action("HUD", ShowHud),
                 MenuItem::action("History", ShowHistory),
                 MenuItem::action("Statistics", ShowStatistics),
                 MenuItem::separator(),
@@ -340,21 +361,20 @@ async fn drive_ui(
             return;
         }
         while let Ok(event) = indicator_events.try_recv() {
-            let notice_event = matches!(
-                event,
-                DictationIndicatorEvent::Preparing
-                    | DictationIndicatorEvent::Started
-                    | DictationIndicatorEvent::JobReadyToPaste { .. }
-                    | DictationIndicatorEvent::ReadyToPaste
-                    | DictationIndicatorEvent::PasteCommitted
-            );
-            if indicator.is_none() && !notice_event {
+            // Lifecycle events also drive the status icon when the floating HUD is absent.
+            if indicator.is_none() && matches!(event, DictationIndicatorEvent::Meter { .. }) {
                 continue;
             }
             if let Err(error) = cx.update(|cx| {
+                crate::status_item::handle_indicator(event);
                 match event {
-                    DictationIndicatorEvent::JobReadyToPaste { .. }
-                    | DictationIndicatorEvent::ReadyToPaste => {
+                    DictationIndicatorEvent::JobReadyToPaste {
+                        copied_to_clipboard,
+                        ..
+                    }
+                    | DictationIndicatorEvent::ReadyToPaste {
+                        copied_to_clipboard,
+                    } => {
                         crate::status_item::set_ready_to_paste(true);
                         if paste_notice.is_none() {
                             paste_notice = crate::paste_notice::PasteNotice::new()
@@ -364,7 +384,7 @@ async fn drive_ui(
                                 .ok();
                         }
                         if let Some(notice) = &mut paste_notice {
-                            notice.show();
+                            notice.show(copied_to_clipboard);
                         }
                     }
                     DictationIndicatorEvent::PasteCommitted => {
@@ -394,6 +414,9 @@ async fn drive_ui(
         if let Some(notice) = &mut paste_notice {
             let _ = cx.update(|_| notice.maintain());
         }
+        if ui.status_actions.is_some() {
+            let _ = cx.update(|_| crate::status_item::animate());
+        }
         while let Some(action) = ui
             .status_actions
             .as_ref()
@@ -406,6 +429,7 @@ async fn drive_ui(
                 StatusItemAction::OpenModels => {
                     ui.open_pane(cx, |window, cx| window.show_models(cx))
                 }
+                StatusItemAction::OpenHud => ui.open_pane(cx, |window, cx| window.show_hud(cx)),
                 StatusItemAction::OpenHistory => {
                     ui.open_pane(cx, |window, cx| window.show_history(cx))
                 }
@@ -458,7 +482,7 @@ mod tests {
     #[gpui::test]
     fn menu_actions_reopen_a_closed_window(cx: &mut gpui::TestAppContext) {
         use crate::app_window::{
-            PreviewPane, ShowHistory, ShowModels, ShowSettings, ShowStatistics,
+            PreviewPane, ShowHistory, ShowHud, ShowModels, ShowSettings, ShowStatistics,
         };
 
         let (listener_controls, _controls) = mpsc::sync_channel(1);
@@ -476,8 +500,13 @@ mod tests {
             }),
         });
         cx.update(|cx| install_menus(cx, &ui));
-        let actions: [&dyn gpui::Action; 4] =
-            [&ShowSettings, &ShowModels, &ShowHistory, &ShowStatistics];
+        let actions: [&dyn gpui::Action; 5] = [
+            &ShowSettings,
+            &ShowModels,
+            &ShowHud,
+            &ShowHistory,
+            &ShowStatistics,
+        ];
         for action in actions {
             cx.update(|cx| {
                 assert!(cx.windows().is_empty());

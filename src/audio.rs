@@ -4,7 +4,9 @@ use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use crate::microphone::{InputDescription, resolve_channel};
+use crate::microphone::{
+    DevicePreference, InputDescription, preferred_input_indices, resolve_channel,
+};
 use color_eyre::eyre::{Result, WrapErr, eyre};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, SizedSample, Stream, StreamConfig};
@@ -132,9 +134,12 @@ pub struct RecoveringAudioInput {
     input: Option<AudioInput>,
     device_override: Option<String>,
     selected_device: Option<String>,
+    preferences: Vec<DevicePreference>,
     active_revision: u64,
     recovery: MicrophoneRecovery,
     replacement: Option<Receiver<InputOpenResult>>,
+    routing_probe: Option<Receiver<Result<DevicePreference, String>>>,
+    next_routing_probe: Instant,
 }
 
 pub enum RecoveringAudioInputEvent {
@@ -150,10 +155,12 @@ pub enum RecoveringAudioInputEvent {
 
 const MICROPHONE_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const MICROPHONE_RETRY_MAX: Duration = Duration::from_secs(5);
+const ROUTING_PROBE_INTERVAL: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum MicrophoneRecoveryReason {
     SelectionChanged,
+    AvailabilityChanged,
     StreamFailed,
 }
 
@@ -192,6 +199,13 @@ impl MicrophoneRecovery {
             self.next_attempt = Some(now);
             self.delay = MICROPHONE_RETRY_INITIAL;
             self.reason = Some(MicrophoneRecoveryReason::StreamFailed);
+        }
+    }
+
+    fn request_routing_change(&mut self, revision: u64, now: Instant) {
+        self.request_selection_change(revision, now);
+        if self.reason != Some(MicrophoneRecoveryReason::StreamFailed) {
+            self.reason = Some(MicrophoneRecoveryReason::AvailabilityChanged);
         }
     }
 
@@ -241,10 +255,11 @@ impl AudioInput {
         )
     }
 
-    pub fn open(device_queries: &[&str]) -> Result<Self> {
-        let host = cpal::default_host();
-        let device = find_device(&host, device_queries)?;
-        Self::open_device(device)
+    fn open_automatic(preferences: &[DevicePreference]) -> Result<Self> {
+        try_input_candidates(automatic_devices(preferences)?, |device| {
+            let name = device.to_string();
+            Self::open_device(device).wrap_err_with(|| format!("could not open microphone {name}"))
+        })
     }
 
     pub fn open_named(name: &str) -> Result<Self> {
@@ -346,9 +361,15 @@ impl RecoveringAudioInput {
         device_override: Option<&str>,
         selection_revision: u64,
         selected_device: Option<&str>,
+        preferences: &[DevicePreference],
     ) -> Self {
-        let mut input = Self::closed(device_override, selection_revision, selected_device);
-        let opened = open_configured_input(device_override, selected_device, true);
+        let mut input = Self::closed(
+            device_override,
+            selection_revision,
+            selected_device,
+            preferences,
+        );
+        let opened = open_configured_input(device_override, selected_device, preferences, true);
         input.finish_initial_open(opened, Instant::now());
         input
     }
@@ -368,14 +389,18 @@ impl RecoveringAudioInput {
         device_override: Option<&str>,
         selection_revision: u64,
         selected_device: Option<&str>,
+        preferences: &[DevicePreference],
     ) -> Self {
         Self {
             input: None,
             device_override: device_override.map(str::to_owned),
             selected_device: selected_device.map(str::to_owned),
+            preferences: preferences.to_vec(),
             active_revision: selection_revision,
             recovery: MicrophoneRecovery::default(),
             replacement: None,
+            routing_probe: None,
+            next_routing_probe: Instant::now() + ROUTING_PROBE_INTERVAL,
         }
     }
 
@@ -385,6 +410,7 @@ impl RecoveringAudioInput {
             Some("HEX nonexistent microphone for pending open test"),
             0,
             None,
+            &[],
         );
         let (sender, receiver) = mpsc::channel();
         input.replacement = Some(receiver);
@@ -408,6 +434,8 @@ impl RecoveringAudioInput {
     pub fn close(&mut self) {
         self.input = None;
         self.replacement = None;
+        self.routing_probe = None;
+        self.next_routing_probe = Instant::now() + ROUTING_PROBE_INTERVAL;
         self.recovery.recovered();
     }
 
@@ -430,11 +458,34 @@ impl RecoveringAudioInput {
         }
     }
 
-    pub fn request_selection(&mut self, revision: u64, selected_device: Option<&str>) {
+    pub fn request_selection(
+        &mut self,
+        revision: u64,
+        selected_device: Option<&str>,
+        preferences: &[DevicePreference],
+    ) {
         if self.device_override.is_some() || revision == self.active_revision {
             return;
         }
+        let keeps_explicit_input = selected_device.is_some_and(|selected| {
+            self.selected_device.as_deref() == Some(selected)
+                && self.description().is_some_and(|current| {
+                    current.name == selected
+                        && current.fallback_from.is_none()
+                        && current.requested_channel
+                            == crate::app_settings::microphone_channel(current.device_id.as_deref())
+                })
+        });
         self.selected_device = selected_device.map(str::to_owned);
+        self.preferences = preferences.to_vec();
+        self.routing_probe = None;
+        self.next_routing_probe = Instant::now() + ROUTING_PROBE_INTERVAL;
+        // Automatic priorities do not affect an explicitly selected healthy
+        // stream. A channel edit still takes the normal deferred-reopen path.
+        if keeps_explicit_input && self.recovery.reason.is_none() && self.replacement.is_none() {
+            self.active_revision = revision;
+            return;
+        }
         if self.input.is_none() && !self.is_recovering() {
             let was_opening = self.replacement.take().is_some();
             self.active_revision = revision;
@@ -454,6 +505,7 @@ impl RecoveringAudioInput {
         capture_idle: bool,
     ) -> RecoveringAudioInputEvent {
         let now = Instant::now();
+        self.maintain_routing(now, capture_idle);
         if let Some((opened_revision, result)) = self.poll_replacement() {
             let target_revision = self
                 .recovery
@@ -465,6 +517,17 @@ impl RecoveringAudioInput {
             }
             match result {
                 Ok(replacement) if capture_idle || self.input.is_none() => {
+                    // An available preferred device may fail to open. If the
+                    // fallback is already active, keep its stream and pre-roll.
+                    if self.recovery.reason == Some(MicrophoneRecoveryReason::AvailabilityChanged)
+                        && self.is_current_device(&DevicePreference {
+                            id: replacement.description.device_id.clone(),
+                            name: replacement.device_name.clone(),
+                        })
+                    {
+                        self.recovery.recovered();
+                        return RecoveringAudioInputEvent::Timeout;
+                    }
                     self.input = Some(replacement);
                     self.active_revision = opened_revision;
                     self.recovery.recovered();
@@ -544,13 +607,17 @@ impl RecoveringAudioInput {
             .unwrap_or(self.active_revision);
         let device_override = self.device_override.clone();
         let selected_device = self.selected_device.clone();
-        let cold_open = self.input.is_none();
+        let preferences = self.preferences.clone();
+        let allow_fallback = self.input.is_none()
+            || self.recovery.blocks_audio()
+            || self.recovery.reason == Some(MicrophoneRecoveryReason::AvailabilityChanged);
         let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let result = open_configured_input(
                 device_override.as_deref(),
                 selected_device.as_deref(),
-                cold_open,
+                &preferences,
+                allow_fallback,
             )
             .map_err(|error| error.to_string());
             let _ = sender.send((revision, result));
@@ -570,29 +637,154 @@ impl RecoveringAudioInput {
         self.replacement = None;
         Some(result)
     }
+
+    /// Enumeration runs outside the audio owner. A returned routing decision
+    /// is only consumed between clips, and normal generation checks still
+    /// govern the replacement stream. CLI overrides are never rerouted.
+    fn maintain_routing(&mut self, now: Instant, capture_idle: bool) {
+        if !capture_idle
+            || self.device_override.is_some()
+            || self.input.is_none()
+            || self.replacement.is_some()
+            || self.recovery.reason.is_some()
+        {
+            return;
+        }
+        if let Some(probe) = &self.routing_probe {
+            match probe.try_recv() {
+                Ok(Ok(preferred)) => {
+                    self.routing_probe = None;
+                    if !self.is_current_device(&preferred) {
+                        self.recovery
+                            .request_routing_change(self.active_revision, now);
+                    }
+                    return;
+                }
+                Ok(Err(_)) | Err(TryRecvError::Disconnected) => self.routing_probe = None,
+                Err(TryRecvError::Empty) => return,
+            }
+        }
+        if now < self.next_routing_probe {
+            return;
+        }
+        // Channel fixtures must never discover and open a developer's actual
+        // microphone, even when a slow test exceeds the polling interval.
+        #[cfg(test)]
+        if self
+            .input
+            .as_ref()
+            .is_some_and(|input| input._stream.is_none())
+        {
+            return;
+        }
+        self.next_routing_probe = now + ROUTING_PROBE_INTERVAL;
+        let selected = self.selected_device.clone();
+        let preferences = self.preferences.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = input_description(selected.as_deref(), &preferences)
+                .map(|description| DevicePreference {
+                    id: description.device_id,
+                    name: description.name,
+                })
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+        self.routing_probe = Some(receiver);
+    }
+
+    fn is_current_device(&self, device: &DevicePreference) -> bool {
+        self.description().is_some_and(|current| {
+            device.matches(&DevicePreference {
+                id: current.device_id.clone(),
+                name: current.name.clone(),
+            })
+        })
+    }
 }
 
 fn open_configured_input(
     device_override: Option<&str>,
     selected_device: Option<&str>,
+    preferences: &[DevicePreference],
     fallback_from_selected: bool,
 ) -> Result<AudioInput> {
+    let (mut input, fallback_from) = open_with_selection(
+        device_override,
+        selected_device,
+        fallback_from_selected,
+        AudioInput::open_named,
+        || AudioInput::open_automatic(preferences),
+    )?;
+    input.description.fallback_from = fallback_from;
+    Ok(input)
+}
+
+fn open_with_selection<T>(
+    device_override: Option<&str>,
+    selected_device: Option<&str>,
+    fallback_from_selected: bool,
+    mut named: impl FnMut(&str) -> Result<T>,
+    mut automatic: impl FnMut() -> Result<T>,
+) -> Result<(T, Option<String>)> {
     if let Some(device) = device_override {
-        return AudioInput::open_named(device);
+        return named(device).map(|input| (input, None));
     }
     if let Some(device) = selected_device {
-        return AudioInput::open_named(device).or_else(|error| {
+        return named(device).map(|input| (input, None)).or_else(|error| {
             if !fallback_from_selected {
                 return Err(error);
             }
             tracing::warn!(%error, device, "selected microphone is unavailable; using automatic selection");
-            AudioInput::open(AUTOMATIC_INPUT_DEVICE_PREFERENCES).map(|mut input| {
-                input.description.fallback_from = Some(device.to_owned());
-                input
-            })
+            automatic().map(|input| (input, Some(device.to_owned())))
         });
     }
-    AudioInput::open(AUTOMATIC_INPUT_DEVICE_PREFERENCES)
+    automatic().map(|input| (input, None))
+}
+
+fn try_input_candidates<D, T>(
+    candidates: impl IntoIterator<Item = D>,
+    mut open: impl FnMut(D) -> Result<T>,
+) -> Result<T> {
+    let mut errors = Vec::new();
+    for candidate in candidates {
+        match open(candidate) {
+            Ok(input) => return Ok(input),
+            Err(error) => errors.push(format!("{error:#}")),
+        }
+    }
+    Err(eyre!(
+        "no preferred or default microphone could be opened: {}",
+        errors.join("; ")
+    ))
+}
+
+fn device_identity(device: &Device) -> DevicePreference {
+    DevicePreference {
+        id: device
+            .id()
+            .ok()
+            .map(|id| id.id().to_owned())
+            .filter(|id| !id.is_empty()),
+        name: device.to_string(),
+    }
+}
+
+/// Available inputs, retaining distinct devices even when names collide.
+pub fn input_device_catalog() -> Result<Vec<DevicePreference>> {
+    let mut devices = cpal::default_host()
+        .input_devices()
+        .wrap_err("could not enumerate input devices")?
+        .map(|device| device_identity(&device))
+        .collect::<Vec<_>>();
+    devices.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then(left.id.cmp(&right.id))
+    });
+    devices.dedup();
+    Ok(devices)
 }
 
 pub fn input_device_names() -> Result<Vec<String>> {
@@ -608,7 +800,7 @@ pub fn input_device_names() -> Result<Vec<String>> {
 }
 
 fn describe_device(device: &Device, channels: u16) -> InputDescription {
-    let device_id = device.id().ok().map(|id| id.id().to_owned());
+    let device_id = device_identity(device).id;
     let requested_channel = crate::app_settings::microphone_channel(device_id.as_deref());
     InputDescription {
         device_id,
@@ -621,48 +813,79 @@ fn describe_device(device: &Device, channels: u16) -> InputDescription {
 }
 
 /// Read routing metadata without opening or recording the microphone.
-pub fn input_description(selected_device: Option<&str>) -> Result<InputDescription> {
-    let host = cpal::default_host();
-    let selected = selected_device.and_then(|name| {
-        host.input_devices()
-            .ok()?
-            .find(|device| device.to_string() == name)
-    });
-    let fallback_from = selected_device
-        .filter(|_| selected.is_none())
-        .map(str::to_owned);
-    let device = match selected {
-        Some(device) => device,
-        None => find_device(&host, AUTOMATIC_INPUT_DEVICE_PREFERENCES)?,
+pub fn input_description(
+    selected_device: Option<&str>,
+    preferences: &[DevicePreference],
+) -> Result<InputDescription> {
+    let describe = |device: Device| -> Result<InputDescription> {
+        let channels = device.default_input_config()?.channels();
+        if channels == 0 {
+            return Err(eyre!("microphone reports no input channels"));
+        }
+        Ok(describe_device(&device, channels))
     };
-    let channels = device.default_input_config()?.channels();
-    let mut description = describe_device(&device, channels);
+    let (mut description, fallback_from) = open_with_selection(
+        None,
+        selected_device,
+        true,
+        |name| {
+            let device = cpal::default_host()
+                .input_devices()?
+                .find(|device| device.to_string() == name)
+                .ok_or_else(|| eyre!("microphone is unavailable: {name}"))?;
+            describe(device)
+        },
+        || try_input_candidates(automatic_devices(preferences)?, describe),
+    )?;
     description.fallback_from = fallback_from;
     Ok(description)
 }
 
-fn find_device(host: &cpal::Host, queries: &[&str]) -> Result<Device> {
-    let devices: Vec<_> = host
+fn automatic_device_indices(
+    available: &[DevicePreference],
+    preferences: &[DevicePreference],
+    fallback: Option<usize>,
+) -> Vec<usize> {
+    let legacy;
+    let preferences = if preferences.is_empty() {
+        legacy = AUTOMATIC_INPUT_DEVICE_PREFERENCES
+            .iter()
+            .filter_map(|query| {
+                available
+                    .iter()
+                    .find(|device| device.name.to_lowercase().contains(&query.to_lowercase()))
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        &legacy
+    } else {
+        preferences
+    };
+    preferred_input_indices(available, preferences, fallback)
+}
+
+fn automatic_devices(preferences: &[DevicePreference]) -> Result<Vec<Device>> {
+    let host = cpal::default_host();
+    let mut devices: Vec<_> = host
         .input_devices()
         .wrap_err("could not enumerate input devices")?
         .collect();
-    for query in queries {
-        if let Some(device) = devices.iter().find(|device| {
-            device
-                .to_string()
-                .to_lowercase()
-                .contains(&query.to_lowercase())
-        }) {
-            return Ok(device.clone());
-        }
-    }
-    let default = host.default_input_device().ok_or_else(|| {
-        eyre!(
-            "no preferred or default input device is available (preferred: {})",
-            queries.join(", ")
-        )
-    })?;
-    Ok(avoid_bluetooth_input(default, &devices))
+    let fallback = host.default_input_device().map(|default| {
+        let default = avoid_bluetooth_input(default, &devices);
+        let identity = device_identity(&default);
+        devices
+            .iter()
+            .position(|device| identity.matches(&device_identity(device)))
+            .unwrap_or_else(|| {
+                devices.push(default);
+                devices.len() - 1
+            })
+    });
+    let identities = devices.iter().map(device_identity).collect::<Vec<_>>();
+    Ok(automatic_device_indices(&identities, preferences, fallback)
+        .into_iter()
+        .map(|index| devices[index].clone())
+        .collect())
 }
 
 #[cfg(target_os = "macos")]
@@ -688,10 +911,10 @@ fn automatic_input_index(default: usize, transports: &[InputTransport]) -> usize
 
 #[cfg(target_os = "macos")]
 fn avoid_bluetooth_input(default: Device, devices: &[Device]) -> Device {
-    let default_id = default.id().ok();
+    let identity = device_identity(&default);
     let Some(default_index) = devices
         .iter()
-        .position(|device| device.id().ok() == default_id)
+        .position(|device| identity.matches(&device_identity(device)))
     else {
         return default;
     };
@@ -857,6 +1080,257 @@ fn captured_through(
 mod tests {
     use super::*;
 
+    fn preference(id: &str, name: &str) -> DevicePreference {
+        DevicePreference {
+            id: Some(id.into()),
+            name: name.into(),
+        }
+    }
+
+    fn test_input(id: &str, name: &str) -> (AudioInput, Sender<(Vec<f32>, CaptureInstant)>) {
+        let (mut input, samples) = AudioInput::channel_for_test();
+        input.device_name = name.into();
+        input.description.device_id = Some(id.into());
+        input.description.name = name.into();
+        (input, samples)
+    }
+
+    #[test]
+    fn configured_priority_replaces_legacy_order_and_preserves_system_fallback() {
+        let available = [
+            preference("system", "Built-in Microphone"),
+            preference("studio", "Studio Display Microphone"),
+            preference("ua", "Universal Audio Thunderbolt"),
+        ];
+        assert_eq!(
+            automatic_device_indices(&available, &[], Some(0)),
+            [2, 1, 0]
+        );
+        assert_eq!(
+            automatic_device_indices(&available, &[available[1].clone()], Some(0)),
+            [1, 0]
+        );
+        assert_eq!(
+            automatic_device_indices(&available, &[preference("missing", "Unavailable")], Some(0)),
+            [0]
+        );
+        assert_eq!(
+            automatic_device_indices(&available, &[available[1].clone()], None),
+            [1]
+        );
+    }
+
+    #[test]
+    fn changing_automatic_priority_preserves_an_explicit_stream_and_its_revision() {
+        let mut input = RecoveringAudioInput::closed(None, 3, Some("Explicit"), &[]);
+        let (active, samples) = test_input("explicit-priority-test", "Explicit");
+        input.finish_initial_open(Ok(active), Instant::now());
+        let preferences = [preference("automatic", "Automatic preference")];
+        input.request_selection(4, Some("Explicit"), &preferences);
+        assert_eq!(input.active_revision, 4);
+        assert_eq!(input.preferences, preferences);
+        assert!(input.recovery.reason.is_none());
+        assert!(input.replacement.is_none());
+        samples
+            .send((vec![0.25], CaptureInstant::from_nanos(1)))
+            .unwrap();
+        assert!(matches!(
+            input.recv_timeout(Duration::ZERO, false),
+            RecoveringAudioInputEvent::Chunk { .. }
+        ));
+    }
+
+    #[test]
+    fn explicit_channel_changes_still_use_the_deferred_reopen_path() {
+        let mut input = RecoveringAudioInput::closed(None, 3, Some("Explicit"), &[]);
+        let (mut active, _samples) = test_input("explicit-channel-test", "Explicit");
+        // An input without a UID cannot match a saved channel preference, so
+        // the current requested channel differs from the runtime mix default.
+        active.description.device_id = None;
+        active.description.channels = 2;
+        active.description.requested_channel = Some(2);
+        active.description.channel = Some(2);
+        input.finish_initial_open(Ok(active), Instant::now());
+        input.request_selection(4, Some("Explicit"), &[]);
+        assert_eq!(input.active_revision, 3);
+        assert_eq!(input.recovery.target_revision, Some(4));
+        assert_eq!(input.description().unwrap().channel, Some(2));
+    }
+
+    #[test]
+    fn automatic_open_tries_the_next_preference_and_then_the_system_device() {
+        let mut attempted = Vec::new();
+        let opened = try_input_candidates(["preferred", "second", "system"], |name| {
+            attempted.push(name);
+            if name == "system" {
+                Ok(name)
+            } else {
+                Err(eyre!("unavailable"))
+            }
+        })
+        .unwrap();
+        assert_eq!(attempted, ["preferred", "second", "system"]);
+        assert_eq!(opened, "system");
+        attempted.clear();
+        let opened = try_input_candidates(["preferred", "second", "system"], |name| {
+            attempted.push(name);
+            if name == "second" {
+                Ok(name)
+            } else {
+                Err(eyre!("unavailable"))
+            }
+        })
+        .unwrap();
+        assert_eq!(attempted, ["preferred", "second"]);
+        assert_eq!(opened, "second");
+    }
+
+    #[test]
+    fn cli_and_explicit_selection_keep_precedence_over_automatic_preferences() {
+        let (selected, fallback) = open_with_selection(
+            Some("CLI"),
+            Some("Settings"),
+            true,
+            |name| Ok(name.to_owned()),
+            || panic!("CLI must not use automatic routing"),
+        )
+        .unwrap();
+        assert_eq!(selected, "CLI");
+        assert_eq!(fallback, None);
+        let result = open_with_selection::<()>(
+            Some("CLI"),
+            Some("Settings"),
+            true,
+            |_| Err(eyre!("missing")),
+            || panic!("missing CLI must not fall back"),
+        );
+        assert!(result.is_err());
+        let (selected, fallback) = open_with_selection(
+            None,
+            Some("Settings"),
+            true,
+            |name| Ok(name.to_owned()),
+            || panic!("explicit choice has precedence"),
+        )
+        .unwrap();
+        assert_eq!(selected, "Settings");
+        assert_eq!(fallback, None);
+        let (selected, fallback) = open_with_selection(
+            None,
+            Some("Missing"),
+            true,
+            |_| Err(eyre!("missing")),
+            || Ok("Automatic"),
+        )
+        .unwrap();
+        assert_eq!(selected, "Automatic");
+        assert_eq!(fallback.as_deref(), Some("Missing"));
+        assert!(
+            open_with_selection::<()>(
+                None,
+                Some("Missing"),
+                false,
+                |_| Err(eyre!("missing")),
+                || panic!("keep current stream during a failed explicit edit")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn reconnected_preference_is_applied_only_after_the_active_capture() {
+        let preferred = preference("preferred", "USB");
+        let mut input =
+            RecoveringAudioInput::closed(None, 3, None, std::slice::from_ref(&preferred));
+        let (active, _samples) = test_input("fallback", "Built-in");
+        input.finish_initial_open(Ok(active), Instant::now());
+        let (sender, receiver) = mpsc::channel();
+        input.routing_probe = Some(receiver);
+        sender.send(Ok(preferred.clone())).unwrap();
+
+        input.maintain_routing(Instant::now(), false);
+        assert!(input.recovery.reason.is_none());
+        assert!(input.routing_probe.is_some());
+        assert_eq!(input.device_name(), "Built-in");
+        input.maintain_routing(Instant::now(), true);
+        assert!(input.recovery.reason == Some(MicrophoneRecoveryReason::AvailabilityChanged));
+        assert_eq!(input.recovery.target_revision, Some(3));
+        assert!(
+            !input.is_recovering(),
+            "an available input continues supplying audio"
+        );
+
+        let (sender, receiver) = mpsc::channel();
+        let (replacement, _samples) = test_input("preferred", "USB renamed");
+        input.replacement = Some(receiver);
+        sender.send((3, Ok(replacement))).unwrap();
+        assert!(matches!(
+            input.recv_timeout(Duration::ZERO, true),
+            RecoveringAudioInputEvent::Reopened
+        ));
+        assert_eq!(input.device_name(), "USB renamed");
+        assert_eq!(input.preferences, [preferred]);
+    }
+
+    #[test]
+    fn preference_edits_discard_stale_workers_and_do_not_interrupt_a_clip() {
+        let mut input = RecoveringAudioInput::closed(None, 3, None, &[]);
+        let (mut active, _active_samples) = test_input("active", "Current");
+        active.description.channels = 2;
+        active.description.channel = Some(2);
+        active.description.requested_channel = Some(2);
+        input.finish_initial_open(Ok(active), Instant::now());
+        let next = preference("next", "Next");
+        input.request_selection(4, None, std::slice::from_ref(&next));
+        let (sender, receiver) = mpsc::channel();
+        let (replacement, _replacement_samples) = test_input("next", "Next");
+        input.replacement = Some(receiver);
+        sender.send((4, Ok(replacement))).unwrap();
+        assert!(matches!(
+            input.recv_timeout(Duration::ZERO, false),
+            RecoveringAudioInputEvent::Timeout
+        ));
+        assert_eq!(input.device_name(), "Current");
+        assert_eq!(input.active_revision, 3);
+        assert_eq!(input.description().unwrap().channel, Some(2));
+
+        input.request_selection(5, None, &[]);
+        let (sender, receiver) = mpsc::channel();
+        let (replacement, _replacement_samples) = test_input("next", "Next");
+        input.replacement = Some(receiver);
+        sender.send((4, Ok(replacement))).unwrap();
+        assert!(matches!(
+            input.recv_timeout(Duration::ZERO, true),
+            RecoveringAudioInputEvent::Timeout
+        ));
+        assert_eq!(input.device_name(), "Current");
+        assert_eq!(input.recovery.target_revision, Some(5));
+        assert!(input.preferences.is_empty());
+    }
+
+    #[test]
+    fn failed_preferred_open_keeps_the_existing_fallback_stream() {
+        let mut input = RecoveringAudioInput::closed(None, 3, None, &[]);
+        let (active, samples) = test_input("same", "Current");
+        input.finish_initial_open(Ok(active), Instant::now());
+        input.recovery.request_routing_change(3, Instant::now());
+        let (sender, receiver) = mpsc::channel();
+        let (replacement, _replacement_samples) = test_input("same", "Current");
+        input.replacement = Some(receiver);
+        sender.send((3, Ok(replacement))).unwrap();
+        assert!(matches!(
+            input.recv_timeout(Duration::ZERO, true),
+            RecoveringAudioInputEvent::Timeout
+        ));
+        let at = CaptureInstant::from_nanos(1);
+        samples.send((vec![0.25], at)).unwrap();
+        assert!(matches!(
+            input.recv_timeout(Duration::ZERO, false),
+            RecoveringAudioInputEvent::Chunk { .. }
+        ));
+        assert!(input.recovery.reason.is_none());
+    }
+
     #[test]
     fn explicit_channels_avoid_silent_channel_attenuation_and_phase_cancellation() {
         let signal = [0.25_f32, -0.5, 0.75];
@@ -957,9 +1431,9 @@ mod tests {
 
     #[test]
     fn closed_input_applies_selection_without_opening() {
-        let mut input = RecoveringAudioInput::closed(None, 3, Some("Old microphone"));
+        let mut input = RecoveringAudioInput::closed(None, 3, Some("Old microphone"), &[]);
 
-        input.request_selection(4, Some("Next microphone"));
+        input.request_selection(4, Some("Next microphone"), &[]);
 
         assert!(!input.is_open());
         assert_eq!(input.active_revision, 4);
@@ -969,7 +1443,7 @@ mod tests {
 
     #[test]
     fn failed_startup_retry_keeps_backoff_without_an_open_stream() {
-        let mut input = RecoveringAudioInput::closed(None, 3, Some("Missing microphone"));
+        let mut input = RecoveringAudioInput::closed(None, 3, Some("Missing microphone"), &[]);
         let started = Instant::now();
         input.finish_initial_open(Err(eyre!("device unavailable")), started);
         assert!(input.is_recovering());
@@ -1006,7 +1480,7 @@ mod tests {
         assert!(!input.is_opening());
         assert_eq!(input.recovery.next_attempt, Some(next_attempt));
 
-        input.request_selection(4, Some("Next microphone"));
+        input.request_selection(4, Some("Next microphone"), &[]);
         assert!(input.is_recovering());
         assert_eq!(input.recovery.target_revision, Some(4));
         assert_eq!(input.active_revision, 3);
@@ -1016,7 +1490,7 @@ mod tests {
 
     #[test]
     fn startup_retry_recovers_metadata_and_audio_without_restarting() {
-        let mut input = RecoveringAudioInput::closed(None, 3, Some("Test microphone"));
+        let mut input = RecoveringAudioInput::closed(None, 3, Some("Test microphone"), &[]);
         input.finish_initial_open(Err(eyre!("device unavailable")), Instant::now());
         let (sender, receiver) = mpsc::channel();
         input.replacement = Some(receiver);
@@ -1047,9 +1521,10 @@ mod tests {
             Some("HEX nonexistent microphone for pending recovery test"),
             3,
             None,
+            &[],
         );
         input.request_recovery();
-        input.request_selection(4, Some("Ignored selection under CLI override"));
+        input.request_selection(4, Some("Ignored selection under CLI override"), &[]);
         assert_eq!(input.active_revision, 3);
         assert!(input.selected_device.is_none());
 
@@ -1068,7 +1543,7 @@ mod tests {
 
     #[test]
     fn failed_on_demand_open_does_not_retry_while_idle() {
-        let mut input = RecoveringAudioInput::closed(None, 3, None);
+        let mut input = RecoveringAudioInput::closed(None, 3, None, &[]);
         let (sender, receiver) = mpsc::channel();
         input.replacement = Some(receiver);
         sender.send((3, Err("device unavailable".into()))).unwrap();

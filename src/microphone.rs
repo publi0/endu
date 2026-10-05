@@ -4,6 +4,51 @@ use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
+/// A configured input preference or an entry in the available-device catalog.
+/// A UID identifies the device even after a rename. Name matching is only used
+/// for devices whose backend cannot provide a stable identifier.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DevicePreference {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub name: String,
+}
+
+impl DevicePreference {
+    pub fn matches(&self, available: &Self) -> bool {
+        match &self.id {
+            Some(id) => available.id.as_ref() == Some(id),
+            None => self.name == available.name,
+        }
+    }
+}
+
+/// Preference order followed by the system fallback, without selecting a
+/// similarly named device when a saved UID is absent. Missing entries remain
+/// in the saved list so a reconnected device can regain its priority.
+pub(crate) fn preferred_input_indices(
+    available: &[DevicePreference],
+    preferences: &[DevicePreference],
+    fallback: Option<usize>,
+) -> Vec<usize> {
+    let mut indices = Vec::new();
+    for preference in preferences {
+        if let Some(index) = available
+            .iter()
+            .position(|device| preference.matches(device))
+            && !indices.contains(&index)
+        {
+            indices.push(index);
+        }
+    }
+    if let Some(index) = fallback.filter(|index| *index < available.len())
+        && !indices.contains(&index)
+    {
+        indices.push(index);
+    }
+    indices
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ChannelSelection {
     pub device_id: String,
@@ -165,6 +210,56 @@ pub fn latest() -> Option<RecordingDiagnostic> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn device(id: Option<&str>, name: &str) -> DevicePreference {
+        DevicePreference {
+            id: id.map(str::to_owned),
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn input_preferences_follow_uids_across_renames_without_matching_impostors() {
+        let available = [
+            device(Some("usb-b"), "USB mic"),
+            device(Some("usb-a"), "Renamed mic"),
+            device(None, "Legacy mic"),
+        ];
+        let preferences = [device(Some("usb-a"), "USB mic"), device(None, "Legacy mic")];
+        assert_eq!(
+            preferred_input_indices(&available, &preferences, Some(0)),
+            [1, 2, 0]
+        );
+        let disconnected = [device(Some("usb-b"), "USB mic"), device(None, "Legacy mic")];
+        assert_eq!(
+            preferred_input_indices(&disconnected, &preferences, Some(0)),
+            [1, 0]
+        );
+        assert_eq!(
+            preferred_input_indices(&available, &preferences, Some(0)),
+            [1, 2, 0]
+        );
+    }
+
+    #[test]
+    fn missing_and_duplicate_preferences_fall_through_once_to_the_default() {
+        let available = [device(Some("a"), "A"), device(Some("b"), "B")];
+        let preferences = [
+            device(Some("missing"), "A"),
+            available[1].clone(),
+            available[1].clone(),
+        ];
+        assert_eq!(
+            preferred_input_indices(&available, &preferences, Some(1)),
+            [1]
+        );
+        assert_eq!(preferred_input_indices(&available, &[], Some(0)), [0]);
+        assert!(preferred_input_indices(&available, &[], None).is_empty());
+        assert_eq!(
+            serde_json::from_str::<DevicePreference>(r#"{"name":"Legacy mic"}"#).unwrap(),
+            device(None, "Legacy mic")
+        );
+    }
 
     #[test]
     fn levels_measure_known_signal_without_changing_samples() {

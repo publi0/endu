@@ -10,6 +10,7 @@ use color_eyre::eyre::{Result, eyre};
 
 use crate::audio::{CaptureInstant, RecoveringAudioInput, RecoveringAudioInputEvent};
 use crate::dictation::{DictationCapture, Finish};
+use crate::microphone::DevicePreference;
 use crate::recording_environment::RecordingEnvironmentController;
 use crate::suppression::PendingInputEvents;
 
@@ -108,6 +109,7 @@ enum Command {
     SelectMicrophone {
         revision: u64,
         device: Option<String>,
+        preferences: Vec<DevicePreference>,
     },
     SetReleaseWhileIdle(bool),
     Shutdown,
@@ -153,14 +155,25 @@ impl DictationAudio {
         device_override: Option<&str>,
         selection_revision: u64,
         selected_device: Option<&str>,
+        preferences: &[DevicePreference],
         recording_environment: RecordingEnvironmentController,
         pending_input: PendingInputEvents,
         release_while_idle: bool,
     ) -> Result<Self> {
         let input = if release_while_idle {
-            RecoveringAudioInput::closed(device_override, selection_revision, selected_device)
+            RecoveringAudioInput::closed(
+                device_override,
+                selection_revision,
+                selected_device,
+                preferences,
+            )
         } else {
-            RecoveringAudioInput::open(device_override, selection_revision, selected_device)
+            RecoveringAudioInput::open(
+                device_override,
+                selection_revision,
+                selected_device,
+                preferences,
+            )
         };
         let device_name = input
             .is_open()
@@ -268,10 +281,16 @@ impl DictationAudio {
         self.state.recovering.load(Ordering::Acquire)
     }
 
-    pub fn request_selection(&self, revision: u64, device: Option<&str>) {
+    pub fn request_selection(
+        &self,
+        revision: u64,
+        device: Option<&str>,
+        preferences: &[DevicePreference],
+    ) {
         let _ = self.commands.send(Command::SelectMicrophone {
             revision,
             device: device.map(str::to_owned),
+            preferences: preferences.to_vec(),
         });
     }
 
@@ -396,10 +415,10 @@ impl Owner {
                     Err(_) => break,
                 }
             }
-            let capture_idle = self.capture_idle();
+            let can_reconfigure = self.can_reconfigure_input();
             let event = self
                 .input
-                .recv_timeout(Duration::from_millis(10), capture_idle);
+                .recv_timeout(Duration::from_millis(10), can_reconfigure);
             self.handle_input(event);
             self.reconcile_input();
         }
@@ -465,8 +484,13 @@ impl Owner {
                 self.state.recording.store(false, Ordering::Release);
                 let _ = reply.send(());
             }
-            Command::SelectMicrophone { revision, device } => {
-                self.input.request_selection(revision, device.as_deref());
+            Command::SelectMicrophone {
+                revision,
+                device,
+                preferences,
+            } => {
+                self.input
+                    .request_selection(revision, device.as_deref(), &preferences);
             }
             Command::SetReleaseWhileIdle(release) => {
                 self.release_while_idle = release;
@@ -486,13 +510,13 @@ impl Owner {
             if remaining.is_zero() {
                 break;
             }
-            let capture_idle = self.capture_idle();
+            let can_reconfigure = self.can_reconfigure_input();
             if !self.input.is_open() {
                 break;
             }
             let event = self
                 .input
-                .recv_timeout(remaining.min(Duration::from_millis(10)), capture_idle);
+                .recv_timeout(remaining.min(Duration::from_millis(10)), can_reconfigure);
             self.handle_input(event);
         }
     }
@@ -501,6 +525,14 @@ impl Owner {
         !self.capture.is_recording()
             && self.pending_capture.is_none()
             && self.pending_input.oldest().is_none()
+    }
+
+    fn can_reconfigure_input(&self) -> bool {
+        // A release acknowledgement may make the owner idle just before its
+        // next reconciliation closes the stream. Do not start an idle routing
+        // replacement in that interval. A requested cold open still completes
+        // because RecoveringAudioInput accepts results when no stream is open.
+        !self.release_while_idle && self.capture_idle()
     }
 
     fn handle_input(&mut self, event: RecoveringAudioInputEvent) {
@@ -1033,6 +1065,41 @@ mod tests {
     }
 
     #[test]
+    fn release_mode_never_allows_idle_routing_after_a_capture_or_cancel() {
+        let (mut owner, input, _samples) = owner_for_test(true);
+        assert!(owner.can_reconfigure_input());
+        owner.handle(Command::SetReleaseWhileIdle(true));
+        assert!(owner.capture_idle());
+        assert!(!owner.can_reconfigure_input());
+        let generation = input.capture_generation();
+        control(&mut owner, |reply| Command::Cancel { reply });
+        assert_eq!(input.capture_generation(), generation);
+        assert!(!owner.can_reconfigure_input());
+        owner.reconcile_input();
+        assert!(!owner.input.is_open());
+        assert!(!owner.input.is_opening());
+        assert!(!owner.input.is_recovering());
+        assert_eq!(input.capture_generation(), generation);
+
+        // Updating a closed Automatic route does not open the device or
+        // manufacture a new capture generation while waiting for a shortcut.
+        owner.input = RecoveringAudioInput::closed(None, 0, None, &[]);
+        owner.handle(Command::SelectMicrophone {
+            revision: 1,
+            device: None,
+            preferences: vec![DevicePreference {
+                id: Some("preferred".into()),
+                name: "Preferred".into(),
+            }],
+        });
+        owner.reconcile_input();
+        assert!(!owner.input.is_open());
+        assert!(!owner.input.is_opening());
+        assert!(!owner.input.is_recovering());
+        assert_eq!(input.capture_generation(), generation);
+    }
+
+    #[test]
     fn boundary_drain_preserves_finish_failure_but_does_not_fail_a_new_capture() {
         for starting in [false, true] {
             let (mut owner, input, samples) = owner_for_test(true);
@@ -1124,6 +1191,7 @@ mod tests {
             Some("HEX nonexistent microphone for startup recovery test"),
             0,
             None,
+            &[],
             RecordingEnvironmentController::for_test(),
             PendingInputEvents::default(),
             false,

@@ -28,7 +28,9 @@ Já tem o Hex instalado? Use os [comandos de atualização](#atualizar).
 
 ## Como funciona
 
-Segure o atalho, fale e solte. O Hex transcreve o áudio e cola o resultado no
+Dê um toque no atalho para começar a gravar e aperte novamente para encerrar.
+Se preferir, mantenha o atalho pressionado e solte para encerrar. O Hex
+transcreve o áudio e cola o resultado no
 aplicativo onde você começou a gravar, se ele continuar em foco ao concluir.
 Você escolhe o modelo e os fallbacks; o app cuida da
 captura, do corte de silêncio e da ordem de entrega dos ditados.
@@ -39,9 +41,33 @@ atalho → gravação → corte de silêncio → OpenRouter → colar
                                        próximo modelo
 ```
 
-O app fica na barra de menus e reúne quatro telas: **Settings**, **Models**,
-**History** e **Statistics**. A transcrição exige conexão à internet e uma chave própria do
+O app fica na barra de menus e reúne cinco telas: **Settings**, **Models**,
+**HUD**, **History** e **Statistics**. A transcrição exige conexão à internet e uma chave própria do
 [OpenRouter](https://openrouter.ai/keys).
+
+## Tamanho em relação ao original
+
+Comparação entre as releases para Apple silicon do
+[Hex original 2.1.24](https://github.com/anomalyco/hex/releases/tag/app-v2.1.24)
+e deste [Hex 3.0.7](https://github.com/publi0/hex/releases/tag/v3.0.7):
+
+| Medida | Original 2.1.24 | Hex 3.0.7 | Redução |
+| --- | ---: | ---: | ---: |
+| Pacote de download | 34,88 MB | 8,97 MB | **25,91 MB · 74,3%** |
+| Linhas nos arquivos do aplicativo | 62.623 | 29.140 | **33.483 linhas · 53,5%** |
+
+O `Hex.app` da versão 3.0.7, descompactado, soma **19,41 MB** em arquivos.
+
+**Critério da medição:** MB corresponde a 1.000.000 de bytes. O pacote
+original é um DMG e o nosso é um ZIP; a diferença de formato e compressão
+também influencia o tamanho do download. Dados do usuário e modelos
+baixados separadamente não entram nessas medidas.
+
+A contagem de linhas usa os arquivos de código em `src/`, `native/`,
+`tests/` e `build.rs` das duas versões publicadas. Inclui testes, comentários
+e linhas vazias; exclui documentação, site, SDK e dependências externas.
+Os números se referem especificamente a essas versões, sem alterações em
+desenvolvimento.
 
 ## Atualizar
 
@@ -79,14 +105,39 @@ ou concede permissões por conta própria.
    tela de setup. As permissões são concedidas por você nos ajustes do macOS.
 2. Cole sua chave do OpenRouter. O app a salva no Keychain e testa o acesso.
 3. Em **Models**, escolha o modelo principal, os fallbacks e o idioma.
-4. Coloque o cursor onde quer escrever, segure **Option**, fale e solte.
+4. Coloque o cursor onde quer escrever, toque **Option**, fale e pressione
+   **Option** novamente para encerrar. Segurar e soltar também funciona.
 
-O atalho é configurável. Com double-tap habilitado, dois toques rápidos travam
-a gravação; a próxima pressão a encerra. **Esc** cancela a captura ou, quando
-não há gravação ativa, o ditado pendente mais recente. Capturas com menos de
-300 ms são descartadas.
+Os dois atalhos são configuráveis e têm **Reset** para voltar ao padrão:
+**Option** para ditar e **Option + Shift + V** para colar o último ditado.
+Reset também reativa o Paste Last quando estiver em **Off**, e avisa se o
+padrão estiver ocupado pelo outro atalho.
 
-O indicador flutuante mantém a cápsula vermelha durante a gravação e a esfera
+O modo padrão **Tap or hold** trava a gravação quando
+você solta o atalho antes de 300 ms; uma nova pressão encerra. Ao segurá-lo por
+300 ms ou mais, soltar encerra o ditado. **Hold only** mantém só o gesto de
+segurar; **Double tap** preserva a opção anterior de dois toques para travar.
+Configurações antigas que desativaram explicitamente o double-tap mantêm
+**Hold only**. **Esc** cancela a captura ou o ditado pendente mais recente.
+Áudios com menos de 300 ms continuam sendo descartados.
+
+A opção **Enter to paste and send**, desligada inicialmente, permite pressionar
+**Enter** durante a gravação travada para encerrar, transcrever, colar e enviar
+um Enter ao campo. Ela não atua enquanto você segura o atalho; **Shift+Enter**
+continua tendo seu comportamento normal. O texto pode ser enviado como uma
+mensagem em aplicativos de conversa.
+
+Esse Enter fica vinculado àquela gravação e ao aplicativo de destino. Uma
+nova tecla ou clique durante a espera impede o envio automático e deixa o
+resultado disponível em **Paste Last**. Se o foco mudar depois da colagem,
+o texto já inserido permanece, mas o Enter é omitido. Erros, resultado vazio
+e cancelamento não enviam Enter. **Paste Last** nunca repete esse envio.
+
+Em **Double tap**, **Double-tap timing** oferece Short (200 ms), Normal
+(300 ms) e Tolerant (450 ms), sem alterar a duração mínima da captura nem
+o limiar de 300 ms do modo Tap or hold.
+
+No padrão, o indicador flutuante mantém a cápsula vermelha durante a gravação e a esfera
 azul na transcrição. Se o microfone precisar abrir, a mesma cápsula aparece
 apagada até o dispositivo estar pronto. Com o microfone já aberto, entra
 direto no vermelho, sem espera adicional. Você pode iniciar
@@ -94,7 +145,7 @@ outro ditado enquanto o anterior é transcrito: os resultados são colados na
 ordem em que foram enviados. **Paste Last Dictation**, no menu, cola novamente
 o último resultado da sessão; se houver uma captura ativa, ela é descartada.
 
-Se outro aplicativo estiver em foco ao concluir, o Hex não altera o clipboard
+Por padrão, se outro aplicativo estiver em foco ao concluir, o Hex não altera o clipboard
 nem cola automaticamente. O aviso **Dictation ready** aparece por alguns
 segundos, e **Paste Last Dictation (ready)** fica disponível no menu. Coloque
 o cursor no destino e use essa ação para inserir o texto. O resultado fica
@@ -102,11 +153,61 @@ apenas na memória até outro ditado substituí-lo ou o app encerrar; entra no
 History somente depois da colagem. A proteção identifica o aplicativo,
 não a janela ou o campo dentro dele.
 
+Em **Settings → Paste Last**, **Copy when auto-paste fails** pode manter a
+transcrição no clipboard quando o Hex detecta erro de colagem ou mudança do
+aplicativo de destino. A opção vem desligada. Quando ativada, o aviso
+**Dictation copied** indica que você pode usar **⌘V**. Cancelamentos não
+acionam a cópia. Falhas silenciosas do aplicativo receptor não são detectadas.
+
 Os seletores de microfone, canal, idioma, modelo e retenção do History aceitam
 teclado: **Tab** dá foco, **Enter** abre ou confirma, as **setas** percorrem as
-opções e **Esc** fecha. Confirmações e erros de salvamento aparecem junto ao
-controle alterado. Durante uma operação com a chave, ações incompatíveis
+opções e **Esc** fecha. A seleção do controle confirma o salvamento; mensagens
+aparecem somente para erros ou resultados de testes explícitos. Durante uma operação com a chave, ações incompatíveis
 ficam indisponíveis até ela terminar.
+
+## HUD
+
+Em **HUD**, na barra lateral, escolha **Top** ou **Bottom** para posicionar o
+indicador no topo ou na parte inferior da tela. **Display** escolhe a tela do
+ponteiro, da janela ativa ou um monitor fixo. Se o monitor fixo desconectar,
+o HUD acompanha o ponteiro até ele voltar. **Edge distance** ajusta a margem
+entre 0 e 160 pontos; a posição respeita a área livre do Dock e da barra de menus.
+
+**Size** oferece Small, Normal e Large. **Brightness** oferece Subtle, Normal
+e Intense. Os padrões preservam o tamanho, o brilho e a animação existentes.
+
+As cores de **Recording** e **Transcribing** são independentes. Cada uma tem
+seis opções: vermelho, laranja, verde, turquesa, azul e roxo. O padrão continua
+vermelho na gravação e azul na transcrição. A cápsula de preparação permanece
+neutra e as animações são preservadas.
+
+As escolhas são salvas automaticamente e aplicadas sem reiniciar o app. O
+aviso de ditado pronto também acompanha a posição escolhida.
+
+## Recuperar uma gravação
+
+Antes de cada tentativa de transcrição, o Hex salva uma cópia local do áudio
+em WAV, com acesso restrito ao seu usuário. Se a conexão, a API ou todos os
+fallbacks falharem, a gravação aparece em **History** com **Retry**, o aplicativo
+em que o ditado começou e o motivo da falha (como timeout, conexão ou código
+HTTP). Os detalhes exibidos não incluem respostas brutas ou credenciais. O áudio
+salvo também pode ser recuperado depois de fechar e reabrir o aplicativo.
+
+**Retry** usa a chave, os modelos e os limites atuais de **Models**. Só uma
+recuperação manual roda por vez. Quando funcionar, o texto será salvo na
+mesma entrada e poderá ser copiado com **Copy text**; não há colagem
+automática. O áudio temporário só é removido depois que esse texto é salvo.
+
+As entradas de recuperação não são apagadas pela retenção normal nem por
+**Clear dictations**. Áudios com falha e textos recuperados ficam disponíveis
+até você excluí-los na própria entrada, com confirmação. O diretório é
+`~/Library/Application Support/hex-openrouter/recording-recovery/`.
+
+Se o disco não permitir salvar, o Hex mantém uma cópia em memória durante a
+sessão e mostra um aviso para manter o aplicativo aberto. Essa cópia não
+sobrevive ao encerramento. O recurso protege tentativas iniciadas de
+transcrição; não é um gravador contínuo nem recupera uma captura descartada
+com Esc ou áudio ainda em memória antes de começar a tentativa.
 
 ## Models
 
@@ -162,7 +263,7 @@ As preferências gerais do aplicativo ficam em **Settings**:
 
 | Controle | Comportamento |
 | --- | --- |
-| **Dictation / Paste last** | Atalhos e comportamento do double-tap. |
+| **Dictation / Paste last** | Atalhos, Reset, modos Tap or hold/Hold only/Double tap, sensibilidade dos dois toques e envio opcional com Enter. |
 | **Microphone / Application** | Microfone, liberação do dispositivo enquanto ocioso, comportamento de outros áudios durante a gravação, sons, ícone no Dock e início no login. |
 | **Microphone / Input channel** | Mantém a mistura atual por padrão. Em interfaces com vários canais, permite escolher explicitamente o canal do microfone. A escolha fica vinculada ao dispositivo. |
 | **Microphone / Input levels** | Mostra RMS, pico e avisos de sinal muito baixo, ausência de sinal ou possível clipping na última gravação analisada. |
@@ -187,9 +288,30 @@ ditado começar logo em seguida. Se detectar uma mudança manual de volume ou
 mute, o Hex deixa de controlar o nível para preservar sua escolha. A opção
 **Pause media** mantém seu comportamento de pausar e retomar os players.
 
-O sinal sonoro de início tem um reforço de volume para facilitar perceber
-quando a gravação começou. O controle geral continua valendo, inclusive
-quando os sons estão desligados; o sinal de término mantém seu volume.
+**While dictating → Lower volume** reduz o áudio sem silenciar. O padrão
+mantém **80% do volume anterior**: se estava em 50%, passa a 40% durante o
+ditado. Em **Volume while dictating**, digite um percentual de 0 a 100 e
+clique em **Save** ou pressione Return. A alteração vale para o próximo
+ditado; ao terminar, o volume anterior volta com fade. Ajustes manuais de
+volume continuam sendo preservados.
+
+Em **Sounds**, início, término e erro/cancelamento têm volumes independentes,
+incluindo Off para cada evento. A migração preserva o volume que você já usava,
+inclusive sons desligados e o reforço anterior do sinal de início.
+
+**Input priority** organiza os microfones usados por **Automatic**. Adicione
+os dispositivos e use as setas para ordenar. Preferências explícitas e o
+override de linha de comando continuam tendo precedência. A lista vazia mantém
+a seleção automática anterior. Reconexões são verificadas em background e a
+troca acontece entre ditados; liberar o microfone ocioso continua sem abri-lo.
+
+Em **Preferences → Export / Import**, o Hex usa um arquivo JSON versionado para
+os controles do app e as preferências de transcrição, incluindo modo de gravação,
+envio com Enter, redução de volume e cópia após falha de colagem. Chave, endereço da API,
+permissões, início no login, histórico, retenção e áudio não são exportados nem
+alterados pela importação. O arquivo é validado antes da aplicação; falhas de
+salvamento tentam restaurar as preferências anteriores. Arquivos maiores que
+256 KiB ou de formato incompatível são recusados.
 
 ## History e Statistics
 
@@ -221,8 +343,9 @@ retornados pelo provedor.
 ## Dados e privacidade
 
 O áudio enviado passa pelo OpenRouter e pelo provedor do modelo escolhido.
-O Hex não salva arquivos de áudio localmente. As regras de retenção desses
-serviços são independentes dos controles locais do app.
+O Hex salva áudio temporariamente antes de transcrever. Gravações com falha
+ficam no Mac para recuperação, até Retry funcionar ou você excluí-las.
+As regras de retenção desses serviços são independentes dos controles locais do app.
 
 Os arquivos locais ficam em `~/Library/Application Support/hex-openrouter`:
 
@@ -231,6 +354,7 @@ Os arquivos locais ficam em `~/Library/Application Support/hex-openrouter`:
 | `settings.json` | Preferências do aplicativo e atalhos. |
 | `openrouter.json` | Modelos, idioma e parâmetros de transcrição; a chave só aparece se configurada em texto puro. |
 | `history.json` | Texto dos ditados e metadados, conforme a retenção escolhida. |
+| `recording-recovery/` | WAVs de tentativas pendentes/com falha e textos recuperados; acesso restrito ao usuário. |
 | `stats.json` | Totais diários, sem texto, áudio ou corpos de respostas de erro. |
 | `logs/live.ndjson` e `logs/process.log` | Eventos e diagnósticos. O log de eventos inclui texto colado e aplicativo em foco; erros podem incluir detalhes retornados pelo provedor. |
 

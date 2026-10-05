@@ -17,8 +17,8 @@ use metal::{
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSEvent, NSPanel, NSScreen, NSStatusWindowLevel, NSView,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSBackingStoreType, NSColor, NSPanel, NSStatusWindowLevel, NSView, NSWindowCollectionBehavior,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use objc2_quartz_core::CALayer;
@@ -27,7 +27,6 @@ const WINDOW_WIDTH: f32 = 112.0;
 const WINDOW_HEIGHT: f32 = 64.0;
 const CAPSULE_WIDTH: f32 = 56.0;
 const CAPSULE_HEIGHT: f32 = 16.0;
-const TOP_OFFSET: f64 = 12.0;
 const ENTRANCE_ANGULAR_FREQUENCY: f32 = 24.0;
 const EXIT_ANGULAR_FREQUENCY: f32 = 24.0;
 const GEOMETRY_ANGULAR_FREQUENCY: f32 = 24.0;
@@ -40,16 +39,34 @@ const RECORDING_FLASH_HALF_LIFE: Duration = Duration::from_millis(280);
 pub enum DictationIndicatorEvent {
     Preparing,
     Started,
-    Meter { average: f32, peak: f32 },
-    Submitted { job_id: u64 },
-    Transcribing { job_id: u64 },
+    Meter {
+        average: f32,
+        peak: f32,
+    },
+    Submitted {
+        job_id: u64,
+    },
+    Transcribing {
+        job_id: u64,
+    },
     Discarded,
     Cancelled,
-    JobCompleted { job_id: u64 },
-    JobCancelled { job_id: u64 },
-    JobFailed { job_id: u64 },
-    JobReadyToPaste { job_id: u64 },
-    ReadyToPaste,
+    JobCompleted {
+        job_id: u64,
+    },
+    JobCancelled {
+        job_id: u64,
+    },
+    JobFailed {
+        job_id: u64,
+    },
+    JobReadyToPaste {
+        job_id: u64,
+        copied_to_clipboard: bool,
+    },
+    ReadyToPaste {
+        copied_to_clipboard: bool,
+    },
     PasteCommitted,
     Failed,
 }
@@ -231,7 +248,7 @@ impl MetalIndicator {
             display_link_context,
             ordered: false,
         };
-        indicator.position_on_pointer_screen();
+        indicator.position_on_selected_screen();
         Ok(indicator)
     }
 
@@ -241,7 +258,7 @@ impl MetalIndicator {
             event,
             DictationIndicatorEvent::Preparing | DictationIndicatorEvent::Started
         ) {
-            self.position_on_pointer_screen();
+            self.position_on_selected_screen();
             self.window.orderFrontRegardless();
             self.ordered = true;
             tracing::info!("Metal dictation indicator shown");
@@ -255,7 +272,7 @@ impl MetalIndicator {
 
     fn maintain(&mut self) {
         if self.renderer.is_active() {
-            self.position_on_pointer_screen();
+            self.position_on_selected_screen();
             if !self.ordered {
                 self.window.orderFrontRegardless();
                 self.ordered = true;
@@ -271,26 +288,33 @@ impl MetalIndicator {
         }
     }
 
-    fn position_on_pointer_screen(&mut self) {
-        let Some(mtm) = MainThreadMarker::new() else {
+    fn position_on_selected_screen(&mut self) {
+        let preferences = crate::hud_settings::current();
+        let Some(screen) = crate::hud_screen::resolve(preferences) else {
             return;
         };
-        let pointer = NSEvent::mouseLocation();
-        let screens = NSScreen::screens(mtm);
-        let Some(screen) = screens.iter().find(|screen| {
-            let frame = screen.frame();
-            pointer.x >= frame.origin.x
-                && pointer.x < frame.origin.x + frame.size.width
-                && pointer.y >= frame.origin.y
-                && pointer.y < frame.origin.y + frame.size.height
-        }) else {
-            return;
-        };
-        let visible = screen.visibleFrame();
-        let capsule_margin = f64::from((WINDOW_HEIGHT - CAPSULE_HEIGHT) / 2.0);
+        let size_factor = preferences.size.scale();
+        let window_width = f64::from(WINDOW_WIDTH * size_factor);
+        let window_height = f64::from(WINDOW_HEIGHT * size_factor);
+        let frame = self.window.frame();
+        if (frame.size.width - window_width).abs() > 0.01
+            || (frame.size.height - window_height).abs() > 0.01
+        {
+            self.window
+                .setContentSize(NSSize::new(window_width, window_height));
+        }
+        self.renderer
+            .set_viewport(screen.backing_scale, size_factor);
+        let visible = screen.visible_frame;
         let top_left = NSPoint::new(
-            visible.origin.x + (visible.size.width - f64::from(WINDOW_WIDTH)) / 2.0,
-            visible.origin.y + visible.size.height + capsule_margin - TOP_OFFSET,
+            visible.origin.x + (visible.size.width - window_width) / 2.0,
+            preferences.position.window_top(
+                visible.origin.y,
+                visible.size.height,
+                window_height,
+                f64::from(CAPSULE_HEIGHT * size_factor),
+                f64::from(preferences.edge_distance),
+            ),
         );
         let frame = self.window.frame();
         if (frame.origin.x - top_left.x).abs() > 0.5
@@ -298,7 +322,6 @@ impl MetalIndicator {
         {
             self.window.setFrameTopLeftPoint(top_left);
         }
-        self.renderer.set_scale(screen.backingScaleFactor() as f32);
     }
 }
 
@@ -351,8 +374,11 @@ impl SharedRenderer {
         self.active.store(true, Ordering::Release);
     }
 
-    fn set_scale(&self, scale: f32) {
-        self.renderer.lock().unwrap().set_scale(scale);
+    fn set_viewport(&self, scale: f32, size_factor: f32) {
+        self.renderer
+            .lock()
+            .unwrap()
+            .set_viewport(scale, size_factor);
     }
 
     fn draw(&self) {
@@ -446,9 +472,12 @@ struct Uniforms {
     completion: f32,
     recording_flash: f32,
     preparing: f32,
+    recording_hue_shift: f32,
+    transcription_hue_shift: f32,
+    brightness: f32,
 }
 
-const _: () = assert!(std::mem::size_of::<Uniforms>() == 112);
+const _: () = assert!(std::mem::size_of::<Uniforms>() == 120);
 
 fn recording_flash(elapsed: Duration) -> f32 {
     2.0_f32.powf(-elapsed.as_secs_f32() / RECORDING_FLASH_HALF_LIFE.as_secs_f32())
@@ -476,6 +505,7 @@ struct MetalRenderer {
     exiting: bool,
     completion_pending: bool,
     scale: f32,
+    size_factor: f32,
     target_average: f32,
     target_peak: f32,
     average: Spring,
@@ -541,6 +571,7 @@ impl MetalRenderer {
             exiting: true,
             completion_pending: false,
             scale: 2.0,
+            size_factor: 1.0,
             target_average: 0.0,
             target_peak: 0.0,
             average: Spring::new(0.0),
@@ -638,10 +669,11 @@ impl MetalRenderer {
             DictationIndicatorEvent::JobFailed { job_id } => {
                 self.finish_job(job_id, now, Phase::Failed);
             }
-            DictationIndicatorEvent::JobReadyToPaste { job_id } => {
+            DictationIndicatorEvent::JobReadyToPaste { job_id, .. } => {
                 self.finish_job(job_id, now, Phase::Hidden);
             }
-            DictationIndicatorEvent::ReadyToPaste | DictationIndicatorEvent::PasteCommitted => {}
+            DictationIndicatorEvent::ReadyToPaste { .. }
+            | DictationIndicatorEvent::PasteCommitted => {}
             DictationIndicatorEvent::Failed => {
                 self.capture_phase = None;
                 self.phase_started = now;
@@ -700,15 +732,18 @@ impl MetalRenderer {
         self.processing.velocity = 0.0;
     }
 
-    fn set_scale(&mut self, scale: f32) {
-        if (self.scale - scale).abs() < f32::EPSILON {
+    fn set_viewport(&mut self, scale: f32, size_factor: f32) {
+        if (self.scale - scale).abs() < f32::EPSILON
+            && (self.size_factor - size_factor).abs() < f32::EPSILON
+        {
             return;
         }
         self.scale = scale;
+        self.size_factor = size_factor;
         self.layer.set_contents_scale(f64::from(scale));
         self.layer.set_drawable_size(CGSize::new(
-            f64::from(WINDOW_WIDTH * scale),
-            f64::from(WINDOW_HEIGHT * scale),
+            f64::from(WINDOW_WIDTH * scale * size_factor),
+            f64::from(WINDOW_HEIGHT * scale * size_factor),
         ));
     }
 
@@ -793,8 +828,13 @@ impl MetalRenderer {
         let command_buffer = self.command_queue.new_command_buffer();
         let encoder = command_buffer.new_render_command_encoder(descriptor);
         encoder.set_render_pipeline_state(&self.pipeline);
+        let preferences = crate::hud_settings::current();
+        let [recording_hue_shift, transcription_hue_shift] = preferences.hue_shifts();
         let uniforms = Uniforms {
-            resolution: [WINDOW_WIDTH * self.scale, WINDOW_HEIGHT * self.scale],
+            resolution: [
+                WINDOW_WIDTH * self.scale * self.size_factor,
+                WINDOW_HEIGHT * self.scale * self.size_factor,
+            ],
             time: now.duration_since(self.render_started).as_secs_f32(),
             width: self.width.value,
             height: CAPSULE_HEIGHT,
@@ -832,6 +872,9 @@ impl MetalRenderer {
             },
             recording_flash: recording_flash_for(self.phase, elapsed),
             preparing: self.preparing,
+            recording_hue_shift,
+            transcription_hue_shift,
+            brightness: preferences.brightness.factor(),
         };
         encoder.set_fragment_bytes(
             0,
@@ -983,11 +1026,14 @@ mod tests {
 
     #[test]
     fn rust_uniform_layout_matches_metal() {
-        assert_eq!(std::mem::size_of::<Uniforms>(), 112);
+        assert_eq!(std::mem::size_of::<Uniforms>(), 120);
         assert_eq!(std::mem::align_of::<Uniforms>(), 8);
         assert_eq!(std::mem::offset_of!(Uniforms, sphere_outline), 92);
         assert_eq!(std::mem::offset_of!(Uniforms, recording_flash), 100);
         assert_eq!(std::mem::offset_of!(Uniforms, preparing), 104);
+        assert_eq!(std::mem::offset_of!(Uniforms, recording_hue_shift), 108);
+        assert_eq!(std::mem::offset_of!(Uniforms, transcription_hue_shift), 112);
+        assert_eq!(std::mem::offset_of!(Uniforms, brightness), 116);
     }
 
     #[test]

@@ -23,6 +23,7 @@ use crate::suppression::InputActivity;
 pub enum PasteOutcome {
     Pasted,
     Deferred,
+    CopiedToClipboard,
 }
 
 pub struct Paster {
@@ -59,6 +60,12 @@ struct ClipboardRestore {
 }
 
 impl ClipboardRestore {
+    fn forget(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.original = None;
+        self.last_change_count = None;
+    }
+
     fn register(
         &mut self,
         previous: ClipboardSnapshot,
@@ -213,7 +220,48 @@ impl Paster {
         &mut self,
         text: &str,
         target: &crate::context::ContextSnapshot,
-        commit: impl FnOnce() -> bool,
+        submit_after_paste: Option<u64>,
+        commit: impl Fn() -> bool,
+    ) -> Result<PasteOutcome> {
+        let enabled = crate::app_settings::copy_on_paste_failure();
+        let outcome = self.paste_attempt(text, target, submit_after_paste, &commit);
+        fallback_after_attempt(outcome, enabled, &commit, || self.copy_fallback(text))
+    }
+
+    fn copy_fallback(&mut self, text: &str) -> Result<()> {
+        let mut restore = self
+            .clipboard_restore
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // This opt-in copy replaces the clipboard. Preserve it if possible so
+        // a failed write can still be rolled back. No key event is posted.
+        let previous_count = self.clipboard.changeCount();
+        let previous = capture_clipboard(&self.clipboard).ok();
+        if self.clipboard.changeCount() != previous_count {
+            return Err(eyre!("clipboard changed while preparing the fallback copy"));
+        }
+        if let Err(error) = write_clipboard_text(&self.clipboard, text) {
+            if let Some(previous) = previous
+                && restore_clipboard(&self.clipboard, &previous).is_ok()
+                && restore.last_change_count == Some(previous_count)
+            {
+                restore.last_change_count = Some(self.clipboard.changeCount());
+            }
+            return Err(error);
+        }
+        // A restore scheduled by the failed paste must never erase this copy.
+        restore.forget();
+        self.prepared_clipboard = None;
+        self.continuation = None;
+        Ok(())
+    }
+
+    fn paste_attempt(
+        &mut self,
+        text: &str,
+        target: &crate::context::ContextSnapshot,
+        submit_after_paste: Option<u64>,
+        commit: impl Fn() -> bool,
     ) -> Result<PasteOutcome> {
         let revision = self.activity.revision();
         let text = self
@@ -254,8 +302,13 @@ impl Paster {
                 }
                 Ok((restore, previous, previous_change_count))
             },
-            commit,
+            &commit,
             || {
+                if submit_after_paste
+                    .is_some_and(|expected| expected != self.activity.interaction_revision())
+                {
+                    return None;
+                }
                 target
                     .target
                     .as_ref()
@@ -280,7 +333,7 @@ impl Paster {
             return Ok(PasteOutcome::Deferred);
         };
         let clipboard_restore = self.clipboard_restore.clone();
-        complete_paste(
+        let submitted = complete_paste_with_submit(
             || keyboard::post_command_to_pid('v', pid),
             move || {
                 thread::spawn(move || {
@@ -308,14 +361,57 @@ impl Paster {
                 });
             },
             thread::sleep,
+            || {
+                submit_if_current(
+                    submit_after_paste,
+                    &commit,
+                    || self.activity.interaction_revision(),
+                    || {
+                        target
+                            .target
+                            .as_ref()
+                            .and_then(|target| target.current_process_id())
+                            == Some(pid)
+                    },
+                    || keyboard::post_return_to_pid(pid),
+                )
+            },
         )?;
-        self.continuation = Some(Continuation {
+        self.continuation = (!submitted).then_some(Continuation {
             revision,
             target: target.target.clone(),
             inserted: text,
         });
         Ok(PasteOutcome::Pasted)
     }
+}
+
+fn fallback_after_attempt(
+    outcome: Result<PasteOutcome>,
+    enabled: bool,
+    commit: &dyn Fn() -> bool,
+    copy: impl FnOnce() -> Result<()>,
+) -> Result<PasteOutcome> {
+    if !enabled
+        || matches!(
+            outcome,
+            Ok(PasteOutcome::Pasted | PasteOutcome::CopiedToClipboard)
+        )
+    {
+        return outcome;
+    }
+    // Clipboard preparation can fail before the original output commit. Check
+    // again here so cancellation/shutdown can still win before the fallback.
+    if !commit() {
+        return Err(eyre!("paste was cancelled"));
+    }
+    if let Err(error) = &outcome {
+        tracing::warn!(%error, "automatic paste failed; copying the transcript instead");
+    }
+    copy().map_err(|error| {
+        error.wrap_err("could not copy the transcript after automatic paste failed")
+    })?;
+    Ok(PasteOutcome::CopiedToClipboard)
 }
 
 pub(crate) fn commit_prepared_paste<P, T>(
@@ -343,18 +439,55 @@ fn commit_targeted_paste<P, T>(
     })
 }
 
+#[cfg(test)]
 fn complete_paste(
     post_paste: impl FnOnce() -> Result<()>,
     schedule_restore: impl FnOnce(),
     wait: impl FnOnce(Duration),
 ) -> Result<()> {
+    complete_paste_with_submit(post_paste, schedule_restore, wait, || false).map(|_| ())
+}
+
+fn complete_paste_with_submit(
+    post_paste: impl FnOnce() -> Result<()>,
+    schedule_restore: impl FnOnce(),
+    wait: impl FnOnce(Duration),
+    submit: impl FnOnce() -> bool,
+) -> Result<bool> {
     let posted = post_paste();
     schedule_restore();
     posted?;
     // Keep the clipboard stable for the target's 100 ms consumption window.
     // This is not an acknowledgment; longer OS or application stalls can still lose a paste.
     wait(PASTE_SETTLE_DELAY);
-    Ok(())
+    Ok(submit())
+}
+
+fn submit_if_current(
+    intent: Option<u64>,
+    output_allowed: impl FnOnce() -> bool,
+    revision: impl FnOnce() -> u64,
+    destination_is_current: impl FnOnce() -> bool,
+    post: impl FnOnce() -> Result<()>,
+) -> bool {
+    let Some(expected) = intent else {
+        return false;
+    };
+    if !output_allowed() || revision() != expected || !destination_is_current() {
+        tracing::info!(
+            "Return skipped after paste because output stopped, the destination changed, or user input intervened"
+        );
+        return false;
+    }
+    match post() {
+        Ok(()) => true,
+        Err(error) => {
+            // Text was inserted, so retain normal paste/History success even if
+            // Return could not be posted. Never repeat this through Paste Last.
+            tracing::warn!(%error, "text pasted but Return could not be posted");
+            false
+        }
+    }
 }
 
 fn capture_clipboard(clipboard: &NSPasteboard) -> Result<ClipboardSnapshot> {
@@ -665,12 +798,150 @@ fn replace_character(text: &str, index: usize, replacement: impl Iterator<Item =
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fallback_copies_only_detected_failures_when_enabled_and_committed() {
+        use std::cell::Cell;
+        for enabled in [false, true] {
+            for cancelled in [false, true] {
+                for error in [false, true] {
+                    let copied = Cell::new(false);
+                    let outcome = if error {
+                        Err(eyre!("paste failure"))
+                    } else {
+                        Ok(PasteOutcome::Deferred)
+                    };
+                    let result = fallback_after_attempt(outcome, enabled, &|| !cancelled, || {
+                        copied.set(true);
+                        Ok(())
+                    });
+                    assert_eq!(copied.get(), enabled && !cancelled);
+                    if copied.get() {
+                        assert_eq!(result.unwrap(), PasteOutcome::CopiedToClipboard);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            fallback_after_attempt(
+                Ok(PasteOutcome::Pasted),
+                true,
+                &|| panic!("already committed"),
+                || panic!("successful paste must restore the clipboard normally")
+            )
+            .unwrap(),
+            PasteOutcome::Pasted
+        );
+        assert!(
+            fallback_after_attempt(Err(eyre!("paste failure")), true, &|| true, || Err(eyre!(
+                "clipboard unavailable"
+            )))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fallback_copy_invalidates_pending_clipboard_restoration() {
+        let mut restore = ClipboardRestore::default();
+        let original = ClipboardSnapshot { items: Vec::new() };
+        let scheduled_generation = restore.register(original, 1, 2);
+        restore.forget();
+        assert_ne!(restore.generation, scheduled_generation);
+        assert!(restore.original.is_none());
+        assert!(restore.last_change_count.is_none());
+    }
+
     use std::cell::{Cell, RefCell};
 
     use super::*;
     use objc2_foundation::NSData;
 
     static PASTEBOARD_TEST: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn return_follows_a_successful_paste_and_its_consumption_window() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let sent = complete_paste_with_submit(
+            || {
+                events.borrow_mut().push("paste");
+                Ok(())
+            },
+            || events.borrow_mut().push("restore scheduled"),
+            |delay| {
+                assert_eq!(delay, PASTE_SETTLE_DELAY);
+                events.borrow_mut().push("wait");
+            },
+            || {
+                submit_if_current(
+                    Some(7),
+                    || true,
+                    || 7,
+                    || true,
+                    || {
+                        events.borrow_mut().push("return");
+                        Ok(())
+                    },
+                )
+            },
+        )
+        .unwrap();
+        assert!(sent);
+        assert_eq!(
+            *events.borrow(),
+            ["paste", "restore scheduled", "wait", "return"]
+        );
+        assert!(
+            complete_paste_with_submit(
+                || Err(eyre!("paste failed")),
+                || {},
+                |_| panic!("no wait"),
+                || panic!("no Return")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn return_is_not_sent_for_manual_paste_new_input_or_a_changed_destination() {
+        for (intent, revision, same_target) in
+            [(None, 7, true), (Some(7), 8, true), (Some(7), 7, false)]
+        {
+            assert!(!submit_if_current(
+                intent,
+                || true,
+                || revision,
+                || same_target,
+                || panic!("must not send")
+            ));
+        }
+        assert!(!submit_if_current(
+            Some(7),
+            || true,
+            || 7,
+            || true,
+            || Err(eyre!("posting failed"))
+        ));
+    }
+
+    #[test]
+    fn shutdown_during_paste_settling_prevents_the_later_return() {
+        let allowed = Cell::new(true);
+        let submitted = complete_paste_with_submit(
+            || Ok(()),
+            || {},
+            |_| allowed.set(false),
+            || {
+                submit_if_current(
+                    Some(7),
+                    || allowed.get(),
+                    || 7,
+                    || true,
+                    || panic!("shutdown must not submit the pasted text"),
+                )
+            },
+        )
+        .unwrap();
+        assert!(!submitted);
+    }
 
     #[test]
     fn continuation_requires_the_same_application_and_input_revision() {

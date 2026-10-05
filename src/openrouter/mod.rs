@@ -165,6 +165,12 @@ pub fn load_config() -> Result<Config> {
 }
 
 pub(crate) fn load_config_at(path: &Path) -> Result<Config> {
+    with_config_edits(|| load_config_at_unlocked(path))
+}
+
+// Call only while CONFIG_EDITS is held. Public reads must not observe the
+// Models half of a preferences import that may still roll back.
+fn load_config_at_unlocked(path: &Path) -> Result<Config> {
     match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .wrap_err_with(|| format!("invalid OpenRouter config at {}", path.display())),
@@ -207,12 +213,19 @@ pub fn update_config(edit: impl FnOnce(&Config) -> Result<Config>) -> Result<Con
 }
 
 fn update_config_at(path: &Path, edit: impl FnOnce(&Config) -> Result<Config>) -> Result<Config> {
+    with_config_edits(|| {
+        let config = edit(&load_config_at_unlocked(path)?)?;
+        save_config_at(path, &config)?;
+        Ok(config)
+    })
+}
+
+/// Hold the same writer lock across a multi-file preferences import and rollback.
+pub(crate) fn with_config_edits<T>(edit: impl FnOnce() -> Result<T>) -> Result<T> {
     let _guard = CONFIG_EDITS
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let config = edit(&load_config_at(path)?)?;
-    save_config_at(path, &config)?;
-    Ok(config)
+    edit()
 }
 
 fn config_temporary_path(path: &Path) -> PathBuf {

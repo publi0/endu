@@ -28,6 +28,9 @@ struct Uniforms {
     float completion;
     float recording_flash;
     float preparing;
+    float recording_hue_shift;
+    float transcription_hue_shift;
+    float brightness;
 };
 
 struct VertexOutput {
@@ -72,6 +75,30 @@ void screen(thread float4 &destination, float3 color, float amount) {
     destination.rgb = 1.0 - (1.0 - destination.rgb) * (1.0 - color * amount);
 }
 
+// Rotate hue without changing value or saturation. The defaults
+// take the exact identity path, preserving the original recording/orb colors.
+float3 rotate_hue(float3 color, float turns) {
+    if (abs(turns) < 0.000001) return color;
+    float upper = max(color.r, max(color.g, color.b));
+    float lower = min(color.r, min(color.g, color.b));
+    float chroma = upper - lower;
+    if (chroma < 0.000001) return color;
+    float sector;
+    if (upper == color.r) sector = (color.g - color.b) / chroma;
+    else if (upper == color.g) sector = (color.b - color.r) / chroma + 2.0;
+    else sector = (color.r - color.g) / chroma + 4.0;
+    sector = fract(sector / 6.0 + turns) * 6.0;
+    float middle = chroma * (1.0 - abs(fmod(sector, 2.0) - 1.0));
+    float3 rotated;
+    if (sector < 1.0) rotated = float3(chroma, middle, 0.0);
+    else if (sector < 2.0) rotated = float3(middle, chroma, 0.0);
+    else if (sector < 3.0) rotated = float3(0.0, chroma, middle);
+    else if (sector < 4.0) rotated = float3(0.0, middle, chroma);
+    else if (sector < 5.0) rotated = float3(middle, 0.0, chroma);
+    else rotated = float3(chroma, 0.0, middle);
+    return rotated + lower;
+}
+
 fragment float4 indicator_fragment(
     VertexOutput input [[stage_in]],
     constant Uniforms &uniforms [[buffer(0)]])
@@ -95,6 +122,7 @@ fragment float4 indicator_fragment(
         composite(result, float3(0.36, 0.37, 0.39), shape * 0.56);
         float rim = coverage(abs(distance) - 0.3, edge);
         composite(result, float3(0.55, 0.57, 0.60), rim * 0.22 * detail_clarity);
+        if (uniforms.brightness != 1.0) result.rgb *= uniforms.brightness;
         return result * uniforms.opacity;
     }
 
@@ -113,7 +141,8 @@ fragment float4 indicator_fragment(
         float3(1.0, 0.025, 0.035),
         float3(0.05, 0.85, 0.58),
         editing);
-    float3 blue_accent = float3(0.1, 0.34, 1.0);
+    red_accent = rotate_hue(red_accent, uniforms.recording_hue_shift);
+    float3 blue_accent = rotate_hue(float3(0.1, 0.34, 1.0), uniforms.transcription_hue_shift);
     float3 violet_accent = float3(0.64, 0.2, 1.0);
     float3 pipeline_accent = mix(blue_accent, violet_accent, post_processing);
     float3 accent = mix(red_accent, pipeline_accent, processing);
@@ -135,6 +164,7 @@ fragment float4 indicator_fragment(
         average_power);
     recording_base = mix(recording_base, float3(0.0, 0.48, 0.3), editing);
     recording_base = mix(recording_base, float3(1.0, 0.08, 0.06), recording_flash * 0.72);
+    recording_base = rotate_hue(recording_base, uniforms.recording_hue_shift);
     float sphere_light = clamp(0.48 - point.x * 0.035 - point.y * 0.045, 0.0, 1.0);
     float3 blue_base = mix(
         float3(0.0, 0.02, 0.32),
@@ -144,6 +174,7 @@ fragment float4 indicator_fragment(
         float3(0.12, 0.0, 0.3),
         float3(0.38, 0.04, 0.68),
         sphere_light);
+    blue_base = rotate_hue(blue_base, uniforms.transcription_hue_shift);
     float3 pipeline_base = mix(blue_base, violet_base, post_processing);
     float3 base = mix(recording_base, pipeline_base, processing);
     composite(result, base, shape);
@@ -193,7 +224,8 @@ fragment float4 indicator_fragment(
             1.0);
         float3 orb_shadow = mix(float3(0.0, 0.015, 0.24), float3(0.1, 0.0, 0.26), post_processing);
         float3 orb_light = mix(float3(0.05, 0.22, 0.72), float3(0.4, 0.05, 0.7), post_processing);
-        composite(result, mix(orb_shadow, orb_light, light), orb_mask * processing * detail_clarity);
+        float3 orb_color = rotate_hue(mix(orb_shadow, orb_light, light), uniforms.transcription_hue_shift);
+        composite(result, orb_color, orb_mask * processing * detail_clarity);
 
         float rim = pow(1.0 - normal_z, 2.4);
         composite(result, pipeline_accent, rim * orb_mask * processing * 0.3 * detail_clarity);
@@ -255,6 +287,7 @@ fragment float4 indicator_fragment(
             }
         }
         float3 shine_color = mix(float3(0.66, 0.84, 1.0), float3(0.92, 0.72, 1.0), post_processing);
+        shine_color = rotate_hue(shine_color, uniforms.transcription_hue_shift);
         float shine_strength = mix(0.16, 0.68, clamp(uniforms.line_glow, 0.0, 1.0));
         float surface_wrap = orb_mask * mix(0.28, 1.0, normal_z);
         float rim_spill = (1.0 - orb_mask) * glow(orb_distance, 2.2);
@@ -286,14 +319,14 @@ fragment float4 indicator_fragment(
         float leading_processing = index == 0
             ? post_processing * clamp(uniforms.capturing, 0.0, 1.0)
             : 0.0;
-        float3 queued_blue = float3(0.12, 0.58, 1.0);
+        float3 queued_blue = rotate_hue(float3(0.12, 0.58, 1.0), uniforms.transcription_hue_shift);
         float3 dot_color = mix(queued_blue, violet_accent, leading_processing);
         composite(result, dot_color, dot * (index == 0 ? 0.92 : 0.52));
     }
 
-    screen(result, float3(0.72, 0.88, 1.0), shape * completion_flash * 0.32);
+    screen(result, rotate_hue(float3(0.72, 0.88, 1.0), uniforms.transcription_hue_shift), shape * completion_flash * 0.32);
     float completion_rim = exp2(-pow(abs(distance) / 0.72, 2.0));
-    screen(result, float3(0.82, 0.93, 1.0), completion_rim * completion_flash * 0.58);
+    screen(result, rotate_hue(float3(0.82, 0.93, 1.0), uniforms.transcription_hue_shift), completion_rim * completion_flash * 0.58);
 
     float sphere_outline = clamp(uniforms.sphere_outline, 0.0, 1.0);
     float processing_stroke = mix(0.04, 0.4, sphere_outline);
@@ -301,10 +334,11 @@ fragment float4 indicator_fragment(
         abs(distance) - 0.4,
         0.38 + lifecycle_softness * 0.3) * mix(0.56, processing_stroke, processing) * detail_clarity;
     composite(result, mix(accent, float3(1.0), 0.1), stroke);
-    screen(result, float3(1.0, 0.2, 0.16), shape * recording_flash * 0.36);
+    screen(result, rotate_hue(float3(1.0, 0.2, 0.16), uniforms.recording_hue_shift), shape * recording_flash * 0.36);
     float recording_flash_rim = exp2(-pow(abs(distance) / 0.9, 2.0));
-    screen(result, float3(1.0, 0.58, 0.48), recording_flash_rim * recording_flash * 0.82);
+    screen(result, rotate_hue(float3(1.0, 0.58, 0.48), uniforms.recording_hue_shift), recording_flash_rim * recording_flash * 0.82);
 
+    if (uniforms.brightness != 1.0) result.rgb *= uniforms.brightness;
     result *= uniforms.opacity;
     return result;
 }

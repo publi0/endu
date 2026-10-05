@@ -25,7 +25,15 @@ mod feedback;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod history;
 #[cfg(target_os = "macos")]
+mod hud_screen;
+#[cfg(target_os = "macos")]
+mod hud_settings;
+#[cfg(target_os = "macos")]
+mod hud_settings_view;
+#[cfg(target_os = "macos")]
 mod instance;
+#[cfg(target_os = "macos")]
+mod interaction_settings;
 #[cfg(target_os = "macos")]
 mod keyboard;
 #[cfg(target_os = "macos")]
@@ -34,6 +42,8 @@ mod listener;
 mod login_item;
 #[cfg(target_os = "macos")]
 mod microphone;
+#[cfg(target_os = "macos")]
+mod microphone_priority_view;
 #[cfg(target_os = "macos")]
 mod onboarding;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -47,7 +57,13 @@ mod permission_guide;
 #[cfg(target_os = "macos")]
 mod pipeline;
 #[cfg(target_os = "macos")]
+mod preferences_transfer;
+#[cfg(target_os = "macos")]
 mod recording_environment;
+#[cfg(target_os = "macos")]
+mod recording_recovery;
+#[cfg(target_os = "macos")]
+mod sound_settings_view;
 #[cfg(target_os = "macos")]
 mod status_item;
 #[cfg(target_os = "macos")]
@@ -97,6 +113,21 @@ enum Command {
         /// Open the explicit history retention choices in the History preview.
         #[arg(long)]
         open_history_retention: bool,
+        /// Position override for the isolated dictation-hud preview.
+        #[arg(long, value_enum)]
+        hud_position: Option<hud_settings::HudPosition>,
+        /// Recording color override for the isolated dictation-hud preview.
+        #[arg(long, value_enum)]
+        recording_color: Option<hud_settings::HudColor>,
+        /// Transcription color override for the isolated dictation-hud preview.
+        #[arg(long, value_enum)]
+        transcription_color: Option<hud_settings::HudColor>,
+        #[arg(long, value_enum)]
+        hud_size: Option<hud_settings::HudSize>,
+        #[arg(long, value_enum)]
+        hud_brightness: Option<hud_settings::HudBrightness>,
+        #[arg(long, value_parser = clap::value_parser!(u16).range(0..=160))]
+        hud_distance: Option<u16>,
     },
 }
 
@@ -108,6 +139,7 @@ enum AppPreviewTarget {
     Onboarding,
     Settings,
     Models,
+    Hud,
     History,
     Statistics,
 }
@@ -128,7 +160,7 @@ fn main() -> Result<()> {
         } => {
             let _instance = instance::acquire("listener")?;
             let launch = if preview_dictation {
-                desktop::Launch::DictationHudPreview
+                desktop::Launch::DictationHudPreview(hud_settings::HudPreferences::default())
             } else {
                 desktop::Launch::App(desktop::ListenerConfig { event_path, device })
             };
@@ -138,10 +170,39 @@ fn main() -> Result<()> {
             target,
             permissions_missing,
             open_history_retention,
+            hud_position,
+            recording_color,
+            transcription_color,
+            hud_size,
+            hud_brightness,
+            hud_distance,
         } => {
+            if (hud_position.is_some()
+                || recording_color.is_some()
+                || transcription_color.is_some()
+                || hud_size.is_some()
+                || hud_brightness.is_some()
+                || hud_distance.is_some())
+                && !matches!(target, AppPreviewTarget::DictationHud)
+            {
+                color_eyre::eyre::bail!("HUD appearance options require preview dictation-hud");
+            }
             let pane = match target {
                 AppPreviewTarget::DictationHud => {
-                    return desktop::run(&SHUTDOWN, desktop::Launch::DictationHudPreview);
+                    let defaults = hud_settings::HudPreferences::default();
+                    return desktop::run(
+                        &SHUTDOWN,
+                        desktop::Launch::DictationHudPreview(hud_settings::HudPreferences {
+                            position: hud_position.unwrap_or(defaults.position),
+                            recording_color: recording_color.unwrap_or(defaults.recording_color),
+                            transcription_color: transcription_color
+                                .unwrap_or(defaults.transcription_color),
+                            size: hud_size.unwrap_or(defaults.size),
+                            brightness: hud_brightness.unwrap_or(defaults.brightness),
+                            edge_distance: hud_distance.unwrap_or(defaults.edge_distance),
+                            ..defaults
+                        }),
+                    );
                 }
                 AppPreviewTarget::PasteNotice => {
                     return desktop::run(&SHUTDOWN, desktop::Launch::PasteNoticePreview);
@@ -151,6 +212,7 @@ fn main() -> Result<()> {
                 }
                 AppPreviewTarget::History => app_window::PreviewPane::History,
                 AppPreviewTarget::Models => app_window::PreviewPane::Models,
+                AppPreviewTarget::Hud => app_window::PreviewPane::Hud,
                 AppPreviewTarget::Statistics => app_window::PreviewPane::Statistics,
             };
             desktop::run(
@@ -191,6 +253,7 @@ mod tests {
         ));
         assert!(Cli::try_parse_from(["hex", "preview", "statistics"]).is_ok());
         assert!(Cli::try_parse_from(["hex", "preview", "paste-notice"]).is_ok());
+        assert!(Cli::try_parse_from(["hex", "preview", "hud"]).is_ok());
         assert!(matches!(
             Cli::try_parse_from(["hex", "preview", "models"])
                 .unwrap()

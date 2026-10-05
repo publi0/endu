@@ -11,12 +11,14 @@ use color_eyre::eyre::{Result, eyre};
 
 #[cfg(test)]
 use crate::app_settings::HotkeyBinding;
-use crate::app_settings::{HOTKEY_MODIFIERS_MASK, RuntimeHotkey, RuntimeHotkeys};
+use crate::app_settings::{DictationMode, HOTKEY_MODIFIERS_MASK, RuntimeHotkey, RuntimeHotkeys};
 use crate::audio::CaptureInstant;
 use crate::dictation::MINIMUM_HOLD_DURATION;
+use crate::interaction_settings::DoubleTapSensitivity;
 
-const DOUBLE_TAP_WINDOW: Duration = MINIMUM_HOLD_DURATION;
 const ESCAPE_KEY_CODE: u16 = 53;
+const RETURN_KEY_CODE: u16 = 36;
+const KEYPAD_ENTER_KEY_CODE: u16 = 76;
 
 const EVENT_LEFT_MOUSE_DOWN: u32 = 1;
 const EVENT_RIGHT_MOUSE_DOWN: u32 = 3;
@@ -26,6 +28,7 @@ const EVENT_FLAGS_CHANGED: u32 = 12;
 const EVENT_OTHER_MOUSE_DOWN: u32 = 25;
 const EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = u32::MAX - 1;
 const EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = u32::MAX;
+const KEYBOARD_EVENT_AUTOREPEAT: u32 = 8;
 const KEYBOARD_EVENT_KEYCODE: u32 = 9;
 const EVENT_SOURCE_USER_DATA: u32 = 42;
 
@@ -111,6 +114,8 @@ pub struct ObservedInputEvent {
     sequence: u64,
     pub event: InputEvent,
     pub capture_at: CaptureInstant,
+    pub submit_epoch: Option<u64>,
+    pub interaction_revision: u64,
 }
 
 #[derive(Clone, Default)]
@@ -153,6 +158,7 @@ pub struct InputMonitor {
     pub activity: InputActivity,
     pending: PendingInputEvents,
     escape_cancels: Arc<AtomicBool>,
+    submit_guard_state: Arc<AtomicU64>,
     run_loop: Arc<AtomicPtr<c_void>>,
     worker: Option<JoinHandle<()>>,
 }
@@ -168,16 +174,38 @@ impl Drop for PendingInputAcknowledgement<'_> {
     }
 }
 
+#[derive(Default)]
+struct ActivityCounters {
+    typing: AtomicU64,
+    interaction: AtomicU64,
+}
+
 #[derive(Clone, Default)]
-pub struct InputActivity(Arc<AtomicU64>);
+pub struct InputActivity(Arc<ActivityCounters>);
 
 impl InputActivity {
     pub fn revision(&self) -> u64 {
-        self.0.load(Ordering::Acquire)
+        self.0.typing.load(Ordering::Acquire)
     }
 
     pub fn invalidate(&self) {
-        self.0.fetch_add(1, Ordering::AcqRel);
+        self.0.typing.fetch_add(1, Ordering::AcqRel);
+        self.0.interaction.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn interaction_revision(&self) -> u64 {
+        self.0.interaction.load(Ordering::Acquire)
+    }
+
+    fn mark_interaction(&self, input: InputEvent) -> u64 {
+        if matches!(
+            input,
+            InputEvent::Key { down: true, .. } | InputEvent::MouseDown | InputEvent::Flags(_)
+        ) {
+            self.0.interaction.fetch_add(1, Ordering::AcqRel) + 1
+        } else {
+            self.interaction_revision()
+        }
     }
 
     fn observe(&self, input: InputEvent, suppressed: bool) {
@@ -187,7 +215,7 @@ impl InputActivity {
                 InputEvent::Key { down: true, .. } | InputEvent::MouseDown
             )
         {
-            self.invalidate();
+            self.0.typing.fetch_add(1, Ordering::AcqRel);
         }
     }
 }
@@ -202,6 +230,8 @@ impl InputMonitor {
         let tap_run_loop = run_loop.clone();
         let escape_cancels = Arc::new(AtomicBool::new(false));
         let tap_escape_cancels = escape_cancels.clone();
+        let submit_guard_state = Arc::new(AtomicU64::new(0));
+        let tap_submit_guard_state = submit_guard_state.clone();
         let paste_key_code = crate::keyboard::key_code_for('v').unwrap_or(9);
         let pending = PendingInputEvents::default();
         let tap_pending = pending.clone();
@@ -214,6 +244,7 @@ impl InputMonitor {
                 sender,
                 tap_activity,
                 tap_escape_cancels,
+                tap_submit_guard_state,
                 tap_pending,
                 tap_run_loop,
                 ready_sender,
@@ -227,6 +258,7 @@ impl InputMonitor {
             activity,
             pending,
             escape_cancels,
+            submit_guard_state,
             run_loop,
             worker: Some(worker),
         })
@@ -234,6 +266,18 @@ impl InputMonitor {
 
     pub fn set_escape_cancels(&self, enabled: bool) {
         self.escape_cancels.store(enabled, Ordering::Release);
+    }
+
+    pub fn reset_submit_guard(&self, locked: bool) {
+        let _ =
+            self.submit_guard_state
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                    Some((state & !1).wrapping_add(2) | u64::from(locked))
+                });
+    }
+
+    pub fn submit_epoch(&self) -> u64 {
+        self.submit_guard_state.load(Ordering::Acquire) & !1
     }
 
     pub fn pending_events(&self) -> PendingInputEvents {
@@ -265,6 +309,7 @@ struct EventTapContext {
     sender: Sender<ObservedInputEvent>,
     activity: InputActivity,
     escape_cancels: Arc<AtomicBool>,
+    submit_guard_state: Arc<AtomicU64>,
     key_tap: AtomicPtr<c_void>,
     observation_tap: AtomicPtr<c_void>,
     shortcut_suppression: Mutex<ShortcutSuppression>,
@@ -276,6 +321,7 @@ fn run_event_tap(
     sender: Sender<ObservedInputEvent>,
     activity: InputActivity,
     escape_cancels: Arc<AtomicBool>,
+    submit_guard_state: Arc<AtomicU64>,
     pending: PendingInputEvents,
     run_loop: Arc<AtomicPtr<c_void>>,
     ready: SyncSender<Result<()>>,
@@ -284,6 +330,7 @@ fn run_event_tap(
         sender,
         activity,
         escape_cancels,
+        submit_guard_state,
         key_tap: AtomicPtr::new(ptr::null_mut()),
         observation_tap: AtomicPtr::new(ptr::null_mut()),
         shortcut_suppression: Mutex::new(ShortcutSuppression::default()),
@@ -424,6 +471,7 @@ unsafe extern "C" fn event_callback(
                 unsafe { CGEventTapEnable(tap, true) };
             }
         }
+        context.activity.invalidate();
         send_input(context, InputEvent::TapDisabled, CaptureInstant::ZERO);
         return event;
     }
@@ -457,6 +505,15 @@ unsafe extern "C" fn event_callback(
     // Physical HID events used raw Mach ticks on the tested Apple Silicon system.
     // SAFETY: CoreGraphics supplied a valid event to this callback.
     let capture_at = CaptureInstant::from_nanos(unsafe { CGEventGetTimestamp(event) });
+    // Holding Enter is still one explicit request; its autorepeat must not
+    // invalidate the request while also being suppressed as part of that press.
+    let autorepeat = event_type == EVENT_KEY_DOWN
+        && unsafe { CGEventGetIntegerValueField(event, KEYBOARD_EVENT_AUTOREPEAT) } != 0;
+    let interaction_revision = if autorepeat {
+        context.activity.interaction_revision()
+    } else {
+        context.activity.mark_interaction(input)
+    };
     if crate::app_settings::hotkey_capture_active() {
         context.activity.observe(input, false);
         context
@@ -466,28 +523,66 @@ unsafe extern "C" fn event_callback(
             .reset();
         return event;
     }
-    let delivered = send_input(context, input, capture_at);
     let mut suppression = context
         .shortcut_suppression
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let suppress = suppression.process_all(
+    let hotkeys = crate::app_settings::runtime_hotkeys();
+    let submit_epoch = suppression.observe_submit(
         input,
-        crate::app_settings::runtime_hotkeys(),
+        capture_at,
+        hotkeys.dictation,
+        SubmitOptions {
+            mode: crate::app_settings::dictation_mode(),
+            double_tap_only: crate::app_settings::double_tap_only(),
+            sensitivity: crate::app_settings::double_tap_sensitivity(),
+            enabled: crate::app_settings::enter_to_submit(),
+        },
+        context.submit_guard_state.load(Ordering::Acquire),
+    );
+    let delivered = send_input_with_submit(
+        context,
+        input,
+        capture_at,
+        submit_epoch,
+        interaction_revision,
+    );
+    let suppress = suppression.process_with_submit(
+        input,
+        hotkeys,
         delivered,
         context.escape_cancels.load(Ordering::Acquire),
+        submit_epoch.is_some(),
     );
     context.activity.observe(input, suppress);
     if suppress { ptr::null_mut() } else { event }
 }
 
 fn send_input(context: &EventTapContext, event: InputEvent, capture_at: CaptureInstant) -> bool {
+    send_input_with_submit(
+        context,
+        event,
+        capture_at,
+        None,
+        context.activity.interaction_revision(),
+    )
+}
+
+fn send_input_with_submit(
+    context: &EventTapContext,
+    event: InputEvent,
+    capture_at: CaptureInstant,
+    submit_epoch: Option<u64>,
+    interaction_revision: u64,
+) -> bool {
     let sequence = context.next_sequence.fetch_add(1, Ordering::Relaxed);
     context.pending.push(sequence, capture_at);
     match context.sender.send(ObservedInputEvent {
         sequence,
         event,
         capture_at,
+        submit_epoch,
+        interaction_revision,
     }) {
         Ok(()) => true,
         Err(_) => {
@@ -503,19 +598,100 @@ fn send_input(context: &EventTapContext, event: InputEvent, capture_at: CaptureI
 struct ShortcutSuppression {
     // Repeats and releases keep the original press's suppression decision.
     key_presses: HashMap<u16, bool>,
+    submit_guard: Option<SubmitGuard>,
+}
+
+#[derive(Clone, Copy)]
+struct SubmitOptions {
+    mode: DictationMode,
+    double_tap_only: bool,
+    sensitivity: DoubleTapSensitivity,
+    enabled: bool,
+}
+
+struct SubmitGuard {
+    epoch: u64,
+    gesture: DictationHotkey,
 }
 
 impl ShortcutSuppression {
     fn reset(&mut self) {
         self.key_presses.clear();
+        self.submit_guard = None;
     }
 
+    // Predict only whether Enter must be withheld. The listener still owns audio
+    // and validates this request; sharing its gesture logic prevents a fast Enter
+    // from reaching the input before the listener consumes the locking release.
+    fn observe_submit(
+        &mut self,
+        input: InputEvent,
+        at: CaptureInstant,
+        binding: RuntimeHotkey,
+        options: SubmitOptions,
+        guard_state: u64,
+    ) -> Option<u64> {
+        let SubmitOptions {
+            mode,
+            double_tap_only,
+            sensitivity,
+            enabled,
+        } = options;
+        let epoch = guard_state & !1;
+        if self
+            .submit_guard
+            .as_ref()
+            .is_none_or(|guard| guard.epoch != epoch)
+        {
+            let mut gesture =
+                DictationHotkey::with_binding(false, at, mode == DictationMode::DoubleTap, binding);
+            gesture.set_mode(mode);
+            if guard_state & 1 != 0 {
+                gesture.state = State::Locked;
+            }
+            self.submit_guard = Some(SubmitGuard { epoch, gesture });
+        }
+        let guard = self.submit_guard.as_mut().unwrap();
+        guard.gesture.set_mode(mode);
+        // Double-tap-only eligibility depends on whether the new binding has a
+        // key. Apply it first so imports take effect on this very first edge.
+        guard.gesture.set_binding(binding);
+        guard.gesture.set_double_tap_only(double_tap_only);
+        guard.gesture.set_double_tap_sensitivity(sensitivity);
+        let request = enabled
+            && guard.gesture.is_locked()
+            && matches!(input, InputEvent::Key { code: RETURN_KEY_CODE | KEYPAD_ENTER_KEY_CODE,
+                down: true, flags } if flags & HOTKEY_MODIFIERS_MASK == 0)
+            && match input {
+                InputEvent::Key { code, .. } => !self.key_presses.contains_key(&code),
+                _ => false,
+            };
+        guard.gesture.process(input, at);
+        if request && guard.gesture.finish_locked() {
+            Some(epoch)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
     fn process_all(
         &mut self,
         input: InputEvent,
         hotkeys: RuntimeHotkeys,
         delivered: bool,
         escape_cancels: bool,
+    ) -> bool {
+        self.process_with_submit(input, hotkeys, delivered, escape_cancels, false)
+    }
+
+    fn process_with_submit(
+        &mut self,
+        input: InputEvent,
+        hotkeys: RuntimeHotkeys,
+        delivered: bool,
+        escape_cancels: bool,
+        submit: bool,
     ) -> bool {
         let bindings = [Some(hotkeys.dictation), hotkeys.paste_last];
         match input {
@@ -525,7 +701,8 @@ impl ShortcutSuppression {
                 flags,
             } => *self.key_presses.entry(code).or_insert_with(|| {
                 delivered
-                    && ((code == ESCAPE_KEY_CODE && escape_cancels)
+                    && (submit
+                        || (code == ESCAPE_KEY_CODE && escape_cancels)
                         || bindings
                             .iter()
                             .flatten()
@@ -579,6 +756,7 @@ fn paste_action(input: InputEvent, hotkeys: RuntimeHotkeys) -> Option<HotkeyActi
 pub enum HotkeyAction {
     Start,
     Finish,
+    FinishAndSubmit,
     Discard,
     Cancel,
     PasteLast,
@@ -624,7 +802,9 @@ pub struct DictationHotkey {
     state: State,
     pressed_keys: HashSet<u16>,
     double_tap_enabled: bool,
+    tap_to_toggle: bool,
     double_tap_only: bool,
+    double_tap_window: Duration,
     binding: RuntimeHotkey,
     stale_keys_neutral_since: Option<CaptureInstant>,
     recovery_ignore_through: Option<CaptureInstant>,
@@ -635,13 +815,39 @@ pub struct DictationHotkey {
 }
 
 impl DictationHotkey {
-    pub fn new(now: CaptureInstant, double_tap_enabled: bool, binding: RuntimeHotkey) -> Self {
-        Self::with_binding(
+    pub fn new(now: CaptureInstant, mode: DictationMode, binding: RuntimeHotkey) -> Self {
+        let mut hotkey = Self::with_binding(
             trigger_is_physically_down(binding),
             now,
-            double_tap_enabled,
+            mode == DictationMode::DoubleTap,
             binding,
-        )
+        );
+        hotkey.tap_to_toggle = mode == DictationMode::TapOrHold;
+        hotkey
+    }
+
+    pub fn set_mode(&mut self, mode: DictationMode) {
+        // A gesture keeps the interpretation it had at its initial press.
+        if self.is_recording() {
+            return;
+        }
+        self.tap_to_toggle = mode == DictationMode::TapOrHold;
+        self.set_double_tap_enabled(mode == DictationMode::DoubleTap);
+        if self.tap_to_toggle && self.state.is_pending_gesture() {
+            self.state = State::IDLE;
+        }
+    }
+
+    pub fn is_locked(&self) -> bool {
+        matches!(self.state, State::Locked)
+    }
+
+    pub fn finish_locked(&mut self) -> bool {
+        if !self.is_locked() {
+            return false;
+        }
+        self.state = State::Dirty;
+        true
     }
 
     fn with_binding(
@@ -661,7 +867,9 @@ impl DictationHotkey {
             },
             pressed_keys: HashSet::new(),
             double_tap_enabled,
+            tap_to_toggle: false,
             double_tap_only: false,
+            double_tap_window: DoubleTapSensitivity::Normal.window(),
             binding,
             stale_keys_neutral_since: None,
             recovery_ignore_through: None,
@@ -687,6 +895,24 @@ impl DictationHotkey {
         }
     }
 
+    /// A new timing preference cannot complete a gesture begun under the old one.
+    /// Keep active capture boundaries and physical key tracking untouched.
+    pub fn set_double_tap_sensitivity(&mut self, sensitivity: DoubleTapSensitivity) {
+        let window = sensitivity.window();
+        if self.double_tap_window == window {
+            return;
+        }
+        self.double_tap_window = window;
+        match &mut self.state {
+            State::Idle { last_release_at } => *last_release_at = None,
+            State::Recording {
+                previous_release, ..
+            } => *previous_release = None,
+            state if state.is_pending_gesture() => *state = State::IDLE,
+            _ => {}
+        }
+    }
+
     pub fn set_double_tap_only(&mut self, enabled: bool) {
         self.double_tap_only =
             enabled && self.binding.key_code.is_some() && self.double_tap_enabled;
@@ -697,11 +923,11 @@ impl DictationHotkey {
     }
 
     pub fn set_binding(&mut self, binding: RuntimeHotkey) {
-        if let State::Idle { last_release_at } = &mut self.state
-            && self.binding != binding
-        {
+        if !self.is_recording() && self.binding != binding {
             self.binding = binding;
-            *last_release_at = None;
+            // Imports can change the binding without using shortcut-capture UI.
+            // A pending gesture from the old shortcut must never finish on the new one.
+            self.state = State::IDLE;
         }
     }
 
@@ -731,13 +957,13 @@ impl DictationHotkey {
     }
 
     // Call only after draining input. Polling repairs bookkeeping, never capture boundaries.
-    pub fn recover_stale_keys(&mut self) {
+    pub fn recover_stale_keys(&mut self) -> bool {
         self.recover_stale_keys_with(
             CaptureInstant::now,
             // Match the annotated-session tap, including assistive keyboard input.
             || unsafe { CGEventSourceFlagsState(COMBINED_SESSION_STATE) },
             |code| unsafe { CGEventSourceKeyState(COMBINED_SESSION_STATE, code) },
-        );
+        )
     }
 
     fn recover_stale_keys_with(
@@ -745,7 +971,7 @@ impl DictationHotkey {
         now: impl FnOnce() -> CaptureInstant,
         mut flags: impl FnMut() -> u64,
         mut key_down: impl FnMut(u16) -> bool,
-    ) {
+    ) -> bool {
         let recoverable = match self.state {
             State::Dirty => true,
             // A lock captures while the keyboard sits idle. A missed key-up would
@@ -755,7 +981,7 @@ impl DictationHotkey {
         };
         if !recoverable {
             self.stale_keys_neutral_since = None;
-            return;
+            return false;
         }
         // A missing modifier release can leave Dirty with no ordinary keys tracked.
         // Avoid a full scan when a tracked key is still physically held.
@@ -773,15 +999,15 @@ impl DictationHotkey {
             || flags() & modifiers_mask != 0
         {
             self.stale_keys_neutral_since = None;
-            return;
+            return false;
         }
         let sampled_through = now();
         let Some(neutral_since) = self.stale_keys_neutral_since else {
             self.stale_keys_neutral_since = Some(sampled_through);
-            return;
+            return false;
         };
         if sampled_through.duration_since(neutral_since) < STALE_KEY_NEUTRAL_DURATION {
-            return;
+            return false;
         }
         let locked = matches!(self.state, State::Locked);
         tracing::warn!(
@@ -797,6 +1023,7 @@ impl DictationHotkey {
         self.stale_keys_neutral_since = None;
         self.recovery_ignore_through = Some(sampled_through);
         self.recovery_updated_keys.clear();
+        true
     }
 
     // Suspended shortcut matching must still observe releases of previously held keys.
@@ -918,7 +1145,7 @@ impl DictationHotkey {
                 None
             }
             State::AwaitingSecondTap { released_at }
-                if trigger_pressed && now.duration_since(released_at) < DOUBLE_TAP_WINDOW =>
+                if trigger_pressed && now.duration_since(released_at) < self.double_tap_window =>
             {
                 self.state = State::SecondTapPressed {
                     first_released_at: released_at,
@@ -927,7 +1154,7 @@ impl DictationHotkey {
             }
             State::SecondTapPressed { first_released_at }
                 if trigger_released
-                    && now.duration_since(first_released_at) < DOUBLE_TAP_WINDOW =>
+                    && now.duration_since(first_released_at) < self.double_tap_window =>
             {
                 self.state = State::Locked;
                 Some(HotkeyAction::Start)
@@ -947,7 +1174,7 @@ impl DictationHotkey {
                 None
             }
             State::AwaitingSecondTap { released_at }
-                if now.duration_since(released_at) >= DOUBLE_TAP_WINDOW =>
+                if now.duration_since(released_at) >= self.double_tap_window =>
             {
                 self.state = if trigger_pressed {
                     State::FirstTapPressed
@@ -962,7 +1189,8 @@ impl DictationHotkey {
             }
             State::Idle { last_release_at } if trigger_pressed => {
                 let previous_release = last_release_at.filter(|released| {
-                    self.double_tap_enabled && now.duration_since(*released) < DOUBLE_TAP_WINDOW
+                    self.double_tap_enabled
+                        && now.duration_since(*released) < self.double_tap_window
                 });
                 self.state = State::Recording {
                     started_at: now,
@@ -970,10 +1198,28 @@ impl DictationHotkey {
                 };
                 Some(HotkeyAction::Start)
             }
+            State::Recording { started_at, .. }
+                if self.tap_to_toggle
+                    && now.duration_since(started_at) < MINIMUM_HOLD_DURATION
+                    && (unrelated_key_down
+                        || extra_modifiers
+                        || matches!(event, InputEvent::MouseDown)) =>
+            {
+                self.state = State::Dirty;
+                Some(HotkeyAction::Discard)
+            }
+            State::Recording { started_at, .. }
+                if self.tap_to_toggle
+                    && trigger_released
+                    && now.duration_since(started_at) < MINIMUM_HOLD_DURATION =>
+            {
+                self.state = State::Locked;
+                None
+            }
             State::Recording {
                 previous_release: Some(released),
                 ..
-            } if trigger_released && now.duration_since(released) < DOUBLE_TAP_WINDOW => {
+            } if trigger_released && now.duration_since(released) < self.double_tap_window => {
                 self.state = State::Locked;
                 None
             }
@@ -1054,6 +1300,423 @@ mod tests {
         fn CGEventSetIntegerValueField(event: EventRef, field: u32, value: i64);
     }
 
+    fn tap_mode(binding: RuntimeHotkey) -> DictationHotkey {
+        let mut hotkey = DictationHotkey::with_binding(false, CaptureInstant::ZERO, false, binding);
+        hotkey.set_mode(DictationMode::TapOrHold);
+        hotkey
+    }
+
+    fn at_ms(ms: u64) -> CaptureInstant {
+        CaptureInstant::from_nanos(ms * 1_000_000)
+    }
+
+    #[test]
+    fn a_single_tap_locks_but_a_hold_finishes_on_release() {
+        for key_code in [None, Some(49)] {
+            let binding = RuntimeHotkey {
+                modifiers: crate::app_settings::HotkeyModifiers::option(),
+                key_code,
+            };
+            let press = if let Some(code) = key_code {
+                InputEvent::Key {
+                    code,
+                    down: true,
+                    flags: OPTION_KEY_MASK,
+                }
+            } else {
+                InputEvent::Flags(OPTION_KEY_MASK)
+            };
+            let release = if let Some(code) = key_code {
+                InputEvent::Key {
+                    code,
+                    down: false,
+                    flags: OPTION_KEY_MASK,
+                }
+            } else {
+                InputEvent::Flags(0)
+            };
+            for duration in [30, 299, 300, 900] {
+                let mut hotkey = tap_mode(binding);
+                assert_eq!(hotkey.process(press, at_ms(0)), Some(HotkeyAction::Start));
+                if duration < 300 {
+                    assert_eq!(hotkey.process(release, at_ms(duration)), None);
+                    assert!(hotkey.is_locked());
+                    assert_eq!(
+                        hotkey.process(press, at_ms(1_000)),
+                        Some(HotkeyAction::Finish)
+                    );
+                    assert_eq!(hotkey.process(release, at_ms(1_010)), None);
+                    assert!(!hotkey.is_recording());
+                } else {
+                    assert_eq!(
+                        hotkey.process(release, at_ms(duration)),
+                        Some(HotkeyAction::Finish)
+                    );
+                    assert!(!hotkey.is_recording());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_quick_unrelated_key_or_click_does_not_lock_a_modifier_capture() {
+        for input in [
+            InputEvent::MouseDown,
+            InputEvent::Key {
+                code: 0,
+                down: true,
+                flags: 0,
+            },
+            InputEvent::Key {
+                code: 0,
+                down: true,
+                flags: OPTION_KEY_MASK,
+            },
+        ] {
+            let mut hotkey = tap_mode(HotkeyBinding::default().runtime());
+            hotkey.process(InputEvent::Flags(OPTION_KEY_MASK), at_ms(0));
+            assert_eq!(
+                hotkey.process(input, at_ms(50)),
+                Some(HotkeyAction::Discard)
+            );
+            assert!(!hotkey.is_recording());
+            hotkey.process(InputEvent::Flags(0), at_ms(60));
+            assert!(!hotkey.is_locked());
+        }
+    }
+
+    #[test]
+    fn mode_changes_wait_until_the_current_capture_ends() {
+        let mut hotkey = tap_mode(HotkeyBinding::default().runtime());
+        hotkey.process(InputEvent::Flags(OPTION_KEY_MASK), at_ms(0));
+        hotkey.set_mode(DictationMode::Hold);
+        assert_eq!(hotkey.process(InputEvent::Flags(0), at_ms(80)), None);
+        assert!(hotkey.is_locked());
+        assert_eq!(
+            hotkey.process(InputEvent::Flags(OPTION_KEY_MASK), at_ms(400)),
+            Some(HotkeyAction::Finish)
+        );
+        hotkey.process(InputEvent::Flags(0), at_ms(450));
+        hotkey.set_mode(DictationMode::Hold);
+        hotkey.process(InputEvent::Flags(OPTION_KEY_MASK), at_ms(500));
+        assert_eq!(
+            hotkey.process(InputEvent::Flags(0), at_ms(550)),
+            Some(HotkeyAction::Finish)
+        );
+    }
+
+    #[test]
+    fn fast_enter_is_withheld_without_waiting_for_the_listener() {
+        let mut suppression = ShortcutSuppression::default();
+        let binding = HotkeyBinding::default().runtime();
+        let hotkeys = RuntimeHotkeys {
+            dictation: binding,
+            paste_last: None,
+        };
+        let options = SubmitOptions {
+            mode: DictationMode::TapOrHold,
+            double_tap_only: false,
+            sensitivity: DoubleTapSensitivity::Normal,
+            enabled: true,
+        };
+        let mut event = |input, millis| {
+            let intent = suppression.observe_submit(input, at_ms(millis), binding, options, 0);
+            let consumed =
+                suppression.process_with_submit(input, hotkeys, true, false, intent.is_some());
+            (intent, consumed)
+        };
+        assert_eq!(event(InputEvent::Flags(OPTION_KEY_MASK), 0), (None, false));
+        assert_eq!(event(InputEvent::Flags(0), 40), (None, false));
+        let down = InputEvent::Key {
+            code: RETURN_KEY_CODE,
+            down: true,
+            flags: 0,
+        };
+        let up = InputEvent::Key {
+            code: RETURN_KEY_CODE,
+            down: false,
+            flags: 0,
+        };
+        assert_eq!(event(down, 41), (Some(0), true));
+        assert_eq!(
+            event(down, 42),
+            (None, true),
+            "repeat keeps the first suppression decision"
+        );
+        assert_eq!(event(up, 43), (None, true));
+        assert_eq!(
+            event(down, 60),
+            (None, false),
+            "outside recording Enter works normally"
+        );
+    }
+
+    #[test]
+    fn submit_requires_a_lock_bare_enter_and_an_enabled_option() {
+        let binding = HotkeyBinding::default().runtime();
+        for (locked, enabled, flags, expected) in [
+            (false, true, 0, false),
+            (true, false, 0, false),
+            (true, true, SHIFT_KEY_MASK, false),
+            (true, true, 0, true),
+        ] {
+            let mut suppression = ShortcutSuppression::default();
+            let options = SubmitOptions {
+                mode: DictationMode::TapOrHold,
+                double_tap_only: false,
+                sensitivity: DoubleTapSensitivity::Normal,
+                enabled,
+            };
+            let result = suppression.observe_submit(
+                InputEvent::Key {
+                    code: KEYPAD_ENTER_KEY_CODE,
+                    down: true,
+                    flags,
+                },
+                at_ms(10),
+                binding,
+                options,
+                u64::from(locked),
+            );
+            assert_eq!(result.is_some(), expected);
+        }
+    }
+
+    #[test]
+    fn an_external_cancel_invalidates_the_predicted_lock() {
+        let binding = HotkeyBinding::default().runtime();
+        let options = SubmitOptions {
+            mode: DictationMode::TapOrHold,
+            double_tap_only: false,
+            sensitivity: DoubleTapSensitivity::Normal,
+            enabled: true,
+        };
+        let mut suppression = ShortcutSuppression::default();
+        suppression.observe_submit(
+            InputEvent::Flags(OPTION_KEY_MASK),
+            at_ms(0),
+            binding,
+            options,
+            0,
+        );
+        suppression.observe_submit(InputEvent::Flags(0), at_ms(40), binding, options, 0);
+        assert!(
+            suppression
+                .submit_guard
+                .as_ref()
+                .unwrap()
+                .gesture
+                .is_locked()
+        );
+        assert_eq!(
+            suppression.observe_submit(
+                InputEvent::Key {
+                    code: RETURN_KEY_CODE,
+                    down: true,
+                    flags: 0
+                },
+                at_ms(41),
+                binding,
+                options,
+                2
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn submit_intent_tracks_suppressed_user_actions_but_not_key_release() {
+        let activity = InputActivity::default();
+        let enter = InputEvent::Key {
+            code: RETURN_KEY_CODE,
+            down: true,
+            flags: 0,
+        };
+        let intent = activity.mark_interaction(enter);
+        activity.observe(enter, true);
+        assert_eq!(activity.revision(), 0);
+        assert_eq!(
+            activity.mark_interaction(InputEvent::Key {
+                code: RETURN_KEY_CODE,
+                down: false,
+                flags: 0
+            }),
+            intent
+        );
+        activity.mark_interaction(InputEvent::Key {
+            code: ESCAPE_KEY_CODE,
+            down: true,
+            flags: 0,
+        });
+        assert_ne!(
+            activity.interaction_revision(),
+            intent,
+            "even a suppressed Escape invalidates sending"
+        );
+        let next_intent = activity.mark_interaction(enter);
+        activity.mark_interaction(InputEvent::Flags(OPTION_KEY_MASK));
+        assert_ne!(
+            activity.interaction_revision(),
+            next_intent,
+            "starting a modifier-only dictation must invalidate the previous submit intent"
+        );
+        assert_eq!(
+            activity.revision(),
+            0,
+            "dictation gestures still preserve continuation"
+        );
+    }
+
+    #[test]
+    fn submit_prediction_uses_the_same_double_tap_preset_as_capture() {
+        let binding = RuntimeHotkey {
+            modifiers: crate::app_settings::modifiers_from_flags(SHIFT_KEY_MASK),
+            key_code: Some(49),
+        };
+        let hotkeys = RuntimeHotkeys {
+            dictation: binding,
+            paste_last: None,
+        };
+        for (sensitivity, second_release, locked) in [
+            (DoubleTapSensitivity::Short, 290, false),
+            (DoubleTapSensitivity::Normal, 290, true),
+            (DoubleTapSensitivity::Tolerant, 390, true),
+        ] {
+            for double_tap_only in [false, true] {
+                let options = SubmitOptions {
+                    mode: DictationMode::DoubleTap,
+                    double_tap_only,
+                    sensitivity,
+                    enabled: true,
+                };
+                let mut suppression = ShortcutSuppression::default();
+                for (down, ms) in [(true, 0), (false, 40), (true, 150), (false, second_release)] {
+                    let input = InputEvent::Key {
+                        code: 49,
+                        down,
+                        flags: SHIFT_KEY_MASK,
+                    };
+                    let intent = suppression.observe_submit(input, at_ms(ms), binding, options, 0);
+                    assert!(intent.is_none());
+                    suppression.process_with_submit(input, hotkeys, true, false, false);
+                }
+                let input = InputEvent::Key {
+                    code: RETURN_KEY_CODE,
+                    down: true,
+                    flags: 0,
+                };
+                let intent = suppression.observe_submit(
+                    input,
+                    at_ms(second_release + 1),
+                    binding,
+                    options,
+                    0,
+                );
+                assert_eq!(
+                    intent.is_some(),
+                    locked,
+                    "{sensitivity:?}, double_tap_only={double_tap_only}"
+                );
+                assert_eq!(
+                    suppression.process_with_submit(input, hotkeys, true, false, intent.is_some()),
+                    locked
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn importing_a_new_shortcut_disarms_pending_taps_from_the_old_binding() {
+        let old = RuntimeHotkey {
+            modifiers: crate::app_settings::modifiers_from_flags(SHIFT_KEY_MASK),
+            key_code: Some(49),
+        };
+        let new = RuntimeHotkey {
+            key_code: Some(40),
+            ..old
+        };
+        let event = |code, down| InputEvent::Key {
+            code,
+            down,
+            flags: SHIFT_KEY_MASK,
+        };
+        let mut hotkey = DictationHotkey::with_binding(false, at_ms(0), true, old);
+        hotkey.set_double_tap_only(true);
+        hotkey.process(event(49, true), at_ms(0));
+        hotkey.process(event(49, false), at_ms(40));
+        hotkey.set_binding(new);
+        assert_eq!(hotkey.process(event(49, true), at_ms(100)), None);
+        assert_eq!(hotkey.process(event(49, false), at_ms(140)), None);
+        assert!(!hotkey.is_recording());
+        for (down, ms) in [(true, 200), (false, 240), (true, 300)] {
+            assert_eq!(hotkey.process(event(40, down), at_ms(ms)), None);
+        }
+        assert_eq!(
+            hotkey.process(event(40, false), at_ms(340)),
+            Some(HotkeyAction::Start)
+        );
+    }
+
+    #[test]
+    fn importing_a_key_binding_enables_double_tap_only_on_the_first_edge() {
+        let old = HotkeyBinding::default().runtime();
+        let new = RuntimeHotkey {
+            modifiers: crate::app_settings::modifiers_from_flags(SHIFT_KEY_MASK),
+            key_code: Some(49),
+        };
+        let mut suppression = ShortcutSuppression::default();
+        let options = SubmitOptions {
+            mode: DictationMode::DoubleTap,
+            double_tap_only: false,
+            sensitivity: DoubleTapSensitivity::Normal,
+            enabled: true,
+        };
+        suppression.observe_submit(InputEvent::Flags(0), at_ms(0), old, options, 0);
+        let options = SubmitOptions {
+            double_tap_only: true,
+            ..options
+        };
+        for (index, (down, ms)) in [(true, 100), (false, 140), (true, 200), (false, 240)]
+            .into_iter()
+            .enumerate()
+        {
+            let input = InputEvent::Key {
+                code: 49,
+                down,
+                flags: SHIFT_KEY_MASK,
+            };
+            assert!(
+                suppression
+                    .observe_submit(input, at_ms(ms), new, options, 0)
+                    .is_none()
+            );
+            let gesture = &suppression.submit_guard.as_ref().unwrap().gesture;
+            assert!(
+                gesture.double_tap_only,
+                "the new key binding must be applied before eligibility"
+            );
+            assert_eq!(
+                gesture.is_recording(),
+                index == 3,
+                "the first tap must never start capture"
+            );
+        }
+        assert_eq!(
+            suppression.observe_submit(
+                InputEvent::Key {
+                    code: RETURN_KEY_CODE,
+                    down: true,
+                    flags: 0
+                },
+                at_ms(241),
+                new,
+                options,
+                0,
+            ),
+            Some(0)
+        );
+    }
+
     // Drive the real callback without installing a tap or posting global input.
     fn callback_input(timestamps_and_events: &[(u64, InputEvent)]) -> Vec<ObservedInputEvent> {
         let (sender, receiver) = mpsc::channel();
@@ -1061,6 +1724,7 @@ mod tests {
             sender,
             activity: InputActivity::default(),
             escape_cancels: Arc::new(AtomicBool::new(false)),
+            submit_guard_state: Arc::new(AtomicU64::new(0)),
             key_tap: AtomicPtr::new(ptr::null_mut()),
             observation_tap: AtomicPtr::new(ptr::null_mut()),
             shortcut_suppression: Mutex::new(ShortcutSuppression::default()),
@@ -2398,7 +3062,10 @@ mod tests {
             modifiers: crate::app_settings::modifiers_from_flags(SHIFT_KEY_MASK),
             key_code: Some(49),
         };
-        for delay in [DOUBLE_TAP_WINDOW, Duration::from_secs(1)] {
+        for delay in [
+            DoubleTapSensitivity::Normal.window(),
+            Duration::from_secs(1),
+        ] {
             let mut hotkey = DictationHotkey::with_binding(false, now, true, binding);
             hotkey.set_double_tap_only(true);
             let event = |down| InputEvent::Key {
@@ -2428,6 +3095,163 @@ mod tests {
             );
             assert!(hotkey.is_recording());
         }
+    }
+
+    #[test]
+    fn each_sensitivity_uses_its_own_second_release_boundary() {
+        let now = capture_time();
+        let binding = RuntimeHotkey {
+            modifiers: crate::app_settings::modifiers_from_flags(SHIFT_KEY_MASK),
+            key_code: Some(49),
+        };
+        let event = |down| InputEvent::Key {
+            code: 49,
+            down,
+            flags: SHIFT_KEY_MASK,
+        };
+        for sensitivity in DoubleTapSensitivity::ALL {
+            for double_tap_only in [false, true] {
+                for inside in [false, true] {
+                    let mut hotkey = DictationHotkey::with_binding(false, now, true, binding);
+                    hotkey.set_double_tap_sensitivity(sensitivity);
+                    hotkey.set_double_tap_only(double_tap_only);
+                    hotkey.process(event(true), now);
+                    let first_release = now + Duration::from_millis(50);
+                    hotkey.process(event(false), first_release);
+                    hotkey.process(
+                        event(true),
+                        first_release + (sensitivity.window() - Duration::from_millis(50)),
+                    );
+                    let second_release = first_release
+                        + (sensitivity.window() - Duration::from_millis(u64::from(inside)));
+                    let action = hotkey.process(event(false), second_release);
+                    assert_eq!(
+                        hotkey.is_recording(),
+                        inside,
+                        "{sensitivity:?}, double_tap_only={double_tap_only}"
+                    );
+                    assert_eq!(
+                        action,
+                        match (double_tap_only, inside) {
+                            (true, true) => Some(HotkeyAction::Start),
+                            (false, false) => Some(HotkeyAction::Finish),
+                            _ => None,
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn changing_sensitivity_discards_every_pending_double_tap_only_gesture() {
+        let now = capture_time();
+        let binding = RuntimeHotkey {
+            modifiers: crate::app_settings::modifiers_from_flags(SHIFT_KEY_MASK),
+            key_code: Some(49),
+        };
+        let event = |down| InputEvent::Key {
+            code: 49,
+            down,
+            flags: SHIFT_KEY_MASK,
+        };
+        for observed in 1..=3 {
+            let mut hotkey = DictationHotkey::with_binding(false, now, true, binding);
+            hotkey.set_double_tap_only(true);
+            for (down, ms) in [(true, 0), (false, 50), (true, 150)]
+                .into_iter()
+                .take(observed)
+            {
+                assert_eq!(
+                    hotkey.process(event(down), now + Duration::from_millis(ms)),
+                    None
+                );
+            }
+            hotkey.set_double_tap_sensitivity(DoubleTapSensitivity::Tolerant);
+            assert_eq!(
+                hotkey.process(event(false), now + Duration::from_millis(200)),
+                None
+            );
+            assert!(!hotkey.is_recording());
+            for (down, ms) in [(true, 1_000), (false, 1_050), (true, 1_300)] {
+                assert_eq!(
+                    hotkey.process(event(down), now + Duration::from_millis(ms)),
+                    None
+                );
+            }
+            assert_eq!(
+                hotkey.process(event(false), now + Duration::from_millis(1_450)),
+                Some(HotkeyAction::Start)
+            );
+        }
+    }
+
+    #[test]
+    fn sensitivity_changes_forget_previous_taps_but_preserve_active_capture() {
+        let now = capture_time();
+        for change_during_hold in [false, true] {
+            let mut hotkey = test_hotkey(false, now);
+            hotkey.process(InputEvent::Flags(OPTION_KEY_MASK), now);
+            hotkey.process(InputEvent::Flags(0), now + Duration::from_millis(50));
+            if !change_during_hold {
+                hotkey.set_double_tap_sensitivity(DoubleTapSensitivity::Tolerant);
+            }
+            assert_eq!(
+                hotkey.process(
+                    InputEvent::Flags(OPTION_KEY_MASK),
+                    now + Duration::from_millis(100)
+                ),
+                Some(HotkeyAction::Start)
+            );
+            if change_during_hold {
+                hotkey.set_double_tap_sensitivity(DoubleTapSensitivity::Tolerant);
+            }
+            assert!(hotkey.is_recording());
+            assert_eq!(
+                hotkey.process(InputEvent::Flags(0), now + Duration::from_millis(200)),
+                Some(HotkeyAction::Finish)
+            );
+            assert!(!hotkey.is_recording());
+        }
+
+        let mut locked = test_hotkey(false, now);
+        for (flags, ms) in [
+            (OPTION_KEY_MASK, 0),
+            (0, 50),
+            (OPTION_KEY_MASK, 100),
+            (0, 150),
+        ] {
+            locked.process(InputEvent::Flags(flags), now + Duration::from_millis(ms));
+        }
+        assert!(locked.is_recording());
+        locked.set_double_tap_sensitivity(DoubleTapSensitivity::Short);
+        assert!(locked.is_recording());
+        assert_eq!(
+            locked.process(
+                InputEvent::Flags(OPTION_KEY_MASK),
+                now + Duration::from_millis(800)
+            ),
+            Some(HotkeyAction::Finish)
+        );
+    }
+
+    #[test]
+    fn reapplying_the_same_sensitivity_does_not_interrupt_double_tap() {
+        let now = capture_time();
+        let mut hotkey = test_hotkey(false, now);
+        hotkey.process(InputEvent::Flags(OPTION_KEY_MASK), now);
+        hotkey.process(InputEvent::Flags(0), now + Duration::from_millis(50));
+        hotkey.set_double_tap_sensitivity(DoubleTapSensitivity::Normal);
+        hotkey.process(
+            InputEvent::Flags(OPTION_KEY_MASK),
+            now + Duration::from_millis(100),
+        );
+        hotkey.set_double_tap_sensitivity(DoubleTapSensitivity::Normal);
+        assert_eq!(
+            hotkey.process(InputEvent::Flags(0), now + Duration::from_millis(200)),
+            None
+        );
+        assert!(hotkey.is_recording());
     }
 
     #[test]
