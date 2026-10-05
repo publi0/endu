@@ -36,12 +36,12 @@ Você escolhe o modelo e os fallbacks; o app cuida da
 captura, do corte de silêncio e da ordem de entrega dos ditados.
 
 ```text
-atalho → gravação → corte de silêncio → OpenRouter → colar
+atalho → gravação → corte de silêncio → OpenRouter → formatação local → colar
                                              ↓ erro
                                        próximo modelo
 ```
 
-O app fica na barra de menus e reúne cinco telas: **Settings**, **Models**,
+O app fica na barra de menus e reúne sete telas: **Settings**, **Microphone**, **Models**, **Post-processing**,
 **HUD**, **History** e **Statistics**. A transcrição exige conexão à internet e uma chave própria do
 [OpenRouter](https://openrouter.ai/keys).
 
@@ -222,7 +222,9 @@ e os parâmetros avançados de transcrição pelo OpenRouter.
 | **Advanced** | URL da API, timeout por tentativa e por trecho, duração dos trechos, espera máxima para repetir um HTTP 429 e temperatura. |
 
 Idioma e modelos são salvos ao mudar o controle. Os campos de
-**Advanced** são aplicados com **Save** ou **Return**. A configuração é relida
+**Advanced** são salvos automaticamente ao sair do campo; **Return** também
+conclui a edição e **Esc** a cancela. Valores inválidos mantêm a configuração
+anterior e mostram o erro. A configuração é relida
 antes de cada ditado, sem precisar reiniciar o app.
 
 Qualquer falha de um modelo — timeout, erro de transporte, resposta vazia ou
@@ -257,6 +259,32 @@ A chave é resolvida nesta ordem: `OPENROUTER_API_KEY`, campo `api_key` do
 arquivo e Keychain. Prefira o Keychain para evitar uma chave em texto puro.
 O arquivo pode conter mais fallbacks que os dois editáveis pela interface.
 
+## Post-processing
+
+O menu lateral **Post-processing** reúne regras locais para formatar o texto
+antes de colar. Todas começam desligadas, não fazem outra chamada a modelo e
+têm um exemplo de resultado na própria tela. **Command + 7** abre a seção.
+
+| Opção | Efeito |
+| --- | --- |
+| **Lowercase text** | Converte todas as letras para minúsculas. |
+| **Lowercase first letter** | Converte só a primeira letra, inclusive depois de aspas ou outros sinais. |
+| **Remove punctuation** | Remove pontuação Unicode, mantendo palavras separadas; também afeta separadores de números e endereços. |
+| **Remove ellipses** | Remove `…`, `...` e sequências equivalentes de pontos. |
+| **Remove final period** | Retira o ponto final; preserva interrogações, exclamações e reticências. |
+| **Collapse spaces** | Reduz espaços e tabulações repetidos, preservando parágrafos. |
+| **Single line** | Une quebras de linha e parágrafos com espaços. |
+
+Minúsculas para o texto inteiro já cobre a primeira letra; remover toda a
+pontuação já cobre reticências e ponto final. As opções específicas ficam
+indisponíveis enquanto a regra mais abrangente está ligada.
+
+As regras são capturadas ao enviar o ditado. History, Paste Last e a cópia
+após falha usam o resultado formatado; alterações posteriores não reescrevem
+ditados anteriores. Um resultado vazio não cola nem envia Enter. Retry usa
+as opções atuais; se nada restar após a formatação, mantém o áudio salvo.
+As estatísticas continuam medindo a transcrição antes dessa formatação local.
+
 ## Settings
 
 As preferências gerais do aplicativo ficam em **Settings**:
@@ -264,10 +292,22 @@ As preferências gerais do aplicativo ficam em **Settings**:
 | Controle | Comportamento |
 | --- | --- |
 | **Dictation / Paste last** | Atalhos, Reset, modos Tap or hold/Hold only/Double tap, sensibilidade dos dois toques e envio opcional com Enter. |
-| **Microphone / Application** | Microfone, liberação do dispositivo enquanto ocioso, comportamento de outros áudios durante a gravação, sons, ícone no Dock e início no login. |
-| **Microphone / Input channel** | Mantém a mistura atual por padrão. Em interfaces com vários canais, permite escolher explicitamente o canal do microfone. A escolha fica vinculada ao dispositivo. |
-| **Microphone / Input levels** | Mostra RMS, pico e avisos de sinal muito baixo, ausência de sinal ou possível clipping na última gravação analisada. |
-| **Microphone / Trim silence** | Remove silêncio nas bordas e reduz pausas longas antes do envio. Usa uma heurística de energia do áudio; clipes classificados como silenciosos não são enviados. Pode ser desligado. |
+| **Application / Sounds** | Sons, ícone no Dock e início no login. |
+| **Preferences** | Importação e exportação das preferências. |
+
+## Microphone
+
+O menu lateral **Microphone** reúne as configurações de entrada e gravação,
+incluindo o comportamento de outros áudios durante o ditado. Também pode ser
+aberto pelo menu do app ou com **Command + 6**.
+
+| Controle | Comportamento |
+| --- | --- |
+| **Input device / Automatic priority** | Dispositivo de entrada e ordem dos microfones preferidos. |
+| **Microphone mode** | Mantém o dispositivo pronto ou o libera enquanto está ocioso. |
+| **Input channel** | Mantém a mistura atual por padrão. Em interfaces com vários canais, permite escolher explicitamente o canal do microfone. A escolha fica vinculada ao dispositivo. |
+| **Input levels** | Mostra RMS, pico e avisos de sinal muito baixo, ausência de sinal ou possível clipping na última gravação analisada. |
+| **Trim silence** | Remove silêncio nas bordas e reduz pausas longas antes do envio. Usa uma heurística de energia do áudio; clipes classificados como silenciosos não são enviados. Pode ser desligado. |
 
 O **Trim silence** é salvo assim que você muda o controle. Avisos e atalhos
 para conceder permissões do macOS também aparecem nessa tela.
@@ -286,16 +326,16 @@ Em **While dictating → Mute**, o volume desce e volta em cerca de **120 ms**
 por transição. O fade roda fora da captura e pode inverter o sentido se outro
 ditado começar logo em seguida. Se detectar uma mudança manual de volume ou
 mute, o Hex deixa de controlar o nível para preservar sua escolha. A opção
-**Pause media** mantém seu comportamento de pausar e retomar os players.
+**Pause** pausa e retoma os players; **Keep** mantém o áudio sem alterações.
 
-**While dictating → Lower volume** reduz o áudio sem silenciar. O padrão
+**While dictating → Lower** reduz o áudio sem silenciar. O padrão
 mantém **80% do volume anterior**: se estava em 50%, passa a 40% durante o
 ditado. Em **Volume while dictating**, digite um percentual de 0 a 100 e
-clique em **Save** ou pressione Return. A alteração vale para o próximo
+saia do campo para salvar automaticamente, ou pressione Return. A alteração vale para o próximo
 ditado; ao terminar, o volume anterior volta com fade. Ajustes manuais de
 volume continuam sendo preservados.
 
-Em **Sounds**, início, término e erro/cancelamento têm volumes independentes,
+Em **Settings → Sounds**, início, término e erro/cancelamento têm volumes independentes,
 incluindo Off para cada evento. A migração preserva o volume que você já usava,
 inclusive sons desligados e o reforço anterior do sinal de início.
 

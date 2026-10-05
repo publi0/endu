@@ -20,12 +20,12 @@ use crate::desktop_ui::{
     TEXT, TEXT_SOFT, compact_button, disclosure_button, picker_open_key, picker_popup,
     settings_panel, settings_row, settings_section_label,
 };
-use crate::text_input::{Changed, Dismissed, Navigate, Submitted, TextInput};
+use crate::text_input::{Changed, Dismissed, EditFinished, Navigate, Submitted, TextInput};
 
-const MODEL_BUTTON_WIDTH: f32 = 300.0;
-const KEY_INPUT_WIDTH: f32 = 300.0;
-const NARROW_INPUT: f32 = 120.0;
-const WIDE_INPUT: f32 = 300.0;
+const MODEL_BUTTON_WIDTH: f32 = crate::desktop_ui::SETTINGS_CONTROL_WIDTH;
+const KEY_INPUT_WIDTH: f32 = crate::desktop_ui::SETTINGS_CONTROL_WIDTH;
+const NARROW_INPUT: f32 = crate::desktop_ui::NUMBER_INPUT_WIDTH;
+const WIDE_INPUT: f32 = crate::desktop_ui::SETTINGS_CONTROL_WIDTH;
 const PICKER_WIDTH: f32 = 380.0;
 const KEYS_URL: &str = "https://openrouter.ai/keys";
 
@@ -165,14 +165,24 @@ impl OpenRouterSettings {
             ),
         };
         let mut subscriptions = Vec::new();
-        let key_input = cx.new(|cx| TextInput::new(cx, "sk-or-v1-…", ""));
+        let key_input = cx.new(|cx| TextInput::new(cx, "sk-or-v1-…", "").commit_on_blur());
         subscriptions.push(cx.subscribe(&key_input, |this, _, _: &Submitted, cx| {
             this.save_key(cx);
+        }));
+        subscriptions.push(cx.subscribe(&key_input, |this, _, _: &EditFinished, cx| {
+            if (this.key_editing || matches!(this.key_status, Some(KeyStatus::Missing)))
+                && !this.key_input.read(cx).text().trim().is_empty()
+            {
+                this.save_key(cx);
+            }
+        }));
+        subscriptions.push(cx.subscribe(&key_input, |this, _, _: &Dismissed, cx| {
+            this.cancel_key_replacement(cx);
         }));
         let form = AdvancedForm::from_config(&config);
         let mut field = |placeholder: &'static str, value: &str, cx: &mut Context<Self>| {
             let value = value.to_owned();
-            let entity = cx.new(|cx| TextInput::new(cx, placeholder, &value));
+            let entity = cx.new(|cx| TextInput::new(cx, placeholder, &value).commit_on_blur());
             subscriptions.push(cx.subscribe(&entity, |this, _, _: &Changed, cx| {
                 this.advanced_dirty = true;
                 this.clear_message(Scope::Advanced);
@@ -180,6 +190,15 @@ impl OpenRouterSettings {
             }));
             subscriptions.push(cx.subscribe(&entity, |this, _, _: &Submitted, cx| {
                 this.save_advanced(cx);
+            }));
+            subscriptions.push(cx.subscribe(&entity, |this, _, _: &EditFinished, cx| {
+                this.save_advanced(cx);
+            }));
+            subscriptions.push(cx.subscribe(&entity, |this, _, _: &Dismissed, cx| {
+                this.load_advanced(&this.advanced_saved.clone(), cx);
+                this.advanced_dirty = false;
+                this.clear_message(Scope::Advanced);
+                cx.notify();
             }));
             entity
         };
@@ -313,6 +332,16 @@ impl OpenRouterSettings {
 
     pub(crate) fn has_key_operation(&self) -> bool {
         self.busy()
+    }
+
+    pub(crate) fn finish_editing(&mut self, cx: &mut Context<Self>) {
+        self.save_advanced(cx);
+        if self.key_input.read(cx).has_pending_edit()
+            && !self.key_input.read(cx).text().trim().is_empty()
+            && (self.key_editing || matches!(self.key_status, Some(KeyStatus::Missing)))
+        {
+            self.save_key(cx);
+        }
     }
 
     pub(crate) fn config_snapshot(&self) -> Config {
@@ -961,7 +990,11 @@ impl OpenRouterSettings {
                             .items_center()
                             .text_size(px(12.0))
                             .text_color(rgb(MUTED))
-                            .child("••••••••••••"),
+                            .child(
+                                self.key_operation
+                                    .map(KeyOperation::label)
+                                    .unwrap_or("••••••••••••"),
+                            ),
                     )
                 })
                 .child(
@@ -984,27 +1017,16 @@ impl OpenRouterSettings {
                                     }
                                 })),
                         )
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .when(has_key, |buttons| {
-                                    buttons.child(
-                                        button("Cancel", false)
-                                            .id("openrouter-cancel-key")
-                                            .when(self.busy(), |button| button.opacity(0.45))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.cancel_key_replacement(cx)
-                                            })),
-                                    )
-                                })
-                                .child(
-                                    button(self.action_label(KeyOperation::Save, "Save key"), true)
-                                        .id("openrouter-save-key")
-                                        .when(self.busy(), |button| button.opacity(0.45))
-                                        .on_click(cx.listener(|this, _, _, cx| this.save_key(cx))),
-                                ),
-                        ),
+                        .child(div().flex().gap_2().when(has_key, |buttons| {
+                            buttons.child(
+                                button("Cancel", false)
+                                    .id("openrouter-cancel-key")
+                                    .when(self.busy(), |button| button.opacity(0.45))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cancel_key_replacement(cx)
+                                    })),
+                            )
+                        })),
                 )
                 .into_any_element();
         }
@@ -1082,12 +1104,12 @@ impl OpenRouterSettings {
             .gap_2()
             .child(
                 div()
-                    .h(px(28.0))
+                    .h(px(crate::desktop_ui::CONTROL_HEIGHT))
                     .px_3()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .rounded_sm()
+                    .rounded(px(crate::desktop_ui::CONTROL_RADIUS))
                     .bg(rgb(0x17231a))
                     .text_size(px(11.0))
                     .font_weight(FontWeight::SEMIBOLD)
@@ -1107,7 +1129,9 @@ impl OpenRouterSettings {
                 "Read from openrouter.json in plain text; moving it to the Keychain is safer"
             }
             Some(KeyStatus::Environment) => "Set by the environment; it overrides any saved key",
-            Some(KeyStatus::Missing) => "Required to transcribe. Paste a key and press Return",
+            Some(KeyStatus::Missing) => {
+                "Paste a key; it saves when you leave the field or press Return"
+            }
         }
     }
 
@@ -1624,11 +1648,7 @@ impl OpenRouterSettings {
                 div()
                     .text_size(px(11.0))
                     .text_color(rgb(FAINT))
-                    .child(if self.advanced_dirty {
-                        "Unsaved changes. Press Return or Save."
-                    } else {
-                        ""
-                    }),
+                    .child("Changes save when you leave a field."),
             )
             .child(
                 div()
@@ -1646,14 +1666,6 @@ impl OpenRouterSettings {
                             .on_click(
                                 cx.listener(|this, _, _, cx| this.restore_advanced_defaults(cx)),
                             ),
-                    )
-                    .child(
-                        button("Save", self.advanced_dirty)
-                            .id("openrouter-save-advanced")
-                            .when(self.busy() || !self.advanced_dirty, |button| {
-                                button.opacity(0.45)
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| this.save_advanced(cx))),
                     ),
             );
         div()
@@ -1810,6 +1822,81 @@ impl Render for OpenRouterSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn advanced_fields_and_key_save_when_editing_finishes(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.bind_keys(crate::text_input::key_bindings()));
+        let (view, cx) = cx.add_window_view(|_, cx| OpenRouterSettings::new(false, true, cx));
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.advanced_open = true;
+                cx.notify();
+            })
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            view.read(cx)
+                .advanced
+                .temperature
+                .focus_handle(cx)
+                .focus(window)
+        });
+        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_input("0.");
+        cx.update(|_, cx| assert_eq!(view.read(cx).advanced.temperature.read(cx).text(), "0."));
+        cx.simulate_input("5");
+        cx.update(|window, cx| {
+            view.read(cx)
+                .advanced
+                .attempt_timeout
+                .focus_handle(cx)
+                .focus(window)
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_eq!(view.read(cx).config.transcription.temperature, Some(0.5)));
+        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_input("0");
+        cx.update(|window, _| window.blur());
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            assert_eq!(view.config.transcription.attempt_timeout_seconds, 30);
+            assert!(view.render_error(Scope::Advanced).is_some());
+        });
+        cx.update(|window, cx| {
+            view.read(cx)
+                .advanced
+                .attempt_timeout
+                .focus_handle(cx)
+                .focus(window)
+        });
+        cx.simulate_keystrokes("escape");
+        cx.update(|_, cx| assert_eq!(view.read(cx).advanced.attempt_timeout.read(cx).text(), "30"));
+
+        cx.update(|window, cx| view.read(cx).key_input.focus_handle(cx).focus(window));
+        cx.simulate_input("preview-key-0123456789");
+        cx.update(|_, cx| assert_eq!(view.read(cx).key_status(), Some(&KeyStatus::Missing)));
+        cx.update(|window, _| window.blur());
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                view.read(cx).key_status(),
+                Some(&KeyStatus::Keychain("demo".into()))
+            )
+        });
+        cx.update(|window, cx| view.update(cx, |view, cx| view.begin_key_replacement(window, cx)));
+        cx.run_until_parked();
+        cx.simulate_input("cancelled-preview-key");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            assert!(!view.key_editing);
+            assert!(view.key_input.read(cx).text().is_empty());
+            assert_eq!(view.key_status(), Some(&KeyStatus::Keychain("demo".into())));
+        });
+    }
 
     #[gpui::test]
     fn importing_models_replaces_advanced_drafts_without_touching_key_edits(

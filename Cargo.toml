@@ -1,6 +1,6 @@
 [package]
 name = "voice-control"
-version = "3.1.0"
+version = "3.1.1"
 edition = "2024"
 default-run = "voice-control"
 license = "MIT"
@@ -29,6 +29,7 @@ serde_json = "1.0.151"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 unicode-segmentation = "1.13.3"
+unicode-properties = { version = "0.1.4", default-features = false, features = ["general-category"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 arboard = { version = "3.6.1", default-features = false }

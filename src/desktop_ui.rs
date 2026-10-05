@@ -92,7 +92,9 @@ pub(crate) fn picker_popup(menu: impl IntoElement) -> AnyElement {
 #[derive(Clone, Copy)]
 pub(crate) enum NavigationIcon {
     Settings,
+    Microphone,
     Models,
+    PostProcessing,
     Hud,
     History,
     Statistics,
@@ -102,7 +104,9 @@ impl NavigationIcon {
     fn sf_symbol(self) -> &'static str {
         match self {
             Self::Settings => "slider.horizontal.3",
+            Self::Microphone => "mic",
             Self::Models => "sparkles",
+            Self::PostProcessing => "textformat",
             Self::Hud => "capsule",
             Self::History => "clock.fill",
             Self::Statistics => "chart.bar.fill",
@@ -145,7 +149,11 @@ pub(crate) const FAINT: u32 = 0x626262;
 pub(crate) const NEGATIVE: u32 = 0xc98f89;
 
 pub(crate) const CONTROL_HEIGHT: f32 = 32.0;
-pub(crate) const TEXT_INPUT_HEIGHT: f32 = 34.0;
+pub(crate) const CONTROL_TEXT_SIZE: f32 = 12.0;
+pub(crate) const CONTROL_RADIUS: f32 = 6.0;
+pub(crate) const SETTINGS_CONTROL_WIDTH: f32 = 300.0;
+pub(crate) const NUMBER_INPUT_WIDTH: f32 = 96.0;
+pub(crate) const TEXT_INPUT_HEIGHT: f32 = CONTROL_HEIGHT;
 pub(crate) const MULTILINE_INPUT_HEIGHT: f32 = 76.0;
 pub(crate) const PANEL_RADIUS: f32 = 10.0;
 pub(crate) const COMPACT_PANEL_HEADER_HEIGHT: f32 = 38.0;
@@ -272,15 +280,15 @@ pub(crate) fn pane_body() -> Div {
         .justify_center()
 }
 
-/// The one pane-header action button: a bordered 30-point chip. Every
+/// The one pane-header action button, using the shared control height. Every
 /// clickable header action renders this.
 pub(crate) fn header_button(label: impl IntoElement) -> Div {
     div()
-        .h(px(30.0))
+        .h(px(CONTROL_HEIGHT))
         .px_3()
         .flex()
         .items_center()
-        .rounded_sm()
+        .rounded(px(CONTROL_RADIUS))
         .border_1()
         .border_color(rgb(LINE))
         .bg(rgb(SURFACE))
@@ -423,12 +431,12 @@ pub(crate) fn settings_copy(
 
 pub(crate) fn compact_button(label: impl IntoElement) -> Div {
     div()
-        .h(px(30.0))
+        .h(px(CONTROL_HEIGHT))
         .px_3()
         .flex()
         .items_center()
-        .rounded_sm()
-        .text_size(px(12.0))
+        .rounded(px(CONTROL_RADIUS))
+        .text_size(px(CONTROL_TEXT_SIZE))
         .text_color(rgb(TEXT_SOFT))
         .hover(|button| button.bg(rgb(SURFACE_HOVER)))
         .child(label)
@@ -466,18 +474,18 @@ pub(crate) fn compact_panel_header(title: impl IntoElement, action: Option<AnyEl
 
 pub(crate) fn disclosure_button(label: impl IntoElement) -> Div {
     div()
-        .w(px(220.0))
+        .w(px(SETTINGS_CONTROL_WIDTH))
         .h(px(CONTROL_HEIGHT))
         .px_3()
         .flex_none()
         .flex()
         .items_center()
         .gap_2()
-        .rounded(px(6.0))
+        .rounded(px(CONTROL_RADIUS))
         .border_1()
         .border_color(rgb(LINE))
         .bg(rgb(CANVAS))
-        .text_size(px(11.0))
+        .text_size(px(CONTROL_TEXT_SIZE))
         .text_color(rgb(TEXT_SOFT))
         .hover(|button| button.bg(rgb(SURFACE_HOVER)).text_color(rgb(TEXT)))
         .child(div().min_w(px(0.0)).flex_1().truncate().child(label))
@@ -528,7 +536,7 @@ pub(crate) fn segmented_control() -> Div {
         .flex_none()
         .flex()
         .items_center()
-        .rounded(px(6.0))
+        .rounded(px(CONTROL_RADIUS))
         .border_1()
         .border_color(rgb(LINE))
         .bg(rgb(CANVAS))
@@ -541,7 +549,7 @@ pub(crate) fn segmented_item(selected: bool) -> Div {
         .flex()
         .items_center()
         .rounded(px(4.0))
-        .text_size(px(11.0))
+        .text_size(px(CONTROL_TEXT_SIZE))
         .text_color(if selected { rgb(TEXT) } else { rgb(MUTED) })
         .when(selected, |item| item.bg(rgb(SURFACE_SELECTED)))
         .when(!selected, |item| {
@@ -550,6 +558,21 @@ pub(crate) fn segmented_item(selected: bool) -> Div {
                     .text_color(rgb(TEXT_SOFT))
             })
         })
+}
+
+pub(crate) fn settings_segment_width(count: usize) -> f32 {
+    (SETTINGS_CONTROL_WIDTH - 6.0) / count.max(1) as f32
+}
+
+pub(crate) fn settings_segmented_control() -> Div {
+    segmented_control().w(px(SETTINGS_CONTROL_WIDTH))
+}
+
+pub(crate) fn settings_segmented_item(selected: bool, count: usize) -> Div {
+    segmented_item(selected)
+        .w(px(settings_segment_width(count)))
+        .px_0()
+        .justify_center()
 }
 
 /// A [`segmented_control`] whose selection indicator slides between items.
@@ -659,6 +682,63 @@ mod layout_tests {
     use super::*;
     use gpui::{Context, Render, TestAppContext, Window, size};
 
+    struct StandardControls(gpui::Entity<crate::text_input::TextInput>);
+
+    impl Render for StandardControls {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .flex()
+                .flex_col()
+                .items_start()
+                .gap_2()
+                .child(
+                    disclosure_button("Active window").debug_selector(|| "standard-picker".into()),
+                )
+                .child(
+                    settings_segmented_control()
+                        .debug_selector(|| "standard-segments".into())
+                        .children((0..3).map(|index| {
+                            settings_segmented_item(index == 0, 3)
+                                .debug_selector(move || format!("standard-segment-{index}"))
+                                .child(["Small", "Normal", "Large"][index])
+                        })),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(NUMBER_INPUT_WIDTH))
+                        .debug_selector(|| "standard-number".into())
+                        .child(self.0.clone()),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn settings_controls_share_height_width_and_equal_segments(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, cx| {
+            StandardControls(cx.new(|cx| crate::text_input::TextInput::new(cx, "", "24")))
+        });
+        cx.run_until_parked();
+        let picker = cx.debug_bounds("standard-picker").unwrap();
+        let segments = cx.debug_bounds("standard-segments").unwrap();
+        let number = cx.debug_bounds("standard-number").unwrap();
+        assert_eq!(picker.size.width, px(SETTINGS_CONTROL_WIDTH));
+        assert_eq!(picker.size.width, segments.size.width);
+        assert_eq!(picker.size.height, px(CONTROL_HEIGHT));
+        assert_eq!(picker.size.height, segments.size.height);
+        assert_eq!(picker.size.height, number.size.height);
+        assert_eq!(number.size.width, px(NUMBER_INPUT_WIDTH));
+        let widths: Vec<_> = [
+            "standard-segment-0",
+            "standard-segment-1",
+            "standard-segment-2",
+        ]
+        .into_iter()
+        .map(|selector| cx.debug_bounds(selector).unwrap().size.width)
+        .collect();
+        assert!(widths.iter().all(|width| *width == widths[0]));
+    }
+
     struct SettingsRow;
 
     impl Render for SettingsRow {
@@ -669,7 +749,7 @@ mod layout_tests {
                     "Default: keeps the microphone open for the fastest start. A short pre-roll helps catch the beginning of speech. Failed recordings are kept locally for recovery.",
                     div()
                         .debug_selector(|| "settings-control".into())
-                        .w(px(220.0))
+                        .w(px(SETTINGS_CONTROL_WIDTH))
                         .h(px(CONTROL_HEIGHT))
                         .flex_none(),
                 )
@@ -730,7 +810,7 @@ mod layout_tests {
             let copy = cx.debug_bounds("settings-copy").unwrap();
             let control = cx.debug_bounds("settings-control").unwrap();
             assert_eq!(row.size.width, px(width));
-            assert_eq!(control.size.width, px(220.0));
+            assert_eq!(control.size.width, px(SETTINGS_CONTROL_WIDTH));
             assert_eq!(control.size.height, px(CONTROL_HEIGHT));
             assert!(
                 control.right() <= row.right(),

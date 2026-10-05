@@ -201,6 +201,8 @@ impl IconImages {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatusItemAction {
     OpenSettings,
+    OpenMicrophone,
+    OpenPostProcessing,
     OpenModels,
     OpenHud,
     OpenHistory,
@@ -231,6 +233,16 @@ objc2::define_class!(
         #[unsafe(method(openModels:))]
         fn open_models(&self, _sender: &AnyObject) {
             let _ = self.ivars().actions.try_send(StatusItemAction::OpenModels);
+        }
+
+        #[unsafe(method(openMicrophone:))]
+        fn open_microphone(&self, _sender: &AnyObject) {
+            let _ = self.ivars().actions.try_send(StatusItemAction::OpenMicrophone);
+        }
+
+        #[unsafe(method(openPostProcessing:))]
+        fn open_post_processing(&self, _sender: &AnyObject) {
+            let _ = self.ivars().actions.try_send(StatusItemAction::OpenPostProcessing);
         }
 
         #[unsafe(method(openHud:))]
@@ -348,7 +360,15 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
     );
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     add_item(&menu, &target, "Settings", sel!(openSettings:), mtm);
+    add_item(&menu, &target, "Microphone", sel!(openMicrophone:), mtm);
     add_item(&menu, &target, "Models", sel!(openModels:), mtm);
+    add_item(
+        &menu,
+        &target,
+        "Post-processing",
+        sel!(openPostProcessing:),
+        mtm,
+    );
     add_item(&menu, &target, "HUD", sel!(openHud:), mtm);
     add_item(&menu, &target, "History", sel!(openHistory:), mtm);
     add_item(&menu, &target, "Statistics", sel!(openStatistics:), mtm);

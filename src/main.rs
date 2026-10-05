@@ -57,6 +57,10 @@ mod permission_guide;
 #[cfg(target_os = "macos")]
 mod pipeline;
 #[cfg(target_os = "macos")]
+mod post_processing;
+#[cfg(target_os = "macos")]
+mod post_processing_view;
+#[cfg(target_os = "macos")]
 mod preferences_transfer;
 #[cfg(target_os = "macos")]
 mod recording_environment;
@@ -138,7 +142,9 @@ enum AppPreviewTarget {
     PasteNotice,
     Onboarding,
     Settings,
+    Microphone,
     Models,
+    PostProcessing,
     Hud,
     History,
     Statistics,
@@ -212,6 +218,8 @@ fn main() -> Result<()> {
                 }
                 AppPreviewTarget::History => app_window::PreviewPane::History,
                 AppPreviewTarget::Models => app_window::PreviewPane::Models,
+                AppPreviewTarget::PostProcessing => app_window::PreviewPane::PostProcessing,
+                AppPreviewTarget::Microphone => app_window::PreviewPane::Microphone,
                 AppPreviewTarget::Hud => app_window::PreviewPane::Hud,
                 AppPreviewTarget::Statistics => app_window::PreviewPane::Statistics,
             };
@@ -254,6 +262,8 @@ mod tests {
         assert!(Cli::try_parse_from(["hex", "preview", "statistics"]).is_ok());
         assert!(Cli::try_parse_from(["hex", "preview", "paste-notice"]).is_ok());
         assert!(Cli::try_parse_from(["hex", "preview", "hud"]).is_ok());
+        assert!(Cli::try_parse_from(["hex", "preview", "microphone"]).is_ok());
+        assert!(Cli::try_parse_from(["hex", "preview", "post-processing"]).is_ok());
         assert!(matches!(
             Cli::try_parse_from(["hex", "preview", "models"])
                 .unwrap()

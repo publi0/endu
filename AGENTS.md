@@ -5,9 +5,10 @@
 A slim macOS fork of HEX: tap a shortcut to lock recording or hold and release,
 trim the silence, send
 the clip to OpenRouter with an ordered model fallback chain, and paste the
-transcript. Settings, Models, HUD, History, and Statistics are the only panes.
+transcript. Settings, Microphone, Models, Post-processing, HUD, History, and Statistics are the only panes.
 OpenRouter key, language, models, and advanced limits belong in Models;
-silence trimming belongs in Settings under Microphone. Indicator position and
+device/channel choices, priority, input levels, capture mode, silence trimming
+and audio behavior while dictating belong in Microphone. Indicator position and
 recording/transcription palettes belong in HUD. Everything
 else from upstream (local models, voice commands, Voice Action, Modes and
 OpenCode, meetings, the local API and SDK, Linux) was deleted on purpose; do
@@ -59,6 +60,8 @@ not reintroduce seams for them.
   owner applies device changes only between clips.
 - `preferences_transfer`: a versioned, validated allowlist; never export keys,
   endpoints, History/retention, audio, permissions or login registration.
+- `post_processing`, `post_processing_view`: local, deterministic formatting
+  preferences and their settings UI. All rules default off; no extra model call.
 - `status_item`, `login_item`, `onboarding`, `permission_guide`, `instance`,
   `feedback`: menu bar, launch at login, setup gate, permission helper, single
   instance lock, and tones.
@@ -117,6 +120,14 @@ not reintroduce seams for them.
   retried once on the same model.
 - Statistics record daily totals only, never text or audio, and recording
   them must never affect dictation.
+- Each accepted dictation snapshots its post-processing preferences. Format
+  once before ordered output; History and Paste Last retain that result and
+  its casing policy. Continuation must not undo explicit lowercase choices.
+  Empty formatted text must never paste, copy, send Return or enter History.
+  Retry snapshots current formatting preferences; if formatting removes all
+  recovered text, preserve the source audio and show a safe explanation.
+  Existing History entries are never reformatted retroactively. Statistics
+  continue to measure the transcription, before local text formatting.
 - Normal History records only successful pasted output with seven-day default
   retention and hard caps. The History pane also exposes separate recovery
   entries, whose audio/text must not be pruned by those normal-history rules.
@@ -170,6 +181,15 @@ not reintroduce seams for them.
   and disable incompatible key operations while one is pending.
   Across all panes, the selected option or updated field confirms a save: do
   not add Saved/success rows. Keep errors and explicit key-test results visible.
+  Settings have no Apply/Save buttons. Text fields validate and save when
+  editing finishes (focus leaves or Enter); Escape cancels the draft. Do not
+  persist incomplete text while typing, duplicate a save on Enter then blur,
+  or treat programmatic imports as fresh user edits.
+  Reuse desktop_ui control metrics: 32-point height, 12-point control text,
+  300-point pickers/segmented controls, and 96-point numeric inputs. Segments
+  divide the available width evenly. Do not invent per-pane control sizes.
+  Display selection is one menu with pointer/window modes and connected
+  displays; refresh that list when opening it rather than adding a button.
 
 ## Mandatory local validation before every commit
 
@@ -222,7 +242,9 @@ the changes uncommitted. Do not move the checks into GitHub Actions.
 ```sh
 scripts/build-app.sh  # target/app/Hex-<version>.zip
 cargo run -- preview settings
+cargo run -- preview microphone
 cargo run -- preview models
+cargo run -- preview post-processing
 cargo run -- preview hud
 cargo run -- preview history --open-history-retention
 cargo run -- preview statistics

@@ -36,9 +36,13 @@ use crate::onboarding::{
 };
 use crate::openrouter::settings_view::{KeyChanged, OpenRouterSettings};
 use crate::openrouter::stats_view::StatisticsView;
+use crate::post_processing_view::{PostProcessingChange, PostProcessingView};
 use crate::recording_recovery::{RecordingRecovery, RecoveryEntry, RecoveryStatus};
 use crate::sound_settings_view::{SoundEvent, SoundSettingsView, SoundVolumeChange};
-use crate::text_input::{Changed as TextChanged, Submitted as TextSubmitted, TextInput};
+use crate::text_input::{
+    Changed as TextChanged, Dismissed as TextDismissed, EditFinished as TextEditFinished,
+    Submitted as TextSubmitted, TextInput,
+};
 
 const WINDOW_WIDTH: f32 = 1040.0;
 const WINDOW_HEIGHT: f32 = 720.0;
@@ -57,6 +61,8 @@ actions!(
         QuitApplication,
         ShowHistory,
         ShowModels,
+        ShowMicrophone,
+        ShowPostProcessing,
         ShowHud,
         ShowSettings,
         ShowStatistics,
@@ -252,7 +258,9 @@ fn open_new(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PreviewPane {
     Settings,
+    Microphone,
     Models,
+    PostProcessing,
     Hud,
     History,
     Statistics,
@@ -271,16 +279,20 @@ pub struct AppWindowPreview {
 enum Pane {
     #[default]
     Settings,
+    Microphone,
     Models,
+    PostProcessing,
     Hud,
     History,
     Statistics,
 }
 
 impl Pane {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 7] = [
         Self::Settings,
+        Self::Microphone,
         Self::Models,
+        Self::PostProcessing,
         Self::Hud,
         Self::History,
         Self::Statistics,
@@ -289,7 +301,9 @@ impl Pane {
     fn label(self) -> &'static str {
         match self {
             Self::Settings => "Settings",
+            Self::Microphone => "Microphone",
             Self::Models => "Models",
+            Self::PostProcessing => "Post-processing",
             Self::Hud => "HUD",
             Self::History => "History",
             Self::Statistics => "Statistics",
@@ -299,7 +313,9 @@ impl Pane {
     fn icon(self) -> NavigationIcon {
         match self {
             Self::Settings => NavigationIcon::Settings,
+            Self::Microphone => NavigationIcon::Microphone,
             Self::Models => NavigationIcon::Models,
+            Self::PostProcessing => NavigationIcon::PostProcessing,
             Self::Hud => NavigationIcon::Hud,
             Self::History => NavigationIcon::History,
             Self::Statistics => NavigationIcon::Statistics,
@@ -434,6 +450,7 @@ enum SettingControl {
     Hud,
     MicrophonePriority,
     DoubleTapSensitivity,
+    PostProcessing,
 }
 
 struct SettingsFeedback {
@@ -461,6 +478,7 @@ pub struct AppWindow {
     settings_error: Option<String>,
     settings_feedback: Option<SettingsFeedback>,
     hud_settings: Entity<HudSettingsView>,
+    post_processing_view: Entity<PostProcessingView>,
     sound_settings: Entity<SoundSettingsView>,
     microphone_priority: Entity<MicrophonePriorityView>,
     sensitivity_focus: [FocusHandle; 3],
@@ -566,7 +584,16 @@ impl AppWindow {
         let window_focus = cx.focus_handle();
         window_focus.focus(native_window);
         let hotkey_focus = cx.focus_handle();
+        let closing = cx.weak_entity();
+        native_window.on_window_should_close(cx, move |_, cx| {
+            let _ = closing.update(cx, |this, cx| this.finish_editing(cx));
+            true
+        });
         let mut subscriptions = vec![
+            cx.on_app_quit(|this, cx| {
+                this.finish_editing(cx);
+                async {}
+            }),
             cx.on_blur(&hotkey_focus, native_window, |this, _, cx| {
                 this.cancel_hotkey_capture(cx)
             }),
@@ -585,8 +612,29 @@ impl AppWindow {
                 }
             }),
         ];
-        let lower_volume_input =
-            cx.new(|cx| TextInput::new(cx, "80", settings.lower_volume_percent.to_string()));
+        let lower_volume_input = cx.new(|cx| {
+            TextInput::new(cx, "80", settings.lower_volume_percent.to_string()).commit_on_blur()
+        });
+        subscriptions.push(
+            cx.subscribe(&lower_volume_input, |this, _, _: &TextEditFinished, cx| {
+                this.save_lower_volume(cx)
+            }),
+        );
+        subscriptions.push(
+            cx.subscribe(&lower_volume_input, |this, _, _: &TextDismissed, cx| {
+                this.lower_volume_input.update(cx, |input, cx| {
+                    input.set_text(this.settings.lower_volume_percent.to_string(), cx)
+                });
+                if this
+                    .settings_feedback
+                    .as_ref()
+                    .is_some_and(|feedback| feedback.control == SettingControl::LowerVolume)
+                {
+                    this.settings_feedback = None;
+                }
+                cx.notify();
+            }),
+        );
         subscriptions.push(
             cx.subscribe(&lower_volume_input, |this, _, _: &TextSubmitted, cx| {
                 this.save_lower_volume(cx);
@@ -672,6 +720,21 @@ impl AppWindow {
         let microphone_priority = cx.new(|cx| {
             MicrophonePriorityView::new(settings.microphone_priority.clone(), preview_mode, cx)
         });
+        let post_processing_view =
+            cx.new(|cx| PostProcessingView::new(settings.post_processing, cx));
+        subscriptions.push(cx.observe(&post_processing_view, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.subscribe(
+            &post_processing_view,
+            |this, _, change: &PostProcessingChange, cx| {
+                this.update_settings(SettingControl::PostProcessing, cx, |settings| {
+                    settings.post_processing = change.0
+                });
+                let preferences = this.settings.post_processing;
+                let error = this.feedback_error(SettingControl::PostProcessing);
+                this.post_processing_view
+                    .update(cx, |view, cx| view.set_preferences(preferences, error, cx));
+            },
+        ));
         subscriptions.push(cx.observe(&hud_settings, |_, _, cx| cx.notify()));
         subscriptions.push(cx.observe(&sound_settings, |_, _, cx| cx.notify()));
         subscriptions.push(cx.observe(&microphone_priority, |_, _, cx| cx.notify()));
@@ -764,6 +827,8 @@ impl AppWindow {
             preview: preview_mode,
             pane: match preview.as_ref().map(|preview| preview.pane) {
                 Some(PreviewPane::Models) => Pane::Models,
+                Some(PreviewPane::PostProcessing) => Pane::PostProcessing,
+                Some(PreviewPane::Microphone) => Pane::Microphone,
                 Some(PreviewPane::Hud) => Pane::Hud,
                 Some(PreviewPane::History) => Pane::History,
                 Some(PreviewPane::Statistics) => Pane::Statistics,
@@ -830,6 +895,7 @@ impl AppWindow {
             settings_error,
             settings_feedback: None,
             hud_settings,
+            post_processing_view,
             sound_settings,
             microphone_priority,
             sensitivity_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
@@ -914,7 +980,7 @@ impl AppWindow {
                 view.refresh();
                 cx.notify();
             }),
-            Pane::Settings | Pane::Models | Pane::Hud => {
+            Pane::Settings | Pane::Microphone | Pane::Models | Pane::PostProcessing | Pane::Hud => {
                 self.permission_refresh_at = Instant::now()
             }
         }
@@ -929,8 +995,16 @@ impl AppWindow {
         self.select_pane(Pane::Settings, cx);
     }
 
+    pub(crate) fn show_microphone(&mut self, cx: &mut Context<Self>) {
+        self.select_pane(Pane::Microphone, cx);
+    }
+
     pub(crate) fn show_models(&mut self, cx: &mut Context<Self>) {
         self.select_pane(Pane::Models, cx);
+    }
+
+    pub(crate) fn show_post_processing(&mut self, cx: &mut Context<Self>) {
+        self.select_pane(Pane::PostProcessing, cx);
     }
 
     pub(crate) fn show_hud(&mut self, cx: &mut Context<Self>) {
@@ -951,7 +1025,7 @@ impl AppWindow {
                 && (Instant::now() < self.permission_refresh_at
                     || !self.setup_visible
                         && self.listener_start.is_none()
-                        && !matches!(self.pane, Pane::Settings | Pane::Models)
+                        && !matches!(self.pane, Pane::Settings | Pane::Microphone | Pane::Models)
                         && self.setup_status.api_key)
         {
             return false;
@@ -1121,22 +1195,42 @@ impl AppWindow {
             cx.notify();
             return;
         };
-        self.update_settings(SettingControl::LowerVolume, cx, |settings| {
+        if self.update_settings(SettingControl::LowerVolume, cx, |settings| {
             settings.lower_volume_percent = percent;
-        });
+        }) {
+            self.lower_volume_input
+                .update(cx, |input, cx| input.set_text(percent.to_string(), cx));
+        }
     }
 
-    fn render_lower_volume_row(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// Flush valid drafts before a window or app exit removes its focus tree.
+    pub(crate) fn finish_editing(&mut self, cx: &mut Context<Self>) {
+        if self.lower_volume_input.read(cx).has_pending_edit() {
+            self.save_lower_volume(cx);
+        }
+        if let Some(distance) = self.hud_settings.read(cx).pending_distance(cx) {
+            self.update_settings(SettingControl::Hud, cx, |settings| {
+                settings.hud.edge_distance = distance
+            });
+            let preferences = self.settings.hud;
+            let error = self.feedback_error(SettingControl::Hud);
+            self.hud_settings
+                .update(cx, |view, cx| view.set_preferences(preferences, error, cx));
+        }
+        self.openrouter_settings
+            .update(cx, |view, cx| view.finish_editing(cx));
+        self.openrouter_setup
+            .update(cx, |view, cx| view.finish_editing(cx));
+    }
+
+    fn render_lower_volume_row(&self) -> Option<AnyElement> {
         (self.settings.recording_audio_behavior == RecordingAudioBehavior::LowerVolume).then(|| {
             self.setting_row(
                 SettingControl::LowerVolume,
-                "Volume while dictating",
+                "Volume while dictating (%)",
                 "Percentage of the previous volume to keep. Applies to the next dictation; the original level returns when you stop.",
-                div().flex().items_center().gap_2()
-                    .child(div().w(px(64.0)).child(self.lower_volume_input.clone()))
-                    .child(div().text_color(rgb(MUTED)).child("%"))
-                    .child(compact_button("Save").id("save-lower-volume")
-                        .on_click(cx.listener(|this, _, _, cx| this.save_lower_volume(cx)))),
+                div().flex_none().w(px(crate::desktop_ui::NUMBER_INPUT_WIDTH))
+                    .child(self.lower_volume_input.clone()),
             ).border_b_0().into_any_element()
         })
     }
@@ -1380,7 +1474,7 @@ impl AppWindow {
         self.recovery_copied = false;
         if let Some(store) = &self.recovery {
             self.recovery_error = (if self.preview {
-                store.retry_with(id, |_| {
+                store.retry_with_preferences(id, self.settings.post_processing, |_| {
                     Ok(crate::openrouter::transcribe::Transcription {
                         text: "Recovered preview dictation.".into(),
                         report: None,
@@ -2546,7 +2640,7 @@ impl AppWindow {
     }
 
     fn poll_microphone(&mut self) -> bool {
-        if self.preview || self.pane != Pane::Settings {
+        if self.preview || self.pane != Pane::Microphone {
             return false;
         }
         let latest = crate::microphone::latest();
@@ -3108,6 +3202,9 @@ impl AppWindow {
         self.openrouter_settings.update(cx, |view, cx| {
             view.apply_imported_config(imported.config, cx)
         });
+        let preferences = self.settings.post_processing;
+        self.post_processing_view
+            .update(cx, |view, cx| view.set_preferences(preferences, None, cx));
         self.refresh_microphone_description();
         // While the preferences window is open its Dock icon stays available;
         // the existing close/drop path applies the imported background setting.
@@ -3175,7 +3272,7 @@ impl AppWindow {
             .into_any_element()
     }
 
-    fn render_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_microphone(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let permission_warnings = self.render_permission_warnings(cx);
         let microphone_channel = self.render_microphone_channel(cx);
         let microphone_diagnostic = self.render_microphone_diagnostic();
@@ -3186,74 +3283,7 @@ impl AppWindow {
             .cursor_pointer()
             .child(toggle(if trim_enabled { 1.0 } else { 0.0 }))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_trim_silence(cx)));
-        let hotkey_control = self.render_hotkey_setting_control(HotkeyKind::Dictation, window, cx);
-        let paste_last_control =
-            self.render_hotkey_setting_control(HotkeyKind::PasteLast, window, cx);
-        let mode_control = div().flex_none().flex().gap_1().children(
-            DictationMode::ALL
-                .into_iter()
-                .enumerate()
-                .map(|(index, mode)| {
-                    compact_button(mode.label())
-                        .id(("dictation-mode", index))
-                        .track_focus(&self.dictation_mode_focus[index])
-                        .border_1()
-                        .border_color(rgb(LINE))
-                        .focus(|style| style.border_color(rgb(ACCENT)))
-                        .when(mode == self.settings.dictation_mode, |button| {
-                            button.bg(rgb(SURFACE_SELECTED)).text_color(rgb(TEXT))
-                        })
-                        .on_click(
-                            cx.listener(move |this, _, _, cx| this.set_dictation_mode(mode, cx)),
-                        )
-                }),
-        );
-        let mode_description = match self.settings.dictation_mode {
-            DictationMode::TapOrHold => {
-                "Tap to keep recording; press again to stop. Or hold and release to finish."
-            }
-            DictationMode::Hold => {
-                "Hold the shortcut while speaking; release to transcribe and paste."
-            }
-            DictationMode::DoubleTap => {
-                "Hold to dictate, or double-tap to keep recording until the next press."
-            }
-        };
-        self.double_tap_only_visibility.set_enabled(
-            self.settings.dictation_mode == DictationMode::DoubleTap
-                && self.settings.dictation_hotkey.key.is_some(),
-        );
-        let double_tap_only_visibility = self
-            .double_tap_only_visibility
-            .render_position(window)
-            .clamp(0.0, 1.0);
-        let dock_icon_position = self.dock_icon_toggle.render_position(window);
-        let launch_at_login_position = self.launch_at_login_toggle.render_position(window);
         let release_microphone_position = self.release_microphone_toggle.render_position(window);
-        let sensitivity_control = div().flex_none().flex().gap_1().children(
-            DoubleTapSensitivity::ALL
-                .into_iter()
-                .enumerate()
-                .map(|(index, sensitivity)| {
-                    compact_button(sensitivity.label())
-                        .id(("double-tap-sensitivity", index))
-                        .track_focus(&self.sensitivity_focus[index])
-                        .border_1()
-                        .border_color(rgb(LINE))
-                        .focus(|style| style.border_color(rgb(ACCENT)))
-                        .when(
-                            self.settings.double_tap_sensitivity == sensitivity,
-                            |button| button.bg(rgb(SURFACE_SELECTED)),
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.update_settings(
-                                SettingControl::DoubleTapSensitivity,
-                                cx,
-                                |settings| settings.double_tap_sensitivity = sensitivity,
-                            );
-                        }))
-                }),
-        );
         let microphone_label = self
             .settings
             .microphone
@@ -3262,29 +3292,8 @@ impl AppWindow {
         let microphone_picker = self
             .microphone_picker_open
             .then(|| self.render_microphone_picker(cx));
-        let launch_at_login_control = if self.launch_at_login_status.is_none() {
-            div()
-                .text_size(px(11.0))
-                .text_color(rgb(MUTED))
-                .child(if self.login_item_worker.is_some() {
-                    "Checking…"
-                } else {
-                    "Unavailable"
-                })
-                .into_any_element()
-        } else if self.launch_at_login_status == Some(LoginItemStatus::RequiresApproval) {
-            compact_button("Open Settings")
-                .id("launch-at-login-approval")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.request_login_item(LoginItemRequest::OpenSettings);
-                    cx.notify();
-                }))
-                .into_any_element()
-        } else {
-            toggle(launch_at_login_position)
-        };
         let recording_audio_position = self.recording_audio_spring.render_position(window);
-        let audio_widths = [50.0, 96.0, 90.0, 80.0];
+        let audio_widths = [crate::desktop_ui::settings_segment_width(4); 4];
         let audio_behavior = sliding_segmented_control(recording_audio_position, &audio_widths)
             .children(
                 [
@@ -3313,31 +3322,187 @@ impl AppWindow {
                         }))
                 }),
             );
-        let microphone_mode = sliding_segmented_control(release_microphone_position, &[114.0; 2])
-            .children(
-                [("Keep ready (fast)", false), ("Release when idle", true)]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, (label, release))| {
-                        sliding_segmented_item(
-                            114.0,
-                            self.settings.release_microphone_while_idle == release,
-                        )
-                        .id(("microphone-mode", index))
-                        .child(label)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if this.settings.release_microphone_while_idle != release
-                                && this.update_settings(
-                                    SettingControl::MicrophoneMode,
-                                    cx,
-                                    |settings| settings.release_microphone_while_idle = release,
+        let microphone_mode = sliding_segmented_control(
+            release_microphone_position,
+            &[crate::desktop_ui::settings_segment_width(2); 2],
+        )
+        .children(
+            [("Keep ready (fast)", false), ("Release when idle", true)]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (label, release))| {
+                    sliding_segmented_item(
+                        crate::desktop_ui::settings_segment_width(2),
+                        self.settings.release_microphone_while_idle == release,
+                    )
+                    .id(("microphone-mode", index))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.settings.release_microphone_while_idle != release
+                            && this.update_settings(
+                                SettingControl::MicrophoneMode,
+                                cx,
+                                |settings| settings.release_microphone_while_idle = release,
+                            )
+                        {
+                            this.release_microphone_toggle.set_enabled(release);
+                        }
+                    }))
+                }),
+        );
+        configuration_pane("Microphone", "microphone-scroll", div().children(permission_warnings)
+                .child(settings_section_label("INPUT AND RECORDING"))
+                .child(
+                    settings_panel()
+                        .child(self.setting_row(SettingControl::Microphone,
+                            "Input device",
+                            "Automatic picks the preferred available microphone",
+                            div()
+                                .relative()
+                                .flex_none()
+                                .child(
+                                    disclosure_button(microphone_label)
+                                        .id("microphone-setting").debug_selector(|| "microphone-setting".into())
+                                        .track_focus(&self.microphone_picker_state.trigger)
+                                        .focus(|style| style.border_color(rgb(ACCENT)))
+                                        .on_click(cx.listener(|this, event, window, cx| {
+                if matches!(event, gpui::ClickEvent::Mouse(_)) {
+                    this.toggle_microphone_picker(window, cx);
+                }
+            }))
+                                        .on_key_down(cx.listener(|this, event, window, cx| {
+                                            if picker_open_key(event) {
+                                                this.toggle_microphone_picker(window, cx);
+                                                cx.stop_propagation();
+                                            }
+                                        })),
                                 )
-                            {
-                                this.release_microphone_toggle.set_enabled(release);
-                            }
-                        }))
-                    }),
-            );
+                                .children(microphone_picker.map(picker_popup)),
+                        ))
+                        .child(self.microphone_priority.clone())
+                        .child(microphone_channel)
+                        .child(microphone_diagnostic)
+                        .child(self.setting_row(SettingControl::MicrophoneMode,
+                            "Microphone mode",
+                            if self.settings.release_microphone_while_idle {
+                                "Opens on the shortcut: the orange indicator only shows while dictating, but the first syllable can be lost"
+                            } else {
+                                "Keeps the microphone open so a short pre-roll catches the start of speech. Failed transcriptions keep their audio for recovery"
+                            },
+                            microphone_mode,
+                        ))
+                        .child(self.setting_row(SettingControl::Trim,
+                            "Trim silence",
+                            "Cuts silence and long pauses before sending, so less audio is billed. Recordings with no speech are not sent",
+                            trim_control,
+                        ))
+                        .child(
+                            self.setting_row(SettingControl::AudioBehavior,
+                                "While dictating",
+                                match self.settings.recording_audio_behavior {
+                                    RecordingAudioBehavior::Mute => "Fades system audio out and back in quickly; preserves detected manual volume changes",
+                                    RecordingAudioBehavior::LowerVolume => "Lowers system audio with a quick fade; preserves detected manual volume changes",
+                                    RecordingAudioBehavior::PauseMedia => "Pauses playing media and resumes it after dictation",
+                                    RecordingAudioBehavior::DoNothing => "Leaves other audio unchanged while dictating",
+                                },
+                                audio_behavior,
+                            )
+                            .when(self.settings.recording_audio_behavior != RecordingAudioBehavior::LowerVolume, |row| row.border_b_0()),
+                        )
+                        .children(self.render_lower_volume_row()),
+                )
+        )
+    }
+
+    fn render_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let permission_warnings = self.render_permission_warnings(cx);
+        let hotkey_control = self.render_hotkey_setting_control(HotkeyKind::Dictation, window, cx);
+        let paste_last_control =
+            self.render_hotkey_setting_control(HotkeyKind::PasteLast, window, cx);
+        let mode_control = crate::desktop_ui::settings_segmented_control().children(
+            DictationMode::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(index, mode)| {
+                    crate::desktop_ui::settings_segmented_item(
+                        mode == self.settings.dictation_mode,
+                        DictationMode::ALL.len(),
+                    )
+                    .id(("dictation-mode", index))
+                    .track_focus(&self.dictation_mode_focus[index])
+                    .border_1()
+                    .border_color(gpui::transparent_black())
+                    .focus(|style| style.border_color(rgb(ACCENT)))
+                    .child(mode.label())
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_dictation_mode(mode, cx)))
+                }),
+        );
+        let mode_description = match self.settings.dictation_mode {
+            DictationMode::TapOrHold => {
+                "Tap to keep recording; press again to stop. Or hold and release to finish."
+            }
+            DictationMode::Hold => {
+                "Hold the shortcut while speaking; release to transcribe and paste."
+            }
+            DictationMode::DoubleTap => {
+                "Hold to dictate, or double-tap to keep recording until the next press."
+            }
+        };
+        self.double_tap_only_visibility.set_enabled(
+            self.settings.dictation_mode == DictationMode::DoubleTap
+                && self.settings.dictation_hotkey.key.is_some(),
+        );
+        let double_tap_only_visibility = self
+            .double_tap_only_visibility
+            .render_position(window)
+            .clamp(0.0, 1.0);
+        let dock_icon_position = self.dock_icon_toggle.render_position(window);
+        let launch_at_login_position = self.launch_at_login_toggle.render_position(window);
+        let sensitivity_control = crate::desktop_ui::settings_segmented_control().children(
+            DoubleTapSensitivity::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(index, sensitivity)| {
+                    crate::desktop_ui::settings_segmented_item(
+                        self.settings.double_tap_sensitivity == sensitivity,
+                        DoubleTapSensitivity::ALL.len(),
+                    )
+                    .id(("double-tap-sensitivity", index))
+                    .track_focus(&self.sensitivity_focus[index])
+                    .border_1()
+                    .border_color(gpui::transparent_black())
+                    .focus(|style| style.border_color(rgb(ACCENT)))
+                    .child(sensitivity.label())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.update_settings(
+                            SettingControl::DoubleTapSensitivity,
+                            cx,
+                            |settings| settings.double_tap_sensitivity = sensitivity,
+                        );
+                    }))
+                }),
+        );
+        let launch_at_login_control = if self.launch_at_login_status.is_none() {
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(MUTED))
+                .child(if self.login_item_worker.is_some() {
+                    "Checking…"
+                } else {
+                    "Unavailable"
+                })
+                .into_any_element()
+        } else if self.launch_at_login_status == Some(LoginItemStatus::RequiresApproval) {
+            compact_button("Open Settings")
+                .id("launch-at-login-approval")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.request_login_item(LoginItemRequest::OpenSettings);
+                    cx.notify();
+                }))
+                .into_any_element()
+        } else {
+            toggle(launch_at_login_position)
+        };
         configuration_pane(
             "Settings",
             "settings-scroll",
@@ -3417,65 +3582,6 @@ impl AppWindow {
                                 }),
                         ),
                     ).child(self.render_clipboard_fallback(cx)),
-                )
-                .child(settings_section_label("MICROPHONE"))
-                .child(
-                    settings_panel()
-                        .child(self.setting_row(SettingControl::Microphone,
-                            "Input device",
-                            "Automatic picks the preferred available microphone",
-                            div()
-                                .relative()
-                                .flex_none()
-                                .child(
-                                    disclosure_button(microphone_label)
-                                        .id("microphone-setting")
-                                        .track_focus(&self.microphone_picker_state.trigger)
-                                        .focus(|style| style.border_color(rgb(ACCENT)))
-                                        .on_click(cx.listener(|this, event, window, cx| {
-                if matches!(event, gpui::ClickEvent::Mouse(_)) {
-                    this.toggle_microphone_picker(window, cx);
-                }
-            }))
-                                        .on_key_down(cx.listener(|this, event, window, cx| {
-                                            if picker_open_key(event) {
-                                                this.toggle_microphone_picker(window, cx);
-                                                cx.stop_propagation();
-                                            }
-                                        })),
-                                )
-                                .children(microphone_picker.map(picker_popup)),
-                        ))
-                        .child(self.microphone_priority.clone())
-                        .child(microphone_channel)
-                        .child(microphone_diagnostic)
-                        .child(self.setting_row(SettingControl::MicrophoneMode,
-                            "Microphone mode",
-                            if self.settings.release_microphone_while_idle {
-                                "Opens on the shortcut: the orange indicator only shows while dictating, but the first syllable can be lost"
-                            } else {
-                                "Keeps the microphone open so a short pre-roll catches the start of speech. Failed transcriptions keep their audio for recovery"
-                            },
-                            microphone_mode,
-                        ))
-                        .child(self.setting_row(SettingControl::Trim,
-                            "Trim silence",
-                            "Cuts silence and long pauses before sending, so less audio is billed. Recordings with no speech are not sent",
-                            trim_control,
-                        ))
-                        .child(
-                            self.setting_row(SettingControl::AudioBehavior,
-                                "While dictating",
-                                match self.settings.recording_audio_behavior {
-                                    RecordingAudioBehavior::Mute => "Fades system audio out and back in quickly; preserves detected manual volume changes",
-                                    RecordingAudioBehavior::LowerVolume => "Lowers system audio with a quick fade; preserves detected manual volume changes",
-                                    _ => "What happens to other audio once a hold becomes a dictation",
-                                },
-                                audio_behavior,
-                            )
-                            .when(self.settings.recording_audio_behavior != RecordingAudioBehavior::LowerVolume, |row| row.border_b_0()),
-                        )
-                        .children(self.render_lower_volume_row(cx)),
                 )
                 .child(settings_section_label("APPLICATION"))
                 .child(
@@ -3695,7 +3801,9 @@ impl Render for AppWindow {
         } else {
             match self.pane {
                 Pane::Settings => self.render_settings(window, cx),
+                Pane::Microphone => self.render_microphone(window, cx),
                 Pane::Models => self.render_models(),
+                Pane::PostProcessing => self.post_processing_view.clone().into_any_element(),
                 Pane::Hud => self.hud_settings.clone().into_any_element(),
                 Pane::History => {
                     self.reconcile_recovery_focus(window);
@@ -3733,7 +3841,10 @@ impl Render for AppWindow {
                     cx.notify();
                 }
             }))
-            .on_action(|_: &CloseWindow, window, _| window.remove_window())
+            .on_action(cx.listener(|this, _: &CloseWindow, window, cx| {
+                this.finish_editing(cx);
+                window.remove_window();
+            }))
             .on_action(|_: &MinimizeWindow, window, _| window.minimize_window())
             .on_action(|_: &ToggleFullscreen, window, _| window.toggle_fullscreen())
             .on_action(cx.listener(|this, _: &ShowSettings, window, cx| {
@@ -3741,8 +3852,18 @@ impl Render for AppWindow {
                 this.focus_pane(window);
                 window.activate_window();
             }))
+            .on_action(cx.listener(|this, _: &ShowMicrophone, window, cx| {
+                this.select_pane(Pane::Microphone, cx);
+                this.focus_pane(window);
+                window.activate_window();
+            }))
             .on_action(cx.listener(|this, _: &ShowModels, window, cx| {
                 this.select_pane(Pane::Models, cx);
+                this.focus_pane(window);
+                window.activate_window();
+            }))
+            .on_action(cx.listener(|this, _: &ShowPostProcessing, window, cx| {
+                this.show_post_processing(cx);
                 this.focus_pane(window);
                 window.activate_window();
             }))
@@ -4293,6 +4414,7 @@ fn write_preferences_export_to(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::Focusable;
 
     fn preview_fixture(window: &mut Window, cx: &mut Context<AppWindow>) -> AppWindow {
         AppWindow::new(
@@ -4602,8 +4724,39 @@ mod tests {
     }
 
     #[gpui::test]
+    fn microphone_pane_owns_input_controls_without_resetting_settings(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(preview_fixture);
+        assert!(cx.debug_bounds("microphone-setting").is_none());
+        cx.update(|_, cx| view.update(cx, |view, cx| view.show_microphone(cx)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("microphone-setting").is_some());
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(view.pane, Pane::Microphone);
+                view.toggle_trim_silence(cx);
+                assert!(!view.openrouter_settings.read(cx).trim_silence());
+                view.show_settings(cx);
+            })
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("microphone-setting").is_none());
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.show_microphone(cx);
+                assert!(!view.openrouter_settings.read(cx).trim_silence());
+            })
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("microphone-setting").is_some());
+    }
+
+    #[gpui::test]
     fn microphone_and_channel_choices_are_keyboard_accessible(cx: &mut gpui::TestAppContext) {
         let (view, cx) = cx.add_window_view(preview_fixture);
+        cx.update(|_, cx| view.update(cx, |view, cx| view.show_microphone(cx)));
+        cx.run_until_parked();
         cx.update(|window, cx| view.read(cx).microphone_picker_state.trigger.focus(window));
         cx.simulate_keystrokes("enter down enter");
         cx.simulate_event(gpui::KeyUpEvent {
@@ -4645,6 +4798,44 @@ mod tests {
                     .is_focused(window)
             );
         });
+    }
+
+    #[gpui::test]
+    fn lower_volume_saves_on_focus_change_without_a_button(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.bind_keys(crate::text_input::key_bindings()));
+        let (view, cx) = cx.add_window_view(preview_fixture);
+        cx.update(|_, cx| view.update(cx, |view, cx| view.show_microphone(cx)));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.settings.recording_audio_behavior = RecordingAudioBehavior::LowerVolume;
+                cx.notify();
+            })
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            view.read(cx)
+                .lower_volume_input
+                .focus_handle(cx)
+                .focus(window)
+        });
+        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_input("35");
+        cx.update(|window, _| window.blur());
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_eq!(view.read(cx).settings.lower_volume_percent, 35));
+        cx.update(|window, cx| {
+            view.read(cx)
+                .lower_volume_input
+                .focus_handle(cx)
+                .focus(window)
+        });
+        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_input("65");
+        assert!(cx.simulate_close());
+        cx.cx
+            .read(|cx| assert_eq!(view.read(cx).settings.lower_volume_percent, 65));
     }
 
     #[gpui::test]
@@ -4740,6 +4931,8 @@ mod tests {
     #[gpui::test]
     fn microphone_errors_stay_visible_outside_the_scrolling_choices(cx: &mut gpui::TestAppContext) {
         let (view, cx) = cx.add_window_view(preview_fixture);
+        cx.update(|_, cx| view.update(cx, |view, cx| view.show_microphone(cx)));
+        cx.run_until_parked();
         cx.simulate_resize(gpui::size(px(1040.0), px(720.0)));
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
@@ -4933,6 +5126,8 @@ mod tests {
     #[gpui::test]
     fn microphone_trim_control_keeps_its_value_across_panes(cx: &mut gpui::TestAppContext) {
         let (view, cx) = cx.add_window_view(preview_fixture);
+        cx.update(|_, cx| view.update(cx, |view, cx| view.show_microphone(cx)));
+        cx.run_until_parked();
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 assert!(view.openrouter_settings.read(cx).trim_silence());
@@ -4941,6 +5136,7 @@ mod tests {
                 assert!(view.settings_error.is_none());
                 view.show_models(cx);
                 view.show_settings(cx);
+                view.show_microphone(cx);
                 assert!(!view.openrouter_settings.read(cx).trim_silence());
                 view.toggle_trim_silence(cx);
                 assert!(view.openrouter_settings.read(cx).trim_silence());
@@ -4952,6 +5148,8 @@ mod tests {
     #[gpui::test]
     fn explicit_microphone_channel_stays_bound_to_its_device(cx: &mut gpui::TestAppContext) {
         let (view, cx) = cx.add_window_view(preview_fixture);
+        cx.update(|_, cx| view.update(cx, |view, cx| view.show_microphone(cx)));
+        cx.run_until_parked();
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 let device = view.microphone_description.clone().unwrap();

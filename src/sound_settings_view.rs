@@ -6,7 +6,8 @@ use gpui::{
 };
 
 use crate::desktop_ui::{
-    ACCENT, LINE, NEGATIVE, segmented_control, segmented_item, settings_panel, settings_row,
+    ACCENT, LINE, NEGATIVE, settings_panel, settings_row, settings_segmented_control,
+    settings_segmented_item,
 };
 use crate::interaction_settings::SoundVolumes;
 
@@ -140,12 +141,12 @@ impl SoundSettingsView {
     fn render_row(&self, sound: SoundEvent, cx: &mut Context<Self>) -> AnyElement {
         let row = sound.index();
         let volume = sound.volume(self.volumes);
-        let control =
-            segmented_control().children(LEVELS.into_iter().enumerate().map(|(index, level)| {
+        let control = settings_segmented_control().children(LEVELS.into_iter().enumerate().map(
+            |(index, level)| {
                 // An imported intermediate level is shown in the copy, not rounded
                 // into a preset selection that the user never chose.
                 let selected = (volume - level).abs() < f32::EPSILON;
-                segmented_item(selected)
+                settings_segmented_item(selected, LEVELS.len())
                     .id(("sound-level", row * LEVELS.len() + index))
                     .debug_selector(move || format!("sound-level-{row}-{index}"))
                     .track_focus(
@@ -153,13 +154,9 @@ impl SoundSettingsView {
                             .clone()
                             .tab_stop(self.focus_index[row] == index),
                     )
-                    .w(px(36.0))
-                    .px_0()
-                    .justify_center()
                     .border_1()
                     .border_color(gpui::transparent_black())
                     .focus(|style| style.border_color(rgb(ACCENT)))
-                    .text_size(px(9.0))
                     .cursor_pointer()
                     .child(LABELS[index])
                     .on_click(cx.listener(move |this, event, window, cx| {
@@ -171,7 +168,8 @@ impl SoundSettingsView {
                     .on_key_down(cx.listener(move |this, event, window, cx| {
                         this.control_key(sound, index, event, window, cx);
                     }))
-            }));
+            },
+        ));
         div()
             .border_color(rgb(LINE))
             .when(sound != SoundEvent::ErrorCancel, |row| row.border_b_1())

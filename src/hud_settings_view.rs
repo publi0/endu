@@ -8,7 +8,7 @@ use gpui::{
 };
 
 use crate::desktop_ui::{
-    ACCENT, LINE, MUTED, NEGATIVE, PANE_CONTENT_WIDTH, PickerState, SURFACE, SURFACE_HOVER,
+    ACCENT, LINE, NEGATIVE, PANE_CONTENT_WIDTH, PickerState, SURFACE, SURFACE_HOVER,
     SURFACE_SELECTED, TEXT, TEXT_SOFT, compact_button, disclosure_button, pane_header,
     picker_open_key, picker_popup, settings_panel, settings_row, settings_section_label,
 };
@@ -17,7 +17,7 @@ use crate::hud_settings::{
     HudBrightness, HudColor, HudPosition, HudPreferences, HudScreen, HudSize, MAX_EDGE_DISTANCE,
     MIN_EDGE_DISTANCE, MonitorId,
 };
-use crate::text_input::{Changed, Submitted, TextInput};
+use crate::text_input::{Changed, Dismissed, EditFinished, Submitted, TextInput};
 
 #[derive(Clone, Copy, Debug)]
 pub struct HudChange {
@@ -47,10 +47,7 @@ pub struct HudSettingsView {
     position_focus: [FocusHandle; 2],
     size_focus: [FocusHandle; 3],
     brightness_focus: [FocusHandle; 3],
-    screen_focus: [FocusHandle; 2],
     color_focus: [[FocusHandle; 6]; 2],
-    apply_focus: FocusHandle,
-    refresh_focus: FocusHandle,
     distance_submit: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
@@ -60,17 +57,37 @@ impl EventEmitter<HudChange> for HudSettingsView {}
 impl HudSettingsView {
     pub fn new(preferences: HudPreferences, preview: bool, cx: &mut Context<Self>) -> Self {
         let preferences = preferences.normalized();
-        let distance = cx.new(|cx| TextInput::new(cx, "12", preferences.edge_distance.to_string()));
-        let subscriptions = vec![cx.subscribe(&distance, |this, _, _: &Changed, cx| {
-            if this
-                .error
-                .as_ref()
-                .is_some_and(|(scope, _)| *scope == Section::Distance)
-            {
-                this.error = None;
-            }
-            cx.notify();
-        })];
+        let distance = cx.new(|cx| {
+            TextInput::new(cx, "12", preferences.edge_distance.to_string()).commit_on_blur()
+        });
+        let subscriptions = vec![
+            cx.subscribe(&distance, |this, _, _: &Changed, cx| {
+                if this
+                    .error
+                    .as_ref()
+                    .is_some_and(|(scope, _)| *scope == Section::Distance)
+                {
+                    this.error = None;
+                }
+                cx.notify();
+            }),
+            cx.subscribe(&distance, |this, _, _: &EditFinished, cx| {
+                this.apply_distance(cx)
+            }),
+            cx.subscribe(&distance, |this, _, _: &Dismissed, cx| {
+                this.distance.update(cx, |input, cx| {
+                    input.set_text(this.preferences.edge_distance.to_string(), cx)
+                });
+                if this
+                    .error
+                    .as_ref()
+                    .is_some_and(|(section, _)| *section == Section::Distance)
+                {
+                    this.error = None;
+                }
+                cx.notify();
+            }),
+        ];
         Self {
             preferences,
             preview,
@@ -83,12 +100,9 @@ impl HudSettingsView {
             position_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             size_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             brightness_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
-            screen_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             color_focus: std::array::from_fn(|_| {
                 std::array::from_fn(|_| cx.focus_handle().tab_stop(true))
             }),
-            apply_focus: cx.focus_handle().tab_stop(true),
-            refresh_focus: cx.focus_handle().tab_stop(true),
             distance_submit: None,
             _subscriptions: subscriptions,
         }
@@ -150,6 +164,15 @@ impl HudSettingsView {
         }
     }
 
+    /// Window closing does not dispatch GPUI's next-frame blur listeners.
+    pub(crate) fn pending_distance(&self, cx: &gpui::App) -> Option<u16> {
+        let input = self.distance.read(cx);
+        input
+            .has_pending_edit()
+            .then(|| parse_distance(input.text()).ok())
+            .flatten()
+    }
+
     fn refresh_monitors(&mut self) {
         self.monitors = monitor_choices(self.preview);
     }
@@ -160,22 +183,18 @@ impl HudSettingsView {
             self.monitor_picker.trigger.focus(window);
         } else {
             self.refresh_monitors();
-            if self.monitors.is_empty() {
-                self.error = Some((
-                    Section::Screen,
-                    "No connected monitors are available.".into(),
-                ));
-                cx.notify();
-                return;
-            }
-            let selected = self
-                .monitors
-                .iter()
-                .position(|choice| Some(choice.id) == self.preferences.fixed_monitor)
-                .unwrap_or(0);
+            let selected = match self.preferences.screen {
+                HudScreen::Pointer => 0,
+                HudScreen::ActiveWindow => 1,
+                HudScreen::FixedMonitor => self
+                    .monitors
+                    .iter()
+                    .position(|choice| Some(choice.id) == self.preferences.fixed_monitor)
+                    .map_or(0, |index| index + 2),
+            };
             self.monitor_open = true;
             self.monitor_picker
-                .open(selected, self.monitors.len(), window);
+                .open(selected, self.monitors.len() + 2, window);
         }
         cx.notify();
     }
@@ -205,9 +224,26 @@ impl HudSettingsView {
         );
     }
 
+    fn choose_display(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(&screen) = HudScreen::ALL[..2].get(index) {
+            self.monitor_open = false;
+            self.monitor_picker.trigger.focus(window);
+            self.change(
+                Section::Screen,
+                HudPreferences {
+                    screen,
+                    ..self.preferences
+                },
+                cx,
+            );
+        } else if let Some(choice) = self.monitors.get(index.saturating_sub(2)) {
+            self.choose_monitor(choice.id, window, cx);
+        }
+    }
+
     fn monitor_keys(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
-        if self.monitor_picker.navigate(key, self.monitors.len()) {
+        if self.monitor_picker.navigate(key, self.monitors.len() + 2) {
             cx.stop_propagation();
             cx.notify();
         } else if matches!(key, "escape" | "tab") {
@@ -216,9 +252,7 @@ impl HudSettingsView {
             cx.stop_propagation();
             cx.notify();
         } else if matches!(key, "enter" | "space") {
-            if let Some(choice) = self.monitors.get(self.monitor_picker.highlight) {
-                self.choose_monitor(choice.id, window, cx);
-            }
+            self.choose_display(self.monitor_picker.highlight, window, cx);
             cx.stop_propagation();
         }
     }
@@ -234,20 +268,17 @@ impl HudSettingsView {
     ) -> AnyElement {
         let (selected, focus) = selection;
         let change = Rc::new(change);
-        div()
-            .flex_none()
-            .flex()
-            .gap_2()
+        crate::desktop_ui::settings_segmented_control()
             .children(choices.iter().enumerate().map(|(index, &value)| {
                 let change = change.clone();
-                compact_button(label(value))
+                crate::desktop_ui::settings_segmented_item(value == selected, choices.len())
+                    .child(label(value))
                     .id((id, index))
                     .debug_selector(move || format!("{id}-{index}"))
                     .track_focus(&focus[index])
                     .focus(|style| style.border_color(rgb(ACCENT)))
                     .border_1()
-                    .border_color(rgb(LINE))
-                    .h(px(32.0))
+                    .border_color(gpui::transparent_black())
                     .when(value == selected, |button| {
                         button.bg(rgb(SURFACE_SELECTED)).text_color(rgb(TEXT))
                     })
@@ -269,7 +300,7 @@ impl HudSettingsView {
             self.preferences.transcription_color
         };
         div()
-            .w(px(304.0))
+            .w(px(crate::desktop_ui::SETTINGS_CONTROL_WIDTH))
             .flex_none()
             .flex()
             .flex_wrap()
@@ -282,7 +313,7 @@ impl HudSettingsView {
                     .focus(|style| style.border_color(rgb(ACCENT)))
                     .border_1()
                     .border_color(rgb(LINE))
-                    .w(px(96.0))
+                    .w(px((crate::desktop_ui::SETTINGS_CONTROL_WIDTH - 16.0) / 3.0))
                     .h(px(32.0))
                     .gap(px(6.0))
                     .when(color == selected, |button| {
@@ -321,57 +352,64 @@ impl HudSettingsView {
     }
 
     fn screen_control(&self, cx: &mut Context<Self>) -> AnyElement {
-        let choices = self.choices(
-            "hud-screen",
-            &HudScreen::ALL[..2],
-            (self.preferences.screen, &self.screen_focus),
-            HudScreen::label,
-            |this, screen, cx| {
-                this.change(
-                    Section::Screen,
-                    HudPreferences {
-                        screen,
-                        ..this.preferences
-                    },
-                    cx,
-                )
-            },
-            cx,
-        );
-        let selected = self.preferences.screen == HudScreen::FixedMonitor;
-        let label = self
-            .preferences
-            .fixed_monitor
-            .and_then(|id| self.monitors.iter().find(|choice| choice.id == id))
-            .map(|choice| format!("Fixed: {}", choice.name))
-            .unwrap_or_else(|| "Choose fixed monitor".into());
+        let label = match self.preferences.screen {
+            HudScreen::Pointer => "Follow pointer".to_owned(),
+            HudScreen::ActiveWindow => HudScreen::ActiveWindow.label().to_owned(),
+            HudScreen::FixedMonitor => self
+                .preferences
+                .fixed_monitor
+                .and_then(|id| self.monitors.iter().find(|choice| choice.id == id))
+                .map(|choice| choice.name.clone())
+                .unwrap_or_else(|| "Unavailable display".into()),
+        };
         let popup = self.monitor_open.then(|| {
-            let rows = self.monitors.iter().enumerate().map(|(index, choice)| {
-                let id = choice.id;
+            let labels = [
+                "Follow pointer".to_owned(),
+                HudScreen::ActiveWindow.label().to_owned(),
+            ]
+            .into_iter()
+            .chain(self.monitors.iter().map(|choice| choice.name.clone()));
+            let rows = labels.enumerate().map(|(index, label)| {
+                let selected = match index {
+                    0 => self.preferences.screen == HudScreen::Pointer,
+                    1 => self.preferences.screen == HudScreen::ActiveWindow,
+                    _ => {
+                        self.preferences.screen == HudScreen::FixedMonitor
+                            && self.monitors.get(index - 2).is_some_and(|choice| {
+                                Some(choice.id) == self.preferences.fixed_monitor
+                            })
+                    }
+                };
                 div()
                     .id(("hud-monitor-choice", index))
-                    .h(px(34.0))
+                    .h(px(crate::desktop_ui::CONTROL_HEIGHT))
                     .px_3()
                     .flex_none()
                     .flex()
                     .items_center()
+                    .justify_between()
+                    .gap_2()
                     .rounded_sm()
-                    .text_size(px(12.0))
+                    .text_size(px(crate::desktop_ui::CONTROL_TEXT_SIZE))
                     .text_color(rgb(TEXT_SOFT))
+                    .when(index == 2, |row| row.border_t_1().border_color(rgb(LINE)))
                     .when(index == self.monitor_picker.highlight, |row| {
                         row.bg(rgb(SURFACE_SELECTED))
                     })
                     .hover(|row| row.bg(rgb(SURFACE_HOVER)))
-                    .child(div().truncate().child(choice.name.clone()))
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.choose_monitor(id, window, cx)),
-                    )
+                    .child(div().min_w_0().truncate().child(label))
+                    .when(selected, |row| {
+                        row.child(div().flex_none().text_color(rgb(TEXT)).child("✓"))
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.choose_display(index, window, cx)
+                    }))
             });
             div()
                 .id("hud-monitor-menu")
                 .debug_selector(|| "hud-monitor-menu".into())
                 .track_focus(&self.monitor_picker.menu)
-                .w(px(300.0))
+                .w(px(crate::desktop_ui::SETTINGS_CONTROL_WIDTH))
                 .p_2()
                 .rounded_sm()
                 .border_1()
@@ -398,47 +436,26 @@ impl HudSettingsView {
         });
         div()
             .flex_none()
-            .flex()
-            .flex_col()
-            .items_end()
-            .gap_2()
-            .child(choices)
+            .relative()
             .child(
-                div()
-                    .relative()
-                    .child(
-                        disclosure_button(label)
-                            .id("hud-monitor-trigger")
-                            .debug_selector(|| "hud-monitor-trigger".into())
-                            .track_focus(&self.monitor_picker.trigger)
-                            .focus(|style| style.border_color(rgb(ACCENT)))
-                            .when(selected, |button| {
-                                button.bg(rgb(SURFACE_SELECTED)).text_color(rgb(TEXT))
-                            })
-                            .on_key_down(cx.listener(|this, event, window, cx| {
-                                if picker_open_key(event) {
-                                    this.toggle_monitors(window, cx);
-                                    cx.stop_propagation();
-                                }
-                            }))
-                            .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
-                                if !matches!(event, ClickEvent::Keyboard(_)) {
-                                    this.toggle_monitors(window, cx);
-                                }
-                            })),
-                    )
-                    .children(popup.map(picker_popup)),
-            )
-            .child(
-                compact_button("Refresh monitors")
-                    .id("hud-monitor-refresh")
-                    .track_focus(&self.refresh_focus)
+                disclosure_button(label)
+                    .id("hud-monitor-trigger")
+                    .debug_selector(|| "hud-monitor-trigger".into())
+                    .track_focus(&self.monitor_picker.trigger)
                     .focus(|style| style.border_color(rgb(ACCENT)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.refresh_monitors();
-                        cx.notify();
+                    .on_key_down(cx.listener(|this, event, window, cx| {
+                        if picker_open_key(event) {
+                            this.toggle_monitors(window, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                        if !matches!(event, ClickEvent::Keyboard(_)) {
+                            this.toggle_monitors(window, cx);
+                        }
                     })),
             )
+            .children(popup.map(picker_popup))
             .into_any_element()
     }
 
@@ -545,21 +562,8 @@ impl Render for HudSettingsView {
         let transcription = self.palette(false, cx);
         let distance = div()
             .flex_none()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(div().w(px(66.0)).child(self.distance.clone()))
-            .child(div().text_size(px(11.0)).text_color(rgb(MUTED)).child("pt"))
-            .child(
-                compact_button("Apply")
-                    .id("hud-distance-apply")
-                    .debug_selector(|| "hud-distance-apply".into())
-                    .track_focus(&self.apply_focus)
-                    .focus(|style| style.border_color(rgb(ACCENT)))
-                    .border_1()
-                    .border_color(rgb(LINE))
-                    .on_click(cx.listener(|this, _, _, cx| this.apply_distance(cx))),
-            );
+            .w(px(crate::desktop_ui::NUMBER_INPUT_WIDTH))
+            .child(self.distance.clone());
         let disconnected = self.preferences.screen == HudScreen::FixedMonitor
             && !self
                 .monitors
@@ -568,22 +572,60 @@ impl Render for HudSettingsView {
         let display_note = if disconnected {
             "The saved monitor is unavailable. The HUD follows your pointer until it reconnects."
         } else {
-            "The HUD and Paste Last notice use this display. If unavailable, they follow your pointer."
+            "Where the HUD and paste notices appear."
         };
         let content = div()
             .child(settings_section_label("PLACEMENT"))
-            .child(settings_panel()
-                .child(self.row(Section::Position, "Screen edge", "Top or bottom of the visible display area, clear of the Dock.", position))
-                .child(self.row(Section::Screen, "Display", display_note, screen))
-                .child(self.row(Section::Distance, "Edge distance", "0–160 points from the screen edge. Press Enter or Apply.", distance).border_b_0()))
-            .child(div().mt_6().child(settings_section_label("APPEARANCE")))
-            .child(settings_panel()
-                .child(self.row(Section::Size, "Size", "Scales the capsule and transcription sphere together.", size))
-                .child(self.row(Section::Brightness, "Brightness", "Adjusts the light while keeping the current animation.", brightness))
-                .child(self.row(Section::Recording, "Recording", "Color of the capsule while you speak.", recording))
-                .child(self.row(Section::Transcription, "Transcribing", "Color of the sphere while audio is transcribed.", transcription).border_b_0()))
-            .child(div().pt_4().px_1().text_size(px(11.0)).text_color(rgb(MUTED))
-                .child("Changes apply immediately. The preparing capsule stays neutral while the microphone opens."));
+            .child(
+                settings_panel()
+                    .child(self.row(
+                        Section::Position,
+                        "Screen edge",
+                        "Top or bottom of the visible display area, clear of the Dock.",
+                        position,
+                    ))
+                    .child(self.row(Section::Screen, "Display", display_note, screen))
+                    .child(
+                        self.row(
+                            Section::Distance,
+                            "Edge distance (pt)",
+                            "0–160 points. Saves when you leave the field.",
+                            distance,
+                        )
+                        .border_b_0(),
+                    ),
+            )
+            .child(settings_section_label("APPEARANCE"))
+            .child(
+                settings_panel()
+                    .child(self.row(
+                        Section::Size,
+                        "Size",
+                        "Scales the capsule and transcription sphere together.",
+                        size,
+                    ))
+                    .child(self.row(
+                        Section::Brightness,
+                        "Brightness",
+                        "Adjusts the light while keeping the current animation.",
+                        brightness,
+                    ))
+                    .child(self.row(
+                        Section::Recording,
+                        "Recording",
+                        "Color of the capsule while you speak.",
+                        recording,
+                    ))
+                    .child(
+                        self.row(
+                            Section::Transcription,
+                            "Transcribing",
+                            "Color of the sphere while audio is transcribed.",
+                            transcription,
+                        )
+                        .border_b_0(),
+                    ),
+            );
         div()
             .size_full()
             .flex()
@@ -694,7 +736,7 @@ mod tests {
             })
         });
         cx.update(|window, cx| view.read(cx).monitor_picker.trigger.focus(window));
-        cx.simulate_keystrokes("enter down enter");
+        cx.simulate_keystrokes("enter end enter");
         cx.simulate_event(gpui::KeyUpEvent {
             keystroke: gpui::Keystroke::parse("enter").unwrap(),
         });
@@ -711,6 +753,50 @@ mod tests {
             assert_eq!(view.preferences.transcription_color, HudColor::Blue);
         });
         assert_eq!(changes.borrow().len(), 1);
+        cx.simulate_keystrokes("enter home enter");
+        cx.update(|_, cx| assert_eq!(view.read(cx).preferences.screen, HudScreen::Pointer));
+        cx.simulate_keystrokes("enter down enter");
+        cx.update(|_, cx| assert_eq!(view.read(cx).preferences.screen, HudScreen::ActiveWindow));
+        assert_eq!(changes.borrow().len(), 3);
+        drop(subscription);
+    }
+
+    #[gpui::test]
+    fn distance_saves_on_focus_change_without_trapping_invalid_input(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| cx.bind_keys(crate::text_input::key_bindings()));
+        let (view, cx) =
+            cx.add_window_view(|_, cx| HudSettingsView::new(HudPreferences::default(), true, cx));
+        let subscription = cx.update(|_, cx| {
+            cx.subscribe(&view, |view, event: &HudChange, cx| {
+                view.update(cx, |view, cx| {
+                    view.set_preferences(event.preferences, None, cx)
+                });
+            })
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        cx.update(|window, cx| view.read(cx).distance.focus_handle(cx).focus(window));
+        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_input("24");
+        cx.update(|window, cx| view.read(cx).size_focus[0].focus(window));
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_eq!(view.read(cx).preferences.edge_distance, 24));
+        cx.update(|window, cx| view.read(cx).distance.focus_handle(cx).focus(window));
+        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_input("161");
+        cx.update(|window, cx| view.read(cx).size_focus[0].focus(window));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let view = view.read(cx);
+            assert_eq!(view.preferences.edge_distance, 24);
+            assert!(view.error.is_some());
+            assert!(view.size_focus[0].is_focused(window));
+        });
+        cx.update(|window, cx| view.read(cx).distance.focus_handle(cx).focus(window));
+        cx.simulate_keystrokes("escape");
+        cx.update(|_, cx| assert_eq!(view.read(cx).distance.read(cx).text(), "24"));
         drop(subscription);
     }
 

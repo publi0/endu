@@ -4,14 +4,17 @@ use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window,
-    WrappedLine, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
+    ShapedLine, SharedString, Style, Subscription, TextAlign, TextRun, UTF16Selection,
+    UnderlineStyle, Window, WrappedLine, actions, div, fill, point, prelude::*, px, relative, rgb,
+    rgba, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::desktop_ui::{CANVAS, LINE, MULTILINE_INPUT_HEIGHT, MUTED, TEXT, TEXT_INPUT_HEIGHT};
+use crate::desktop_ui::{
+    CANVAS, CONTROL_TEXT_SIZE, LINE, MULTILINE_INPUT_HEIGHT, MUTED, TEXT, TEXT_INPUT_HEIGHT,
+};
 
-const FOCUS: u32 = 0x5a86c8;
+const FOCUS: u32 = crate::desktop_ui::ACCENT;
 const SELECTION: u32 = 0x4776b866;
 
 actions!(
@@ -59,6 +62,8 @@ actions!(
 /// Emitted after keyboard, clipboard, or input-method editing changes the text.
 pub struct Changed;
 pub struct Submitted;
+/// An edited settings field lost focus; validate and persist its current value.
+pub struct EditFinished;
 pub struct Navigate(pub i32);
 pub struct Dismissed;
 
@@ -131,6 +136,9 @@ pub struct TextInput {
     height: Pixels,
     picker: bool,
     history: EditHistory,
+    commit_on_blur: bool,
+    edited: bool,
+    blur_subscription: Option<Subscription>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -298,14 +306,29 @@ impl TextInput {
             }),
             picker,
             history: EditHistory::default(),
+            commit_on_blur: false,
+            edited: false,
+            blur_subscription: None,
         }
+    }
+
+    /// Settings fields finish editing when focus leaves, without a save button.
+    /// Search/picker fields retain their explicit submission behavior.
+    pub fn commit_on_blur(mut self) -> Self {
+        self.commit_on_blur = true;
+        self
     }
 
     pub fn text(&self) -> &str {
         self.content.as_ref()
     }
 
+    pub fn has_pending_edit(&self) -> bool {
+        self.edited
+    }
+
     pub fn set_text(&mut self, text: impl AsRef<str>, cx: &mut Context<Self>) {
+        self.edited = false;
         let text = normalize(text.as_ref(), self.multiline);
         if self.content.as_ref() == text {
             return;
@@ -447,6 +470,7 @@ impl TextInput {
         if self.multiline {
             self.replace_text_in_range(None, "\n", window, cx);
         } else {
+            self.edited = false;
             cx.emit(Submitted);
             if !self.picker {
                 window.blur();
@@ -455,6 +479,7 @@ impl TextInput {
     }
 
     fn escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
+        self.edited = false;
         cx.emit(Dismissed);
         if !self.picker {
             window.blur();
@@ -475,6 +500,7 @@ impl TextInput {
         self.marked_range = None;
         if let Some(state) = state {
             self.restore_edit_state(state);
+            self.edited = true;
             cx.emit(Changed);
         }
         cx.notify();
@@ -485,6 +511,7 @@ impl TextInput {
         self.marked_range = None;
         if let Some(state) = state {
             self.restore_edit_state(state);
+            self.edited = true;
             cx.emit(Changed);
         }
         cx.notify();
@@ -862,6 +889,7 @@ impl TextInput {
 
         if self.content.as_ref() != content {
             self.content = content.into();
+            self.edited = true;
             cx.emit(Changed);
         }
         cx.notify();
@@ -870,6 +898,7 @@ impl TextInput {
 
 impl EventEmitter<Changed> for TextInput {}
 impl EventEmitter<Submitted> for TextInput {}
+impl EventEmitter<EditFinished> for TextInput {}
 impl EventEmitter<Navigate> for TextInput {}
 impl EventEmitter<Dismissed> for TextInput {}
 
@@ -1327,6 +1356,14 @@ fn multiline_selection_quads(
 
 impl Render for TextInput {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.commit_on_blur && self.blur_subscription.is_none() {
+            self.blur_subscription = Some(cx.on_blur(&self.focus_handle, window, |this, _, cx| {
+                if this.edited {
+                    this.edited = false;
+                    cx.emit(EditFinished);
+                }
+            }));
+        }
         let border = if self.focus_handle.is_focused(window) {
             FOCUS
         } else {
@@ -1379,15 +1416,15 @@ impl Render for TextInput {
             .w_full()
             .h(self.height)
             .px(px(10.))
-            .py(px(7.))
+            .py(px(6.))
             .overflow_hidden()
-            .rounded_sm()
+            .rounded(px(crate::desktop_ui::CONTROL_RADIUS))
             .border_1()
             .border_color(rgb(border))
             .bg(rgb(CANVAS))
             .text_color(rgb(TEXT))
-            .text_size(px(14.))
-            .line_height(px(20.))
+            .text_size(px(CONTROL_TEXT_SIZE))
+            .line_height(px(18.))
             .child(TextElement { input: cx.entity() })
     }
 }
@@ -1445,6 +1482,72 @@ fn utf8_offset_for_utf16(text: &str, offset: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn settings_finish_edits_once_and_ignore_cancelled_or_replaced_drafts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(|cx| cx.bind_keys(key_bindings()));
+        let (input, cx) = cx.add_window_view(|_, cx| TextInput::new(cx, "", "12").commit_on_blur());
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let subscriptions = cx.update(|_, cx| {
+            let blur_events = events.clone();
+            let enter_events = events.clone();
+            (
+                cx.subscribe(&input, move |_, _: &EditFinished, _| {
+                    blur_events.borrow_mut().push("blur")
+                }),
+                cx.subscribe(&input, move |_, _: &Submitted, _| {
+                    enter_events.borrow_mut().push("enter")
+                }),
+            )
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        cx.update(|window, cx| input.focus_handle(cx).focus(window));
+        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_input("24");
+        assert!(
+            events.borrow().is_empty(),
+            "typing must not commit incomplete text"
+        );
+        cx.update(|window, _| window.blur());
+        cx.run_until_parked();
+        assert_eq!(*events.borrow(), ["blur"]);
+
+        cx.update(|window, cx| input.focus_handle(cx).focus(window));
+        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_input("35");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(
+            *events.borrow(),
+            ["blur", "enter"],
+            "Enter must not also commit through blur"
+        );
+
+        cx.update(|window, cx| input.focus_handle(cx).focus(window));
+        cx.simulate_input("9");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(events.borrow().len(), 2);
+
+        cx.update(|window, cx| input.focus_handle(cx).focus(window));
+        cx.simulate_input("1");
+        cx.update(|window, cx| {
+            let same_text = input.read(cx).text().to_owned();
+            input.update(cx, |input, cx| input.set_text(same_text, cx));
+            window.blur();
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            events.borrow().len(),
+            2,
+            "an authoritative import must disarm the old draft even if its text matches"
+        );
+        drop(subscriptions);
+    }
 
     fn edit_state(content: &str) -> EditState {
         EditState {

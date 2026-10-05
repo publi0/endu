@@ -372,9 +372,9 @@ impl RecordingAudioBehavior {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Mute => "Mute",
-            Self::LowerVolume => "Lower volume",
-            Self::PauseMedia => "Pause media",
-            Self::DoNothing => "Do nothing",
+            Self::LowerVolume => "Lower",
+            Self::PauseMedia => "Pause",
+            Self::DoNothing => "Keep",
         }
     }
 
@@ -450,6 +450,7 @@ pub struct AppSettings {
     pub show_dock_icon: bool,
     pub history_retention: crate::history::HistoryRetention,
     pub hud: crate::hud_settings::HudPreferences,
+    pub post_processing: crate::post_processing::Preferences,
 }
 
 impl Default for AppSettings {
@@ -475,6 +476,7 @@ impl Default for AppSettings {
             show_dock_icon: true,
             history_retention: crate::history::HistoryRetention::default(),
             hud: crate::hud_settings::HudPreferences::default(),
+            post_processing: crate::post_processing::Preferences::default(),
         }
     }
 }
@@ -576,6 +578,7 @@ impl AppSettings {
 
     pub(crate) fn apply_runtime(&self) {
         self.hud.apply_runtime();
+        self.post_processing.apply_runtime();
         COPY_ON_PASTE_FAILURE.store(self.copy_on_paste_failure, Ordering::Release);
         RELEASE_MICROPHONE_WHILE_IDLE.store(self.release_microphone_while_idle, Ordering::Release);
         crate::feedback::set_enabled(self.sound_effects);
@@ -792,6 +795,10 @@ mod tests {
         );
         assert!(settings.show_dock_icon);
         assert_eq!(settings.hud, crate::hud_settings::HudPreferences::default());
+        assert_eq!(
+            settings.post_processing,
+            crate::post_processing::Preferences::default()
+        );
     }
 
     #[test]

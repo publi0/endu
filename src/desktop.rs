@@ -271,7 +271,8 @@ fn join_listener(worker: &Rc<RefCell<Option<JoinHandle<()>>>>) {
 fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
     use crate::app_window::{
         CloseWindow, HideApplication, MinimizeWindow, QuitApplication, ShowHistory, ShowHud,
-        ShowModels, ShowSettings, ShowStatistics, ToggleFullscreen,
+        ShowMicrophone, ShowModels, ShowPostProcessing, ShowSettings, ShowStatistics,
+        ToggleFullscreen,
     };
     cx.bind_keys([
         KeyBinding::new("cmd-w", CloseWindow, None),
@@ -285,6 +286,8 @@ fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
         KeyBinding::new("cmd-3", ShowStatistics, None),
         KeyBinding::new("cmd-4", ShowModels, None),
         KeyBinding::new("cmd-5", ShowHud, None),
+        KeyBinding::new("cmd-6", ShowMicrophone, None),
+        KeyBinding::new("cmd-7", ShowPostProcessing, None),
     ]);
     cx.bind_keys(crate::text_input::key_bindings());
     let settings_ui = ui.clone();
@@ -294,6 +297,14 @@ fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
     let models_ui = ui.clone();
     cx.on_action(move |_: &ShowModels, cx| {
         models_ui.open_pane(cx, |window, cx| window.show_models(cx));
+    });
+    let microphone_ui = ui.clone();
+    cx.on_action(move |_: &ShowMicrophone, cx| {
+        microphone_ui.open_pane(cx, |window, cx| window.show_microphone(cx));
+    });
+    let post_processing_ui = ui.clone();
+    cx.on_action(move |_: &ShowPostProcessing, cx| {
+        post_processing_ui.open_pane(cx, |window, cx| window.show_post_processing(cx));
     });
     let hud_ui = ui.clone();
     cx.on_action(move |_: &ShowHud, cx| {
@@ -310,7 +321,10 @@ fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
     let close_window = ui.app_window.clone();
     cx.on_action(move |_: &CloseWindow, cx| {
         if let Some(window) = close_window.borrow_mut().take() {
-            let _ = window.update(cx, |_, window, _| window.remove_window());
+            let _ = window.update(cx, |view, window, cx| {
+                view.finish_editing(cx);
+                window.remove_window();
+            });
         }
     });
     cx.on_action(|_: &QuitApplication, cx| cx.quit());
@@ -320,7 +334,9 @@ fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
             name: "Hex".into(),
             items: vec![
                 MenuItem::action("Settings", ShowSettings),
+                MenuItem::action("Microphone", ShowMicrophone),
                 MenuItem::action("Models", ShowModels),
+                MenuItem::action("Post-processing", ShowPostProcessing),
                 MenuItem::action("HUD", ShowHud),
                 MenuItem::action("History", ShowHistory),
                 MenuItem::action("Statistics", ShowStatistics),
@@ -429,6 +445,12 @@ async fn drive_ui(
                 StatusItemAction::OpenModels => {
                     ui.open_pane(cx, |window, cx| window.show_models(cx))
                 }
+                StatusItemAction::OpenMicrophone => {
+                    ui.open_pane(cx, |window, cx| window.show_microphone(cx))
+                }
+                StatusItemAction::OpenPostProcessing => {
+                    ui.open_pane(cx, |window, cx| window.show_post_processing(cx))
+                }
                 StatusItemAction::OpenHud => ui.open_pane(cx, |window, cx| window.show_hud(cx)),
                 StatusItemAction::OpenHistory => {
                     ui.open_pane(cx, |window, cx| window.show_history(cx))
@@ -482,7 +504,8 @@ mod tests {
     #[gpui::test]
     fn menu_actions_reopen_a_closed_window(cx: &mut gpui::TestAppContext) {
         use crate::app_window::{
-            PreviewPane, ShowHistory, ShowHud, ShowModels, ShowSettings, ShowStatistics,
+            PreviewPane, ShowHistory, ShowHud, ShowMicrophone, ShowModels, ShowPostProcessing,
+            ShowSettings, ShowStatistics,
         };
 
         let (listener_controls, _controls) = mpsc::sync_channel(1);
@@ -500,8 +523,10 @@ mod tests {
             }),
         });
         cx.update(|cx| install_menus(cx, &ui));
-        let actions: [&dyn gpui::Action; 5] = [
+        let actions: [&dyn gpui::Action; 7] = [
             &ShowSettings,
+            &ShowMicrophone,
+            &ShowPostProcessing,
             &ShowModels,
             &ShowHud,
             &ShowHistory,

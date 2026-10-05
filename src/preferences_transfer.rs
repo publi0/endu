@@ -60,6 +60,8 @@ struct AppPreferences {
     paste_last_hotkey: Option<ShortcutPreferences>,
     show_dock_icon: bool,
     hud: HudTransfer,
+    #[serde(default)]
+    post_processing: Option<crate::post_processing::Preferences>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -492,6 +494,7 @@ impl AppPreferences {
                 .as_ref()
                 .map(ShortcutPreferences::from_binding),
             show_dock_icon: settings.show_dock_icon,
+            post_processing: Some(settings.post_processing),
             hud: HudTransfer {
                 position: hud.position,
                 recording_color: hud.recording_color,
@@ -553,6 +556,9 @@ impl AppPreferences {
             .as_ref()
             .map(ShortcutPreferences::binding);
         settings.show_dock_icon = self.show_dock_icon;
+        if let Some(preferences) = self.post_processing {
+            settings.post_processing = preferences;
+        }
         let hud = self.hud;
         settings.hud = HudPreferences {
             position: hud.position,
@@ -638,6 +644,7 @@ mod tests {
             show_dock_icon: false,
             history_retention: crate::history::HistoryRetention::Off,
             hud: HudPreferences::default(),
+            post_processing: crate::post_processing::Preferences::default(),
         }
     }
 
@@ -740,6 +747,11 @@ mod tests {
             source.enter_to_submit = true;
             source.copy_on_paste_failure = true;
             source.double_tap_sensitivity = DoubleTapSensitivity::Tolerant;
+            source.post_processing = crate::post_processing::Preferences {
+                lowercase: true,
+                remove_final_period: true,
+                ..Default::default()
+            };
             let bytes = export_bytes(&source, &Config::default()).unwrap();
             let imported = preview_bundle(
                 decode(&bytes).unwrap(),
@@ -748,6 +760,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(imported.settings.dictation_mode, mode);
+            assert_eq!(imported.settings.post_processing, source.post_processing);
             assert_eq!(
                 imported.settings.double_tap_lock,
                 mode == DictationMode::DoubleTap
@@ -778,6 +791,7 @@ mod tests {
             "enter_to_submit",
             "copy_on_paste_failure",
             "lower_volume_percent",
+            "post_processing",
         ] {
             value["app"].as_object_mut().unwrap().remove(field);
         }
@@ -785,6 +799,10 @@ mod tests {
             enter_to_submit: true,
             copy_on_paste_failure: true,
             lower_volume_percent: 40,
+            post_processing: crate::post_processing::Preferences {
+                single_line: true,
+                ..Default::default()
+            },
             ..AppSettings::default()
         };
         for (legacy_lock, mode) in [
@@ -799,6 +817,7 @@ mod tests {
             assert!(applied.enter_to_submit);
             assert!(applied.copy_on_paste_failure);
             assert_eq!(applied.lower_volume_percent, 40);
+            assert_eq!(applied.post_processing, current.post_processing);
         }
     }
 
@@ -811,6 +830,7 @@ mod tests {
             "/app",
             "/app/sounds",
             "/app/hud",
+            "/app/post_processing",
             "/transcription",
             "/app/dictation_hotkey",
             "/app/dictation_hotkey/modifiers",

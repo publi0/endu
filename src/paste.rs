@@ -17,6 +17,7 @@ use objc2_foundation::NSArray;
 use objc2_foundation::NSString;
 
 use crate::keyboard;
+use crate::post_processing::Preferences as PostProcessing;
 use crate::suppression::InputActivity;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,6 +25,12 @@ pub enum PasteOutcome {
     Pasted,
     Deferred,
     CopiedToClipboard,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PasteOptions {
+    pub submit_after_paste: Option<u64>,
+    pub post_processing: PostProcessing,
 }
 
 pub struct Paster {
@@ -220,11 +227,11 @@ impl Paster {
         &mut self,
         text: &str,
         target: &crate::context::ContextSnapshot,
-        submit_after_paste: Option<u64>,
+        options: PasteOptions,
         commit: impl Fn() -> bool,
     ) -> Result<PasteOutcome> {
         let enabled = crate::app_settings::copy_on_paste_failure();
-        let outcome = self.paste_attempt(text, target, submit_after_paste, &commit);
+        let outcome = self.paste_attempt(text, target, options, &commit);
         fallback_after_attempt(outcome, enabled, &commit, || self.copy_fallback(text))
     }
 
@@ -260,9 +267,10 @@ impl Paster {
         &mut self,
         text: &str,
         target: &crate::context::ContextSnapshot,
-        submit_after_paste: Option<u64>,
+        options: PasteOptions,
         commit: impl Fn() -> bool,
     ) -> Result<PasteOutcome> {
+        let submit_after_paste = options.submit_after_paste;
         let revision = self.activity.revision();
         let text = self
             .continuation
@@ -270,7 +278,9 @@ impl Paster {
             .filter(|continuation| continuation.applies_to(revision, target))
             .map_or_else(
                 || text.to_string(),
-                |continuation| join(&continuation.inserted, text),
+                |continuation| {
+                    join_with_preferences(&continuation.inserted, text, options.post_processing)
+                },
             );
         let generation = commit_targeted_paste(
             || {
@@ -710,9 +720,18 @@ fn cf_data(value: CfDataRef) -> Result<Vec<u8>> {
     Ok(unsafe { std::slice::from_raw_parts(bytes, length as usize) }.to_vec())
 }
 
+#[cfg(test)]
 fn join(previous: &str, next: &str) -> String {
+    join_with_preferences(previous, next, PostProcessing::default())
+}
+
+fn join_with_preferences(previous: &str, next: &str, preferences: PostProcessing) -> String {
     let sentence_start = ends_sentence(previous);
-    let mut next = set_initial_case(next, sentence_start);
+    let mut next = if preferences.controls_initial_case() {
+        next.to_owned()
+    } else {
+        set_initial_case(next, sentence_start)
+    };
     let needs_space = previous
         .chars()
         .next_back()
@@ -1119,6 +1138,26 @@ mod tests {
 
         assert_eq!(result.unwrap_err().to_string(), "post failed");
         assert_eq!(steps.into_inner(), ["post", "restore"]);
+    }
+
+    #[test]
+    fn continuation_never_undoes_explicit_lowercase_preferences() {
+        for preferences in [
+            PostProcessing {
+                lowercase: true,
+                ..PostProcessing::default()
+            },
+            PostProcessing {
+                lowercase_initial: true,
+                ..PostProcessing::default()
+            },
+        ] {
+            assert_eq!(
+                join_with_preferences("Previous sentence.", "olá João", preferences),
+                " olá João"
+            );
+        }
+        assert_eq!(join("Previous sentence.", "olá João"), " Olá João");
     }
 
     #[test]

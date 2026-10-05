@@ -18,7 +18,7 @@ use crate::context::ContextSnapshot;
 use crate::dictation::DictationClip;
 use crate::history::{History, HistoryDraft};
 use crate::openrouter::StepReport;
-use crate::paste::{PasteOutcome, Paster};
+use crate::paste::{PasteOptions, PasteOutcome, Paster};
 use crate::suppression::InputActivity;
 
 const MAX_PENDING_OUTPUTS: usize = 16;
@@ -60,7 +60,7 @@ struct TranscriptionJob {
     submitted_at: Instant,
     clip: DictationClip,
     context: ContextSnapshot,
-    submit_after_paste: Option<u64>,
+    options: PasteOptions,
 }
 
 /// Pipeline timings carried from transcription through output.
@@ -73,7 +73,7 @@ struct JobTimings {
 }
 
 struct CompletedTranscript {
-    submit_after_paste: Option<u64>,
+    options: PasteOptions,
     text: String,
     context: ContextSnapshot,
     timings: JobTimings,
@@ -224,12 +224,12 @@ impl DictationWorker {
             },
             move || {
                 let mut paster = Paster::new(activity);
-                Box::new(move |prepare_only, text, target, submit, commit| {
+                Box::new(move |prepare_only, text, target, options, commit| {
                     if prepare_only {
                         paster.prepare();
                         Ok(PasteOutcome::Pasted)
                     } else {
-                        paster.paste(text, target, submit, commit)
+                        paster.paste(text, target, options, commit)
                     }
                 })
             },
@@ -301,7 +301,10 @@ impl DictationWorker {
                 job_id,
                 control: control.clone(),
                 submitted_at: Instant::now(),
-                submit_after_paste,
+                options: PasteOptions {
+                    submit_after_paste,
+                    post_processing: crate::post_processing::Preferences::current(),
+                },
                 clip,
                 context,
             })
@@ -436,8 +439,13 @@ fn run_transcription_worker(
         };
         let result = result
             .map(|transcription| CompletedTranscript {
-                submit_after_paste: job.submit_after_paste,
-                text: transcription.text.trim().to_owned(),
+                options: job.options,
+                text: job
+                    .options
+                    .post_processing
+                    .process(transcription.text.trim())
+                    .trim()
+                    .to_owned(),
                 context: job.context,
                 timings,
                 report: transcription.report,
@@ -458,7 +466,7 @@ fn run_transcription_worker(
 
 /// `paste(prepare_only, text, commit)` either captures the clipboard
 /// ahead of time or pastes `text` once `commit` accepts.
-type PasteFn<'a> = dyn FnMut(bool, &str, &ContextSnapshot, Option<u64>, &dyn Fn() -> bool) -> Result<PasteOutcome>
+type PasteFn<'a> = dyn FnMut(bool, &str, &ContextSnapshot, PasteOptions, &dyn Fn() -> bool) -> Result<PasteOutcome>
     + 'a;
 
 fn run_output_worker(
@@ -480,7 +488,13 @@ fn run_output_worker(
             break;
         }
         if matches!(job, OutputJob::PreparePaste) {
-            let _ = paste(true, "", &ContextSnapshot::default(), None, &|| true);
+            let _ = paste(
+                true,
+                "",
+                &ContextSnapshot::default(),
+                PasteOptions::default(),
+                &|| true,
+            );
             continue;
         }
         for job in ordered.push(job) {
@@ -489,7 +503,7 @@ fn run_output_worker(
             }
             let event = finish_output(
                 job,
-                &mut |text, target, submit, commit| paste(false, text, target, submit, commit),
+                &mut |text, target, options, commit| paste(false, text, target, options, commit),
                 &mut last_transcript,
                 history.as_ref(),
                 state,
@@ -532,7 +546,7 @@ fn commit_output(state: &Mutex<WorkerState>, commit: &dyn Fn() -> bool) -> bool 
 
 /// `paste(text, commit)` pastes `text` once `commit` accepts.
 type OutputPasteFn<'a> =
-    dyn FnMut(&str, &ContextSnapshot, Option<u64>, &dyn Fn() -> bool) -> Result<PasteOutcome> + 'a;
+    dyn FnMut(&str, &ContextSnapshot, PasteOptions, &dyn Fn() -> bool) -> Result<PasteOutcome> + 'a;
 
 fn finish_output(
     job: OutputJob,
@@ -574,7 +588,7 @@ fn finish_output(
             let outcome = paste(
                 &completed.text,
                 &completed.context,
-                completed.submit_after_paste,
+                completed.options,
                 &commit,
             );
             match outcome {
@@ -647,9 +661,15 @@ fn finish_output(
                     result: Err("no previous transcript is available".into()),
                 };
             };
-            match paste(&last.completed.text, &target, None, &|| {
-                commit_output(state, &|| true)
-            }) {
+            match paste(
+                &last.completed.text,
+                &target,
+                PasteOptions {
+                    submit_after_paste: None,
+                    ..last.completed.options
+                },
+                &|| commit_output(state, &|| true),
+            ) {
                 Ok(result @ (PasteOutcome::Deferred | PasteOutcome::CopiedToClipboard)) => {
                     WorkerEvent::ReadyToPaste {
                         job_id: None,
@@ -733,7 +753,7 @@ mod tests {
             job_id: DictationJobId(job_id),
             control: Arc::new(JobControl::default()),
             result: Box::new(Ok(CompletedTranscript {
-                submit_after_paste: None,
+                options: PasteOptions::default(),
                 text: text.into(),
                 context,
                 timings: JobTimings {
@@ -1072,16 +1092,17 @@ mod tests {
     fn submit_intent_belongs_to_one_output_and_is_not_replayed_by_paste_last() {
         let mut job = completed(0, "send this");
         if let OutputJob::Completed { result, .. } = &mut job {
-            result.as_mut().as_mut().unwrap().submit_after_paste = Some(17);
+            result.as_mut().as_mut().unwrap().options.submit_after_paste = Some(17);
         }
         let state = Mutex::new(WorkerState::default());
         let mut last = None;
         let intents = RefCell::new(Vec::new());
-        let mut paste = |_: &str, _: &ContextSnapshot, intent, commit: &dyn Fn() -> bool| {
-            assert!(commit());
-            intents.borrow_mut().push(intent);
-            Ok(PasteOutcome::Deferred)
-        };
+        let mut paste =
+            |_: &str, _: &ContextSnapshot, options: PasteOptions, commit: &dyn Fn() -> bool| {
+                assert!(commit());
+                intents.borrow_mut().push(options.submit_after_paste);
+                Ok(PasteOutcome::Deferred)
+            };
         assert!(matches!(
             finish_output(job, &mut paste, &mut last, None, &state),
             WorkerEvent::ReadyToPaste { .. }
@@ -1154,13 +1175,128 @@ mod tests {
     }
 
     #[test]
+    fn post_processing_snapshot_reaches_history_and_paste_last_and_empty_output_never_pastes() {
+        use crate::post_processing::Preferences;
+        let formatted = Preferences {
+            lowercase: true,
+            remove_ellipses: true,
+            remove_final_period: true,
+            collapse_spaces: true,
+            ..Preferences::default()
+        };
+        let (jobs, receiver) = mpsc::sync_channel(4);
+        let (output, outputs) = mpsc::sync_channel(4);
+        let (events, _) = mpsc::channel();
+        for (index, preferences) in [
+            formatted,
+            Preferences::default(),
+            Preferences {
+                remove_ellipses: true,
+                ..Preferences::default()
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            jobs.send(TranscriptionJob {
+                job_id: DictationJobId(index as u64),
+                control: Arc::new(JobControl::default()),
+                submitted_at: Instant::now(),
+                clip: DictationClip::from_samples(vec![0.1; 1_600]),
+                context: ContextSnapshot {
+                    application: Some(index.to_string()),
+                    ..Default::default()
+                },
+                options: PasteOptions {
+                    post_processing: preferences,
+                    submit_after_paste: Some(17),
+                },
+            })
+            .unwrap();
+        }
+        drop(jobs);
+        let state = Mutex::new(WorkerState::default());
+        run_transcription_worker(receiver, &output, &events, &state, |_, context| {
+            Ok(test_transcription(
+                if context.application.as_deref() == Some("2") {
+                    "..."
+                } else {
+                    "Olá...  JOÃO."
+                },
+            ))
+        });
+        let directory = std::env::temp_dir().join(format!(
+            "hex-post-history-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let history = History::new(crate::history::HistoryStore::open(
+            directory.join("history.json"),
+            crate::history::HistoryRetention::Week,
+            crate::history::now_ms(),
+        ));
+        let mut last = None;
+        finish_output(
+            outputs.recv().unwrap(),
+            &mut |text, _, options, commit| {
+                assert_eq!(text, "olá joão");
+                assert_eq!(options.post_processing, formatted);
+                assert_eq!(options.submit_after_paste, Some(17));
+                assert!(commit());
+                Ok(PasteOutcome::Pasted)
+            },
+            &mut last,
+            Some(&history),
+            &state,
+        );
+        assert_eq!(history.search("")[0].text, "olá joão");
+        finish_output(
+            OutputJob::PasteLast {
+                sequence: 3,
+                target: ContextSnapshot::default(),
+            },
+            &mut |text, _, options, commit| {
+                assert_eq!(text, "olá joão");
+                assert_eq!(options.post_processing, formatted);
+                assert_eq!(options.submit_after_paste, None);
+                assert!(commit());
+                Ok(PasteOutcome::Pasted)
+            },
+            &mut last,
+            Some(&history),
+            &state,
+        );
+        assert_eq!(history.search("").len(), 1);
+        let OutputJob::Completed { result, .. } = outputs.recv().unwrap() else {
+            panic!("completed")
+        };
+        assert_eq!(result.unwrap().text, "Olá...  JOÃO.");
+        let event = finish_output(
+            outputs.recv().unwrap(),
+            &mut |_, _, _, _| panic!("empty formatting must not paste or send Enter"),
+            &mut last,
+            Some(&history),
+            &state,
+        );
+        assert!(
+            matches!(event, WorkerEvent::Completed { result: Ok(text), .. } if text.is_empty())
+        );
+        assert_eq!(history.search("").len(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn transcription_errors_reach_the_output_in_order() {
         let (jobs, receiver) = mpsc::sync_channel(4);
         let (output, outputs) = mpsc::sync_channel(4);
         let (events, _events) = mpsc::channel();
         let control = Arc::new(JobControl::default());
         jobs.send(TranscriptionJob {
-            submit_after_paste: None,
+            options: PasteOptions::default(),
             job_id: DictationJobId(0),
             control,
             submitted_at: Instant::now(),

@@ -381,12 +381,30 @@ impl RecordingRecovery {
     }
 
     pub fn retry(&self, id: &str) -> io::Result<()> {
-        self.retry_with(id, crate::openrouter::transcribe::transcribe)
+        self.retry_with_preferences(
+            id,
+            crate::post_processing::Preferences::current(),
+            crate::openrouter::transcribe::transcribe,
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn retry_with(
         &self,
         id: &str,
+        transcribe: impl FnOnce(&[f32]) -> color_eyre::Result<Transcription> + Send + 'static,
+    ) -> io::Result<()> {
+        self.retry_with_preferences(
+            id,
+            crate::post_processing::Preferences::default(),
+            transcribe,
+        )
+    }
+
+    pub(crate) fn retry_with_preferences(
+        &self,
+        id: &str,
+        preferences: crate::post_processing::Preferences,
         transcribe: impl FnOnce(&[f32]) -> color_eyre::Result<Transcription> + Send + 'static,
     ) -> io::Result<()> {
         self.audio_path(id)?;
@@ -417,7 +435,7 @@ impl RecordingRecovery {
                     id: entry.id.clone(),
                     retry: true,
                 };
-                store.run_retry(entry, transcribe);
+                store.run_retry(entry, preferences, transcribe);
             });
         if let Err(error) = spawned {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -459,6 +477,7 @@ impl RecordingRecovery {
     fn run_retry(
         &self,
         mut entry: RecoveryEntry,
+        preferences: crate::post_processing::Preferences,
         transcribe: impl FnOnce(&[f32]) -> color_eyre::Result<Transcription>,
     ) {
         let samples = match self.read_audio(&entry.id) {
@@ -482,8 +501,16 @@ impl RecordingRecovery {
         let result = transcribe(&samples);
         match result {
             Ok(transcription) if !transcription.text.trim().is_empty() => {
+                let text = preferences
+                    .process(transcription.text.trim())
+                    .trim()
+                    .to_owned();
+                if text.is_empty() {
+                    self.finish_failure(entry, "Post-processing removed all text. Change its settings before Retry; the saved audio was kept.");
+                    return;
+                }
                 entry.status = RecoveryStatus::Recovered;
-                entry.text = Some(transcription.text);
+                entry.text = Some(text);
                 entry.message = None;
                 // Commit recovered text before deleting audio, even with History
                 // disabled. It remains available here until explicitly deleted.
@@ -797,6 +824,48 @@ mod tests {
             assert!(Instant::now() < deadline, "retry worker did not finish");
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn retry_formats_text_but_keeps_audio_when_formatting_removes_everything() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let id = failed(&store);
+        let preferences = crate::post_processing::Preferences {
+            lowercase: true,
+            remove_punctuation: true,
+            ..Default::default()
+        };
+        store
+            .retry_with_preferences(&id, preferences, |_| {
+                Ok(Transcription {
+                    text: "...".into(),
+                    report: None,
+                })
+            })
+            .unwrap();
+        wait(&store);
+        let entry = &store.entries("")[0];
+        assert_eq!(entry.status, RecoveryStatus::Failed);
+        assert!(
+            entry
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("Post-processing")
+        );
+        assert!(store.audio_path(&id).unwrap().exists());
+        store
+            .retry_with_preferences(&id, preferences, |_| {
+                Ok(Transcription {
+                    text: "Olá, JOÃO!".into(),
+                    report: None,
+                })
+            })
+            .unwrap();
+        wait(&store);
+        assert_eq!(store.entries("")[0].text.as_deref(), Some("olá joão"));
+        assert!(!store.audio_path(&id).unwrap().exists());
     }
 
     #[test]
