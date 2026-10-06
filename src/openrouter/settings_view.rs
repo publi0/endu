@@ -1041,13 +1041,6 @@ impl OpenRouterSettings {
                             .when(self.busy(), |button| button.opacity(0.45))
                             .on_click(cx.listener(|this, _, _, cx| this.test_key(cx)))
                             .into_any_element(),
-                        button("Replace", false)
-                            .id("openrouter-replace-key")
-                            .when(self.busy(), |button| button.opacity(0.45))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.begin_key_replacement(window, cx)
-                            }))
-                            .into_any_element(),
                         button(
                             if self.key_operation == Some(KeyOperation::Remove) {
                                 KeyOperation::Remove.label()
@@ -1104,6 +1097,7 @@ impl OpenRouterSettings {
             .gap_2()
             .child(
                 div()
+                    .id("openrouter-key-badge")
                     .h(px(crate::desktop_ui::CONTROL_HEIGHT))
                     .px_3()
                     .flex()
@@ -1114,6 +1108,19 @@ impl OpenRouterSettings {
                     .text_size(px(11.0))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(0x91bd99))
+                    // Clicking the saved-key badge opens the replacement editor;
+                    // the standalone Replace button was removed as redundant.
+                    .when(
+                        matches!(self.key_status, Some(KeyStatus::Keychain(_))),
+                        |badge| {
+                            badge
+                                .cursor_pointer()
+                                .hover(|badge| badge.bg(rgb(0x1d2c21)))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.begin_key_replacement(window, cx)
+                                }))
+                        },
+                    )
                     .child(div().size(px(6.0)).rounded_full().bg(rgb(0x69d89f)))
                     .child(badge),
             )
