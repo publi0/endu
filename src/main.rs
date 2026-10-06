@@ -77,6 +77,8 @@ mod suppression;
 #[cfg(target_os = "macos")]
 mod text_input;
 #[cfg(target_os = "macos")]
+mod update_check;
+#[cfg(target_os = "macos")]
 mod volume_fade;
 
 use std::sync::atomic::AtomicBool;

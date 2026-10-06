@@ -23,6 +23,14 @@ pub struct ListenerConfig {
     pub device: Option<String>,
 }
 
+static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Asks the desktop loop to quit on its next tick. Safe from any thread;
+/// used by the update relaunch so `open` can hand off to the new bundle.
+pub fn request_quit() {
+    QUIT_REQUESTED.store(true, Ordering::Relaxed);
+}
+
 /// What the desktop process hosts for its lifetime.
 pub enum Launch {
     /// The production app.
@@ -372,7 +380,7 @@ async fn drive_ui(
     let mut indicator = indicator_enabled.then(DictationIndicatorUi::new);
     let mut paste_notice: Option<crate::paste_notice::PasteNotice> = None;
     loop {
-        if shutdown.load(Ordering::Relaxed) {
+        if shutdown.load(Ordering::Relaxed) || QUIT_REQUESTED.swap(false, Ordering::Relaxed) {
             let _ = cx.update(|cx| cx.quit());
             return;
         }

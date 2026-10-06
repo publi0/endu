@@ -535,6 +535,7 @@ pub struct AppWindow {
     history_retention_open: bool,
     history_retention_picker_state: PickerState,
     history_copied: Option<u64>,
+    pending_update: Option<String>,
 }
 
 impl AppWindow {
@@ -928,6 +929,7 @@ impl AppWindow {
                 .is_some_and(|preview| preview.open_history_retention),
             history_retention_picker_state: PickerState::new(cx),
             history_copied: None,
+            pending_update: None,
         };
         window.history_retention_picker_state.highlight = HistoryRetention::ALL
             .iter()
@@ -2012,16 +2014,53 @@ impl AppWindow {
             .flex_col()
             .child(div().flex().flex_col().gap(px(2.0)).children(items))
             .child(div().flex_1())
+            .child(self.render_update_footer(cx))
+            .into_any_element()
+    }
+
+    /// The sidebar footer shows the running version, or a restart action when
+    /// Homebrew has placed a newer bundle on disk.
+    fn render_update_footer(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.pending_update.is_none() {
+            self.pending_update = crate::update_check::pending_update();
+        }
+        let Some(version) = self.pending_update.clone() else {
+            return div()
+                .flex_none()
+                .pl_2()
+                .h(px(30.0))
+                .flex()
+                .items_center()
+                .text_size(px(11.0))
+                .text_color(rgb(MUTED))
+                .child(format!("Hex {}", env!("CARGO_PKG_VERSION")))
+                .into_any_element();
+        };
+        div()
+            .flex_none()
+            .pl_2()
+            .h(px(30.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
             .child(
                 div()
-                    .flex_none()
-                    .pl_2()
-                    .h(px(30.0))
+                    .id("update-restart")
                     .flex()
                     .items_center()
+                    .h(px(22.0))
+                    .px_2()
+                    .rounded(px(6.0))
                     .text_size(px(11.0))
-                    .text_color(rgb(MUTED))
-                    .child(format!("Hex {}", env!("CARGO_PKG_VERSION"))),
+                    .text_color(rgb(ACCENT))
+                    .hover(|button| button.bg(rgb(SURFACE_HOVER)))
+                    .child(format!("Restart to update to {version}"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(bundle) = crate::update_check::bundle_path() {
+                            this.finish_editing(cx);
+                            crate::update_check::relaunch_and_quit(&bundle);
+                        }
+                    })),
             )
             .into_any_element()
     }
