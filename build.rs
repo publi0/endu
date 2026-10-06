@@ -43,6 +43,15 @@ fn compile_indicator_shader() {
     let library = output_dir.join("dictation_indicator.metallib");
     println!("cargo:rerun-if-changed={}", source.display());
 
+    if std::env::var_os("HEX_SKIP_SHADER_BUILD").is_some() {
+        // Developer machines without the Xcode Metal toolchain can still run
+        // unit tests that never touch the shader. Release builds must not set
+        // this flag.
+        if !library.exists() {
+            std::fs::write(&library, b"HEX_SHADER_STUB").expect("stub metallib");
+        }
+        return;
+    }
     let metal = Command::new("xcrun")
         .args(["--sdk", "macosx", "metal", "-c"])
         .arg(&source)

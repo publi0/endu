@@ -93,7 +93,7 @@ cask "hex-openrouter" do
   homepage "https://github.com/{repository}"
 
   depends_on arch: :arm64
-  depends_on macos: ">= :sequoia"
+  depends_on macos: :sequoia
 
   app "Hex.app"
 

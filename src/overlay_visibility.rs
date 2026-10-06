@@ -15,6 +15,11 @@ use objc2_foundation::{NSNotification, NSNotificationCenter};
 
 const RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
+// WindowServer can report stale isOnActiveSpace/isVisible flags while a Space
+// transition settles. Keep re-registering all-Spaces membership for a short
+// window after every change, even when the flags already look correct.
+const SETTLE_WINDOW: Duration = Duration::from_secs(1);
+
 pub fn collection_behavior() -> NSWindowCollectionBehavior {
     NSWindowCollectionBehavior::CanJoinAllSpaces
         | NSWindowCollectionBehavior::CanJoinAllApplications
@@ -75,6 +80,7 @@ enum Presentation {
 struct VisibilityState {
     ordered: bool,
     last_attempt: Option<Instant>,
+    settle_until: Option<Instant>,
 }
 
 impl VisibilityState {
@@ -90,18 +96,23 @@ impl VisibilityState {
             let hide = self.ordered || visible;
             self.ordered = false;
             self.last_attempt = None;
+            self.settle_until = None;
             return if hide {
                 Presentation::Hide
             } else {
                 Presentation::Unchanged
             };
         }
+        if space_changed {
+            self.settle_until = Some(now + SETTLE_WINDOW);
+        }
         let first_show = !self.ordered;
         let missing = !on_active_space || !visible;
         let retry_due = self
             .last_attempt
             .is_none_or(|last| now.duration_since(last) >= RETRY_INTERVAL);
-        if first_show || space_changed || (missing && retry_due) {
+        let settling = self.settle_until.is_some_and(|until| now < until);
+        if first_show || space_changed || (missing && retry_due) || (settling && retry_due) {
             self.ordered = true;
             self.last_attempt = Some(now);
             // A Space may have changed while the overlay was hidden. Rejoin
@@ -240,6 +251,74 @@ mod tests {
         assert_eq!(
             state.update(true, false, true, false, now),
             Presentation::Rejoin
+        );
+    }
+
+    #[test]
+    fn stale_flags_during_space_settle_still_trigger_bounded_rejoins() {
+        let now = Instant::now();
+        let mut state = VisibilityState::default();
+        // Overlay shown and steady on the current Space.
+        assert_eq!(
+            state.update(true, false, true, false, now),
+            Presentation::Rejoin
+        );
+        assert_eq!(
+            state.update(true, false, true, true, now),
+            Presentation::Unchanged
+        );
+        // Space changes; AppKit keeps reporting stale (correct-looking) flags
+        // while WindowServer settles the move.
+        assert_eq!(
+            state.update(true, true, true, true, now),
+            Presentation::Rejoin
+        );
+        // Immediately after the rejoin the flags still look fine: the settle
+        // window keeps repairing at the retry interval even without "missing".
+        assert_eq!(
+            state.update(true, false, true, true, now + RETRY_INTERVAL / 2),
+            Presentation::Unchanged
+        );
+        assert_eq!(
+            state.update(true, false, true, true, now + RETRY_INTERVAL),
+            Presentation::Rejoin
+        );
+        assert_eq!(
+            state.update(true, false, true, true, now + RETRY_INTERVAL * 2),
+            Presentation::Rejoin
+        );
+        // Once the settle window expires, healthy flags stop the repairs.
+        assert_eq!(
+            state.update(true, false, true, true, now + SETTLE_WINDOW),
+            Presentation::Unchanged
+        );
+        assert_eq!(
+            state.update(true, false, true, true, now + SETTLE_WINDOW + RETRY_INTERVAL),
+            Presentation::Unchanged
+        );
+    }
+
+    #[test]
+    fn hiding_the_overlay_cancels_any_pending_settle_window() {
+        let now = Instant::now();
+        let mut state = VisibilityState::default();
+        assert_eq!(
+            state.update(true, true, true, true, now),
+            Presentation::Rejoin
+        );
+        assert_eq!(
+            state.update(false, false, false, true, now),
+            Presentation::Hide
+        );
+        // Re-shown later: first_show repairs it, but no leftover settle window
+        // keeps reordering beyond that.
+        assert_eq!(
+            state.update(true, false, true, false, now + SETTLE_WINDOW * 2),
+            Presentation::Rejoin
+        );
+        assert_eq!(
+            state.update(true, false, true, true, now + SETTLE_WINDOW * 2 + RETRY_INTERVAL),
+            Presentation::Unchanged
         );
     }
 
