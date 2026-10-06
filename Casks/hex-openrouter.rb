@@ -15,8 +15,7 @@ cask "hex-openrouter" do
 
   # The build is not notarized by Apple.
   postflight_steps do
-    system_command "/usr/bin/xattr",
-                   args: ["-dr", "com.apple.quarantine", "#{appdir}/Hex.app"]
+    run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{appdir}}/Hex.app"]
   end
 
   zap trash: [
