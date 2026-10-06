@@ -6,7 +6,7 @@
 //! relaunch is scheduled with `open` just before quitting so the instance
 //! lock is released first.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use objc2::runtime::AnyObject;
 use objc2_foundation::{NSDictionary, NSString};
@@ -14,14 +14,23 @@ use objc2_foundation::{NSDictionary, NSString};
 /// The installed bundle path when running from an app bundle, or `None` for
 /// ad hoc binaries (cargo run, tests).
 pub fn bundle_path() -> Option<PathBuf> {
-    let executable = std::env::current_exe().ok()?;
-    let mut path = executable.ancestors().nth(3)?;
-    if path.file_name()? != "Contents" {
-        return None;
-    }
-    path = path.parent()?;
-    path.file_name().and_then(|name| name.to_str())?.ends_with(".app")
-        .then(|| path.to_path_buf())
+    bundle_from_executable(&std::env::current_exe().ok()?)
+}
+
+/// Walks up from the executable to the enclosing .app bundle. The binary must
+/// sit in the bundle's Contents directory; a directory that merely sits next
+/// to an .app does not count.
+fn bundle_from_executable(executable: &Path) -> Option<PathBuf> {
+    let bundle = executable.ancestors().find(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".app"))
+    })?;
+    executable
+        .ancestors()
+        .nth(2)
+        .is_some_and(|contents| contents.file_name().is_some_and(|name| name == "Contents"))
+        .then(|| bundle.to_path_buf())
 }
 
 /// The on-disk bundle's marketing version, if it is newer than the running
@@ -96,5 +105,26 @@ mod tests {
         // Tests run from target/debug/deps, not an app bundle.
         assert!(bundle_path().is_none());
         assert!(pending_update().is_none());
+    }
+
+    #[test]
+    fn bundle_paths_resolve_from_the_executable_location() {
+        let app = Path::new("/Applications/Hex.app");
+        let bundled = app.join("Contents/MacOS/hex");
+        assert_eq!(
+            bundle_from_executable(&bundled).as_deref(),
+            Some(app)
+        );
+        // A binary outside a bundle's Contents directory never counts.
+        assert_eq!(bundle_from_executable(&Path::new("/tmp/hex")), None);
+        assert_eq!(
+            bundle_from_executable(&Path::new("/tmp/Hex.app/Contents")),
+            None
+        );
+        // A directory named like a bundle next to the executable is not enough.
+        assert_eq!(
+            bundle_from_executable(&Path::new("/tmp/Hex.app/other/hex")),
+            None
+        );
     }
 }
