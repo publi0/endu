@@ -1,5 +1,0 @@
-[source.crates-io]
-replace-with = "meli-proxy"
-
-[source.meli-proxy]
-registry = "sparse+https://rust.artifacts.furycloud.io/repository/cargo-external/"
