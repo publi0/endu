@@ -26,6 +26,9 @@ const EVENT_KEY_DOWN: u32 = 10;
 const EVENT_KEY_UP: u32 = 11;
 const EVENT_FLAGS_CHANGED: u32 = 12;
 const EVENT_OTHER_MOUSE_DOWN: u32 = 25;
+const EVENT_SCROLL_WHEEL: u32 = 22;
+const EVENT_GESTURE_STARTED: u32 = 29;
+const EVENT_GESTURE_ENDED: u32 = 30;
 const EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = u32::MAX - 1;
 const EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = u32::MAX;
 const KEYBOARD_EVENT_AUTOREPEAT: u32 = 8;
@@ -345,6 +348,12 @@ fn run_event_tap(
         EVENT_RIGHT_MOUSE_DOWN,
         EVENT_FLAGS_CHANGED,
         EVENT_OTHER_MOUSE_DOWN,
+        // Scroll wheels and trackpad gestures can move the pointer or change
+        // the focused field before Hex submits Return, so they advance the
+        // interaction revision like any other user input.
+        EVENT_SCROLL_WHEEL,
+        EVENT_GESTURE_STARTED,
+        EVENT_GESTURE_ENDED,
     ]
     .into_iter()
     .fold(0, |mask, event| mask | 1_u64 << event);
@@ -499,6 +508,7 @@ unsafe extern "C" fn event_callback(
         EVENT_LEFT_MOUSE_DOWN | EVENT_RIGHT_MOUSE_DOWN | EVENT_OTHER_MOUSE_DOWN => {
             InputEvent::MouseDown
         }
+        EVENT_SCROLL_WHEEL | EVENT_GESTURE_STARTED | EVENT_GESTURE_ENDED => InputEvent::MouseDown,
         _ => return event,
     };
     // Both taps are annotated-session taps: their timestamps are nanoseconds.

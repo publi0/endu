@@ -312,29 +312,21 @@ pub fn validate_key(key: &str) -> Result<&str> {
 }
 
 /// Store the key in the login Keychain. Blocking.
+///
+/// Uses Security.framework directly so the item's ACL binds to Hex's signed
+/// identity instead of the globally invokable `/usr/bin/security` helper.
 #[cfg(target_os = "macos")]
 pub fn store_keychain_key(key: &str) -> Result<()> {
     let key = validate_key(key)?;
-    // `security -i` reads the command from stdin, keeping the key off argv.
-    let mut child = std::process::Command::new("/usr/bin/security")
-        .arg("-i")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .wrap_err("could not start security")?;
-    let command =
-        format!("add-generic-password -U -s {KEYCHAIN_SERVICE} -a {KEYCHAIN_ACCOUNT} -w {key}\n");
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(command.as_bytes())?;
-    }
-    let output = child.wait_with_output()?;
+    security_framework::passwords::set_generic_password(
+        KEYCHAIN_SERVICE,
+        KEYCHAIN_ACCOUNT,
+        key.as_bytes(),
+    )
+    .map_err(|error| color_eyre::eyre::eyre!("The Keychain did not accept the key: {error}"))?;
     forget_cached_key();
     if keychain_key().as_deref() != Some(key) {
-        bail!(
-            "The Keychain did not accept the key: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        bail!("The Keychain did not retain the key.");
     }
     Ok(())
 }
@@ -342,17 +334,16 @@ pub fn store_keychain_key(key: &str) -> Result<()> {
 /// Remove the key from the login Keychain. Blocking.
 #[cfg(target_os = "macos")]
 pub fn delete_keychain_key() -> Result<()> {
-    let _ = std::process::Command::new("/usr/bin/security")
-        .args([
-            "delete-generic-password",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            KEYCHAIN_ACCOUNT,
-        ])
-        .output()
-        .wrap_err("could not start security")?;
+    let result = security_framework::passwords::delete_generic_password(
+        KEYCHAIN_SERVICE,
+        KEYCHAIN_ACCOUNT,
+    );
     forget_cached_key();
+    if let Err(error) = &result
+        && error.code() != security_framework_sys::base::errSecItemNotFound
+    {
+        bail!("The Keychain refused the removal: {error}");
+    }
     if keychain_key().is_some() {
         bail!("The key is still in the Keychain.");
     }
@@ -477,23 +468,14 @@ pub fn is_configured() -> bool {
 
 #[cfg(target_os = "macos")]
 fn keychain_key() -> Option<String> {
-    // Reading through /usr/bin/security keeps the item's ACL owned by the tool
-    // that created it, so no Keychain prompt appears for the app.
-    let output = std::process::Command::new("/usr/bin/security")
-        .args([
-            "find-generic-password",
-            "-s",
-            KEYCHAIN_SERVICE,
-            "-a",
-            KEYCHAIN_ACCOUNT,
-            "-w",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let key = String::from_utf8(output.stdout).ok()?;
+    // Reading through Security.framework keeps the item's ACL bound to Hex's
+    // signed identity; no external helper is involved.
+    let key = security_framework::passwords::get_generic_password(
+        KEYCHAIN_SERVICE,
+        KEYCHAIN_ACCOUNT,
+    )
+    .ok()?;
+    let key = String::from_utf8(key).ok()?;
     let key = key.trim();
     (!key.is_empty()).then(|| key.to_owned())
 }

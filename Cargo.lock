@@ -7013,6 +7013,8 @@ dependencies = [
  "objc2-service-management",
  "rodio",
  "rubato",
+ "security-framework",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "tracing",

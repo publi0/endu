@@ -25,6 +25,7 @@ pub fn logs_dir() -> Result<PathBuf> {
 /// the fresh file starts empty. One retained generation is plenty for
 /// post-mortem work and bounds total disk use.
 fn open_capped_log(path: PathBuf) -> io::Result<File> {
+    use std::os::unix::fs::PermissionsExt;
     const MAX_BYTES: u64 = 8 * 1024 * 1024;
     if let Ok(metadata) = fs::metadata(&path)
         && metadata.len() >= MAX_BYTES
@@ -33,7 +34,13 @@ fn open_capped_log(path: PathBuf) -> io::Result<File> {
         let _ = fs::remove_file(&rotated);
         let _ = fs::rename(&path, &rotated);
     }
-    OpenOptions::new().create(true).append(true).open(path)
+    let file = OpenOptions::new().create(true).append(true).open(&path)?;
+    // Logs carry full transcripts and provider diagnostics; keep them
+    // owner-only regardless of the ambient umask.
+    let mut permissions = fs::metadata(&path)?.permissions();
+    permissions.set_mode(0o600);
+    fs::set_permissions(&path, permissions)?;
+    Ok(file)
 }
 
 /// Creates the logs directory, appends process diagnostics to `process.log`
@@ -42,6 +49,14 @@ fn open_capped_log(path: PathBuf) -> io::Result<File> {
 pub fn init_process_logging(shutdown: &'static AtomicBool) -> Result<PathBuf> {
     let log_dir = logs_dir()?;
     fs::create_dir_all(&log_dir)?;
+    // The directory holds full transcripts; keep it owner-only too.
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&log_dir)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&log_dir, permissions)?;
+    }
     let process_log = open_capped_log(log_dir.join("process.log"))?;
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("voice_control=info"));

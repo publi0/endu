@@ -2,7 +2,7 @@
 //! the URL, headers, credentials, and body travel on stdin as a curl config, so
 //! nothing sensitive reaches argv or a temporary file.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -24,6 +24,10 @@ impl Response {
 
 /// curl's config parser accepts lines up to 10 MiB; stay below it.
 pub(crate) const MAX_BODY_BYTES: usize = 9 * 1024 * 1024;
+
+/// Ceiling for provider-supplied Retry-After values; the caller applies its
+/// own smaller cap, this only keeps the parse from panicking on huge inputs.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub(crate) fn post_json(
     url: &str,
@@ -49,13 +53,21 @@ fn request(url: &str, api_key: &str, body: Option<&str>, timeout: Duration) -> R
     } else {
         "curl"
     };
+    // The bearer key and base64 audio travel in these requests; only loopback
+    // endpoints (local LLM gateways) may use cleartext HTTP.
+    let cleartext = url.starts_with("http://localhost")
+        || url.starts_with("http://127.0.0.1")
+        || url.starts_with("http://[::1]");
+    let protocol = if cleartext { "=http,https" } else { "=https" };
     let mut child = Command::new(curl)
         .args([
             "--disable",
             "--silent",
             "--show-error",
             "--proto",
-            "=https,http",
+            protocol,
+            "--proto-redir",
+            protocol,
             "--connect-timeout",
             "10",
             "--max-time",
@@ -75,8 +87,44 @@ fn request(url: &str, api_key: &str, body: Option<&str>, timeout: Duration) -> R
         .take()
         .ok_or_else(|| eyre!("curl stdin unavailable"))?;
     let writer = std::thread::spawn(move || stdin.write_all(&input));
-    let output = child.wait_with_output().wrap_err("curl did not finish")?;
+    // Provider-controlled responses are read with a hard cap so a hostile
+    // endpoint cannot balloon Hex's memory through the buffered streams.
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| eyre!("curl stdout unavailable"))?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| eyre!("curl stderr unavailable"))?;
+    let stdout_reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let mut buffer = Vec::new();
+        let pipe = stdout_pipe;
+        pipe.take((MAX_BODY_BYTES * 2) as u64)
+            .read_to_end(&mut buffer)?;
+        Ok(buffer)
+    });
+    let stderr_reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let mut buffer = Vec::new();
+        let mut pipe = stderr_pipe;
+        pipe.read_to_end(&mut buffer)?;
+        Ok(buffer)
+    });
+    let status = child.wait().wrap_err("curl did not finish")?;
     let _ = writer.join();
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| eyre!("curl stdout reader panicked"))?
+        .wrap_err("could not read curl output")?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| eyre!("curl stderr reader panicked"))?
+        .unwrap_or_default();
+    let output = std::process::Output {
+        status,
+        stdout,
+        stderr,
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("network error ({}): {}", output.status, stderr.trim());
@@ -127,8 +175,16 @@ fn parse_output(mut stdout: Vec<u8>) -> Option<Response> {
     let retry_after = parts
         .next()
         .and_then(|value| value.parse::<f64>().ok())
+        // Provider-controlled values must never panic the worker: cap at the
+        // largest representable wait and let the caller's own cap decide.
         .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
-        .map(Duration::from_secs_f64);
+        .map(|seconds| {
+            if seconds >= MAX_RETRY_AFTER.as_secs_f64() {
+                MAX_RETRY_AFTER
+            } else {
+                Duration::from_secs_f64(seconds)
+            }
+        });
     Some(Response {
         status,
         retry_after,

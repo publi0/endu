@@ -40,6 +40,8 @@ gpui = { version = "0.2.2", default-features = false, features = ["font-kit"] }
 gpui-symbols = { version = "0.6.1", default-features = false, features = ["component", "cache"] }
 metal = "0.33.0"
 objc2 = "0.6.4"
+security-framework = "3.7.0"
+security-framework-sys = "2.17.0"
 objc2-app-kit = "0.3.2"
 objc2-core-audio = "0.3.2"
 objc2-core-foundation = "0.3.2"

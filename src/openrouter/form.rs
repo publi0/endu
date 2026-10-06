@@ -63,8 +63,16 @@ impl AdvancedForm {
     pub fn apply(&self, base: &Config) -> Result<Config, String> {
         let mut config = base.clone();
         let base_url = self.base_url.trim().trim_end_matches('/');
-        if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
-            return Err("API URL must start with https:// or http://.".into());
+        // The bearer key and raw recordings travel in these requests; only
+        // loopback endpoints may stay on cleartext HTTP.
+        let loopback_http = base_url.starts_with("http://")
+            && ["http://localhost", "http://127.0.0.1", "http://[::1]"]
+                .iter()
+                .any(|prefix| base_url.starts_with(prefix));
+        if !(base_url.starts_with("https://") || loopback_http) {
+            return Err(
+                "API URL must use https:// (http:// is only allowed for localhost).".into(),
+            );
         }
         config.base_url = base_url.to_owned();
         config.transcription.attempt_timeout_seconds =

@@ -272,6 +272,9 @@ impl HistoryStore {
 
     /// Delete every entry.
     pub fn clear(&mut self) -> io::Result<()> {
+        // A corrupt-file backup predating the current store is stale once the
+        // user clears history deliberately.
+        let _ = fs::remove_file(self.path.with_extension("json.corrupt"));
         if self.entries.is_empty() {
             return Ok(());
         }

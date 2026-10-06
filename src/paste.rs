@@ -27,6 +27,18 @@ pub enum PasteOutcome {
     CopiedToClipboard,
 }
 
+/// Settle delay before the pre-paste clipboard is restored; the transcript
+/// is readable by same-login apps until then.
+const PASTE_RESTORE_DELAY: Duration = Duration::from_millis(250);
+
+/// Caps for the pre-paste clipboard snapshot. The pasteboard is user- and
+/// app-controlled, so neither its shape nor its size is trusted: a hostile
+/// item must not balloon Hex's memory or stall the paste.
+const MAX_CLIPBOARD_ITEMS: usize = 16;
+const MAX_FLAVOR_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+const CAPTURE_DEADLINE: Duration = Duration::from_millis(400);
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PasteOptions {
     pub submit_after_paste: Option<u64>,
@@ -347,7 +359,10 @@ impl Paster {
             || keyboard::post_command_to_pid('v', pid),
             move || {
                 thread::spawn(move || {
-                    thread::sleep(Duration::from_millis(500));
+                    // The transcript sits on the shared pasteboard until the
+                    // restore runs, so keep that window as short as the target
+                    // app's paste handling allows.
+                    thread::sleep(PASTE_RESTORE_DELAY);
                     let mut restore = clipboard_restore
                         .lock()
                         .unwrap_or_else(|error| error.into_inner());
@@ -502,6 +517,8 @@ fn submit_if_current(
 
 fn capture_clipboard(clipboard: &NSPasteboard) -> Result<ClipboardSnapshot> {
     let capture_started = Instant::now();
+    let capture_deadline = capture_started + CAPTURE_DEADLINE;
+    let mut snapshot_bytes = 0usize;
     let pasteboard = create_pasteboard(&clipboard.name())?;
     unsafe { PasteboardSynchronize(pasteboard.0) };
     let mut item_count = 0;
@@ -509,6 +526,11 @@ fn capture_clipboard(clipboard: &NSPasteboard) -> Result<ClipboardSnapshot> {
         unsafe { PasteboardGetItemCount(pasteboard.0, &mut item_count) },
         "count clipboard items",
     )?;
+    if item_count < 0 || item_count as usize > MAX_CLIPBOARD_ITEMS {
+        return Err(eyre!(
+            "clipboard holds {item_count} items; refusing to snapshot more than {MAX_CLIPBOARD_ITEMS}"
+        ));
+    }
     let mut items = Vec::with_capacity(item_count);
     for index in 1..=item_count {
         let mut item = ptr::null_mut();
@@ -566,11 +588,23 @@ fn capture_clipboard(clipboard: &NSPasteboard) -> Result<ClipboardSnapshot> {
                 if data.is_null() {
                     return Err(eyre!("clipboard format data was unavailable"));
                 }
-                let bytes = cf_data(data);
+                let bytes = cf_data(data)?;
                 unsafe { CFRelease(data) };
+                snapshot_bytes += bytes.len();
+                if bytes.len() > MAX_FLAVOR_BYTES || snapshot_bytes > MAX_SNAPSHOT_BYTES {
+                    tracing::warn!(
+                        %data_type,
+                        bytes = bytes.len(),
+                        "clipboard format exceeded the preservation cap"
+                    );
+                    return Ok(None);
+                }
+                if Instant::now() >= capture_deadline {
+                    return Err(eyre!("clipboard snapshot exceeded its deadline"));
+                }
                 Ok(Some(ClipboardFlavor {
                     data_type,
-                    data: bytes?,
+                    data: bytes,
                     flags: flags & 0x0f,
                 }))
             })

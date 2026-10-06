@@ -179,6 +179,19 @@ impl EventLog {
     }
 
     pub fn dictation(&self, phase: DictationPhase, text: impl Into<String>) -> io::Result<()> {
+        // Failure details can embed provider-controlled response excerpts;
+        // bound what reaches the diagnostic log.
+        const MAX_FAILURE_DETAIL: usize = 300;
+        let phase = match phase {
+            DictationPhase::Failed(message) => {
+                let mut truncated: String = message.chars().take(MAX_FAILURE_DETAIL).collect();
+                if message.chars().count() > MAX_FAILURE_DETAIL {
+                    truncated.push('…');
+                }
+                DictationPhase::Failed(truncated)
+            }
+            phase => phase,
+        };
         self.emit(&VoiceEvent::Dictation {
             timestamp_ms: now_ms(),
             phase,
