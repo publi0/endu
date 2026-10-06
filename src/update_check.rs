@@ -57,8 +57,9 @@ fn version_newer(candidate: &str, current: &str) -> bool {
 
 /// Schedules the app bundle to reopen right after this process exits, then
 /// quits. `open` waits for the bundle to become available, so the instance
-/// lock is released before the new process starts.
-pub fn relaunch_and_quit(bundle: &PathBuf) {
+/// lock is released before the new process starts. Returns `false` when the
+/// relaunch could not be scheduled so the UI can surface the failure.
+pub fn relaunch_and_quit(bundle: &PathBuf) -> bool {
     let result = std::process::Command::new("/usr/bin/open")
         .arg("-a")
         .arg(bundle)
@@ -67,8 +68,12 @@ pub fn relaunch_and_quit(bundle: &PathBuf) {
         Ok(child) => {
             tracing::info!(pid = child.id(), "relaunch scheduled");
             crate::desktop::request_quit();
+            true
         }
-        Err(error) => tracing::error!(%error, "could not schedule the relaunch"),
+        Err(error) => {
+            tracing::error!(%error, "could not schedule the relaunch");
+            false
+        }
     }
 }
 

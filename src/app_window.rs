@@ -539,6 +539,7 @@ pub struct AppWindow {
     history_retention_picker_state: PickerState,
     history_copied: Option<u64>,
     pending_update: Option<String>,
+    update_error: Option<String>,
     update_check_at: Option<Instant>,
 }
 
@@ -934,6 +935,7 @@ impl AppWindow {
             history_retention_picker_state: PickerState::new(cx),
             history_copied: None,
             pending_update: None,
+            update_error: None,
             update_check_at: None,
         };
         window.history_retention_picker_state.highlight = HistoryRetention::ALL
@@ -2029,7 +2031,9 @@ impl AppWindow {
         // Reading the bundle plist is cheap but not free; re-check on a slow
         // cadence instead of every render frame.
         if self.update_check_at.is_none_or(|at| Instant::now() >= at) {
-            self.pending_update = crate::update_check::pending_update();
+            let pending = crate::update_check::pending_update();
+            crate::status_item::set_update_available(pending.is_some());
+            self.pending_update = pending;
             self.update_check_at = Some(Instant::now() + UPDATE_CHECK_INTERVAL);
         }
         let Some(version) = self.pending_update.clone() else {
@@ -2066,10 +2070,21 @@ impl AppWindow {
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let Some(bundle) = crate::update_check::bundle_path() {
                             this.finish_editing(cx);
-                            crate::update_check::relaunch_and_quit(&bundle);
+                            if !crate::update_check::relaunch_and_quit(&bundle) {
+                                this.update_error =
+                                    Some("Could not schedule the relaunch. Quit Hex and reopen it.".into());
+                                cx.notify();
+                            }
                         }
                     })),
             )
+            .children(self.update_error.as_ref().map(|error| {
+                div()
+                    .pr_2()
+                    .text_size(px(10.0))
+                    .text_color(rgb(NEGATIVE))
+                    .child(error.clone())
+            }))
             .into_any_element()
     }
 

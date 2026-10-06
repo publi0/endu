@@ -103,6 +103,7 @@ fn animation_frame(phase: IconPhase, elapsed: Duration, reduce_motion: bool) -> 
 
 struct IconImages {
     idle: Retained<NSImage>,
+    update: Retained<NSImage>,
     recording: Vec<Retained<NSImage>>,
     processing: Vec<Retained<NSImage>>,
 }
@@ -117,12 +118,13 @@ impl IconImages {
         let source_size = symbol.size();
         let side = source_size.width.max(source_size.height);
         let size = NSSize::new(side, side);
-        let idle = Self::frame(&symbol, size, 0.0, None, IconPhase::Idle);
+        let idle = Self::frame(&symbol, size, 0.0, None, IconPhase::Idle, false);
+        let update = Self::frame(&symbol, size, 0.0, None, IconPhase::Idle, true);
         let recording = (0..RECORDING_FRAMES)
             .map(|index| {
                 let cycle = index as f64 / RECORDING_FRAMES as f64 * std::f64::consts::TAU;
                 let opacity = 0.775 + 0.225 * cycle.cos();
-                Self::frame(&symbol, size, 0.0, Some(opacity), IconPhase::Recording)
+                Self::frame(&symbol, size, 0.0, Some(opacity), IconPhase::Recording, false)
             })
             .collect();
         let processing = (0..PROCESSING_FRAMES)
@@ -133,11 +135,13 @@ impl IconImages {
                     -(index as f64) * 360.0 / PROCESSING_FRAMES as f64,
                     None,
                     IconPhase::Processing,
+                    false,
                 )
             })
             .collect();
         Ok(Self {
             idle,
+            update,
             recording,
             processing,
         })
@@ -149,6 +153,7 @@ impl IconImages {
         angle: f64,
         dot: Option<f64>,
         phase: IconPhase,
+        update_badge: bool,
     ) -> Retained<NSImage> {
         let source = symbol.clone();
         // A drawing-backed template stays sharp at either backing scale. All
@@ -179,6 +184,18 @@ impl IconImages {
                     ))
                     .fill();
                 }
+                if update_badge {
+                    // A filled dot at the top-right corner mirrors macOS app
+                    // icon badges without leaving the template appearance.
+                    NSColor::colorWithCalibratedWhite_alpha(0.0, 1.0).setFill();
+                    let diameter = size.width * 0.3;
+                    let offset = size.width * 0.28;
+                    NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
+                        NSPoint::new(offset - diameter / 2.0, offset - diameter / 2.0),
+                        NSSize::new(diameter, diameter),
+                    ))
+                    .fill();
+                }
                 NSGraphicsContext::restoreGraphicsState_class();
                 Bool::YES
             })
@@ -189,7 +206,10 @@ impl IconImages {
         image
     }
 
-    fn image(&self, phase: IconPhase, frame: usize) -> &NSImage {
+    fn image(&self, phase: IconPhase, frame: usize, update_available: bool) -> &NSImage {
+        if phase == IconPhase::Idle && update_available {
+            return &self.update;
+        }
         match phase {
             IconPhase::Idle => &self.idle,
             IconPhase::Recording => &self.recording[frame],
@@ -290,6 +310,7 @@ struct StatusItemController {
     reduce_motion: bool,
     motion_checked_at: Instant,
     ready_to_paste: bool,
+    update_available: bool,
     _menu: Retained<NSMenu>,
     _target: Retained<StatusItemTarget>,
 }
@@ -319,7 +340,7 @@ impl StatusItemController {
         );
         if self.last_frame != Some(frame) {
             if let Some(button) = self.item.button(mtm) {
-                button.setImage(Some(self.images.image(phase, frame)));
+                button.setImage(Some(self.images.image(phase, frame, self.update_available)));
             }
             self.last_frame = Some(frame);
         }
@@ -327,12 +348,17 @@ impl StatusItemController {
 
     fn update_label(&self, mtm: MainThreadMarker) {
         if let Some(button) = self.item.button(mtm) {
-            let label = if self.phase == IconPhase::Idle && self.ready_to_paste {
+            let phase = if self.phase == IconPhase::Idle && self.ready_to_paste {
                 "Dictation ready — choose an app, then Paste Last Dictation"
             } else {
                 self.phase.label()
             };
-            let label = NSString::from_str(label);
+            let phase = if self.update_available {
+                format!("{phase} · update available")
+            } else {
+                phase.to_string()
+            };
+            let label = NSString::from_str(&format!("{phase} · v{}", env!("CARGO_PKG_VERSION")));
             button.setToolTip(Some(&label));
             button.setAccessibilityLabel(Some(&label));
         }
@@ -397,6 +423,7 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
             reduce_motion: NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion(),
             motion_checked_at: now,
             ready_to_paste: false,
+            update_available: false,
             _menu: menu,
             _target: target,
         });
@@ -472,6 +499,24 @@ pub fn set_ready_to_paste(ready: bool) {
                 } else {
                     "Paste Last Dictation"
                 }));
+            controller.update_label(mtm);
+        }
+    });
+}
+
+/// Flags a newer installed bundle so the menu bar icon badges and the tooltip
+/// mention the update until the process exits into the new version.
+pub fn set_update_available(available: bool) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    STATUS_ITEM.with(|controller| {
+        if let Some(controller) = controller.borrow_mut().as_mut()
+            && controller.update_available != available
+        {
+            controller.update_available = available;
+            controller.last_frame = None;
+            controller.update_icon(mtm, Instant::now());
             controller.update_label(mtm);
         }
     });
