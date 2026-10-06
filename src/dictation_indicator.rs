@@ -17,8 +17,7 @@ use metal::{
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSPanel, NSStatusWindowLevel, NSView, NSWindowCollectionBehavior,
-    NSWindowStyleMask,
+    NSBackingStoreType, NSColor, NSPanel, NSStatusWindowLevel, NSView, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use objc2_quartz_core::CALayer;
@@ -186,7 +185,7 @@ struct MetalIndicator {
     renderer: Arc<SharedRenderer>,
     display_link: CVDisplayLink,
     display_link_context: *const SharedRenderer,
-    ordered: bool,
+    visibility: crate::overlay_visibility::OverlayVisibility,
 }
 
 impl MetalIndicator {
@@ -221,13 +220,7 @@ impl MetalIndicator {
         window.setHidesOnDeactivate(false);
         window.setCanHide(false);
         window.setLevel(NSStatusWindowLevel);
-        window.setCollectionBehavior(
-            NSWindowCollectionBehavior::CanJoinAllSpaces
-                | NSWindowCollectionBehavior::CanJoinAllApplications
-                | NSWindowCollectionBehavior::FullScreenAuxiliary
-                | NSWindowCollectionBehavior::Stationary
-                | NSWindowCollectionBehavior::IgnoresCycle,
-        );
+        window.setCollectionBehavior(crate::overlay_visibility::collection_behavior());
         unsafe { window.setReleasedWhenClosed(false) };
 
         let display_link = CVDisplayLink::from_active_cg_displays()
@@ -246,23 +239,25 @@ impl MetalIndicator {
             renderer,
             display_link,
             display_link_context,
-            ordered: false,
+            visibility: crate::overlay_visibility::OverlayVisibility::new(),
         };
         indicator.position_on_selected_screen();
         Ok(indicator)
     }
 
     fn handle(&mut self, event: DictationIndicatorEvent) {
-        self.renderer.handle(event);
         if matches!(
             event,
             DictationIndicatorEvent::Preparing | DictationIndicatorEvent::Started
         ) {
             self.position_on_selected_screen();
-            self.window.orderFrontRegardless();
-            self.ordered = true;
+            self.visibility.update(&self.window, true);
             tracing::info!("Metal dictation indicator shown");
         }
+        // Present first: an off-Space CAMetalLayer may be waiting for a drawable
+        // while holding the renderer lock. WindowServer must see the panel again
+        // before the UI thread waits to update the animation state.
+        self.renderer.handle(event);
         if !self.display_link.is_running()
             && let Err(status) = self.display_link.start()
         {
@@ -273,18 +268,12 @@ impl MetalIndicator {
     fn maintain(&mut self) {
         if self.renderer.is_active() {
             self.position_on_selected_screen();
-            if !self.ordered {
-                self.window.orderFrontRegardless();
-                self.ordered = true;
-            }
+            self.visibility.update(&self.window, true);
         } else {
             if self.display_link.is_running() {
                 let _ = self.display_link.stop();
             }
-            if self.ordered {
-                self.window.orderOut(None);
-                self.ordered = false;
-            }
+            self.visibility.update(&self.window, false);
         }
     }
 
@@ -375,10 +364,12 @@ impl SharedRenderer {
     }
 
     fn set_viewport(&self, scale: f32, size_factor: f32) {
-        self.renderer
-            .lock()
-            .unwrap()
-            .set_viewport(scale, size_factor);
+        // A drawable can be unavailable during a Space/display transition.
+        // Never block the UI's visibility repair behind that render operation;
+        // the next maintenance tick retries the latest viewport preferences.
+        if let Ok(mut renderer) = self.renderer.try_lock() {
+            renderer.set_viewport(scale, size_factor);
+        }
     }
 
     fn draw(&self) {
@@ -748,7 +739,14 @@ impl MetalRenderer {
     }
 
     fn draw(&mut self) -> bool {
-        let now = Instant::now();
+        self.draw_with(Instant::now(), |layer| layer.next_drawable())
+    }
+
+    fn draw_with(
+        &mut self,
+        now: Instant,
+        next_drawable: impl FnOnce(&metal::MetalLayerRef) -> Option<&metal::MetalDrawableRef>,
+    ) -> bool {
         if self.completion_pending
             && now.duration_since(self.phase_started) >= PROCESSING_MORPH_DURATION
         {
@@ -815,8 +813,17 @@ impl MetalRenderer {
         );
         self.target_peak *= 0.91_f32.powf(dt * 60.0);
 
-        let Some(drawable) = self.layer.next_drawable() else {
-            return true;
+        let keep_rendering = visible
+            || !self.opacity.is_settled(0.0, 0.002, EXIT_ANGULAR_FREQUENCY)
+            || !self
+                .visual_scale
+                .is_settled(HIDDEN_SCALE, 0.002, EXIT_ANGULAR_FREQUENCY)
+            || !self
+                .softness
+                .is_settled(HIDDEN_SOFTNESS, 0.02, EXIT_ANGULAR_FREQUENCY);
+        let Some(drawable) = next_drawable(&self.layer) else {
+            // GPU availability must not extend a finished/cancelled lifecycle.
+            return keep_rendering;
         };
         let descriptor = RenderPassDescriptor::new();
         let attachment = descriptor.color_attachments().object_at(0).unwrap();
@@ -886,14 +893,7 @@ impl MetalRenderer {
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
 
-        visible
-            || !self.opacity.is_settled(0.0, 0.002, EXIT_ANGULAR_FREQUENCY)
-            || !self
-                .visual_scale
-                .is_settled(HIDDEN_SCALE, 0.002, EXIT_ANGULAR_FREQUENCY)
-            || !self
-                .softness
-                .is_settled(HIDDEN_SOFTNESS, 0.02, EXIT_ANGULAR_FREQUENCY)
+        keep_rendering
     }
 }
 
@@ -1107,5 +1107,79 @@ mod tests {
         }
 
         assert!(width.value < CAPSULE_HEIGHT + 0.7);
+    }
+
+    #[test]
+    fn missing_drawables_preserve_recording_and_pending_transcription() {
+        let mut renderer = MetalRenderer::new().expect("local macOS checks require Metal");
+        renderer.handle(DictationIndicatorEvent::Started);
+        let started = renderer.phase_started;
+        for frame in 0..120 {
+            assert!(renderer.draw_with(started + Duration::from_millis(frame * 16), |_| None));
+        }
+        renderer.handle(DictationIndicatorEvent::Submitted { job_id: 99 });
+        renderer.handle(DictationIndicatorEvent::Transcribing { job_id: 99 });
+        let started = renderer.phase_started;
+        renderer.last_frame = started;
+        for frame in 0..120 {
+            assert!(renderer.draw_with(started + Duration::from_millis(frame * 16), |_| None));
+        }
+        assert_eq!(renderer.phase, Phase::Transcribing);
+        assert!(renderer.jobs.contains_key(&99));
+    }
+
+    #[test]
+    fn missing_drawables_do_not_keep_cancelled_or_completed_huds_alive() {
+        for terminal in [
+            DictationIndicatorEvent::Cancelled,
+            DictationIndicatorEvent::Discarded,
+            DictationIndicatorEvent::Failed,
+            DictationIndicatorEvent::JobCompleted { job_id: 99 },
+        ] {
+            let mut renderer = MetalRenderer::new().expect("local macOS checks require Metal");
+            renderer.handle(DictationIndicatorEvent::Started);
+            renderer.opacity.reset(1.0);
+            renderer.visual_scale.reset(1.0);
+            renderer.softness.reset(0.0);
+            if matches!(terminal, DictationIndicatorEvent::JobCompleted { .. }) {
+                renderer.handle(DictationIndicatorEvent::Submitted { job_id: 99 });
+            }
+            renderer.handle(terminal);
+            let started = renderer.phase_started;
+            renderer.last_frame = started;
+            let mut alive = true;
+            for frame in 0..120 {
+                alive = renderer.draw_with(started + Duration::from_millis(frame * 16), |_| None);
+            }
+            assert!(
+                !alive,
+                "finished HUD must stop even when WindowServer supplies no drawable"
+            );
+            assert!(renderer.jobs.is_empty());
+            assert!(renderer.capture_phase.is_none());
+        }
+    }
+
+    #[test]
+    fn viewport_updates_do_not_block_space_recovery_behind_the_renderer() {
+        let shared = Arc::new(SharedRenderer::new().expect("local macOS checks require Metal"));
+        let guard = shared.renderer.lock().unwrap();
+        let worker_shared = shared.clone();
+        let (sent, received) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_shared.set_viewport(1.0, 1.5);
+            sent.send(()).unwrap();
+        });
+        let completed_without_renderer = received.recv_timeout(Duration::from_secs(1));
+        drop(guard);
+        worker.join().unwrap();
+        assert!(
+            completed_without_renderer.is_ok(),
+            "UI recovery must not wait for the GPU"
+        );
+        shared.set_viewport(1.0, 1.5);
+        let renderer = shared.renderer.lock().unwrap();
+        assert_eq!(renderer.scale, 1.0);
+        assert_eq!(renderer.size_factor, 1.5);
     }
 }

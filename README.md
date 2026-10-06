@@ -172,6 +172,8 @@ indicador no topo ou na parte inferior da tela. **Display** escolhe a tela do
 ponteiro, da janela ativa ou um monitor fixo. Se o monitor fixo desconectar,
 o HUD acompanha o ponteiro até ele voltar. **Edge distance** ajusta a margem
 entre 0 e 160 pontos; a posição respeita a área livre do Dock e da barra de menus.
+O HUD e o aviso de ditado pronto acompanham o Space ativo do macOS, inclusive
+ao trocar de Desktop ou entrar em tela cheia, sem tirar o foco do aplicativo.
 
 **Size** oferece Small, Normal e Large. **Brightness** oferece Subtle, Normal
 e Intense. Os padrões preservam o tamanho, o brilho e a animação existentes.

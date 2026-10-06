@@ -6,7 +6,7 @@ use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2_app_kit::{
     NSBackingStoreType, NSColor, NSFont, NSPanel, NSStatusWindowLevel, NSTextAlignment,
-    NSTextField, NSView, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSTextField, NSView, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -32,6 +32,7 @@ pub struct PasteNotice {
     until: Option<Instant>,
     title: Retained<NSTextField>,
     detail: Retained<NSTextField>,
+    visibility: crate::overlay_visibility::OverlayVisibility,
 }
 
 impl PasteNotice {
@@ -91,19 +92,14 @@ impl PasteNotice {
         window.setHidesOnDeactivate(false);
         window.setCanHide(false);
         window.setLevel(NSStatusWindowLevel);
-        window.setCollectionBehavior(
-            NSWindowCollectionBehavior::CanJoinAllSpaces
-                | NSWindowCollectionBehavior::CanJoinAllApplications
-                | NSWindowCollectionBehavior::FullScreenAuxiliary
-                | NSWindowCollectionBehavior::Stationary
-                | NSWindowCollectionBehavior::IgnoresCycle,
-        );
+        window.setCollectionBehavior(crate::overlay_visibility::collection_behavior());
         unsafe { window.setReleasedWhenClosed(false) };
         Ok(Self {
             window,
             until: None,
             title,
             detail,
+            visibility: crate::overlay_visibility::OverlayVisibility::new(),
         })
     }
 
@@ -113,7 +109,7 @@ impl PasteNotice {
         self.detail.setStringValue(&NSString::from_str(detail));
         self.position_on_selected_screen();
         self.until = Some(Instant::now() + Duration::from_secs(5));
-        self.window.orderFrontRegardless();
+        self.visibility.update(&self.window, true);
     }
 
     fn position_on_selected_screen(&self) {
@@ -143,7 +139,7 @@ impl PasteNotice {
 
     pub fn hide(&mut self) {
         self.until = None;
-        self.window.orderOut(None);
+        self.visibility.update(&self.window, false);
     }
 
     pub fn maintain(&mut self) {
@@ -151,6 +147,7 @@ impl PasteNotice {
             self.hide();
         } else if self.until.is_some() {
             self.position_on_selected_screen();
+            self.visibility.update(&self.window, true);
         }
     }
 }

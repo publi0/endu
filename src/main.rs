@@ -49,6 +49,8 @@ mod onboarding;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod openrouter;
 #[cfg(target_os = "macos")]
+mod overlay_visibility;
+#[cfg(target_os = "macos")]
 mod paste;
 #[cfg(target_os = "macos")]
 mod paste_notice;

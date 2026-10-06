@@ -168,6 +168,15 @@ not reintroduce seams for them.
   notice follows the same screen and edge. Palette changes affect the entire
   phase, including its glow and highlights, and never tint Preparing. Missing
   fixed displays or active-window metadata fall back without permission prompts.
+  HUD and Paste Last notices observe active-Space changes on NSWorkspace's
+  notification center. Re-register a visible overlay on the active Space without
+  activating Hex or resetting its animation; do not trust a cached ordered flag
+  as proof of native visibility. Never resurrect an idle/cancelled overlay on a
+  Space change, and rate-limit repairs while WindowServer settles a transition.
+  Rendering must remain live for recording/pending work when Metal cannot supply
+  a drawable, but finished/cancelled HUDs must still settle and stop. Viewport
+  maintenance must not wait for a drawable while holding up main-thread Space
+  recovery. Cover these cases with fault-injection tests, not GPU timing sleeps.
 - Imports validate all fields before writing, preserve local credentials and
   endpoints, serialize Models readers/writers, and roll back a partial save.
   Apply runtime only after both files succeed. Imports wait for key operations
