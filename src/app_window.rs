@@ -2641,6 +2641,28 @@ impl AppWindow {
         cx.notify();
     }
 
+    /// The Input device row description names the microphone that dictation
+    /// would use right now, so the effective choice is visible at the top of
+    /// the pane instead of only in the channel and level rows below.
+    fn input_device_description(&self) -> String {
+        match (&self.microphone_description, &self.microphone_description_error) {
+            (Some(description), _) => {
+                let mode = if self.settings.microphone.is_some() {
+                    "Fixed"
+                } else {
+                    "Automatic"
+                };
+                format!(
+                    "Current: {} — {} ({mode})",
+                    description.name,
+                    description.channel_label()
+                )
+            }
+            (None, Some(error)) => format!("Microphone unavailable: {error}"),
+            (None, None) => "Checking the available microphones…".to_string(),
+        }
+    }
+
     fn refresh_microphone_description(&mut self) -> bool {
         let previous = (
             self.microphone_description.clone(),
@@ -3395,7 +3417,7 @@ impl AppWindow {
                     settings_panel()
                         .child(self.setting_row(SettingControl::Microphone,
                             "Input device",
-                            "Automatic picks the preferred available microphone",
+                            self.input_device_description(),
                             div()
                                 .relative()
                                 .flex_none()
