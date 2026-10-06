@@ -72,6 +72,30 @@ enum WriterMessage {
 
 const EVENT_WRITER_CAPACITY: usize = 1_024;
 
+/// Rotate the live log before it grows without bound; one retained generation
+/// is enough for post-mortem diagnostics.
+const EVENT_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Truncates the log to a fresh file once it crosses the size cap, keeping the
+/// previous generation alongside it. Called from the writer thread between
+/// events, so no partial line is ever rotated.
+fn rotate_if_large(path: &Path, writer: &mut BufWriter<File>) -> io::Result<()> {
+    writer.flush()?;
+    let size = match fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if size < EVENT_LOG_MAX_BYTES {
+        return Ok(());
+    }
+    let rotated = path.with_extension("ndjson.1");
+    let _ = fs::remove_file(&rotated);
+    fs::rename(path, &rotated)?;
+    *writer = BufWriter::new(OpenOptions::new().create(true).append(true).open(path)?);
+    Ok(())
+}
+
 impl EventLog {
     pub fn create(path: &Path) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -81,9 +105,17 @@ impl EventLog {
         let (sender, receiver) = mpsc::sync_channel(EVENT_WRITER_CAPACITY);
         let error = Arc::new(Mutex::new(None));
         let worker_error = error.clone();
+        let writer_path = path.to_path_buf();
         let worker = thread::Builder::new()
             .name("event-writer".into())
-            .spawn(move || run_event_writer(BufWriter::new(file), receiver, worker_error))?;
+            .spawn(move || {
+                run_event_writer(
+                    &writer_path,
+                    BufWriter::new(file),
+                    receiver,
+                    worker_error,
+                )
+            })?;
         Ok(Self {
             inner: Arc::new(EventLogInner {
                 sender: Some(sender),
@@ -171,6 +203,7 @@ impl Drop for EventLogInner {
 }
 
 fn run_event_writer(
+    path: &Path,
     mut writer: BufWriter<File>,
     receiver: mpsc::Receiver<WriterMessage>,
     error: Arc<Mutex<Option<(io::ErrorKind, String)>>>,
@@ -181,7 +214,8 @@ fn run_event_writer(
                 let result = serde_json::to_writer(&mut writer, &event)
                     .map_err(io::Error::other)
                     .and_then(|()| writer.write_all(b"\n"))
-                    .and_then(|()| writer.flush());
+                    .and_then(|()| writer.flush())
+                    .and_then(|()| rotate_if_large(path, &mut writer));
                 if let Err(write_error) = result {
                     *error.lock().unwrap_or_else(|error| error.into_inner()) =
                         Some((write_error.kind(), write_error.to_string()));
@@ -254,6 +288,23 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         assert_eq!(serde_json::from_str::<VoiceEvent>(&json).unwrap(), event);
+    }
+
+    #[test]
+    fn large_event_logs_rotate_and_keep_one_generation() {
+        let directory = std::env::temp_dir().join(format!("hex-events-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("live.ndjson");
+        fs::write(&path, "x".repeat(EVENT_LOG_MAX_BYTES as usize + 1)).unwrap();
+        let log = EventLog::create(&path).unwrap();
+        log.dictation(DictationPhase::Pasted, "olá").unwrap();
+        drop(log);
+        // The oversized generation moved aside and the fresh log holds the
+        // new event alone.
+        assert_eq!(fs::read(&path).unwrap().len(), 0);
+        let rotated = path.with_extension("ndjson.1");
+        assert!(fs::metadata(&rotated).unwrap().len() > EVENT_LOG_MAX_BYTES);
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]
