@@ -52,6 +52,9 @@ const HOTKEY_MIN_WIDTH: f32 = 148.0;
 const HOTKEY_SIDE_SELECTOR_WIDTH: f32 = 116.0;
 const PERMISSION_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How often the sidebar footer re-reads the installed bundle version.
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
 actions!(
     hex,
     [
@@ -536,6 +539,7 @@ pub struct AppWindow {
     history_retention_picker_state: PickerState,
     history_copied: Option<u64>,
     pending_update: Option<String>,
+    update_check_at: Option<Instant>,
 }
 
 impl AppWindow {
@@ -930,6 +934,7 @@ impl AppWindow {
             history_retention_picker_state: PickerState::new(cx),
             history_copied: None,
             pending_update: None,
+            update_check_at: None,
         };
         window.history_retention_picker_state.highlight = HistoryRetention::ALL
             .iter()
@@ -2021,8 +2026,11 @@ impl AppWindow {
     /// The sidebar footer shows the running version, or a restart action when
     /// Homebrew has placed a newer bundle on disk.
     fn render_update_footer(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        if self.pending_update.is_none() {
+        // Reading the bundle plist is cheap but not free; re-check on a slow
+        // cadence instead of every render frame.
+        if self.update_check_at.is_none_or(|at| Instant::now() >= at) {
             self.pending_update = crate::update_check::pending_update();
+            self.update_check_at = Some(Instant::now() + UPDATE_CHECK_INTERVAL);
         }
         let Some(version) = self.pending_update.clone() else {
             return div()
