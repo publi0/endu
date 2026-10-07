@@ -45,7 +45,35 @@ pub(crate) fn get(url: &str, api_key: &str, timeout: Duration) -> Result<Respons
     request(url, api_key, None, timeout)
 }
 
+/// Apply the same origin policy before resolving credentials in every transport.
+/// Parse the host rather than trusting prefixes such as `localhost.evil`.
+pub(crate) fn validate_url(value: &str) -> Result<()> {
+    if value
+        .chars()
+        .any(|ch| ch.is_control() || ch.is_whitespace() || ch == '\\')
+    {
+        bail!("The provider URL contains invalid characters.");
+    }
+    let url = url::Url::parse(value).map_err(|_| eyre!("The provider URL is invalid."))?;
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        bail!("Provider URLs cannot contain credentials or fragments.");
+    }
+    let host = url
+        .host()
+        .ok_or_else(|| eyre!("The provider URL needs a host."))?;
+    let loopback = match host {
+        url::Host::Domain(host) => host.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(address) => address.is_loopback(),
+        url::Host::Ipv6(address) => address.is_loopback(),
+    };
+    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+        bail!("Provider URLs require HTTPS; HTTP is allowed only on loopback addresses.");
+    }
+    Ok(())
+}
+
 fn request(url: &str, api_key: &str, body: Option<&str>, timeout: Duration) -> Result<Response> {
+    validate_url(url)?;
     let input = curl_config(url, api_key, body)?;
     let seconds = timeout.as_secs().max(1).to_string();
     let curl = if cfg!(target_os = "macos") {
@@ -55,9 +83,7 @@ fn request(url: &str, api_key: &str, body: Option<&str>, timeout: Duration) -> R
     };
     // The bearer key and base64 audio travel in these requests; only loopback
     // endpoints (local LLM gateways) may use cleartext HTTP.
-    let cleartext = url.starts_with("http://localhost")
-        || url.starts_with("http://127.0.0.1")
-        || url.starts_with("http://[::1]");
+    let cleartext = url.starts_with("http://");
     let protocol = if cleartext { "=http,https" } else { "=https" };
     let mut child = Command::new(curl)
         .args([
@@ -106,8 +132,8 @@ fn request(url: &str, api_key: &str, body: Option<&str>, timeout: Duration) -> R
     });
     let stderr_reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
         let mut buffer = Vec::new();
-        let mut pipe = stderr_pipe;
-        pipe.read_to_end(&mut buffer)?;
+        let pipe = stderr_pipe;
+        pipe.take(64 * 1024).read_to_end(&mut buffer)?;
         Ok(buffer)
     });
     let status = child.wait().wrap_err("curl did not finish")?;
@@ -195,6 +221,33 @@ fn parse_output(mut stdout: Vec<u8>) -> Option<Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_urls_require_tls_except_true_loopback_hosts() {
+        for url in [
+            "https://api.example.test/v1",
+            "http://localhost:8080/v1",
+            "http://127.0.0.1/v1",
+            "http://[::1]:8080/v1",
+        ] {
+            assert!(validate_url(url).is_ok(), "{url}");
+        }
+        for url in [
+            "http://example.test/v1",
+            "http://localhost.evil.test",
+            "http://127.0.0.1.evil.test",
+            "http://localhost@evil.test",
+            "http://127.0.0.1\\@evil.test",
+            "http://[::1].evil.test",
+            "https://user:secret@example.test",
+            "file:///tmp/key",
+            "https://example.test/#fragment",
+            " https://example.test",
+            "https://example.test/\n",
+        ] {
+            assert!(validate_url(url).is_err(), "{url}");
+        }
+    }
 
     #[test]
     fn parses_status_and_retry_after_trailer() {

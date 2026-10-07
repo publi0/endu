@@ -62,6 +62,8 @@ struct AppPreferences {
     hud: HudTransfer,
     #[serde(default)]
     post_processing: Option<crate::post_processing::Preferences>,
+    #[serde(default)]
+    vocabulary: Option<crate::vocabulary::Vocabulary>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -129,6 +131,8 @@ struct HudTransfer {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TranscriptionPreferences {
+    #[serde(default)]
+    model_options: Option<std::collections::BTreeMap<String, crate::providers::ModelOptions>>,
     models: Vec<String>,
     language: String,
     attempt_timeout_seconds: u64,
@@ -176,7 +180,7 @@ pub fn preview_bundle(
     bundle.validate()?;
     let settings = bundle.app.apply_to(current);
     let mut config = config.clone();
-    config.transcription = bundle.transcription.into_config();
+    config.transcription = bundle.transcription.into_config(&config.transcription);
     Ok(ImportOutcome { settings, config })
 }
 
@@ -191,6 +195,7 @@ pub fn import_bundle(bundle: PreferenceBundle, current: &AppSettings) -> Result<
     )?;
     // write_to never applies runtime preferences. Both saves have now succeeded.
     outcome.settings.apply_runtime();
+    crate::providers::apply_runtime(&outcome.config);
     Ok(outcome)
 }
 
@@ -227,7 +232,7 @@ fn import_at(
             Err(_) => bail!("Could not read existing Models settings; import was not applied."),
         };
         let mut config = original.clone();
-        config.transcription = bundle.transcription.into_config();
+        config.transcription = bundle.transcription.into_config(&config.transcription);
         save_models(&config, config_path).map_err(|_| {
             eyre!("Could not save Models preferences; app preferences were not changed.")
         })?;
@@ -255,7 +260,15 @@ impl PreferenceBundle {
         if self.version != VERSION {
             bail!("This preferences file uses an unsupported version.");
         }
+        if let Some(profiles) = &self.transcription.model_options {
+            crate::providers::validate_profiles(profiles).map_err(|e| eyre!("{e}"))?;
+        }
         let app = &self.app;
+        if let Some(vocabulary) = &app.vocabulary {
+            vocabulary
+                .validate()
+                .map_err(|message| color_eyre::eyre::eyre!(message))?;
+        }
         for volume in [app.sounds.start, app.sounds.stop, app.sounds.error_cancel] {
             if !volume.is_finite() || !(0.0..=1.0).contains(&volume) {
                 bail!("Sound volumes must be between 0 and 1.");
@@ -495,6 +508,7 @@ impl AppPreferences {
                 .map(ShortcutPreferences::from_binding),
             show_dock_icon: settings.show_dock_icon,
             post_processing: Some(settings.post_processing),
+            vocabulary: Some(settings.vocabulary.clone()),
             hud: HudTransfer {
                 position: hud.position,
                 recording_color: hud.recording_color,
@@ -559,6 +573,9 @@ impl AppPreferences {
         if let Some(preferences) = self.post_processing {
             settings.post_processing = preferences;
         }
+        if let Some(vocabulary) = &self.vocabulary {
+            settings.vocabulary = vocabulary.clone();
+        }
         let hud = self.hud;
         settings.hud = HudPreferences {
             position: hud.position,
@@ -577,6 +594,7 @@ impl AppPreferences {
 impl TranscriptionPreferences {
     fn from_config(config: &TranscriptionConfig) -> Self {
         Self {
+            model_options: Some(config.model_options.clone()),
             models: config.models.clone(),
             language: config.language.clone(),
             attempt_timeout_seconds: config.attempt_timeout_seconds,
@@ -588,8 +606,11 @@ impl TranscriptionPreferences {
         }
     }
 
-    fn into_config(self) -> TranscriptionConfig {
+    fn into_config(self, previous: &TranscriptionConfig) -> TranscriptionConfig {
         TranscriptionConfig {
+            model_options: self
+                .model_options
+                .unwrap_or_else(|| previous.model_options.clone()),
             models: self.models,
             language: self.language,
             attempt_timeout_seconds: self.attempt_timeout_seconds,
@@ -645,6 +666,7 @@ mod tests {
             history_retention: crate::history::HistoryRetention::Off,
             hud: HudPreferences::default(),
             post_processing: crate::post_processing::Preferences::default(),
+            vocabulary: crate::vocabulary::Vocabulary::default(),
         }
     }
 
@@ -681,6 +703,46 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.directory);
         }
+    }
+
+    #[test]
+    fn model_profiles_round_trip_and_older_exports_preserve_them() {
+        let source = settings();
+        let mut config = Config::default();
+        config.transcription.model_options.insert(
+            "deepgram::nova-3".into(),
+            crate::providers::ModelOptions {
+                language: "pt".into(),
+                streaming: true,
+                smart_format: true,
+                ..Default::default()
+            },
+        );
+        let bytes = export_bytes(&source, &config).unwrap();
+        let imported =
+            preview_bundle(decode(&bytes).unwrap(), &source, &Config::default()).unwrap();
+        assert_eq!(
+            imported.config.transcription.model_options,
+            config.transcription.model_options
+        );
+        let mut legacy: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        legacy["transcription"]
+            .as_object_mut()
+            .unwrap()
+            .remove("model_options");
+        let imported = preview_bundle(
+            decode(&serde_json::to_vec(&legacy).unwrap()).unwrap(),
+            &source,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(
+            imported.config.transcription.model_options,
+            config.transcription.model_options
+        );
+        legacy["transcription"]["model_options"] =
+            json!({"deepgram::nova-3":{"api_key":"never-import"}});
+        assert!(decode(&serde_json::to_vec(&legacy).unwrap()).is_err());
     }
 
     #[test]
@@ -731,7 +793,9 @@ mod tests {
         assert_eq!(applied.microphone_priority, source.microphone_priority);
         assert_eq!(applied.microphone_channel, source.microphone_channel);
         let transferred = Config {
-            transcription: imported.transcription.into_config(),
+            transcription: imported
+                .transcription
+                .into_config(&TranscriptionConfig::default()),
             ..Config::default()
         };
         assert_eq!(export_bytes(&applied, &transferred).unwrap(), bytes);
@@ -752,6 +816,8 @@ mod tests {
                 remove_final_period: true,
                 ..Default::default()
             };
+            source.vocabulary.terms = vec!["Nimbus-Files".into()];
+            source.vocabulary.approximate = true;
             let bytes = export_bytes(&source, &Config::default()).unwrap();
             let imported = preview_bundle(
                 decode(&bytes).unwrap(),
@@ -760,6 +826,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(imported.settings.dictation_mode, mode);
+            assert_eq!(imported.settings.vocabulary, source.vocabulary);
             assert_eq!(imported.settings.post_processing, source.post_processing);
             assert_eq!(
                 imported.settings.double_tap_lock,

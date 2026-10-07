@@ -68,6 +68,7 @@ impl ErrorKind {
     }
 
     /// Classify a transport error message from curl.
+    #[cfg(test)]
     pub fn from_transport(message: &str) -> Self {
         let lower = message.to_lowercase();
         if lower.contains("timed out")
@@ -155,6 +156,7 @@ pub struct Totals {
 impl Totals {
     fn add_sample(&mut self, sample: &Sample) {
         self.recorded_ms += sample.recorded_ms;
+        self.sent_ms += sample.sent_ms;
         if sample.skipped_silent {
             self.skipped_silent += 1;
             return;
@@ -172,7 +174,6 @@ impl Totals {
             }
             None => self.failed_dictations += 1,
         }
-        self.sent_ms += sample.sent_ms;
         self.latency_ms += sample.latency_ms;
         self.tokens += sample.tokens;
         self.cost_usd += sample.cost_usd;
@@ -283,6 +284,7 @@ impl Period {
 
 /// Add one dictation to today's totals. Failures are logged, never raised:
 /// statistics must not affect dictation.
+#[cfg(not(test))]
 pub fn record(sample: &Sample) {
     let result = (|| -> Result<()> {
         let path = crate::app_paths::support_dir()?.join(FILE);
@@ -547,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn silent_audio_counts_as_recorded_but_never_as_sent_or_failed() {
+    fn silent_batch_audio_counts_as_recorded_but_not_sent_or_failed() {
         let mut totals = Totals::default();
         totals.add_sample(&Sample {
             skipped_silent: true,
@@ -560,6 +562,22 @@ mod tests {
         assert_eq!(totals.dictations, 0);
         assert_eq!(totals.failed_dictations, 0);
         assert_eq!(totals.average_latency_ms(), None);
+    }
+
+    #[test]
+    fn final_silence_check_retains_audio_already_sent_by_streaming() {
+        let mut totals = Totals::default();
+        totals.add_sample(&Sample {
+            skipped_silent: true,
+            recorded_ms: 10_000,
+            sent_ms: 8_000,
+            ..Sample::default()
+        });
+        assert_eq!(totals.sent_ms, 8_000);
+        assert_eq!(totals.recorded_ms, 10_000);
+        assert_eq!(totals.skipped_silent, 1);
+        assert_eq!(totals.dictations, 0);
+        assert_eq!(totals.failed_dictations, 0);
     }
 
     #[test]

@@ -42,9 +42,8 @@ pub fn pending_update() -> Option<String> {
     // The binding marks this initializer deprecated without offering a
     // replacement; it remains the direct way to read a property list.
     #[allow(deprecated)]
-    let dictionary = unsafe {
-        NSDictionary::<NSString, AnyObject>::dictionaryWithContentsOfFile(&file)
-    }?;
+    let dictionary =
+        unsafe { NSDictionary::<NSString, AnyObject>::dictionaryWithContentsOfFile(&file) }?;
     let key = NSString::from_str("CFBundleShortVersionString");
     let version = dictionary
         .objectForKey(&key)?
@@ -111,19 +110,16 @@ mod tests {
     fn bundle_paths_resolve_from_the_executable_location() {
         let app = Path::new("/Applications/Hex.app");
         let bundled = app.join("Contents/MacOS/hex");
-        assert_eq!(
-            bundle_from_executable(&bundled).as_deref(),
-            Some(app)
-        );
+        assert_eq!(bundle_from_executable(&bundled).as_deref(), Some(app));
         // A binary outside a bundle's Contents directory never counts.
-        assert_eq!(bundle_from_executable(&Path::new("/tmp/hex")), None);
+        assert_eq!(bundle_from_executable(Path::new("/tmp/hex")), None);
         assert_eq!(
-            bundle_from_executable(&Path::new("/tmp/Hex.app/Contents")),
+            bundle_from_executable(Path::new("/tmp/Hex.app/Contents")),
             None
         );
         // A directory named like a bundle next to the executable is not enough.
         assert_eq!(
-            bundle_from_executable(&Path::new("/tmp/Hex.app/other/hex")),
+            bundle_from_executable(Path::new("/tmp/Hex.app/other/hex")),
             None
         );
     }

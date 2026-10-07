@@ -43,6 +43,7 @@ const CAPTURE_DEADLINE: Duration = Duration::from_millis(400);
 pub struct PasteOptions {
     pub submit_after_paste: Option<u64>,
     pub post_processing: PostProcessing,
+    pub preserve_name_case: bool,
 }
 
 pub struct Paster {
@@ -291,7 +292,12 @@ impl Paster {
             .map_or_else(
                 || text.to_string(),
                 |continuation| {
-                    join_with_preferences(&continuation.inserted, text, options.post_processing)
+                    join_with_case_policy(
+                        &continuation.inserted,
+                        text,
+                        options.post_processing.controls_initial_case()
+                            || options.preserve_name_case,
+                    )
                 },
             );
         let generation = commit_targeted_paste(
@@ -526,7 +532,7 @@ fn capture_clipboard(clipboard: &NSPasteboard) -> Result<ClipboardSnapshot> {
         unsafe { PasteboardGetItemCount(pasteboard.0, &mut item_count) },
         "count clipboard items",
     )?;
-    if item_count < 0 || item_count as usize > MAX_CLIPBOARD_ITEMS {
+    if item_count > MAX_CLIPBOARD_ITEMS {
         return Err(eyre!(
             "clipboard holds {item_count} items; refusing to snapshot more than {MAX_CLIPBOARD_ITEMS}"
         ));
@@ -759,9 +765,14 @@ fn join(previous: &str, next: &str) -> String {
     join_with_preferences(previous, next, PostProcessing::default())
 }
 
+#[cfg(test)]
 fn join_with_preferences(previous: &str, next: &str, preferences: PostProcessing) -> String {
+    join_with_case_policy(previous, next, preferences.controls_initial_case())
+}
+
+fn join_with_case_policy(previous: &str, next: &str, preserve_case: bool) -> String {
     let sentence_start = ends_sentence(previous);
-    let mut next = if preferences.controls_initial_case() {
+    let mut next = if preserve_case {
         next.to_owned()
     } else {
         set_initial_case(next, sentence_start)
@@ -851,6 +862,21 @@ fn replace_character(text: &str, index: usize, replacement: impl Iterator<Item =
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn canonical_name_case_survives_continuation() {
+        assert_eq!(
+            join_with_case_policy("Next.", "nimbus-files", true),
+            " nimbus-files"
+        );
+        assert_eq!(
+            join_with_case_policy("Use", "OpenRouter", true),
+            " OpenRouter"
+        );
+        assert_eq!(
+            join_with_case_policy("Next.", "nimbus-files", false),
+            " Nimbus-files"
+        );
+    }
     #[test]
     fn fallback_copies_only_detected_failures_when_enabled_and_committed() {
         use std::cell::Cell;

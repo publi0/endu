@@ -109,12 +109,7 @@ impl EventLog {
         let worker = thread::Builder::new()
             .name("event-writer".into())
             .spawn(move || {
-                run_event_writer(
-                    &writer_path,
-                    BufWriter::new(file),
-                    receiver,
-                    worker_error,
-                )
+                run_event_writer(&writer_path, BufWriter::new(file), receiver, worker_error)
             })?;
         Ok(Self {
             inner: Arc::new(EventLogInner {

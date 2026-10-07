@@ -518,6 +518,7 @@ mod tests {
             inference_ms: 80,
             total_ms: 1_100,
             transcription: Some(crate::openrouter::StepReport {
+                executions: Vec::new(),
                 model: Some("openai/whisper-large-v3-turbo".into()),
                 latency_ms: 120,
                 ..Default::default()
@@ -849,6 +850,7 @@ mod tests {
             inference_ms: 820,
             total_ms: 1_050,
             transcription: Some(crate::openrouter::StepReport {
+                executions: Vec::new(),
                 model: Some("openai/gpt-4o-mini-transcribe".into()),
                 latency_ms: 820,
                 failed: vec!["openai/whisper-large-v3-turbo".into()],

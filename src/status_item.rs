@@ -124,7 +124,14 @@ impl IconImages {
             .map(|index| {
                 let cycle = index as f64 / RECORDING_FRAMES as f64 * std::f64::consts::TAU;
                 let opacity = 0.775 + 0.225 * cycle.cos();
-                Self::frame(&symbol, size, 0.0, Some(opacity), IconPhase::Recording, false)
+                Self::frame(
+                    &symbol,
+                    size,
+                    0.0,
+                    Some(opacity),
+                    IconPhase::Recording,
+                    false,
+                )
             })
             .collect();
         let processing = (0..PROCESSING_FRAMES)

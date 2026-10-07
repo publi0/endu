@@ -4,8 +4,6 @@
 //! Every control saves `openrouter.json` immediately; the next dictation
 //! reads it.
 
-use std::rc::Rc;
-
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
     IntoElement, KeyDownEvent, MouseDownEvent, Render, ScrollHandle, SharedString, Subscription,
@@ -16,18 +14,18 @@ use super::catalog::{self, CatalogModel};
 use super::form::{self, AdvancedForm, MAX_FALLBACKS};
 use super::{Config, KeyStatus};
 use crate::desktop_ui::{
-    ACCENT, FAINT, LINE, MUTED, NEGATIVE, PickerState, SURFACE, SURFACE_HOVER, SURFACE_SELECTED,
-    TEXT, TEXT_SOFT, compact_button, disclosure_button, picker_open_key, picker_popup,
-    settings_panel, settings_row, settings_section_label,
+    ACCENT, FAINT, LINE, MUTED, NEGATIVE, SURFACE, SURFACE_HOVER, SURFACE_SELECTED, TEXT,
+    TEXT_SOFT, compact_button, disclosure_button, picker_open_key, picker_popup, settings_panel,
+    settings_row, settings_section_label,
 };
+use crate::providers::{Provider, keys};
 use crate::text_input::{Changed, Dismissed, EditFinished, Navigate, Submitted, TextInput};
 
 const MODEL_BUTTON_WIDTH: f32 = crate::desktop_ui::SETTINGS_CONTROL_WIDTH;
 const KEY_INPUT_WIDTH: f32 = crate::desktop_ui::SETTINGS_CONTROL_WIDTH;
 const NARROW_INPUT: f32 = crate::desktop_ui::NUMBER_INPUT_WIDTH;
 const WIDE_INPUT: f32 = crate::desktop_ui::SETTINGS_CONTROL_WIDTH;
-const PICKER_WIDTH: f32 = 380.0;
-const KEYS_URL: &str = "https://openrouter.ai/keys";
+const PICKER_WIDTH: f32 = crate::desktop_ui::SETTINGS_CONTROL_WIDTH;
 
 pub fn new<V: 'static>(preview: bool, cx: &mut Context<V>) -> Entity<OpenRouterSettings> {
     cx.new(|cx| OpenRouterSettings::new(false, preview, cx))
@@ -39,13 +37,34 @@ pub fn new_key_setup<V: 'static>(preview: bool, cx: &mut Context<V>) -> Entity<O
 }
 
 pub struct KeyChanged(pub KeyStatus);
+pub struct ConfigChanged(pub Config);
+#[derive(Clone, Copy, PartialEq)]
+enum ViewMode {
+    Models,
+    Setup,
+    Key(Provider),
+    Global,
+}
+
+pub fn new_provider_key<V: 'static>(
+    provider: Provider,
+    preview: bool,
+    cx: &mut Context<V>,
+) -> Entity<OpenRouterSettings> {
+    cx.new(|cx| OpenRouterSettings::with_mode(ViewMode::Key(provider), preview, cx))
+}
+pub fn new_global_options<V: 'static>(
+    preview: bool,
+    cx: &mut Context<V>,
+) -> Entity<OpenRouterSettings> {
+    cx.new(|cx| OpenRouterSettings::with_mode(ViewMode::Global, preview, cx))
+}
 
 /// Where the last action's outcome is shown.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Scope {
     Configuration,
     Key,
-    Language,
     Model(usize),
     Microphone,
     Advanced,
@@ -122,7 +141,8 @@ struct AdvancedInputs {
 }
 
 pub struct OpenRouterSettings {
-    key_only: bool,
+    mode: ViewMode,
+    key_provider: Provider,
     preview: bool,
     config: Config,
     key_status: Option<KeyStatus>,
@@ -131,10 +151,9 @@ pub struct OpenRouterSettings {
     key_remove_armed: bool,
     key_input: Entity<TextInput>,
     catalog: CatalogState,
+    catalog_revision: u64,
     picker: Option<ModelPicker>,
     model_focus: [FocusHandle; MAX_FALLBACKS + 1],
-    language_picker_open: bool,
-    language_picker_state: PickerState,
     advanced_open: bool,
     advanced: AdvancedInputs,
     advanced_saved: AdvancedForm,
@@ -145,9 +164,25 @@ pub struct OpenRouterSettings {
 }
 
 impl EventEmitter<KeyChanged> for OpenRouterSettings {}
+impl EventEmitter<ConfigChanged> for OpenRouterSettings {}
 
 impl OpenRouterSettings {
     fn new(key_only: bool, preview: bool, cx: &mut Context<Self>) -> Self {
+        Self::with_mode(
+            if key_only {
+                ViewMode::Setup
+            } else {
+                ViewMode::Models
+            },
+            preview,
+            cx,
+        )
+    }
+    fn with_mode(mode: ViewMode, preview: bool, cx: &mut Context<Self>) -> Self {
+        let key_provider = match mode {
+            ViewMode::Key(provider) => provider,
+            _ => Provider::OpenRouter,
+        };
         let loaded = if preview {
             Ok(Config::default())
         } else {
@@ -165,7 +200,7 @@ impl OpenRouterSettings {
             ),
         };
         let mut subscriptions = Vec::new();
-        let key_input = cx.new(|cx| TextInput::new(cx, "sk-or-v1-…", "").commit_on_blur());
+        let key_input = cx.new(|cx| TextInput::new(cx, "Paste API key", "").commit_on_blur());
         subscriptions.push(cx.subscribe(&key_input, |this, _, _: &Submitted, cx| {
             this.save_key(cx);
         }));
@@ -211,7 +246,8 @@ impl OpenRouterSettings {
             temperature: field("provider default", &form.temperature, cx),
         };
         let mut view = Self {
-            key_only,
+            mode,
+            key_provider,
             preview,
             config,
             key_status: None,
@@ -220,10 +256,9 @@ impl OpenRouterSettings {
             key_remove_armed: false,
             key_input,
             catalog: CatalogState::Idle,
+            catalog_revision: 0,
             picker: None,
             model_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
-            language_picker_open: false,
-            language_picker_state: PickerState::new(cx),
             advanced_open: false,
             advanced,
             advanced_saved: form,
@@ -234,7 +269,7 @@ impl OpenRouterSettings {
         };
         if preview {
             view.sync_key_status(KeyStatus::Missing, cx);
-        } else {
+        } else if matches!(mode, ViewMode::Key(_) | ViewMode::Setup) {
             view.refresh_key_status(cx);
         }
         view
@@ -260,6 +295,7 @@ impl OpenRouterSettings {
     /// Rebase one edit onto the latest file, leaving unrelated fields intact.
     fn commit(
         &mut self,
+        cx: &mut Context<Self>,
         scope: Scope,
         edit: impl FnOnce(&Config) -> Result<Config, String>,
         success: &str,
@@ -283,6 +319,7 @@ impl OpenRouterSettings {
             Ok(config) => {
                 self.config = config;
                 self.report(scope, Ok(success.to_owned()));
+                cx.emit(ConfigChanged(self.config.clone()));
                 true
             }
             Err(error) => {
@@ -335,8 +372,11 @@ impl OpenRouterSettings {
     }
 
     pub(crate) fn finish_editing(&mut self, cx: &mut Context<Self>) {
-        self.save_advanced(cx);
-        if self.key_input.read(cx).has_pending_edit()
+        if self.mode == ViewMode::Global {
+            self.save_advanced(cx);
+        }
+        if matches!(self.mode, ViewMode::Key(_) | ViewMode::Setup)
+            && self.key_input.read(cx).has_pending_edit()
             && !self.key_input.read(cx).text().trim().is_empty()
             && (self.key_editing || matches!(self.key_status, Some(KeyStatus::Missing)))
         {
@@ -355,7 +395,22 @@ impl OpenRouterSettings {
         self.load_advanced(&self.advanced_saved.clone(), cx);
         self.advanced_dirty = false;
         self.catalog = CatalogState::Idle;
+        self.catalog_revision = self.catalog_revision.wrapping_add(1);
         self.message = None;
+        cx.notify();
+    }
+
+    pub(crate) fn refresh_config(&mut self, config: Config, cx: &mut Context<Self>) {
+        let endpoint_changed = self.config.base_url != config.base_url;
+        self.config = config;
+        if !self.advanced_dirty {
+            self.advanced_saved = AdvancedForm::from_config(&self.config);
+            self.load_advanced(&self.advanced_saved.clone(), cx);
+        }
+        if endpoint_changed {
+            self.catalog = CatalogState::Idle;
+            self.catalog_revision = self.catalog_revision.wrapping_add(1);
+        }
         cx.notify();
     }
 
@@ -383,10 +438,11 @@ impl OpenRouterSettings {
     fn refresh_key_status(&mut self, cx: &mut Context<Self>) {
         let config = self.config.clone();
         let revision = self.key_revision;
+        let provider = self.key_provider;
         self.run(
             cx,
             KeyOperation::Refresh,
-            move || super::key_status(&config),
+            move || keys::key_status(provider, &config),
             move |this, status, cx| {
                 if this.key_revision == revision {
                     this.sync_key_status(status, cx);
@@ -424,7 +480,7 @@ impl OpenRouterSettings {
             return;
         }
         let key = self.key_input.read(cx).text().trim().to_owned();
-        if let Err(error) = super::validate_key(&key) {
+        if let Err(error) = keys::validate_key(self.key_provider, &key) {
             self.report(Scope::Key, Err(error.to_string()));
             cx.notify();
             return;
@@ -434,13 +490,17 @@ impl OpenRouterSettings {
             self.clear_message(Scope::Key);
             return;
         }
+        let provider = self.key_provider;
         self.run(
             cx,
             KeyOperation::Save,
             move || {
-                super::store_keychain_key(&key)?;
+                keys::store_keychain_key(provider, &key)?;
                 let config = super::load_config()?;
-                Ok::<_, color_eyre::Report>((super::key_status(&config), super::check_key(&config)))
+                Ok::<_, color_eyre::Report>((
+                    keys::key_status(provider, &config),
+                    keys::check_key(provider, &config),
+                ))
             },
             |this, result, cx| match result {
                 Ok((status, check)) => {
@@ -450,7 +510,7 @@ impl OpenRouterSettings {
                         Err(error) => this.report(
                             Scope::Key,
                             Err(format!(
-                                "Key saved, but OpenRouter did not accept it: {error:#}"
+                                "Key stored, but the provider could not validate it: {error:#}"
                             )),
                         ),
                     }
@@ -472,10 +532,11 @@ impl OpenRouterSettings {
             cx.notify();
             return;
         }
+        let provider = self.key_provider;
         self.run(
             cx,
             KeyOperation::Test,
-            move || super::load_config().and_then(|config| super::check_key(&config)),
+            move || super::load_config().and_then(|config| keys::check_key(provider, &config)),
             |this, result, _| {
                 this.report(Scope::Key, result.map_err(|error| format!("{error:#}")));
             },
@@ -497,12 +558,13 @@ impl OpenRouterSettings {
             self.clear_message(Scope::Key);
             return;
         }
+        let provider = self.key_provider;
         self.run(
             cx,
             KeyOperation::Remove,
             move || {
-                super::delete_keychain_key()?;
-                super::load_config().map(|config| super::key_status(&config))
+                keys::delete_keychain_key(provider)?;
+                super::load_config().map(|config| keys::key_status(provider, &config))
             },
             |this, result, cx| match result {
                 Ok(status) => {
@@ -516,7 +578,7 @@ impl OpenRouterSettings {
 
     /// Moves a plaintext key from `openrouter.json` into the Keychain.
     fn move_key_to_keychain(&mut self, cx: &mut Context<Self>) {
-        if self.busy() {
+        if self.key_provider != Provider::OpenRouter || self.busy() {
             return;
         }
         if self.preview {
@@ -525,6 +587,7 @@ impl OpenRouterSettings {
             self.clear_message(Scope::Key);
             return;
         }
+        let provider = self.key_provider;
         self.run(
             cx,
             KeyOperation::Move,
@@ -532,12 +595,12 @@ impl OpenRouterSettings {
                 let key = super::load_config()?.api_key.ok_or_else(|| {
                     color_eyre::eyre::eyre!("The file no longer contains an API key.")
                 })?;
-                super::store_keychain_key(&key)?;
+                keys::store_keychain_key(provider, &key)?;
                 let config = super::update_config(|latest| {
                     form::remove_migrated_key(latest, &key)
                         .map_err(|error| color_eyre::eyre::eyre!("{error}"))
                 })?;
-                Ok::<_, color_eyre::Report>((super::key_status(&config), config))
+                Ok::<_, color_eyre::Report>((keys::key_status(provider, &config), config))
             },
             |this, result, cx| match result {
                 Ok((status, config)) => {
@@ -568,7 +631,7 @@ impl OpenRouterSettings {
                     .map(|id| CatalogModel {
                         id: id.clone(),
                         name: id.clone(),
-                        provider: "Preview".into(),
+                        provider: catalog::provider_label(id).into(),
                     })
                     .collect(),
             );
@@ -576,12 +639,16 @@ impl OpenRouterSettings {
         }
         self.catalog = CatalogState::Loading;
         let config = self.config.clone();
+        let revision = self.catalog_revision;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { catalog::fetch(&config) })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                if this.catalog_revision != revision {
+                    return;
+                }
                 this.catalog = match result {
                     Ok(models) => CatalogState::Loaded(models),
                     Err(error) => CatalogState::Failed(format!("{error:#}")),
@@ -597,7 +664,6 @@ impl OpenRouterSettings {
         if self.busy() {
             return;
         }
-        self.language_picker_open = false;
         self.ensure_catalog(cx);
         let search = cx.new(|cx| TextInput::picker(cx, "Search models or paste an id", ""));
         let subscriptions = vec![
@@ -658,8 +724,7 @@ impl OpenRouterSettings {
     }
 
     pub fn close_pickers(&mut self, cx: &mut Context<Self>) {
-        if self.picker.take().is_some() || self.language_picker_open {
-            self.language_picker_open = false;
+        if self.picker.take().is_some() {
             cx.notify();
         }
     }
@@ -704,7 +769,8 @@ impl OpenRouterSettings {
             return Vec::new();
         };
         let query = picker.search.read(cx).text();
-        let mut choices = picker_choices(self.catalog.models(), query);
+        let catalog = catalog::available_catalog(self.catalog.models());
+        let mut choices = picker_choices(&catalog, query);
         if query.is_empty()
             && let Some(current) = self.config.transcription.models.get(picker.slot)
             && !choices.iter().any(|choice| choice.id() == current)
@@ -721,6 +787,7 @@ impl OpenRouterSettings {
             (Some(model), slot) => format!("{model} is fallback {slot}."),
         };
         let saved = self.commit(
+            cx,
             Scope::Model(slot),
             |config| form::set_model(config, slot, model.as_deref()),
             &success,
@@ -734,70 +801,11 @@ impl OpenRouterSettings {
 
     fn promote_model(&mut self, slot: usize, cx: &mut Context<Self>) {
         self.commit(
+            cx,
             Scope::Model(slot),
             |config| Ok(form::promote_model(config, slot)),
             "Order updated.",
         );
-        cx.notify();
-    }
-
-    fn choose_language(&mut self, language: &str, cx: &mut Context<Self>) -> bool {
-        let success = format!("Language: {}.", super::language_name(language));
-        let saved = self.commit(
-            Scope::Language,
-            |config| form::set_language(config, language),
-            &success,
-        );
-        if saved {
-            self.language_picker_open = false;
-        }
-        cx.notify();
-        saved
-    }
-
-    fn toggle_language_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy() {
-            return;
-        }
-        self.picker = None;
-        self.language_picker_open = !self.language_picker_open;
-        if self.language_picker_open {
-            let index = super::LANGUAGES
-                .iter()
-                .position(|(code, _)| *code == self.config.transcription.language)
-                .unwrap_or(0);
-            self.language_picker_state
-                .open(index, super::LANGUAGES.len(), window);
-        } else {
-            self.language_picker_state.trigger.focus(window);
-        }
-        cx.notify();
-    }
-
-    fn language_picker_key(
-        &mut self,
-        event: &KeyDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let key = event.keystroke.key.as_str();
-        if self
-            .language_picker_state
-            .navigate(key, super::LANGUAGES.len())
-        {
-        } else if matches!(key, "enter" | "space") {
-            if let Some((code, _)) = super::LANGUAGES.get(self.language_picker_state.highlight)
-                && self.choose_language(code, cx)
-            {
-                self.language_picker_state.trigger.focus(window);
-            }
-        } else if matches!(key, "escape" | "tab") {
-            self.language_picker_open = false;
-            self.language_picker_state.close(event, window);
-        } else {
-            return;
-        }
-        cx.stop_propagation();
         cx.notify();
     }
 
@@ -813,6 +821,7 @@ impl OpenRouterSettings {
             "Recordings are sent untrimmed."
         };
         let saved = self.commit(
+            cx,
             Scope::Microphone,
             |config| {
                 let mut config = config.clone();
@@ -878,6 +887,7 @@ impl OpenRouterSettings {
         let form = self.advanced_form(cx);
         let original = self.advanced_saved.clone();
         if self.commit(
+            cx,
             Scope::Advanced,
             |config| form.apply_changes(&original, config),
             "Saved.",
@@ -899,6 +909,7 @@ impl OpenRouterSettings {
     fn restore_advanced_defaults(&mut self, cx: &mut Context<Self>) {
         let defaults = AdvancedForm::from_config(&Config::default());
         if self.commit(
+            cx,
             Scope::Advanced,
             |config| defaults.apply(config),
             "Advanced defaults restored.",
@@ -1013,7 +1024,7 @@ impl OpenRouterSettings {
                                 .child("Get a key ↗")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     if !this.preview {
-                                        cx.open_url(KEYS_URL);
+                                        cx.open_url(this.key_provider.keys_url());
                                     }
                                 })),
                         )
@@ -1030,66 +1041,65 @@ impl OpenRouterSettings {
                 )
                 .into_any_element();
         }
-        let (badge, actions): (String, Vec<AnyElement>) =
-            match &self.key_status {
-                None => ("Checking…".into(), Vec::new()),
-                Some(KeyStatus::Keychain(suffix)) => (
-                    format!("Key saved · …{suffix}"),
-                    vec![
-                        button(self.action_label(KeyOperation::Test, "Test"), false)
-                            .id("openrouter-test-key")
-                            .when(self.busy(), |button| button.opacity(0.45))
-                            .on_click(cx.listener(|this, _, _, cx| this.test_key(cx)))
-                            .into_any_element(),
-                        button(
-                            if self.key_operation == Some(KeyOperation::Remove) {
-                                KeyOperation::Remove.label()
-                            } else if self.key_remove_armed {
-                                "Really remove?"
-                            } else {
-                                "Remove"
-                            },
-                            false,
-                        )
-                        .id("openrouter-remove-key")
+        let (badge, actions): (String, Vec<AnyElement>) = match &self.key_status {
+            None => ("Checking…".into(), Vec::new()),
+            Some(KeyStatus::Keychain(suffix)) => (
+                format!("Key saved · …{suffix}"),
+                vec![
+                    button(self.action_label(KeyOperation::Test, "Test"), false)
+                        .id("openrouter-test-key")
                         .when(self.busy(), |button| button.opacity(0.45))
-                        .when(self.key_remove_armed, |button| {
-                            button.text_color(rgb(NEGATIVE))
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| this.remove_key(cx)))
+                        .on_click(cx.listener(|this, _, _, cx| this.test_key(cx)))
                         .into_any_element(),
-                    ],
-                ),
-                Some(KeyStatus::ConfigFile) => (
-                    "Key in openrouter.json".into(),
-                    vec![
-                        button(self.action_label(KeyOperation::Test, "Test"), false)
-                            .id("openrouter-test-key")
-                            .when(self.busy(), |button| button.opacity(0.45))
-                            .on_click(cx.listener(|this, _, _, cx| this.test_key(cx)))
-                            .into_any_element(),
-                        button(
-                            self.action_label(KeyOperation::Move, "Move to Keychain"),
-                            true,
-                        )
-                        .id("openrouter-move-key")
+                    button(
+                        if self.key_operation == Some(KeyOperation::Remove) {
+                            KeyOperation::Remove.label()
+                        } else if self.key_remove_armed {
+                            "Really remove?"
+                        } else {
+                            "Remove"
+                        },
+                        false,
+                    )
+                    .id("openrouter-remove-key")
+                    .when(self.busy(), |button| button.opacity(0.45))
+                    .when(self.key_remove_armed, |button| {
+                        button.text_color(rgb(NEGATIVE))
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.remove_key(cx)))
+                    .into_any_element(),
+                ],
+            ),
+            Some(KeyStatus::ConfigFile) => (
+                "Key in openrouter.json".into(),
+                vec![
+                    button(self.action_label(KeyOperation::Test, "Test"), false)
+                        .id("openrouter-test-key")
                         .when(self.busy(), |button| button.opacity(0.45))
-                        .on_click(cx.listener(|this, _, _, cx| this.move_key_to_keychain(cx)))
+                        .on_click(cx.listener(|this, _, _, cx| this.test_key(cx)))
                         .into_any_element(),
-                    ],
-                ),
-                Some(KeyStatus::Environment) => (
-                    "Key from OPENROUTER_API_KEY".into(),
-                    vec![
-                        button(self.action_label(KeyOperation::Test, "Test"), false)
-                            .id("openrouter-test-key")
-                            .when(self.busy(), |button| button.opacity(0.45))
-                            .on_click(cx.listener(|this, _, _, cx| this.test_key(cx)))
-                            .into_any_element(),
-                    ],
-                ),
-                Some(KeyStatus::Missing) => unreachable!("handled by the editing branch"),
-            };
+                    button(
+                        self.action_label(KeyOperation::Move, "Move to Keychain"),
+                        true,
+                    )
+                    .id("openrouter-move-key")
+                    .when(self.busy(), |button| button.opacity(0.45))
+                    .on_click(cx.listener(|this, _, _, cx| this.move_key_to_keychain(cx)))
+                    .into_any_element(),
+                ],
+            ),
+            Some(KeyStatus::Environment) => (
+                format!("Key from {}", self.key_provider.env()),
+                vec![
+                    button(self.action_label(KeyOperation::Test, "Test"), false)
+                        .id("openrouter-test-key")
+                        .when(self.busy(), |button| button.opacity(0.45))
+                        .on_click(cx.listener(|this, _, _, cx| this.test_key(cx)))
+                        .into_any_element(),
+                ],
+            ),
+            Some(KeyStatus::Missing) => unreachable!("handled by the editing branch"),
+        };
         div()
             .flex_none()
             .flex()
@@ -1130,15 +1140,13 @@ impl OpenRouterSettings {
 
     fn key_description(&self) -> &'static str {
         match &self.key_status {
-            None => "Looking for your OpenRouter key…",
+            None => "Looking for this provider’s key…",
             Some(KeyStatus::Keychain(_)) => "Stored in the macOS Keychain, never in a file",
             Some(KeyStatus::ConfigFile) => {
                 "Read from openrouter.json in plain text; moving it to the Keychain is safer"
             }
             Some(KeyStatus::Environment) => "Set by the environment; it overrides any saved key",
-            Some(KeyStatus::Missing) => {
-                "Paste a key; it saves when you leave the field or press Return"
-            }
+            Some(KeyStatus::Missing) => "Uses your macOS Keychain",
         }
     }
 
@@ -1146,8 +1154,8 @@ impl OpenRouterSettings {
         let description = self.key_description();
         let control = self.render_key_control(cx);
         self.row_message(
-            settings_row("OpenRouter API key", description, control)
-                .when(self.key_only, |row| row.px_0()),
+            settings_row(self.key_provider.label(), description, control)
+                .when(self.mode == ViewMode::Setup, |row| row.px_0()),
             Scope::Key,
             true,
         )
@@ -1166,61 +1174,107 @@ impl OpenRouterSettings {
             })
     }
 
+    fn render_capabilities(&self, id: &str, width: f32, selector: String) -> gpui::Div {
+        let verified_keywords = !crate::providers::ModelRef::parse(id)
+            .capabilities()
+            .keywords
+            && !self.preview
+            && super::vocabulary_support::has_verified_support(&self.config, id);
+        let debug_selector = selector.clone();
+        div()
+            .debug_selector(move || debug_selector.clone())
+            .w(px(width))
+            .h(px(16.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .children(
+                catalog::capability_badges(id, verified_keywords)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (symbol, label))| {
+                        let label_selector = format!("{selector}-label-{index}");
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap(px(3.0))
+                            .child(
+                                div().size(px(10.0)).flex_none().child(
+                                    gpui_symbols::Icon::new(symbol)
+                                        .size(px(10.0))
+                                        .color(rgb(MUTED))
+                                        .rendering_mode(gpui_symbols::RenderingMode::Monochrome),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .debug_selector(move || label_selector.clone())
+                                    .flex_none()
+                                    .text_size(px(10.0))
+                                    .line_height(px(16.0))
+                                    .text_color(rgb(MUTED))
+                                    .child(label),
+                            )
+                    }),
+            )
+    }
+
     fn render_model_button(
         &self,
         slot: usize,
         model: Option<&str>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let catalog = self.catalog.models();
-        let (label, detail) = match model {
-            Some(id) => (catalog::label(id, catalog), Some(id.to_owned())),
-            None => ("Choose a model".to_owned(), None),
-        };
+        let label = model
+            .map(|id| {
+                format!(
+                    "{} · {}",
+                    catalog::provider_label(id),
+                    catalog::label(id, self.catalog.models())
+                )
+            })
+            .unwrap_or_else(|| "Choose a model".into());
         let open = self
             .picker
             .as_ref()
             .is_some_and(|picker| picker.slot == slot);
         let menu = open.then(|| self.render_picker(slot, model, cx));
         div()
+            .debug_selector(move || format!("model-control-{slot}"))
             .relative()
             .flex_none()
+            .w(px(MODEL_BUTTON_WIDTH))
+            .h(px(crate::desktop_ui::CONTROL_HEIGHT + 20.0))
+            .flex()
+            .flex_col()
+            .gap_1()
             .child(
-                disclosure_button(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .min_w_0()
-                        .child(div().flex_none().text_color(rgb(TEXT)).child(label.clone()))
-                        .when_some(detail.filter(|id| *id != label), |row, id| {
-                            row.child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(10.0))
-                                    .text_color(rgb(FAINT))
-                                    .child(id),
-                            )
-                        }),
-                )
-                .w(px(MODEL_BUTTON_WIDTH))
-                .id(("openrouter-model", slot))
-                .track_focus(&self.model_focus[slot].clone().tab_stop(!self.busy()))
-                .focus(|style| style.border_color(rgb(ACCENT)))
-                .when(self.busy(), |button| button.opacity(0.5))
-                .on_click(cx.listener(move |this, event, window, cx| {
-                    if matches!(event, gpui::ClickEvent::Mouse(_)) {
-                        this.toggle_model_picker(slot, window, cx);
-                    }
-                }))
-                .on_key_down(cx.listener(move |this, event, window, cx| {
-                    if picker_open_key(event) {
-                        this.toggle_model_picker(slot, window, cx);
-                        cx.stop_propagation();
-                    }
-                })),
+                disclosure_button(label)
+                    .id(("openrouter-model", slot))
+                    .track_focus(&self.model_focus[slot].clone().tab_stop(!self.busy()))
+                    .focus(|style| style.border_color(rgb(ACCENT)))
+                    .when(self.busy(), |button| button.opacity(0.5))
+                    .on_click(cx.listener(move |this, event, window, cx| {
+                        if matches!(event, gpui::ClickEvent::Mouse(_)) {
+                            this.toggle_model_picker(slot, window, cx);
+                        }
+                    }))
+                    .on_key_down(cx.listener(move |this, event, window, cx| {
+                        if picker_open_key(event) {
+                            this.toggle_model_picker(slot, window, cx);
+                            cx.stop_propagation();
+                        }
+                    })),
             )
+            .children(model.map(|id| {
+                self.render_capabilities(
+                    id,
+                    MODEL_BUTTON_WIDTH,
+                    format!("model-capabilities-{slot}"),
+                )
+            }))
             .children(menu.map(picker_popup))
             .into_any_element()
     }
@@ -1238,7 +1292,7 @@ impl OpenRouterSettings {
         let highlight = picker.highlight.min(choices.len().saturating_sub(1));
         let status: Option<AnyElement> = match &self.catalog {
             CatalogState::Idle | CatalogState::Loading => {
-                Some(picker_note("Loading OpenRouter's speech-to-text models…").into_any_element())
+                Some(picker_note("Loading OpenRouter models; direct providers are available…").into_any_element())
             }
             CatalogState::Failed(error) => Some(
                 div()
@@ -1253,7 +1307,7 @@ impl OpenRouterSettings {
                             .min_w_0()
                             .text_size(px(11.0))
                             .text_color(rgb(NEGATIVE))
-                            .child(format!("Could not load models: {error}")),
+                            .child(format!("OpenRouter unavailable: {error}. Direct-provider models remain available.")),
                     )
                     .child(
                         button("Retry", false)
@@ -1286,13 +1340,21 @@ impl OpenRouterSettings {
                 ),
                 PickerChoice::Custom(id) => (
                     format!("Use “{id}”"),
-                    "Custom model id, not in the catalog".to_owned(),
+                    format!("{} · Custom model", catalog::provider_label(id)),
                 ),
             };
+            let capabilities = self.render_capabilities(
+                choice.id(),
+                PICKER_WIDTH - 64.0,
+                format!("model-option-capabilities-{index}"),
+            );
             let id = choice.id().to_owned();
             div()
                 .id(("openrouter-model-choice", index))
+                .debug_selector(move || format!("model-option-row-{index}"))
                 .w_full()
+                .h(px(64.0))
+                .flex_none()
                 .px_3()
                 .py(px(7.0))
                 .flex()
@@ -1304,6 +1366,7 @@ impl OpenRouterSettings {
                 .hover(|row| row.bg(rgb(SURFACE_HOVER)))
                 .child(
                     div()
+                        .flex_1()
                         .min_w_0()
                         .flex()
                         .flex_col()
@@ -1321,7 +1384,8 @@ impl OpenRouterSettings {
                                 .text_color(rgb(FAINT))
                                 .truncate()
                                 .child(subtitle),
-                        ),
+                        )
+                        .child(capabilities),
                 )
                 .when(selected, |row| {
                     row.child(
@@ -1379,128 +1443,18 @@ impl OpenRouterSettings {
             .into_any_element()
     }
 
-    fn render_language_control(&self, cx: &mut Context<Self>) -> AnyElement {
-        let current = self.config.transcription.language.clone();
-        let menu = self.language_picker_open.then(|| {
-            let choose = Rc::new(cx.listener(|this, code: &&'static str, window, cx| {
-                if this.choose_language(code, cx) {
-                    this.language_picker_state.trigger.focus(window);
-                }
-            }));
-            div()
-                .id("openrouter-language-picker")
-                .track_focus(&self.language_picker_state.menu)
-                .on_key_down(cx.listener(Self::language_picker_key))
-                .debug_selector(|| "openrouter-language-picker".into())
-                .w(px(220.0))
-                .max_h(px(300.0))
-                .p_2()
-                .flex()
-                .flex_col()
-                .rounded_md()
-                .border_1()
-                .border_color(rgb(LINE))
-                .bg(rgb(SURFACE))
-                .shadow_lg()
-                .occlude()
-                .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    this.language_picker_open = false;
-                    cx.notify();
-                }))
-                .child(
-                    div()
-                        .id("language-choices")
-                        .min_h_0()
-                        .max_h(px(260.0))
-                        .track_scroll(&self.language_picker_state.scroll)
-                        .overflow_y_scroll()
-                        .flex()
-                        .flex_col()
-                        .children(super::LANGUAGES.iter().enumerate().map(
-                            |(index, (code, name))| {
-                                let selected = *code == current;
-                                let choose = choose.clone();
-                                let code: &'static str = code;
-                                div()
-                                    .id(("openrouter-language", index))
-                                    .w_full()
-                                    .h(px(30.0))
-                                    .flex_none()
-                                    .px_3()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .rounded_sm()
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(if selected { TEXT } else { TEXT_SOFT }))
-                                    .when(index == self.language_picker_state.highlight, |row| {
-                                        row.bg(rgb(SURFACE_SELECTED))
-                                    })
-                                    .hover(|row| row.bg(rgb(SURFACE_HOVER)))
-                                    .child(*name)
-                                    .when(code != super::AUTO_LANGUAGE, |row| {
-                                        row.child(
-                                            div()
-                                                .text_size(px(10.0))
-                                                .text_color(rgb(FAINT))
-                                                .child(code),
-                                        )
-                                    })
-                                    .on_click(move |_, window, cx| {
-                                        cx.stop_propagation();
-                                        choose(&code, window, cx);
-                                    })
-                            },
-                        )),
-                )
-                .children(self.render_error(Scope::Language).map(|message| {
-                    div()
-                        .id("language-feedback")
-                        .debug_selector(|| "language-feedback".into())
-                        .flex_none()
-                        .child(message)
-                }))
-        });
-        div()
-            .relative()
-            .flex_none()
-            .child(
-                disclosure_button(super::language_name(&current).to_owned())
-                    .id("openrouter-language")
-                    .track_focus(
-                        &self
-                            .language_picker_state
-                            .trigger
-                            .clone()
-                            .tab_stop(!self.busy()),
-                    )
-                    .focus(|style| style.border_color(rgb(ACCENT)))
-                    .when(self.busy(), |button| button.opacity(0.5))
-                    .on_click(cx.listener(|this, event, window, cx| {
-                        if matches!(event, gpui::ClickEvent::Mouse(_)) {
-                            this.toggle_language_picker(window, cx);
-                        }
-                    }))
-                    .on_key_down(cx.listener(|this, event, window, cx| {
-                        if picker_open_key(event) {
-                            this.toggle_language_picker(window, cx);
-                            cx.stop_propagation();
-                        }
-                    })),
-            )
-            .children(menu.map(picker_popup))
-            .into_any_element()
-    }
-
     fn render_models_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let models = self.config.transcription.models.clone();
         let mut panel = settings_panel();
         let primary = self.render_model_button(0, models.first().map(String::as_str), cx);
-        panel = panel.child(self.row_message(
-            settings_row("Primary model", "Transcribes every dictation", primary),
-            Scope::Model(0),
-            self.picker.as_ref().is_none_or(|picker| picker.slot != 0),
-        ));
+        panel = panel.child(
+            self.row_message(
+                settings_row("Primary model", "Transcribes every dictation", primary)
+                    .debug_selector(|| "model-row-0".into()),
+                Scope::Model(0),
+                self.picker.as_ref().is_none_or(|picker| picker.slot != 0),
+            ),
+        );
         let fallbacks = models.len().saturating_sub(1).min(MAX_FALLBACKS);
         for (slot, model) in models.iter().enumerate().skip(1).take(fallbacks) {
             let button = self.render_model_button(slot, Some(model.as_str()), cx);
@@ -1538,7 +1492,8 @@ impl OpenRouterSettings {
                             "Used when fallback 1 also fails"
                         },
                         control,
-                    ),
+                    )
+                    .debug_selector(move || format!("model-row-{slot}")),
                     Scope::Model(slot),
                     self.picker
                         .as_ref()
@@ -1700,13 +1655,8 @@ impl OpenRouterSettings {
                         narrow(&self.advanced.rate_limit_wait),
                     ))
                     .child(settings_row(
-                        "Temperature",
-                        "0 to 1; empty leaves it to the provider",
-                        narrow(&self.advanced.temperature),
-                    ))
-                    .child(settings_row(
-                        "API URL",
-                        "OpenRouter or a compatible endpoint",
+                        "OpenRouter API URL",
+                        "Used only by models routed through OpenRouter",
                         sized(&self.advanced.base_url, WIDE_INPUT),
                     ))
                     .child(footer),
@@ -1726,7 +1676,8 @@ fn picker_choices(catalog: &[CatalogModel], query: &str) -> Vec<PickerChoice> {
         .cloned()
         .map(PickerChoice::Catalog)
         .collect();
-    let looks_like_id = query.contains('/') && !query.chars().any(char::is_whitespace);
+    let looks_like_id =
+        (query.contains('/') || query.contains("::")) && !query.chars().any(char::is_whitespace);
     if looks_like_id && !catalog.iter().any(|model| model.id == query) {
         choices.push(PickerChoice::Custom(query.to_owned()));
     }
@@ -1755,7 +1706,7 @@ fn button(label: impl Into<SharedString>, primary: bool) -> gpui::Div {
 
 fn icon_button(glyph: &'static str, _label: &'static str) -> gpui::Div {
     div()
-        .size(px(26.0))
+        .size(px(crate::desktop_ui::CONTROL_HEIGHT))
         .flex_none()
         .flex()
         .items_center()
@@ -1778,51 +1729,29 @@ fn picker_note(text: &'static str) -> gpui::Div {
 
 impl Render for OpenRouterSettings {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.key_only {
-            let key_row = self.render_key_row(cx).px_0().border_b_0();
-            return div()
-                .child(div().border_t_1().border_color(rgb(LINE)).child(key_row))
-                .into_any_element();
+        match self.mode {
+            ViewMode::Key(_) | ViewMode::Setup => {
+                let row = self.render_key_row(cx).border_b_0();
+                return div().child(row).into_any_element();
+            }
+            ViewMode::Global => return self.render_advanced(cx),
+            ViewMode::Models => {}
         }
-        let key_row = self.render_key_row(cx);
-        let language = self.render_language_control(cx);
         let models = self.render_models_panel(cx);
-        let advanced = self.render_advanced(cx);
-        div()
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if event.keystroke.key == "tab" {
-                    if this.picker.is_some() { this.close_model_picker(window); }
-                    if event.keystroke.modifiers.shift { window.focus_prev(); }
-                    else { window.focus_next(); }
-                    cx.stop_propagation();
-                    cx.notify();
-                }
-            }))
-            .child(settings_section_label("OPENROUTER"))
-            .children(self.render_message(Scope::Configuration))
-            .child(
-                settings_panel()
-                    .child(key_row)
-                    .child(
-                        self.row_message(settings_row(
-                            "Language",
-                            "Spoken language hint; Auto-detect lets the model decide",
-                            language,
-                        ), Scope::Language, !self.language_picker_open)
-                        .border_b_0(),
-                    ),
-            )
-            .child(models)
-            .child(advanced)
-            .child(
-                div()
-                    .px_1()
-                    .pt_3()
-                    .text_size(px(11.0))
-                    .text_color(rgb(FAINT))
-                    .child("Audio goes to OpenRouter and the model's provider. Failed recordings stay on this Mac for Retry in History."),
-            )
-            .into_any_element()
+        div().on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+            if event.keystroke.key == "tab" {
+                if this.picker.is_some() { this.close_model_picker(window); }
+                if event.keystroke.modifiers.shift { window.focus_prev(); }
+                else { window.focus_next(); }
+                cx.stop_propagation();
+                cx.notify();
+            }
+        }))
+        .children(self.render_message(Scope::Configuration))
+        .child(models)
+        .child(div().px_1().pt_3().text_size(px(11.0)).text_color(rgb(FAINT))
+            .child("Models are tried in this order. Provider keys and each model's language, streaming and other options are in Providers."))
+        .into_any_element()
     }
 }
 
@@ -1831,9 +1760,102 @@ mod tests {
     use super::*;
 
     #[gpui::test]
-    fn advanced_fields_and_key_save_when_editing_finishes(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| cx.bind_keys(crate::text_input::key_bindings()));
+    fn selected_model_controls_and_capabilities_keep_compact_bounds(cx: &mut gpui::TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, cx| OpenRouterSettings::new(false, true, cx));
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                // Nova-3 exercises the densest current feature line: four badges.
+                view.config.transcription.models = vec![
+                    "deepgram::nova-3".into(),
+                    "openai::gpt-transcribe".into(),
+                    "elevenlabs::scribe_v2".into(),
+                ];
+                cx.notify();
+            })
+        });
+        for width in [1040.0, 860.0] {
+            cx.simulate_resize(gpui::size(
+                px(width - crate::desktop_ui::SIDEBAR_WIDTH),
+                px(720.0),
+            ));
+            cx.run_until_parked();
+            for (row, control, badge) in [
+                ("model-row-0", "model-control-0", "model-capabilities-0"),
+                ("model-row-1", "model-control-1", "model-capabilities-1"),
+                ("model-row-2", "model-control-2", "model-capabilities-2"),
+            ] {
+                let row = cx.debug_bounds(row).unwrap();
+                let control = cx.debug_bounds(control).unwrap();
+                let badge = cx.debug_bounds(badge).unwrap();
+                assert_eq!(control.size.width, px(MODEL_BUTTON_WIDTH));
+                assert_eq!(
+                    control.size.height,
+                    px(crate::desktop_ui::CONTROL_HEIGHT + 20.0)
+                );
+                assert_eq!(badge.size.height, px(16.0));
+                assert_eq!(badge.size.width, px(MODEL_BUTTON_WIDTH));
+                assert!(badge.size.width > px(150.0));
+                assert!(row.size.height <= px(100.0), "inflated model row: {row:?}");
+                assert!(control.bottom() <= row.bottom() + px(1.0));
+                assert!(badge.bottom() <= control.bottom() + px(1.0));
+            }
+            let badge = cx.debug_bounds("model-capabilities-0").unwrap();
+            for label in [
+                "model-capabilities-0-label-0",
+                "model-capabilities-0-label-3",
+            ] {
+                let label = cx.debug_bounds(label).unwrap();
+                assert!(
+                    label.size.width > px(5.0),
+                    "capability label collapsed: {label:?}"
+                );
+                assert!(
+                    label.left() >= badge.left() - px(1.0)
+                        && label.right() <= badge.right() + px(1.0)
+                );
+            }
+            cx.update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.open_picker(0, window, cx);
+                    let picker = view.picker.as_mut().unwrap();
+                    picker
+                        .search
+                        .update(cx, |input, cx| input.set_text("deepgram::nova-3", cx));
+                    picker.highlight = 0;
+                    picker.scroll.scroll_to_item(0);
+                    cx.notify();
+                })
+            });
+            cx.run_until_parked();
+            let choice = cx.debug_bounds("model-option-row-0").unwrap();
+            assert!(
+                (choice.size.height - px(64.0)).abs() <= px(1.0),
+                "inflated picker row: {choice:?}"
+            );
+            let badge = cx.debug_bounds("model-option-capabilities-0").unwrap();
+            let label = cx
+                .debug_bounds("model-option-capabilities-0-label-3")
+                .unwrap();
+            assert!(badge.size.width > px(150.0));
+            assert!(label.size.width > px(5.0));
+            assert!(
+                label.right() <= badge.right() + px(1.0),
+                "last badge is outside its line: {label:?} / {badge:?}"
+            );
+            cx.update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.close_model_picker(window);
+                    cx.notify();
+                })
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn global_fields_save_on_blur_and_escape_reverts(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.bind_keys(crate::text_input::key_bindings()));
+        let (view, cx) =
+            cx.add_window_view(|_, cx| OpenRouterSettings::with_mode(ViewMode::Global, true, cx));
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.advanced_open = true;
@@ -1845,14 +1867,34 @@ mod tests {
         cx.update(|window, cx| {
             view.read(cx)
                 .advanced
-                .temperature
+                .attempt_timeout
                 .focus_handle(cx)
                 .focus(window)
         });
         cx.simulate_keystrokes("cmd-a");
-        cx.simulate_input("0.");
-        cx.update(|_, cx| assert_eq!(view.read(cx).advanced.temperature.read(cx).text(), "0."));
-        cx.simulate_input("5");
+        cx.simulate_input("45");
+        cx.update(|_, cx| {
+            assert_eq!(view.read(cx).advanced.attempt_timeout.read(cx).text(), "45");
+            assert!(
+                view.read(cx)
+                    .advanced
+                    .attempt_timeout
+                    .read(cx)
+                    .has_pending_edit()
+            );
+            assert_eq!(
+                view.read(cx).config.transcription.attempt_timeout_seconds,
+                30
+            );
+        });
+        cx.update(|window, _| window.blur());
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(
+                view.read(cx).config.transcription.attempt_timeout_seconds,
+                45
+            )
+        });
         cx.update(|window, cx| {
             view.read(cx)
                 .advanced
@@ -1860,16 +1902,16 @@ mod tests {
                 .focus_handle(cx)
                 .focus(window)
         });
-        cx.run_until_parked();
-        cx.update(|_, cx| assert_eq!(view.read(cx).config.transcription.temperature, Some(0.5)));
         cx.simulate_keystrokes("cmd-a");
         cx.simulate_input("0");
         cx.update(|window, _| window.blur());
         cx.run_until_parked();
         cx.update(|_, cx| {
-            let view = view.read(cx);
-            assert_eq!(view.config.transcription.attempt_timeout_seconds, 30);
-            assert!(view.render_error(Scope::Advanced).is_some());
+            assert_eq!(
+                view.read(cx).config.transcription.attempt_timeout_seconds,
+                45
+            );
+            assert!(view.read(cx).render_error(Scope::Advanced).is_some());
         });
         cx.update(|window, cx| {
             view.read(cx)
@@ -1879,11 +1921,23 @@ mod tests {
                 .focus(window)
         });
         cx.simulate_keystrokes("escape");
-        cx.update(|_, cx| assert_eq!(view.read(cx).advanced.attempt_timeout.read(cx).text(), "30"));
+        cx.update(|_, cx| assert_eq!(view.read(cx).advanced.attempt_timeout.read(cx).text(), "45"));
+    }
 
+    #[gpui::test]
+    fn provider_key_saves_on_blur_and_escape_cancels(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.bind_keys(crate::text_input::key_bindings()));
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            OpenRouterSettings::with_mode(ViewMode::Key(Provider::OpenAi), true, cx)
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
         cx.update(|window, cx| view.read(cx).key_input.focus_handle(cx).focus(window));
         cx.simulate_input("preview-key-0123456789");
-        cx.update(|_, cx| assert_eq!(view.read(cx).key_status(), Some(&KeyStatus::Missing)));
+        cx.update(|_, cx| {
+            assert!(view.read(cx).key_input.read(cx).has_pending_edit());
+            assert_eq!(view.read(cx).key_status(), Some(&KeyStatus::Missing));
+        });
         cx.update(|window, _| window.blur());
         cx.run_until_parked();
         cx.update(|_, cx| {
@@ -1893,15 +1947,12 @@ mod tests {
             )
         });
         cx.update(|window, cx| view.update(cx, |view, cx| view.begin_key_replacement(window, cx)));
-        cx.run_until_parked();
         cx.simulate_input("cancelled-preview-key");
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
         cx.update(|_, cx| {
-            let view = view.read(cx);
-            assert!(!view.key_editing);
-            assert!(view.key_input.read(cx).text().is_empty());
-            assert_eq!(view.key_status(), Some(&KeyStatus::Keychain("demo".into())));
+            assert!(!view.read(cx).key_editing);
+            assert!(view.read(cx).key_input.read(cx).text().is_empty());
         });
     }
 
@@ -1941,39 +1992,32 @@ mod tests {
     }
 
     #[gpui::test]
-    fn keyboard_reaches_selectors_and_returns_focus_after_selection(cx: &mut gpui::TestAppContext) {
+    fn models_selector_supports_keyboard_and_native_choices_when_openrouter_fails(
+        cx: &mut gpui::TestAppContext,
+    ) {
         cx.update(|cx| cx.bind_keys(crate::text_input::key_bindings()));
         let (view, cx) = cx.add_window_view(|_, cx| OpenRouterSettings::new(false, true, cx));
         cx.update(|window, cx| {
-            view.update(cx, |view, cx| view.key_input.focus_handle(cx).focus(window))
+            view.update(cx, |view, cx| {
+                assert!(!view.has_key_operation());
+                view.model_focus[0].focus(window);
+                view.toggle_model_picker(0, window, cx);
+                view.catalog = CatalogState::Failed("Offline fixture".into());
+                assert!(
+                    view.picker_choices(cx)
+                        .iter()
+                        .any(|choice| choice.id() == "deepgram::nova-3")
+                );
+            })
         });
-        cx.simulate_keystrokes("tab");
-        cx.update(|window, cx| {
-            assert!(
-                view.read(cx)
-                    .language_picker_state
-                    .trigger
-                    .is_focused(window)
-            )
-        });
-        cx.simulate_keystrokes("enter down enter");
+        cx.simulate_input("deepgram::nova-3");
+        cx.simulate_keystrokes("enter");
         cx.simulate_event(gpui::KeyUpEvent {
             keystroke: gpui::Keystroke::parse("enter").unwrap(),
         });
         cx.update(|window, cx| {
             let view = view.read(cx);
-            assert_eq!(
-                view.config.transcription.language,
-                super::super::LANGUAGES[1].0
-            );
-            assert!(!view.language_picker_open);
-            assert!(view.language_picker_state.trigger.is_focused(window));
-            assert!(matches!(view.message, Some((Scope::Language, true, _))));
-            assert!(view.render_message(Scope::Language).is_none());
-        });
-        cx.simulate_keystrokes("tab enter escape");
-        cx.update(|window, cx| {
-            let view = view.read(cx);
+            assert_eq!(view.config.transcription.models[0], "deepgram::nova-3");
             assert!(view.picker.is_none());
             assert!(view.model_focus[0].is_focused(window));
         });
@@ -2026,7 +2070,7 @@ mod tests {
         cx.update(|_, cx| {
             let view = view.read(cx);
             let picker = view.picker.as_ref().unwrap();
-            assert_eq!(picker.highlight, 28);
+            assert_eq!(picker.highlight, catalog::available_catalog(&[]).len() + 28);
             assert!(picker.scroll.offset().y < px(0.0));
         });
     }
@@ -2063,9 +2107,7 @@ mod tests {
             view.update(cx, |view, cx| {
                 assert_eq!(view.config, Config::default());
                 assert_eq!(view.key_status(), Some(&KeyStatus::Missing));
-                view.choose_language("pt", cx);
                 view.choose_model(0, Some("preview/model".into()), cx);
-                assert_eq!(view.config.transcription.language, "pt");
                 assert_eq!(view.config.transcription.models[0], "preview/model");
                 view.ensure_catalog(cx);
                 assert!(!view.catalog.models().is_empty());
@@ -2104,14 +2146,13 @@ mod tests {
             view.update(cx, |view, cx| {
                 let original = view.config.clone();
                 view.key_operation = Some(KeyOperation::Refresh);
-                view.choose_language("pt", cx);
                 view.choose_model(0, Some("preview/model".into()), cx);
                 assert!(view.toggle_trim(cx).is_err());
                 view.restore_advanced_defaults(cx);
                 assert_eq!(view.config, original);
                 view.key_operation = None;
-                view.choose_language("pt", cx);
-                assert_eq!(view.config.transcription.language, "pt");
+                view.choose_model(0, Some("preview/model".into()), cx);
+                assert_eq!(view.config.transcription.models[0], "preview/model");
             });
         });
     }

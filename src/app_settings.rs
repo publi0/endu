@@ -451,6 +451,7 @@ pub struct AppSettings {
     pub history_retention: crate::history::HistoryRetention,
     pub hud: crate::hud_settings::HudPreferences,
     pub post_processing: crate::post_processing::Preferences,
+    pub vocabulary: crate::vocabulary::Vocabulary,
 }
 
 impl Default for AppSettings {
@@ -477,6 +478,7 @@ impl Default for AppSettings {
             history_retention: crate::history::HistoryRetention::default(),
             hud: crate::hud_settings::HudPreferences::default(),
             post_processing: crate::post_processing::Preferences::default(),
+            vocabulary: crate::vocabulary::Vocabulary::default(),
         }
     }
 }
@@ -512,6 +514,10 @@ impl AppSettings {
         match fs::read(path) {
             Ok(data) => {
                 let mut settings: Self = serde_json::from_slice(&data)?;
+                settings
+                    .vocabulary
+                    .validate()
+                    .map_err(|message| eyre!(message))?;
                 let loaded = serde_json::to_value(&settings)?;
                 let raw: serde_json::Value = serde_json::from_slice(&data)?;
                 if raw.get("dictation_mode").is_none() {
@@ -551,6 +557,9 @@ impl AppSettings {
     }
 
     pub(crate) fn write_to(&self, path: &std::path::Path) -> Result<()> {
+        self.vocabulary
+            .validate()
+            .map_err(|message| eyre!(message))?;
         let parent = path
             .parent()
             .ok_or_else(|| eyre!("settings path has no parent"))?;
@@ -579,6 +588,7 @@ impl AppSettings {
     pub(crate) fn apply_runtime(&self) {
         self.hud.apply_runtime();
         self.post_processing.apply_runtime();
+        self.vocabulary.apply_runtime();
         COPY_ON_PASTE_FAILURE.store(self.copy_on_paste_failure, Ordering::Release);
         RELEASE_MICROPHONE_WHILE_IDLE.store(self.release_microphone_while_idle, Ordering::Release);
         crate::feedback::set_enabled(self.sound_effects);

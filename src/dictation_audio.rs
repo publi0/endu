@@ -459,6 +459,8 @@ impl Owner {
                     self.drain_through(at);
                     self.capture.become_intentional(at)
                 };
+                self.capture
+                    .publish_live_prefix(self.pending_input.oldest());
                 let _ = reply.send(became_intentional);
             }
             Command::Finish { at, reply } => {
@@ -612,6 +614,8 @@ impl Owner {
                     });
                     if let Some(at) = pending.intentional_at {
                         let _ = self.capture.become_intentional(at);
+                        self.capture
+                            .publish_live_prefix(self.pending_input.oldest());
                         let _ = self.events.send(DictationAudioEvent::ReadyIntentional {
                             capture_generation: self
                                 .state

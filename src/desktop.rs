@@ -113,6 +113,12 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
     } else {
         AppSettings::default()
     };
+    if listener.is_some()
+        && settings.vocabulary.remote_hints
+        && !settings.vocabulary.terms.is_empty()
+    {
+        crate::openrouter::vocabulary_support::schedule(false);
+    }
     let show_dock_icon = settings.show_dock_icon;
     let setup_ready = listener.is_none() || crate::onboarding::status().ready();
     let onboarding_completed = listener.is_none() || crate::onboarding::completion_recorded();
@@ -279,8 +285,8 @@ fn join_listener(worker: &Rc<RefCell<Option<JoinHandle<()>>>>) {
 fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
     use crate::app_window::{
         CloseWindow, HideApplication, MinimizeWindow, QuitApplication, ShowHistory, ShowHud,
-        ShowMicrophone, ShowModels, ShowPostProcessing, ShowSettings, ShowStatistics,
-        ToggleFullscreen,
+        ShowMicrophone, ShowModels, ShowPostProcessing, ShowProviders, ShowSettings,
+        ShowStatistics, ToggleFullscreen,
     };
     cx.bind_keys([
         KeyBinding::new("cmd-w", CloseWindow, None),
@@ -296,11 +302,16 @@ fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
         KeyBinding::new("cmd-5", ShowHud, None),
         KeyBinding::new("cmd-6", ShowMicrophone, None),
         KeyBinding::new("cmd-7", ShowPostProcessing, None),
+        KeyBinding::new("cmd-8", ShowProviders, None),
     ]);
     cx.bind_keys(crate::text_input::key_bindings());
     let settings_ui = ui.clone();
     cx.on_action(move |_: &ShowSettings, cx| {
         settings_ui.open_pane(cx, |window, cx| window.show_settings(cx));
+    });
+    let providers_ui = ui.clone();
+    cx.on_action(move |_: &ShowProviders, cx| {
+        providers_ui.open_pane(cx, |window, cx| window.show_providers(cx));
     });
     let models_ui = ui.clone();
     cx.on_action(move |_: &ShowModels, cx| {
@@ -343,6 +354,7 @@ fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
             items: vec![
                 MenuItem::action("Settings", ShowSettings),
                 MenuItem::action("Microphone", ShowMicrophone),
+                MenuItem::action("Providers", ShowProviders),
                 MenuItem::action("Models", ShowModels),
                 MenuItem::action("Post-processing", ShowPostProcessing),
                 MenuItem::action("HUD", ShowHud),
@@ -513,7 +525,7 @@ mod tests {
     fn menu_actions_reopen_a_closed_window(cx: &mut gpui::TestAppContext) {
         use crate::app_window::{
             PreviewPane, ShowHistory, ShowHud, ShowMicrophone, ShowModels, ShowPostProcessing,
-            ShowSettings, ShowStatistics,
+            ShowProviders, ShowSettings, ShowStatistics,
         };
 
         let (listener_controls, _controls) = mpsc::sync_channel(1);
@@ -531,11 +543,12 @@ mod tests {
             }),
         });
         cx.update(|cx| install_menus(cx, &ui));
-        let actions: [&dyn gpui::Action; 7] = [
+        let actions: [&dyn gpui::Action; 8] = [
             &ShowSettings,
             &ShowMicrophone,
             &ShowPostProcessing,
             &ShowModels,
+            &ShowProviders,
             &ShowHud,
             &ShowHistory,
             &ShowStatistics,

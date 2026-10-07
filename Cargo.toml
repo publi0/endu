@@ -1,6 +1,6 @@
 [package]
 name = "voice-control"
-version = "3.1.6"
+version = "3.2.0"
 edition = "2024"
 default-run = "voice-control"
 license = "MIT"
@@ -28,6 +28,9 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+ureq = { version = "3", features = ["json"] }
+tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
+url = "2.5"
 unicode-segmentation = "1.13.3"
 unicode-properties = { version = "0.1.4", default-features = false, features = ["general-category"] }
 

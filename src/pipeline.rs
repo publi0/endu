@@ -61,6 +61,7 @@ struct TranscriptionJob {
     clip: DictationClip,
     context: ContextSnapshot,
     options: PasteOptions,
+    vocabulary: crate::vocabulary::Snapshot,
 }
 
 /// Pipeline timings carried from transcription through output.
@@ -115,6 +116,7 @@ impl OutputJob {
 struct JobControl {
     cancelled: AtomicBool,
     output_started: Mutex<bool>,
+    stream_cancel: Option<Arc<AtomicBool>>,
 }
 
 impl JobControl {
@@ -126,6 +128,9 @@ impl JobControl {
             .unwrap_or_else(|error| error.into_inner());
         if *output_started {
             return false;
+        }
+        if let Some(cancel) = &self.stream_cancel {
+            cancel.store(true, Ordering::Release);
         }
         !self.cancelled.swap(true, Ordering::AcqRel)
     }
@@ -215,12 +220,10 @@ impl DictationWorker {
     ) -> Self {
         Self::start_with(
             history,
-            move |samples, context| {
-                recovery.transcribe_original(
-                    samples,
-                    context.application.as_deref(),
-                    crate::openrouter::transcribe::transcribe,
-                )
+            move |samples, context, vocabulary, live| {
+                recovery.transcribe_original(samples, context.application.as_deref(), |samples| {
+                    crate::providers::batch::transcribe(samples, vocabulary, live)
+                })
             },
             move || {
                 let mut paster = Paster::new(activity);
@@ -241,6 +244,8 @@ impl DictationWorker {
         transcribe: impl FnMut(
             &[f32],
             &ContextSnapshot,
+            &crate::vocabulary::Snapshot,
+            Option<crate::providers::streaming::PendingLive>,
         ) -> Result<crate::openrouter::transcribe::Transcription>
         + Send
         + 'static,
@@ -293,7 +298,16 @@ impl DictationWorker {
     ) -> Result<DictationJobId, &'static str> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let job_id = DictationJobId(state.next_output_sequence()?);
-        let control = Arc::new(JobControl::default());
+        let control = Arc::new(JobControl {
+            stream_cancel: clip.live.as_ref().map(|live| live.cancellation_flag()),
+            ..Default::default()
+        });
+        let vocabulary = clip
+            .live
+            .as_ref()
+            .map_or_else(crate::vocabulary::Snapshot::current, |live| {
+                live.vocabulary.clone()
+            });
         self.transcription_jobs
             .as_ref()
             .ok_or("dictation worker is unavailable")?
@@ -304,8 +318,10 @@ impl DictationWorker {
                 options: PasteOptions {
                     submit_after_paste,
                     post_processing: crate::post_processing::Preferences::current(),
+                    preserve_name_case: false,
                 },
                 clip,
+                vocabulary,
                 context,
             })
             .map(|()| {
@@ -409,10 +425,12 @@ fn run_transcription_worker(
     mut transcribe: impl FnMut(
         &[f32],
         &ContextSnapshot,
+        &crate::vocabulary::Snapshot,
+        Option<crate::providers::streaming::PendingLive>,
     ) -> Result<crate::openrouter::transcribe::Transcription>,
 ) {
     prioritize_transcription_thread();
-    while let Ok(job) = jobs.recv() {
+    while let Ok(mut job) = jobs.recv() {
         if is_shutting_down(state) {
             break;
         }
@@ -424,10 +442,11 @@ fn run_transcription_worker(
         let queue_ms = job.submitted_at.elapsed().as_millis();
         let audio_ms = job.clip.duration_ms();
         let input_description = job.clip.input.clone();
+        let live = job.clip.live.take().map(|live| *live);
         let samples = job.clip.into_transcription_samples();
         crate::microphone::record(&samples, input_description);
         let started = Instant::now();
-        let result = transcribe(&samples, &job.context);
+        let result = transcribe(&samples, &job.context, &job.vocabulary, live);
         if is_shutting_down(state) {
             break;
         }
@@ -438,17 +457,22 @@ fn run_transcription_worker(
             inference_ms: started.elapsed().as_millis(),
         };
         let result = result
-            .map(|transcription| CompletedTranscript {
-                options: job.options,
-                text: job
+            .map(|transcription| {
+                let formatted = job
                     .options
                     .post_processing
-                    .process(transcription.text.trim())
-                    .trim()
-                    .to_owned(),
-                context: job.context,
-                timings,
-                report: transcription.report,
+                    .process(transcription.text.trim());
+                let restored = job.vocabulary.restore(formatted.trim());
+                CompletedTranscript {
+                    options: PasteOptions {
+                        preserve_name_case: restored.preserve_initial_case,
+                        ..job.options
+                    },
+                    text: restored.text.trim().to_owned(),
+                    context: job.context,
+                    timings,
+                    report: transcription.report,
+                }
             })
             .map_err(|error| format!("{error:#}"));
         if output
@@ -991,7 +1015,7 @@ mod tests {
         let mut count = 0;
         let worker = DictationWorker::start_with(
             None,
-            move |_, _| {
+            move |_, _, _, _| {
                 count += 1;
                 Ok(test_transcription(if count == 1 { "held" } else { "next" }))
             },
@@ -1035,6 +1059,25 @@ mod tests {
         let sequences: Vec<u64> = ready.iter().map(OutputJob::sequence).collect();
         assert_eq!(sequences, [0, 1]);
         assert!(ordered.push(completed(0, "stale")).is_empty());
+    }
+
+    #[test]
+    fn job_cancellation_closes_its_stream_and_output_commit_keeps_its_existing_contract() {
+        let stream = Arc::new(AtomicBool::new(false));
+        let control = JobControl {
+            stream_cancel: Some(stream.clone()),
+            ..Default::default()
+        };
+        assert!(control.cancel());
+        assert!(stream.load(Ordering::Acquire));
+        let stream = Arc::new(AtomicBool::new(false));
+        let control = JobControl {
+            stream_cancel: Some(stream.clone()),
+            ..Default::default()
+        };
+        assert!(control.begin_output());
+        assert!(!control.cancel());
+        assert!(!stream.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1194,21 +1237,55 @@ mod tests {
                 remove_ellipses: true,
                 ..Preferences::default()
             },
+            Preferences {
+                lowercase: true,
+                remove_punctuation: true,
+                ..Default::default()
+            },
         ]
         .into_iter()
         .enumerate()
         {
+            let vocabulary = crate::vocabulary::Snapshot::new(crate::vocabulary::Vocabulary {
+                terms: if index == 3 {
+                    vec!["Nimbus-Files".into()]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            });
+            let mut clip = DictationClip::from_samples(vec![0.1; 1_600]);
+            if index == 3 {
+                // Exercise the actual provider dispatcher on a completed live
+                // result, then the same formatting/vocabulary/History path.
+                let mut config = crate::openrouter::Config::default();
+                config.transcription.models = vec!["deepgram::nova-3".into()];
+                config.transcription.trim_silence = false;
+                clip.live = Some(Box::new(crate::providers::streaming::PendingLive::fixture(
+                    config,
+                    vocabulary.clone(),
+                    Ok(crate::providers::streaming::LiveResult {
+                        text: "NIMBUSFILES".into(),
+                        model: "deepgram::nova-3".into(),
+                        keyword_count: 1,
+                        latency_ms: 425,
+                    }),
+                    1_600,
+                )));
+            }
             jobs.send(TranscriptionJob {
+                vocabulary,
                 job_id: DictationJobId(index as u64),
                 control: Arc::new(JobControl::default()),
                 submitted_at: Instant::now(),
-                clip: DictationClip::from_samples(vec![0.1; 1_600]),
+                clip,
                 context: ContextSnapshot {
                     application: Some(index.to_string()),
                     ..Default::default()
                 },
                 options: PasteOptions {
                     post_processing: preferences,
+                    preserve_name_case: false,
                     submit_after_paste: Some(17),
                 },
             })
@@ -1216,15 +1293,27 @@ mod tests {
         }
         drop(jobs);
         let state = Mutex::new(WorkerState::default());
-        run_transcription_worker(receiver, &output, &events, &state, |_, context| {
-            Ok(test_transcription(
-                if context.application.as_deref() == Some("2") {
-                    "..."
-                } else {
-                    "Olá...  JOÃO."
-                },
-            ))
-        });
+        run_transcription_worker(
+            receiver,
+            &output,
+            &events,
+            &state,
+            |samples, context, vocabulary, live| {
+                if live.is_some() {
+                    return crate::providers::batch::transcribe(samples, vocabulary, live);
+                }
+                Ok(test_transcription(
+                    if context.application.as_deref() == Some("2") {
+                        "..."
+                    } else if context.application.as_deref() == Some("3") {
+                        assert_eq!(vocabulary.settings().terms, ["Nimbus-Files"]);
+                        "NIMBUSFILES"
+                    } else {
+                        "Olá...  JOÃO."
+                    },
+                ))
+            },
+        );
         let directory = std::env::temp_dir().join(format!(
             "hex-post-history-{}-{}",
             std::process::id(),
@@ -1286,6 +1375,35 @@ mod tests {
             matches!(event, WorkerEvent::Completed { result: Ok(text), .. } if text.is_empty())
         );
         assert_eq!(history.search("").len(), 1);
+        finish_output(
+            outputs.recv().unwrap(),
+            &mut |text, _, options, commit| {
+                assert_eq!(text, "Nimbus-Files");
+                assert!(options.preserve_name_case);
+                assert!(commit());
+                Ok(PasteOutcome::Pasted)
+            },
+            &mut last,
+            Some(&history),
+            &state,
+        );
+        finish_output(
+            OutputJob::PasteLast {
+                sequence: 4,
+                target: ContextSnapshot::default(),
+            },
+            &mut |text, _, options, commit| {
+                assert_eq!(text, "Nimbus-Files");
+                assert!(options.preserve_name_case);
+                assert_eq!(options.submit_after_paste, None);
+                assert!(commit());
+                Ok(PasteOutcome::Pasted)
+            },
+            &mut last,
+            Some(&history),
+            &state,
+        );
+        assert_eq!(history.search("Nimbus").len(), 1);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1296,6 +1414,7 @@ mod tests {
         let (events, _events) = mpsc::channel();
         let control = Arc::new(JobControl::default());
         jobs.send(TranscriptionJob {
+            vocabulary: crate::vocabulary::Snapshot::default(),
             options: PasteOptions::default(),
             job_id: DictationJobId(0),
             control,
@@ -1313,7 +1432,7 @@ mod tests {
             &output,
             &events,
             &Mutex::new(WorkerState::default()),
-            |_, context| {
+            |_, context, _, _| {
                 assert_eq!(context.application.as_deref(), Some("Notes"));
                 Err(color_eyre::eyre::eyre!("offline"))
             },
@@ -1367,7 +1486,7 @@ mod tests {
             None,
             {
                 let calls = calls.clone();
-                move |_, _| {
+                move |_, _, _, _| {
                     let _alive = &network_alive;
                     if calls.fetch_add(1, Ordering::SeqCst) == 0 {
                         return Ok(test_transcription("previous"));
@@ -1427,7 +1546,7 @@ mod tests {
             let (pasted, pastes) = mpsc::channel();
             let worker = DictationWorker::start_with(
                 None,
-                |_, _| Ok(test_transcription("previous")),
+                |_, _, _, _| Ok(test_transcription("previous")),
                 move || {
                     let mut first = true;
                     Box::new(move |prepare_only, text, _, _submit, commit| {

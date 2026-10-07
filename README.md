@@ -5,7 +5,7 @@
 <h1 align="center">Hex</h1>
 
 <p align="center">
-  Ditado por atalho para macOS, com transcrição via OpenRouter.
+  Ditado por atalho para macOS, com OpenRouter, OpenAI, Deepgram e ElevenLabs Scribe.
 </p>
 
 ## Instalação rápida
@@ -36,14 +36,14 @@ Você escolhe o modelo e os fallbacks; o app cuida da
 captura, do corte de silêncio e da ordem de entrega dos ditados.
 
 ```text
-atalho → gravação → corte de silêncio → OpenRouter → formatação local → colar
-                                             ↓ erro
-                                       próximo modelo
+atalho → gravação / streaming → provider → formatação local → colar
+                                  ↓ erro
+                             próximo modelo
 ```
 
-O app fica na barra de menus e reúne sete telas: **Settings**, **Microphone**, **Models**, **Post-processing**,
-**HUD**, **History** e **Statistics**. A transcrição exige conexão à internet e uma chave própria do
-[OpenRouter](https://openrouter.ai/keys).
+O app fica na barra de menus e reúne **Settings**, **Microphone**, **Providers**,
+**Models**, **Post-processing**, **HUD**, **History** e **Statistics**. A transcrição
+exige conexão à internet e uma chave própria de pelo menos um provider configurado.
 
 ## Tamanho em relação ao original
 
@@ -103,8 +103,11 @@ ou concede permissões por conta própria.
 
 1. Abra o **Hex** e conceda Microfone, Input Monitoring e Acessibilidade na
    tela de setup. As permissões são concedidas por você nos ajustes do macOS.
-2. Cole sua chave do OpenRouter. O app a salva no Keychain e testa o acesso.
-3. Em **Models**, escolha o modelo principal, os fallbacks e o idioma.
+2. Em **Providers**, conecte OpenRouter, OpenAI, Deepgram ou ElevenLabs. Cada
+   chave fica em uma entrada separada do Keychain. No setup, **Choose another
+   provider** abre essa tela.
+3. Em **Models**, escolha o principal e os fallbacks. Os ajustes de cada modelo
+   ficam em **Providers** e são salvos automaticamente.
 4. Coloque o cursor onde quer escrever, toque **Option**, fale e pressione
    **Option** novamente para encerrar. Segurar e soltar também funciona.
 
@@ -165,6 +168,73 @@ opções e **Esc** fecha. A seleção do controle confirma o salvamento; mensage
 aparecem somente para erros ou resultados de testes explícitos. Durante uma operação com a chave, ações incompatíveis
 ficam indisponíveis até ela terminar.
 
+## Vocabulário personalizado
+
+Em **Models → Keywords**, cada nome aparece como uma pílula. Digite a palavra
+ou expressão e pressione **Return** para adicioná-la; espaços mantêm expressões
+como “Claude Code” juntas. Colar várias linhas ou termos separados por vírgula
+adiciona várias pílulas. O campo também conclui a inclusão ao perder o foco.
+
+O **×** remove a pílula inteira. Com o campo vazio, **Backspace** remove a última;
+**Esc** descarta apenas o texto ainda em edição. O mesmo controle aparece em
+**Post-processing**, com a lista compartilhada. Não é necessário cadastrar
+cada variação de um nome.
+
+- **Send keywords** usa uma lista única para o principal e todos os fallbacks
+  compatíveis. A seção aparece quando qualquer modelo da cadeia tem suporte.
+  Cada adaptador envia somente os termos válidos que cabem nos seus limites.
+  Os mesmos nomes ficam disponíveis para correção local em **Post-processing**.
+- **Restore names locally** reconhece diferenças de caixa, espaços, hífens e
+  pontuação de nomes completos. A grafia cadastrada prevalece sobre as outras
+  opções de formatação.
+- **Correct small spelling errors**, desligado por padrão, permite uma diferença
+  de caractere em nomes longos, somente quando há um candidato claro. Não corrige
+  automaticamente nomes curtos ou ambíguos, nem altera números/versões. O corretor evita URLs, caminhos,
+  e-mails e trechos de código identificáveis no texto recebido.
+- **Try the local correction** permite testar texto no próprio Mac, sem chamada
+  ao modelo. A lista também faz parte da exportação/importação de preferências.
+
+Cada ditado e Retry recebe uma cópia das regras vigentes. History e Paste Last
+mantêm o resultado; editar o vocabulário não altera textos antigos.
+
+### Como a compatibilidade é verificada
+
+O catálogo do OpenRouter não informa de forma completa o suporte a vocabulário.
+O Hex consulta as rotas e verifica os formatos conhecidos de Azure, OpenAI,
+Groq e Deepgram. Usa um áudio sintético de aproximadamente dois segundos e nomes
+fictícios: primeiro testa o parâmetro válido e um tipo inválido; quando necessário,
+compara as grafias em uma sequência A/B/A. **HTTP 200 sozinho não comprova suporte.**
+As verificações usam a chave existente e podem gerar pequenas cobranças de
+transcrição do fornecedor. Nunca usam gravações ou nomes do usuário como amostra.
+
+O resultado fica em cache por sete dias quando há evidência de suporte e por
+um dia quando a verificação é inconclusiva. Falhas de acesso/rede expiram em
+cinco minutos. **Recheck OpenRouter** repete a verificação. Vários endpoints para o
+mesmo modelo não podem ser isolados nessa API; essas rotas e fornecedores sem
+adaptador ficam com correção local. Aceitar um parâmetro ou influenciar uma
+amostra não garante o reconhecimento de todo nome.
+
+São aceitos até 2.000 nomes locais, com até 128 bytes por nome. Os limites de
+envio dependem do modelo e do modo: nenhum termo é cortado no meio para caber.
+No OpenRouter, Azure recebe até 2.000 nomes; os demais adaptadores usam limites
+conservadores de até 50 nomes e 200–400 bytes. Os providers diretos usam seus
+formatos próprios, incluindo keywords, keyterms e contexto de vocabulário.
+Listas grandes podem aumentar a latência. No ElevenLabs, keyterms acrescentam
+20% ao custo; mais de 100 termos em batch também impõem uma cobrança mínima
+de 20 segundos. Essas regras pertencem ao provider e podem mudar.
+Se um fornecedor rejeitar o vocabulário, o Hex tenta uma vez sem ele, respeitando
+o prazo existente, e mantém a cadeia normal de fallbacks. A correção local continua.
+
+Para verificar os modelos por linha de comando, usando a mesma amostra sintética:
+
+```sh
+cargo run -- validate-vocabulary
+```
+
+Referências: [OpenRouter STT](https://openrouter.ai/docs/guides/overview/multimodal/stt),
+[Azure phrase lists](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/improve-accuracy-phrase-list)
+e [Deepgram keyterms](https://developers.deepgram.com/docs/keyterm).
+
 ## HUD
 
 Em **HUD**, na barra lateral, escolha **Top** ou **Bottom** para posicionar o
@@ -188,14 +258,14 @@ aviso de ditado pronto também acompanha a posição escolhida.
 
 ## Recuperar uma gravação
 
-Antes de cada tentativa de transcrição, o Hex salva uma cópia local do áudio
+Quando a gravação termina, antes de entregar o resultado, o Hex salva uma cópia local do áudio
 em WAV, com acesso restrito ao seu usuário. Se a conexão, a API ou todos os
 fallbacks falharem, a gravação aparece em **History** com **Retry**, o aplicativo
 em que o ditado começou e o motivo da falha (como timeout, conexão ou código
 HTTP). Os detalhes exibidos não incluem respostas brutas ou credenciais. O áudio
 salvo também pode ser recuperado depois de fechar e reabrir o aplicativo.
 
-**Retry** usa a chave, os modelos e os limites atuais de **Models**. Só uma
+**Retry** usa a cadeia atual de **Models** e as chaves/opções de **Providers**. Só uma
 recuperação manual roda por vez. Quando funcionar, o texto será salvo na
 mesma entrada e poderá ser copiado com **Copy text**; não há colagem
 automática. O áudio temporário só é removido depois que esse texto é salvo.
@@ -207,59 +277,92 @@ até você excluí-los na própria entrada, com confirmação. O diretório é
 
 Se o disco não permitir salvar, o Hex mantém uma cópia em memória durante a
 sessão e mostra um aviso para manter o aplicativo aberto. Essa cópia não
-sobrevive ao encerramento. O recurso protege tentativas iniciadas de
-transcrição; não é um gravador contínuo nem recupera uma captura descartada
+sobrevive ao encerramento. No streaming, o envio pode começar antes desse salvamento. O recurso protege clipes concluídos; não é um gravador contínuo nem recupera uma captura descartada
 com Esc ou áudio ainda em memória antes de começar a tentativa.
 
-## Models
+## Providers e Models
 
-A tela **Models**, na barra lateral, concentra a chave, o idioma, os modelos
-e os parâmetros avançados de transcrição pelo OpenRouter.
+**Providers** guarda as chaves, as opções específicas de cada modelo e os
+limites globais de tentativa. **Command + 8** abre a tela. **Models** define
+um principal e até dois fallbacks, que podem pertencer a providers diferentes.
+O provider aparece no nome do modelo; os indicadores de recursos mostram
+streaming, keywords e contexto quando disponíveis.
 
-| Controle | Comportamento |
+| Provider | Integração |
 | --- | --- |
-| **OpenRouter API key** | Uma chave salva mostra seus últimos quatro caracteres, com **Test**, **Replace** e **Remove**. A remoção pede confirmação. **Move to Keychain** migra uma chave que esteja no arquivo de configuração. |
-| **Models** | Um modelo principal e até dois fallbacks pela interface. O picker consulta o catálogo de speech-to-text do OpenRouter e aceita IDs customizados. **↑** muda a ordem e **✕** remove um fallback. |
-| **Language** | Envia uma dica de idioma ao modelo. **Auto-detect** deixa a identificação com o provedor. |
-| **Advanced** | URL da API, timeout por tentativa e por trecho, duração dos trechos, espera máxima para repetir um HTTP 429 e temperatura. |
+| **OpenRouter** | Catálogo STT remoto, fallback e vocabulário por rotas verificadas. A API atual usada pelo Hex recebe clipes gravados. |
+| **OpenAI** | GPT Transcribe e modelos GPT-4o/Whisper por upload; GPT Live Transcribe por WebSocket. Nomes são enviados como keywords ou prompt conforme o modelo. |
+| **Deepgram** | Nova-3 e Nova-2, por upload ou streaming. Nova-3 aceita keyterms; formatação, pontuação e números têm controles próprios. |
+| **ElevenLabs** | Scribe v2 por upload e Scribe v2 Realtime por WebSocket, com keyterms e opção de remover hesitações. |
 
-Idioma e modelos são salvos ao mudar o controle. Os campos de
-**Advanced** são salvos automaticamente ao sair do campo; **Return** também
-conclui a edição e **Esc** a cancela. Valores inválidos mantêm a configuração
-anterior e mostram o erro. A configuração é relida
-antes de cada ditado, sem precisar reiniciar o app.
+Uma chave salva mostra somente os últimos quatro caracteres, com **Test** e
+**Remove**. Clique no indicador da chave para substituí-la. O teste verifica acesso à conta; não garante saldo,
+permissão para todos os modelos ou qualidade da transcrição.
 
-Qualquer falha de um modelo — timeout, erro de transporte, resposta vazia ou
-erro HTTP — permite tentar o próximo. Um HTTP 429 com espera informada dentro
-do limite configurado recebe uma tentativa adicional no mesmo modelo.
-Gravações longas são divididas em trechos; cada trecho usa a mesma cadeia de
-fallbacks e seu próprio limite total de tempo.
+Idioma, contexto, streaming e demais opções pertencem a cada combinação de
+provider e modelo. Na primeira escolha, o modelo herda as opções compatíveis
+do anterior. Ao voltar a um modelo já usado, suas escolhas são restauradas;
+removê-lo da cadeia não apaga o perfil. As keywords são a exceção: uma lista
+compartilhada por toda a cadeia, sem cópias por modelo.
+
+**Streaming** envia áudio durante a gravação, mas o Hex só cola o texto final,
+depois do pós-processamento. O toggle é explícito e começa desligado. Modelos
+exclusivamente realtime precisam dele ligado; desligá-lo faz a cadeia pular
+esse modelo. Não há troca silenciosa por outro modelo com nome parecido.
+Os fallbacks começam após o modelo anterior falhar; o app não envia o áudio
+a todos os providers ao mesmo tempo.
+
+Streaming usa PCM contínuo e não compacta pausas como o **Trim silence** de
+clipes gravados. A checagem final de silêncio evita colar uma resposta sem fala,
+mas o áudio pode já ter sido transmitido e cobrado. Falhas de rede, perda de
+blocos ou divergência na fronteira do atalho invalidam a resposta ao vivo. O
+Hex tenta transcrever o clipe final completo, respeitando os limites da cadeia.
+Nenhum texto parcial é colado.
+
+As opções são salvas ao mudar o controle. Campos de texto salvam ao perder o
+foco ou pressionar Return; **Esc** cancela a edição. Valores inválidos mantêm
+a configuração anterior. A sessão de streaming em andamento mantém sua própria cópia das
+opções e das keywords; mudanças valem para os próximos ditados.
+
+Qualquer falha permite tentar o próximo modelo. Um HTTP 429 com espera dentro
+do limite configurado recebe uma tentativa adicional no mesmo modelo. Clipes
+longos enviados após a gravação são divididos em trechos, cada um com a cadeia
+e seu limite de tempo. A URL customizada em Advanced pertence somente ao
+OpenRouter e exige HTTPS, exceto em loopback local; os providers diretos usam os endereços oficiais.
 
 ### Configuração em arquivo
 
-As opções ficam em `~/Library/Application Support/hex-openrouter/openrouter.json`.
-**Show file**, em Advanced, abre sua localização. Exemplo de formato; escolha
-os IDs de modelo no catálogo da interface:
+As opções continuam em `~/Library/Application Support/hex-openrouter/openrouter.json`
+para preservar instalações anteriores. IDs sem prefixo explícito continuam
+sendo do OpenRouter. Providers diretos usam `provider::modelo`:
 
 ```json
 {
   "base_url": "https://openrouter.ai/api/v1",
   "transcription": {
-    "models": ["openai/whisper-large-v3-turbo", "openai/gpt-4o-mini-transcribe"],
-    "language": "auto",
+    "models": ["deepgram::nova-3", "openai::gpt-transcribe", "microsoft/mai-transcribe-2"],
+    "model_options": {
+      "deepgram::nova-3": { "language": "pt", "streaming": true },
+      "openai::gpt-transcribe": { "language": "pt" }
+    },
     "trim_silence": true,
     "attempt_timeout_seconds": 30,
     "total_timeout_seconds": 90,
     "chunk_seconds": 120,
-    "rate_limit_retry_max_wait_ms": 2000,
-    "temperature": 0.0
+    "rate_limit_retry_max_wait_ms": 2000
   }
 }
 ```
 
-A chave é resolvida nesta ordem: `OPENROUTER_API_KEY`, campo `api_key` do
-arquivo e Keychain. Prefira o Keychain para evitar uma chave em texto puro.
-O arquivo pode conter mais fallbacks que os dois editáveis pela interface.
+Prefira o Keychain. Variáveis `OPENROUTER_API_KEY`, `OPENAI_API_KEY`,
+`DEEPGRAM_API_KEY` e `ELEVENLABS_API_KEY` têm precedência sobre a chave salva
+correspondente. Apenas o OpenRouter preserva a compatibilidade com o antigo
+campo `api_key` no arquivo. Chaves e endpoints não entram na exportação.
+
+Contratos oficiais: [OpenAI file transcription](https://developers.openai.com/api/docs/guides/speech-to-text),
+[OpenAI realtime](https://developers.openai.com/api/docs/guides/realtime-transcription),
+[Deepgram live audio](https://developers.deepgram.com/reference/speech-to-text/listen-streaming),
+[ElevenLabs Scribe](https://elevenlabs.io/docs/overview/capabilities/speech-to-text).
 
 ## Post-processing
 
@@ -309,7 +412,7 @@ aberto pelo menu do app ou com **Command + 6**.
 | **Microphone mode** | Mantém o dispositivo pronto ou o libera enquanto está ocioso. |
 | **Input channel** | Mantém a mistura atual por padrão. Em interfaces com vários canais, permite escolher explicitamente o canal do microfone. A escolha fica vinculada ao dispositivo. |
 | **Input levels** | Mostra RMS, pico e avisos de sinal muito baixo, ausência de sinal ou possível clipping na última gravação analisada. |
-| **Trim silence** | Remove silêncio nas bordas e reduz pausas longas antes do envio. Usa uma heurística de energia do áudio; clipes classificados como silenciosos não são enviados. Pode ser desligado. |
+| **Trim silence** | Remove silêncio nas bordas e reduz pausas longas antes do envio. Usa uma heurística de energia. Atua antes do upload de clipes completos; streaming contínuo não compacta pausas. Pode ser desligado. |
 
 O **Trim silence** é salvo assim que você muda o controle. Avisos e atalhos
 para conceder permissões do macOS também aparecem nessa tela.
@@ -358,7 +461,7 @@ salvamento tentam restaurar as preferências anteriores. Arquivos maiores que
 ## History e Statistics
 
 **History** registra os ditados colados com sucesso: texto, aplicativo em
-foco, duração, latência, modelos utilizados, fallbacks e corte de silêncio.
+foco, duração, latência, providers, modelos, fallbacks e corte de silêncio. Os detalhes de cada chamada mostram streaming durante a gravação ou envio posterior, quantidade de keywords enviadas e resultado da tentativa. Registros antigos não inventam esses metadados.
 Tem busca, cópia e controles de retenção e limpeza. A retenção padrão é de
 **7 dias**, com limites adicionais de quantidade e tamanho. A atualização da
 versão 2.x preserva o texto e os relatórios de transcrição existentes.
@@ -367,7 +470,7 @@ versão 2.x preserva o texto e os relatórios de transcrição existentes.
 silenciosos, tokens, custo informado pelo OpenRouter, latência de transcrição,
 fallbacks e erros por tipo e modelo. Não armazena texto nem áudio. A latência
 mostrada corresponde ao processamento da transcrição, sem o tempo na fila
-ou na colagem. Um ditado com vários trechos pode contar para mais de um modelo.
+ou na colagem. Em streaming, a latência mede a espera para concluir depois do fim da gravação. Um ditado com vários trechos pode contar para mais de um modelo.
 
 Em **Models and latency**, cada modelo mostra sua latência média e a
 quantidade de respostas medidas no período. A média usa apenas requisições
@@ -384,8 +487,9 @@ retornados pelo provedor.
 
 ## Dados e privacidade
 
-O áudio enviado passa pelo OpenRouter e pelo provedor do modelo escolhido.
-O Hex salva áudio temporariamente antes de transcrever. Gravações com falha
+O áudio vai ao provider escolhido. Ao usar OpenRouter, também passa por ele.
+Em streaming, o envio começa durante a fala; o salvamento para recuperação ocorre
+ao concluir a gravação, antes de entregar o resultado. Gravações com falha
 ficam no Mac para recuperação, até Retry funcionar ou você excluí-las.
 As regras de retenção desses serviços são independentes dos controles locais do app.
 
@@ -394,15 +498,18 @@ Os arquivos locais ficam em `~/Library/Application Support/hex-openrouter`:
 | Local | Conteúdo |
 | --- | --- |
 | `settings.json` | Preferências do aplicativo e atalhos. |
-| `openrouter.json` | Modelos, idioma e parâmetros de transcrição; a chave só aparece se configurada em texto puro. |
+| `openrouter.json` | Cadeia e perfis por provider/modelo; a chave legada do OpenRouter só aparece se configurada em texto puro. |
 | `history.json` | Texto dos ditados e metadados, conforme a retenção escolhida. |
 | `recording-recovery/` | WAVs de tentativas pendentes/com falha e textos recuperados; acesso restrito ao usuário. |
 | `stats.json` | Totais diários, sem texto, áudio ou corpos de respostas de erro. |
 | `logs/live.ndjson` e `logs/process.log` | Eventos e diagnósticos. O log de eventos inclui texto colado e aplicativo em foco; erros podem incluir detalhes retornados pelo provedor. |
 
 Desligar ou limpar o **History** não desliga nem limpa os logs. Considere seu
-conteúdo antes de compartilhá-los para diagnóstico. A chave salva no Keychain
-não é colocada nos argumentos dos processos de rede ou de acesso ao Keychain.
+conteúdo antes de compartilhá-los para diagnóstico. As chaves são acessadas diretamente pelo Security.framework e ficam somente
+na memória dos transportes, sem aparecer nos argumentos de processos. O app
+não altera automaticamente o acesso de itens antigos do Keychain. Os logs são
+privados ao usuário e têm rotação ao iniciar; traces internos de HTTP/WebSocket
+são bloqueados para não registrar headers, áudio ou URLs contendo keywords.
 
 ## Desenvolvimento
 
@@ -446,6 +553,7 @@ configuração e às credenciais reais:
 ```sh
 cargo run -- preview settings
 cargo run -- preview models
+cargo run -- preview providers
 cargo run -- preview history
 cargo run -- preview statistics
 cargo run -- preview onboarding

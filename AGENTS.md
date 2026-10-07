@@ -4,9 +4,10 @@
 
 A slim macOS fork of HEX: tap a shortcut to lock recording or hold and release,
 trim the silence, send
-the clip to OpenRouter with an ordered model fallback chain, and paste the
-transcript. Settings, Microphone, Models, Post-processing, HUD, History, and Statistics are the only panes.
-OpenRouter key, language, models, and advanced limits belong in Models;
+the clip to a speech provider with an ordered fallback chain, and paste the
+transcript. Settings, Microphone, Providers, Models, Post-processing, HUD, History, and Statistics are the panes.
+Keys, per-model language/streaming/options and advanced limits belong in Providers.
+Models contains the primary/fallback chain and shared keywords;
 device/channel choices, priority, input levels, capture mode, silence trimming
 and audio behavior while dictating belong in Microphone. Indicator position and
 recording/transcription palettes belong in HUD. Everything
@@ -28,6 +29,9 @@ not reintroduce seams for them.
   and bounded stream recovery.
 - `microphone`: explicit device-bound channel selection and the last clip's
   in-memory RMS/peak diagnostics, measured at 16 kHz before silence trimming.
+- `providers`: provider identities/capabilities, separate Keychain credentials, native
+  batch adapters and bounded WebSocket workers. `providers_view` owns credentials
+  and model profiles; `model_options_view` exposes only compatible features.
 - `pipeline`: one transcription worker and one ordered output worker with
   bounded queues, cancellation, paste-last, and History recording.
 - `openrouter`: configuration (`openrouter.json`), Keychain key handling,
@@ -47,6 +51,8 @@ not reintroduce seams for them.
   deferred because the foreground application changed.
 - `history`: the owner-only bounded store of pasted text and metadata.
 - `events`: bounded asynchronous NDJSON observations in `logs/live.ndjson`.
+- `update_check`: detects when Homebrew replaces the installed bundle and offers
+  a restart, using the app bundle enclosing the current executable.
 - `app_settings`: persisted app settings and their live runtime projection.
 - `app_window`, `desktop_ui`, `text_input`: the GPUI window and controls.
 - `desktop`: the GPUI application, menus, menu bar item, HUD, and listener
@@ -109,12 +115,21 @@ not reintroduce seams for them.
 - GUI startup calls `keyboard::initialize_layout` on the main thread before
   anything else uses the keyboard.
 - Release dictation starts only after Microphone, Input Monitoring,
-  Accessibility, and an OpenRouter key are ready.
+  Accessibility, and a usable configured model/provider key are ready.
 - `Release microphone while idle` opens the device on the shortcut with no
   pre-roll and closes it once capture is idle.
-- The API key never reaches argv, logs, or temporary files: `security -i`
-  reads it from stdin and curl reads its config from stdin. Resolution order is
-  `OPENROUTER_API_KEY`, then `api_key` in the file, then the Keychain.
+- API keys never reach argv, logs, or temporary files. Keychain operations use
+  Security.framework directly; native HTTPS/WebSocket transports hold credentials
+  in memory. Preserve existing items; do not delete/recreate keys or claim that
+  updating a value retroactively narrows a legacy item’s access list.
+  Each provider has a separate Keychain account under the existing service.
+  Every network transport validates the parsed URL host before resolving keys:
+  HTTPS is required except for loopback HTTP. Prefixes such as localhost.evil,
+  credentials in URLs and backslashes are rejected. Redirects must not forward
+  credentials. Provider environment variables override its Keychain item; only OpenRouter
+  retains its legacy plaintext `api_key` compatibility. Never send an OpenRouter
+  key to a direct provider or export credentials. Preview/tests never resolve keys
+  or use real network transports, even if another test sets the global config.
 - `openrouter.json` is re-read on every dictation. Any model error falls back
   to the next model; a 429 asking to wait at most the configured time is
   retried once on the same model.
@@ -128,6 +143,43 @@ not reintroduce seams for them.
   recovered text, preserve the source audio and show a safe explanation.
   Existing History entries are never reformatted retroactively. Statistics
   continue to measure the transcription, before local text formatting.
+- Direct model IDs use `provider::model`; legacy `vendor/model` always means
+  OpenRouter. Do not infer native access from the vendor segment. Capabilities
+  are per model and transport, not per provider alone. Unsupported fields never
+  enter a request. Keywords are shared across the whole configured chain; show
+  them in Models if any primary/fallback supports vocabulary hints.
+  Vocabulary names render as whole removable chips in both panes. Enter/blur
+  commits a draft; multi-line/comma paste adds whole terms atomically; spaces
+  remain inside a phrase. Empty-field Backspace removes one chip, Escape
+  cancels the draft. Failed saves retain accepted chips and the pending draft.
+  Other options live in persistent per-model profiles: initialize from compatible
+  source options only once, never overwrite a profile on reselection/removal.
+- Live PCM comes from the authoritative, resampled Recording prefix, after the
+  intentional threshold and before the conservative pending-input boundary.
+  Never use the disposable HUD meter projection. Capture only uses bounded
+  try_send; credentials, DNS, TLS, encoding and socket I/O stay off its thread.
+  Queue gaps, overshoot from a delayed release, disconnects and uncertain writes
+  invalidate the whole live transcript. The completed exact clip is retained
+  for fallback and recovery. Cancel/discard/interruption/drop stop its session;
+  after Finish, cancellation belongs to that pipeline job. Never paste partial
+  text or end capture on a provider's segment completion. Final text still goes
+  through ordered output, formatting, vocabulary and destination verification.
+  Streaming is opt-in, does not compact silence, and may send/bill silence before
+  a final local silence check. Recovery WAV persistence happens after Finish.
+  History stores actual provider/model/mode/keyword counts and attempt outcomes,
+  never term/prompt contents; absent old metadata remains unknown.
+- Vocabulary is snapshotted per accepted dictation and Retry. Apply existing
+  formatting first, then restore canonical name spelling; carry its initial-case
+  policy into Paste Last. Unknown/ambiguous local matches remain unchanged.
+- Vocabulary capability checks run outside capture, with only the bundled
+  synthetic fixture and invented names. Endpoint metadata and HTTP 200 alone
+  cannot establish nested hint support. Require a matching negative control or
+  reproducible A/B/A spelling effect, scoped to one discovered route and version.
+  Never probe user recordings/names or log request bodies, keys, or raw probe errors.
+  Multiple routes cannot be pinned on this endpoint and remain unverified.
+  Cache schema/evidence with expiry; an inconclusive check means local-only.
+  A runtime hint rejection retries without hints once within the original deadline.
+  Unit tests inject transport and never run paid or authenticated requests.
 - Normal History records only successful pasted output with seven-day default
   retention and hard caps. The History pane also exposes separate recovery
   entries, whose audio/text must not be pruned by those normal-history rules.
@@ -236,7 +288,7 @@ not treat a successful release build as evidence that tests passed. Record
 the local command and result when handing off work.
 
 The script isolates application data in a temporary directory and removes
-the API-key environment variable for the test process. Do not point tests at
+all four provider API-key environment variables for the test process. Do not point tests at
 the user's real settings, History, Statistics, or credentials. Native tests
 that are explicitly ignored remain manual checks; report that limitation
 rather than claiming they ran.
@@ -253,6 +305,7 @@ scripts/build-app.sh  # target/app/Hex-<version>.zip
 cargo run -- preview settings
 cargo run -- preview microphone
 cargo run -- preview models
+cargo run -- preview providers
 cargo run -- preview post-processing
 cargo run -- preview hud
 cargo run -- preview history --open-history-retention

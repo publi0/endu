@@ -1,0 +1,8 @@
+Synthetic verification fixture
+
+Text: We are testing Zephyr files.
+Generated with the built-in macOS Samantha voice and converted to mono,
+16-bit little-endian PCM WAV at 16 kHz. Duration: approximately 1.94 seconds.
+
+The verifier uses only this fixture and the invented spellings Zephyr-Files
+and Xephyr-Files. It never uses a user's recording or vocabulary as a probe.

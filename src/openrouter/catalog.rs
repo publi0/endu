@@ -31,13 +31,77 @@ impl CatalogModel {
     }
 }
 
+/// Native choices remain available even when the OpenRouter catalog is offline.
+pub fn native_catalog() -> Vec<CatalogModel> {
+    crate::providers::native_models()
+        .into_iter()
+        .map(|model| CatalogModel {
+            id: crate::providers::ModelRef {
+                provider: model.provider,
+                model: model.id,
+            }
+            .key(),
+            name: model.name.into(),
+            provider: model.provider.label().into(),
+        })
+        .collect()
+}
+
+pub fn available_catalog(remote: &[CatalogModel]) -> Vec<CatalogModel> {
+    let mut models = native_catalog();
+    for id in Config::default().transcription.models {
+        let (_, name) = split_name(&id, "");
+        models.push(CatalogModel {
+            id,
+            name,
+            provider: "OpenRouter".into(),
+        });
+    }
+    for model in remote {
+        if let Some(existing) = models.iter_mut().find(|existing| existing.id == model.id) {
+            *existing = model.clone();
+        } else {
+            models.push(model.clone());
+        }
+    }
+    models
+}
+
+pub fn provider_label(id: &str) -> &'static str {
+    crate::providers::ModelRef::parse(id).provider.label()
+}
+
+/// SF Symbol and short text; render each pair without shrinking or ellipsis.
+pub fn capability_badges(id: &str, verified_keywords: bool) -> Vec<(&'static str, &'static str)> {
+    let caps = crate::providers::ModelRef::parse(id).capabilities();
+    let mut labels = Vec::new();
+    if caps.batch {
+        labels.push(("doc", "File"));
+    }
+    if caps.streaming {
+        labels.push(("bolt.fill", "Streaming"));
+    }
+    if caps.keywords || verified_keywords {
+        labels.push(("number", "Keywords"));
+    }
+    if caps.prompt {
+        labels.push(("text.alignleft", "Context"));
+    }
+    if caps.formatting {
+        labels.push(("textformat", "Format"));
+    }
+    if caps.no_verbatim {
+        labels.push(("sparkles", "Clean"));
+    }
+    labels
+}
+
 /// Fetches the models that output transcriptions. The endpoint is public, so
 /// a missing key is not an error here.
 pub fn fetch(config: &Config) -> Result<Vec<CatalogModel>> {
-    let key = super::api_key(config).unwrap_or_default();
     let response = http::get(
         &config.endpoint("models?output_modalities=transcription"),
-        &key,
+        "",
         CATALOG_TIMEOUT,
     )
     .wrap_err("could not reach OpenRouter")?;
@@ -76,7 +140,7 @@ fn parse(body: &[u8]) -> Result<Vec<CatalogModel>> {
             CatalogModel {
                 id: entry.id,
                 name,
-                provider,
+                provider: format!("OpenRouter · {provider}"),
             }
         })
         .collect();
@@ -112,7 +176,14 @@ pub fn label(id: &str, catalog: &[CatalogModel]) -> String {
     catalog
         .iter()
         .find(|model| model.id == id)
-        .map_or_else(|| id.to_owned(), |model| model.name.clone())
+        .map(|model| model.name.clone())
+        .or_else(|| {
+            native_catalog()
+                .into_iter()
+                .find(|model| model.id == id)
+                .map(|model| model.name)
+        })
+        .unwrap_or_else(|| crate::providers::ModelRef::parse(id).model.to_owned())
 }
 
 #[cfg(test)]
@@ -137,17 +208,17 @@ mod tests {
                 CatalogModel {
                     id: "acme/raw-id".into(),
                     name: "raw-id".into(),
-                    provider: "acme".into(),
+                    provider: "OpenRouter · acme".into(),
                 },
                 CatalogModel {
                     id: "deepgram/nova-3".into(),
                     name: "Nova-3".into(),
-                    provider: "Deepgram".into(),
+                    provider: "OpenRouter · Deepgram".into(),
                 },
                 CatalogModel {
                     id: "openai/whisper-large-v3-turbo".into(),
                     name: "Whisper Large V3 Turbo".into(),
-                    provider: "OpenAI".into(),
+                    provider: "OpenRouter · OpenAI".into(),
                 },
             ]
         );
@@ -158,7 +229,7 @@ mod tests {
         let model = CatalogModel {
             id: "openai/whisper-large-v3-turbo".into(),
             name: "Whisper Large V3 Turbo".into(),
-            provider: "OpenAI".into(),
+            provider: "OpenRouter · OpenAI".into(),
         };
         assert!(model.matches(""));
         assert!(model.matches("openai turbo"));
@@ -176,5 +247,33 @@ mod tests {
     #[test]
     fn unexpected_bodies_are_errors() {
         assert!(parse(b"<html>").is_err());
+    }
+
+    #[test]
+    fn all_providers_are_available_offline_and_remote_names_replace_defaults() {
+        let offline = available_catalog(&[]);
+        for provider in crate::providers::Provider::ALL {
+            assert!(
+                offline
+                    .iter()
+                    .any(|model| crate::providers::ModelRef::parse(&model.id).provider == provider)
+            );
+        }
+        let id = Config::default().transcription.models[0].clone();
+        let remote = CatalogModel {
+            id: id.clone(),
+            name: "Remote model name".into(),
+            provider: "OpenRouter".into(),
+        };
+        let merged = available_catalog(std::slice::from_ref(&remote));
+        assert_eq!(merged.iter().filter(|model| model.id == id).count(), 1);
+        assert!(merged.contains(&remote));
+        assert_eq!(provider_label("openai/gpt-transcribe"), "OpenRouter");
+        assert_eq!(provider_label("openai::gpt-transcribe"), "OpenAI");
+        assert!(
+            capability_badges("deepgram::nova-3", false)
+                .iter()
+                .any(|(_, label)| *label == "Streaming")
+        );
     }
 }

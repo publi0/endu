@@ -35,7 +35,7 @@ run_step() {
 test_support=$(mktemp -d "${TMPDIR:-/tmp}/hex-local-check.XXXXXX")
 trap 'rm -rf -- "$test_support"' EXIT
 export HEX_APPLICATION_SUPPORT_DIR="$test_support"
-unset OPENROUTER_API_KEY
+unset OPENROUTER_API_KEY OPENAI_API_KEY DEEPGRAM_API_KEY ELEVENLABS_API_KEY
 
 run_step "Formatting" cargo fmt --all --check
 run_step "Shell syntax" sh -n scripts/build-app.sh scripts/write-cask.sh

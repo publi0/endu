@@ -1,19 +1,25 @@
 //! Cloud transcription through OpenRouter's `/audio/transcriptions` with an
 //! ordered fallback chain: any failure on one model moves on to the next.
 
-use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::ops::Range;
+#[cfg(test)]
 use std::time::{Duration, Instant};
 
 use color_eyre::Result;
+#[cfg(test)]
 use color_eyre::eyre::{WrapErr, bail, eyre};
+#[cfg(test)]
 use serde_json::{Value, json};
 
-use super::http::{self, Response};
-use super::stats::{self, ErrorKind, Failure, ModelLatency, Sample};
-use super::vad::{self, Trimmed};
-use super::{AUTO_LANGUAGE, AudioTrim, Config, StepReport, excerpt};
+use super::StepReport;
+#[cfg(test)]
+use super::http::Response;
+#[cfg(test)]
+use super::stats::ErrorKind;
+use super::stats::Failure;
+#[cfg(test)]
+use super::{Config, excerpt};
 
 /// HEX hands the transcriber normalized 16 kHz mono samples.
 pub const SAMPLE_RATE: u32 = 16_000;
@@ -28,6 +34,7 @@ pub struct Transcription {
 }
 
 /// One model's successful answer in a fallback chain.
+#[cfg(test)]
 #[derive(Debug, PartialEq)]
 pub(crate) struct Success {
     pub text: String,
@@ -48,7 +55,7 @@ pub(crate) struct ChainFailure {
 impl std::fmt::Display for ChainFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.failures.is_empty() {
-            return formatter.write_str("No OpenRouter transcription models are configured");
+            return formatter.write_str("No transcription models are configured");
         }
         let failures: Vec<String> = self
             .failures
@@ -57,7 +64,7 @@ impl std::fmt::Display for ChainFailure {
             .collect();
         write!(
             formatter,
-            "OpenRouter transcription failed on every model: {}",
+            "Transcription failed on every model: {}",
             failures.join("; ")
         )
     }
@@ -72,146 +79,15 @@ pub(crate) struct Usage {
     pub cost_usd: f64,
 }
 
-/// Transcribe one dictation with the configuration on disk.
-pub fn transcribe(samples: &[f32]) -> Result<Transcription> {
-    let nothing = || {
-        Ok(Transcription {
-            text: String::new(),
-            report: None,
-        })
-    };
-    if samples.is_empty() {
-        return nothing();
-    }
-    let config = super::load_config()?;
-    if models(&config).next().is_none() {
-        bail!(
-            "No OpenRouter transcription models are configured in {}",
-            super::config_path()?.display()
-        );
-    }
-    let recorded_ms = duration_ms(samples.len());
-    let trimmed;
-    let samples = if config.transcription.trim_silence {
-        match vad::trim(samples) {
-            Trimmed::Silent => {
-                tracing::info!(recorded_ms, "no speech detected; skipped OpenRouter");
-                stats::record(&Sample {
-                    skipped_silent: true,
-                    recorded_ms,
-                    ..Sample::default()
-                });
-                return nothing();
-            }
-            Trimmed::Speech(speech) => {
-                trimmed = speech;
-                &trimmed[..]
-            }
-        }
-    } else {
-        samples
-    };
-    let started = Instant::now();
-    let api_key = super::api_key(&config)?;
-    let language = config.transcription.language.trim();
-    let language = (!language.is_empty() && language != AUTO_LANGUAGE).then_some(language);
-    let url = config.endpoint("audio/transcriptions");
-    // 200 s of 16 kHz 16-bit WAV is ~8.5 MB as base64, under the request cap.
-    let chunk_seconds = config.transcription.chunk_seconds.clamp(10, 200);
-    let chunk_samples = (chunk_seconds * u64::from(SAMPLE_RATE)) as usize;
-    let sent_ms = duration_ms(samples.len());
-    let mut texts = Vec::new();
-    let mut models_used: Vec<String> = Vec::new();
-    let mut model_latency: BTreeMap<String, ModelLatency> = BTreeMap::new();
-    let mut failures: Vec<Failure> = Vec::new();
-    let mut usage = Usage::default();
-    for range in chunk_ranges(samples, chunk_samples) {
-        let chunk_started = Instant::now();
-        let audio = encode_base64(&encode_wav(&samples[range])?);
-        let success = match transcribe_with_fallback(
-            &config,
-            &audio,
-            language,
-            |body, timeout| http::post_json(&url, &api_key, body, timeout),
-            std::thread::sleep,
-        ) {
-            Ok(success) => success,
-            Err(failure) => {
-                failures.extend(failure.failures.iter().cloned());
-                stats::record(&Sample {
-                    words: None,
-                    recorded_ms,
-                    sent_ms,
-                    latency_ms: started.elapsed().as_millis() as u64,
-                    tokens: usage.tokens,
-                    cost_usd: usage.cost_usd,
-                    model_latency,
-                    failures,
-                    ..Sample::default()
-                });
-                return Err(failure.into());
-            }
-        };
-        tracing::info!(
-            model = success.model,
-            latency_ms = chunk_started.elapsed().as_millis(),
-            "OpenRouter transcribed audio chunk"
-        );
-        usage.tokens += success.usage.tokens;
-        usage.cost_usd += success.usage.cost_usd;
-        model_latency
-            .entry(success.model.clone())
-            .or_default()
-            .record(success.latency_ms);
-        push_unique(&mut models_used, success.model);
-        failures.extend(success.failures);
-        if !success.text.is_empty() {
-            texts.push(success.text);
-        }
-    }
-    let text = texts.join(" ");
-    let latency_ms = started.elapsed().as_millis() as u64;
-    let model = models_used.join(", ");
-    stats::record(&Sample {
-        words: Some(stats::word_count(&text)),
-        models: models_used,
-        model_latency,
-        recorded_ms,
-        sent_ms,
-        latency_ms,
-        tokens: usage.tokens,
-        cost_usd: usage.cost_usd,
-        failures: failures.clone(),
-        skipped_silent: false,
-    });
-    let mut failed: Vec<String> = Vec::new();
-    for failure in failures {
-        push_unique(&mut failed, failure.model);
-    }
-    Ok(Transcription {
-        text,
-        report: Some(StepReport {
-            model: Some(model),
-            latency_ms,
-            failed,
-            audio: Some(AudioTrim {
-                recorded_ms,
-                sent_ms,
-            }),
-        }),
-    })
+/// Shared entrypoint for recovery and CLI callers without a live capture session.
+pub fn transcribe_with_vocabulary(
+    samples: &[f32],
+    vocabulary: &crate::vocabulary::Snapshot,
+) -> Result<Transcription> {
+    crate::providers::batch::transcribe(samples, vocabulary, None)
 }
 
-fn duration_ms(samples: usize) -> u64 {
-    samples as u64 * 1_000 / u64::from(SAMPLE_RATE)
-}
-
-fn push_unique(list: &mut Vec<String>, value: String) {
-    if !list.contains(&value) {
-        list.push(value);
-    }
-}
-
+#[cfg(test)]
 fn models(config: &Config) -> impl Iterator<Item = &str> {
     config
         .transcription
@@ -223,6 +99,7 @@ fn models(config: &Config) -> impl Iterator<Item = &str> {
 
 /// Try each configured model in order and return the first transcript.
 /// `send` performs one HTTP request; `sleep` waits before a 429 retry.
+#[cfg(test)]
 pub(crate) fn transcribe_with_fallback(
     config: &Config,
     audio_base64: &str,
@@ -243,12 +120,34 @@ pub(crate) fn transcribe_with_fallback(
     )
 }
 
+#[cfg(test)]
 fn transcribe_with_timed_requests(
     config: &Config,
     audio_base64: &str,
     language: Option<&str>,
+    send: impl FnMut(&str, Duration) -> (Result<Response>, Duration),
+    sleep: impl FnMut(Duration),
+) -> std::result::Result<Success, ChainFailure> {
+    chain_with_hints(
+        config,
+        audio_base64,
+        language,
+        &Default::default(),
+        send,
+        sleep,
+        |_| {},
+    )
+}
+
+#[cfg(test)]
+fn chain_with_hints(
+    config: &Config,
+    audio_base64: &str,
+    language: Option<&str>,
+    hints: &super::vocabulary_support::HintPlan,
     mut send: impl FnMut(&str, Duration) -> (Result<Response>, Duration),
     mut sleep: impl FnMut(Duration),
+    mut invalidate: impl FnMut(&str),
 ) -> std::result::Result<Success, ChainFailure> {
     let started = Instant::now();
     let total = config.total_timeout();
@@ -257,6 +156,7 @@ fn transcribe_with_timed_requests(
     let mut failures: Vec<Failure> = Vec::new();
     for model in models(config) {
         let mut retried = false;
+        let mut without_hints = false;
         loop {
             let remaining = total.saturating_sub(started.elapsed());
             if remaining.is_zero() {
@@ -267,12 +167,18 @@ fn transcribe_with_timed_requests(
                 });
                 break;
             }
-            let body = request_body(
+            let mut body = request_body(
                 model,
                 audio_base64,
                 language,
                 config.transcription.temperature,
             );
+            let provider_options = (!without_hints).then(|| hints.for_model(model)).flatten();
+            if let Some(options) = provider_options {
+                let mut value: Value = serde_json::from_str(&body).expect("request JSON");
+                value["provider"] = options.clone();
+                body = value.to_string();
+            }
             let timeout = config.attempt_timeout().min(remaining);
             let (response, request_latency) = send(&body, timeout);
             let (kind, detail) = match response {
@@ -296,6 +202,24 @@ fn transcribe_with_timed_requests(
                     Err(error) => (ErrorKind::InvalidResponse, format!("{model}: {error}")),
                 },
                 Ok(response) => {
+                    if !without_hints && hints.rejected(model, &response) {
+                        without_hints = true;
+                        invalidate(model);
+                        failures.push(Failure {
+                            model: model.to_owned(),
+                            kind: ErrorKind::from_status(response.status),
+                            detail: format!(
+                                "{model}: vocabulary parameter rejected (HTTP {})",
+                                response.status
+                            ),
+                        });
+                        tracing::warn!(
+                            model,
+                            status = response.status,
+                            "vocabulary rejected; retrying without hints"
+                        );
+                        continue;
+                    }
                     if response.status == 401 {
                         super::forget_cached_key();
                     }
@@ -317,7 +241,11 @@ fn transcribe_with_timed_requests(
                         format!(
                             "{model}: HTTP {}: {}",
                             response.status,
-                            excerpt(&response.body)
+                            if provider_options.is_some() {
+                                "Provider request failed; vocabulary details omitted".to_owned()
+                            } else {
+                                excerpt(&response.body)
+                            }
                         ),
                     )
                 }
@@ -341,6 +269,7 @@ fn transcribe_with_timed_requests(
     Err(ChainFailure { failures })
 }
 
+#[cfg(test)]
 fn request_body(
     model: &str,
     audio_base64: &str,
@@ -360,6 +289,7 @@ fn request_body(
     body.to_string()
 }
 
+#[cfg(test)]
 fn parse_transcript(body: &[u8]) -> Result<(String, Usage)> {
     let value: Value = serde_json::from_slice(body)
         .wrap_err_with(|| format!("invalid JSON response: {}", excerpt(body)))?;
@@ -499,6 +429,127 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned()
+    }
+
+    #[test]
+    fn rejected_hints_retry_without_parameters_and_do_not_leak_names() {
+        let config = config(&["hinted"]);
+        let hints = super::super::vocabulary_support::HintPlan::fixture(
+            "hinted",
+            json!({"options":{"azure":{"phraseList":{"phrases":["PRIVATE_FIXTURE_NAME"]}}}}),
+        );
+        let mut requests = Vec::new();
+        let mut invalidated = Vec::new();
+        let success = chain_with_hints(
+            &config,
+            "AAAA",
+            None,
+            &hints,
+            |body, _| {
+                let value: Value = serde_json::from_str(body).unwrap();
+                requests.push(value);
+                let response = if requests.len() == 1 {
+                    Response {
+                        status: 400,
+                        body: br#"{"error":"phraseList PRIVATE_FIXTURE_NAME invalid"}"#.to_vec(),
+                        retry_after: None,
+                    }
+                } else {
+                    Response {
+                        status: 200,
+                        body: br#"{"text":"ok"}"#.to_vec(),
+                        retry_after: None,
+                    }
+                };
+                (Ok(response), Duration::from_millis(1))
+            },
+            |_| {},
+            |model| invalidated.push(model.to_owned()),
+        )
+        .unwrap();
+        assert!(requests[0].get("provider").is_some());
+        assert!(requests[1].get("provider").is_none());
+        assert_eq!(requests.len(), 2);
+        assert_eq!(invalidated, ["hinted"]);
+        assert_eq!(success.text, "ok");
+        assert!(!success.failures[0].detail.contains("PRIVATE_FIXTURE_NAME"));
+    }
+
+    #[test]
+    fn vocabulary_retry_cannot_extend_the_original_deadline() {
+        let mut config = config(&["hinted", "fallback"]);
+        config.transcription.total_timeout_seconds = 1;
+        let hints = super::super::vocabulary_support::HintPlan::fixture(
+            "hinted",
+            json!({"options":{"openai":{"keywords":["Nimbus"]}}}),
+        );
+        let mut calls = 0;
+        let result = chain_with_hints(
+            &config,
+            "AAAA",
+            None,
+            &hints,
+            |_, _| {
+                calls += 1;
+                std::thread::sleep(Duration::from_millis(1_010));
+                (
+                    Ok(Response {
+                        status: 400,
+                        body: b"invalid keywords".to_vec(),
+                        retry_after: None,
+                    }),
+                    Duration::from_secs(1),
+                )
+            },
+            |_| {},
+            |_| {},
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn each_fallback_gets_only_its_own_verified_options() {
+        let config = config(&["unsupported", "hinted"]);
+        let hints = super::super::vocabulary_support::HintPlan::fixture(
+            "hinted",
+            json!({"options":{"openai":{"keywords":["Nimbus"]}}}),
+        );
+        let mut calls = 0;
+        let result = chain_with_hints(
+            &config,
+            "AAAA",
+            None,
+            &hints,
+            |body, _| {
+                let value: Value = serde_json::from_str(body).unwrap();
+                calls += 1;
+                let response = if calls == 1 {
+                    assert!(value.get("provider").is_none());
+                    Response {
+                        status: 503,
+                        body: Vec::new(),
+                        retry_after: None,
+                    }
+                } else {
+                    assert_eq!(
+                        value["provider"]["options"]["openai"]["keywords"],
+                        json!(["Nimbus"])
+                    );
+                    Response {
+                        status: 200,
+                        body: br#"{"text":"ready"}"#.to_vec(),
+                        retry_after: None,
+                    }
+                };
+                (Ok(response), Duration::ZERO)
+            },
+            |_| {},
+            |_| panic!("no rejection"),
+        )
+        .unwrap();
+        assert_eq!(result.model, "hinted");
+        assert_eq!(calls, 2);
     }
 
     #[test]

@@ -96,6 +96,8 @@ impl Rule {
 }
 
 pub struct PostProcessingView {
+    vocabulary: gpui::Entity<crate::vocabulary_view::VocabularyView>,
+    _vocabulary_subscription: gpui::Subscription,
     preferences: Preferences,
     focus: [FocusHandle; 7],
     pending: Option<Rule>,
@@ -103,15 +105,46 @@ pub struct PostProcessingView {
 }
 
 impl EventEmitter<PostProcessingChange> for PostProcessingView {}
+impl EventEmitter<crate::vocabulary_view::VocabularyChange> for PostProcessingView {}
 
 impl PostProcessingView {
-    pub fn new(preferences: Preferences, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        preferences: Preferences,
+        vocabulary: crate::vocabulary::Vocabulary,
+        preview: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let vocabulary =
+            cx.new(|cx| crate::vocabulary_view::VocabularyView::new(vocabulary, preview, cx));
+        let subscription = cx.subscribe(
+            &vocabulary,
+            |_, _, event: &crate::vocabulary_view::VocabularyChange, cx| cx.emit(event.clone()),
+        );
         Self {
+            vocabulary,
+            _vocabulary_subscription: subscription,
             preferences,
             focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             pending: None,
             error: None,
         }
+    }
+
+    pub fn set_vocabulary(
+        &mut self,
+        preferences: crate::vocabulary::Vocabulary,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.vocabulary
+            .update(cx, |view, cx| view.set_preferences(preferences, error, cx));
+    }
+
+    pub fn pending_vocabulary(
+        &self,
+        cx: &mut gpui::App,
+    ) -> Option<Result<crate::vocabulary::Vocabulary, String>> {
+        self.vocabulary.update(cx, |view, cx| view.pending(cx))
     }
 
     pub fn set_preferences(
@@ -213,8 +246,10 @@ impl PostProcessingView {
 
 impl Render for PostProcessingView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let result = self.preferences.process(EXAMPLE);
+        let formatted = self.preferences.process(EXAMPLE);
+        let result = self.vocabulary.read(cx).restore_text(&formatted);
         let content = div()
+            .child(self.vocabulary.clone())
             .child(settings_section_label("LETTER CASE"))
             .child(
                 settings_panel()
@@ -297,8 +332,9 @@ mod tests {
 
     #[gpui::test]
     fn switches_wait_for_save_and_broader_rules_cover_specific_ones(cx: &mut gpui::TestAppContext) {
-        let (view, cx) =
-            cx.add_window_view(|_, cx| PostProcessingView::new(Preferences::default(), cx));
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            PostProcessingView::new(Preferences::default(), Default::default(), true, cx)
+        });
         let accepted = std::rc::Rc::new(std::cell::Cell::new(false));
         let subscription = cx.update(|_, cx| {
             let accepted = accepted.clone();

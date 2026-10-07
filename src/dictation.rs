@@ -16,6 +16,8 @@ const PRE_ROLL_DURATION: Duration = Duration::from_millis(450);
 pub const MINIMUM_HOLD_DURATION: Duration = Duration::from_millis(300);
 const INITIAL_RECORDING_CAPACITY: Duration = Duration::from_secs(10);
 const TRANSCRIPTION_SAMPLE_RATE: u32 = 16_000;
+// Covers ordinary event-tap scheduling latency. Finish still detects older edges.
+const LIVE_BOUNDARY_GUARD: Duration = Duration::from_millis(150);
 
 pub enum Finish {
     Discard,
@@ -25,6 +27,7 @@ pub enum Finish {
 pub struct DictationClip {
     samples: Vec<f32>,
     pub input: Option<crate::microphone::InputDescription>,
+    pub live: Option<Box<crate::providers::streaming::PendingLive>>,
 }
 
 impl DictationClip {
@@ -41,6 +44,7 @@ impl DictationClip {
         Self {
             samples,
             input: None,
+            live: None,
         }
     }
 }
@@ -63,6 +67,8 @@ struct Recording {
     recorded_through: Option<CaptureInstant>,
     input_buffer: Vec<f32>,
     resampler: Option<Fft<f32>>,
+    live_decided: bool,
+    live: Option<crate::providers::streaming::LiveCapture>,
     #[cfg(target_os = "macos")]
     environment: RecordingEnvironmentState,
 }
@@ -121,6 +127,8 @@ impl Recording {
             recorded_through: None,
             input_buffer: Vec::with_capacity(Self::CHUNK_SIZE),
             resampler,
+            live_decided: false,
+            live: None,
             #[cfg(target_os = "macos")]
             environment: RecordingEnvironmentState::Disabled,
         })
@@ -156,6 +164,25 @@ impl Recording {
     fn push_through(&mut self, samples: &[f32], captured_through: CaptureInstant) {
         self.push(samples);
         self.recorded_through = Some(captured_through);
+    }
+
+    fn safe_live_len(&self, oldest_pending: Option<CaptureInstant>) -> usize {
+        let Some(through) = self.recorded_through else {
+            return 0;
+        };
+        let cutoff = through
+            .checked_sub(LIVE_BOUNDARY_GUARD)
+            .unwrap_or(CaptureInstant::ZERO);
+        let cutoff = oldest_pending.map_or(cutoff, |pending| pending.min(cutoff));
+        // Same source-frame rounding as Finish, including actual pre-roll and
+        // delayed-start reconstruction rather than time since the shortcut.
+        let kept = self.source_samples.saturating_sub(samples_for(
+            through.saturating_duration_since(cutoff),
+            self.source_rate,
+        ));
+        let delay = self.resampler.as_ref().map_or(0, Resampler::output_delay);
+        (kept * TRANSCRIPTION_SAMPLE_RATE as usize / self.source_rate as usize)
+            .min(self.samples.len().saturating_sub(delay))
     }
 
     fn finish(mut self, ended_at: Option<CaptureInstant>) -> Vec<f32> {
@@ -330,6 +357,7 @@ impl DictationCapture {
         if let Some(recording) = &mut self.recording {
             recording.push_through(samples, captured_through);
         }
+        self.publish_live_prefix(oldest_pending);
         let retention = oldest_pending
             .map(|pending| {
                 captured_through
@@ -340,6 +368,29 @@ impl DictationCapture {
             .unwrap_or(TIMELINE_BUFFER_DURATION);
         self.keep_warm_for(samples, retention);
         self.ring_captured_through = Some(captured_through);
+    }
+
+    /// Called by the audio owner with the currently observed input barrier.
+    pub fn publish_live_prefix(&mut self, oldest_pending: Option<CaptureInstant>) {
+        let Some(recording) = &mut self.recording else {
+            return;
+        };
+        if !recording.intentional {
+            return;
+        }
+        if !recording.live_decided {
+            recording.live_decided = true;
+            recording.live = crate::providers::streaming::LiveCapture::start();
+        }
+        let length = recording.safe_live_len(oldest_pending);
+        let delay = recording
+            .resampler
+            .as_ref()
+            .map_or(0, Resampler::output_delay);
+        if let Some(live) = &mut recording.live {
+            let start = delay.min(recording.samples.len());
+            live.push_prefix(&recording.samples[start..start + length]);
+        }
     }
 
     pub fn become_intentional(&mut self, now: CaptureInstant) -> bool {
@@ -361,7 +412,7 @@ impl DictationCapture {
     }
 
     pub fn finish(&mut self, now: CaptureInstant) -> Finish {
-        let Some(recording) = self.recording.take() else {
+        let Some(mut recording) = self.recording.take() else {
             return Finish::Discard;
         };
         if !recording.intentional
@@ -370,9 +421,13 @@ impl DictationCapture {
             return Finish::Discard;
         }
 
+        let live = recording.live.take();
+        let samples = recording.finish(Some(now));
+        let live = live.map(|live| Box::new(live.finish(&samples)));
         Finish::Transcribe(DictationClip {
-            samples: recording.finish(Some(now)),
+            samples,
             input: None,
+            live,
         })
     }
 }
@@ -553,6 +608,62 @@ mod tests {
             panic!("expected transcription")
         };
         assert_eq!(clip.duration_ms(), 61_000);
+    }
+
+    #[test]
+    fn immutable_live_prefixes_equal_the_finished_clip_at_every_source_rate() {
+        for rate in [16_000, 44_100, 48_000] {
+            let origin = capture_time();
+            let mut recording = Recording::new(origin, rate);
+            let samples: Vec<_> = (0..rate as usize * 2)
+                .map(|n| (n as f32 * 0.017).sin() * 0.4)
+                .collect();
+            let mut prefix = Vec::new();
+            let release = origin + Duration::from_millis(1_803);
+            let mut received = 0;
+            for chunk in samples.chunks(317) {
+                received += chunk.len();
+                let through = origin
+                    + Duration::from_nanos(received as u64 * 1_000_000_000 / u64::from(rate));
+                recording.push_through(chunk, through);
+                let pending = (through >= release).then_some(release);
+                let end = recording.safe_live_len(pending);
+                let delay = recording
+                    .resampler
+                    .as_ref()
+                    .map_or(0, Resampler::output_delay);
+                assert!(end >= prefix.len());
+                let begin = delay.min(recording.samples.len());
+                let current = &recording.samples[begin..begin + end];
+                assert_eq!(&current[..prefix.len()], &prefix);
+                prefix.extend_from_slice(&current[prefix.len()..]);
+            }
+            let final_clip = recording.finish(Some(release));
+            assert!(prefix.len() <= final_clip.len());
+            assert_eq!(&prefix, &final_clip[..prefix.len()]);
+        }
+    }
+
+    #[test]
+    fn live_boundaries_include_actual_pre_roll_and_detect_late_edges() {
+        let at = capture_time();
+        let mut capture = DictationCapture::new(16_000);
+        capture.ingest(&vec![0.25; 16_000], at);
+        capture.start_at(at);
+        capture.ingest(&vec![0.5; 16_000], at + Duration::from_secs(1));
+        let recording = capture.recording.as_ref().unwrap();
+        assert_eq!(recording.safe_live_len(None), 20_800); // 450ms + 1s - 150ms.
+        assert_eq!(
+            recording.safe_live_len(Some(at + Duration::from_millis(500))),
+            15_200
+        );
+        assert_eq!(
+            recording.safe_live_len(Some(at.checked_sub(Duration::from_secs(1)).unwrap())),
+            0
+        );
+        // Merely extracting does not start network, mutate pre-roll, or flush FFT state.
+        assert!(!recording.live_decided);
+        assert_eq!(recording.source_samples, 23_200);
     }
 
     #[test]

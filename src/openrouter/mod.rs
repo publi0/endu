@@ -8,7 +8,7 @@
 
 pub mod catalog;
 pub mod form;
-mod http;
+pub(crate) mod http;
 pub mod report;
 #[cfg(target_os = "macos")]
 pub mod settings_view;
@@ -16,7 +16,8 @@ pub mod stats;
 #[cfg(target_os = "macos")]
 pub mod stats_view;
 pub mod transcribe;
-mod vad;
+pub(crate) mod vad;
+pub mod vocabulary_support;
 
 pub use report::{AudioTrim, StepReport};
 
@@ -88,6 +89,7 @@ pub struct Config {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
 pub struct TranscriptionConfig {
+    pub model_options: std::collections::BTreeMap<String, crate::providers::ModelOptions>,
     /// Tried in order. Any failure (transport, timeout, HTTP error, invalid
     /// response) moves on to the next model.
     pub models: Vec<String>,
@@ -123,6 +125,7 @@ impl Default for Config {
 impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
+            model_options: Default::default(),
             models: vec![
                 "openai/whisper-large-v3-turbo".into(),
                 "openai/gpt-4o-mini-transcribe".into(),
@@ -161,7 +164,11 @@ pub fn config_path() -> Result<PathBuf> {
 /// use so there is always a file to edit.
 pub fn load_config() -> Result<Config> {
     let path = config_path()?;
-    load_config_at(&path)
+    let config = load_config_at(&path)?;
+    crate::providers::validate_profiles(&config.transcription.model_options)
+        .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+    crate::providers::apply_runtime(&config);
+    Ok(config)
 }
 
 pub(crate) fn load_config_at(path: &Path) -> Result<Config> {
@@ -216,6 +223,7 @@ fn update_config_at(path: &Path, edit: impl FnOnce(&Config) -> Result<Config>) -
     with_config_edits(|| {
         let config = edit(&load_config_at_unlocked(path)?)?;
         save_config_at(path, &config)?;
+        crate::providers::apply_runtime(&config);
         Ok(config)
     })
 }
@@ -234,6 +242,8 @@ fn config_temporary_path(path: &Path) -> PathBuf {
 }
 
 pub(crate) fn save_config_at(path: &Path, config: &Config) -> Result<()> {
+    crate::providers::validate_profiles(&config.transcription.model_options)
+        .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
     let parent = path
         .parent()
         .ok_or_else(|| color_eyre::eyre::eyre!("config path has no parent"))?;
@@ -334,10 +344,8 @@ pub fn store_keychain_key(key: &str) -> Result<()> {
 /// Remove the key from the login Keychain. Blocking.
 #[cfg(target_os = "macos")]
 pub fn delete_keychain_key() -> Result<()> {
-    let result = security_framework::passwords::delete_generic_password(
-        KEYCHAIN_SERVICE,
-        KEYCHAIN_ACCOUNT,
-    );
+    let result =
+        security_framework::passwords::delete_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT);
     forget_cached_key();
     if let Err(error) = &result
         && error.code() != security_framework_sys::base::errSecItemNotFound
@@ -453,28 +461,13 @@ pub(crate) fn forget_cached_key() {
         .unwrap_or_else(|error| error.into_inner()) = None;
 }
 
-/// Ready to transcribe: readable config, at least one model, and a key. Used
-/// as the "installed" state of the OpenRouter catalog entry.
-pub fn is_configured() -> bool {
-    load_config().is_ok_and(|config| {
-        config
-            .transcription
-            .models
-            .iter()
-            .any(|model| !model.trim().is_empty())
-            && api_key(&config).is_ok()
-    })
-}
-
 #[cfg(target_os = "macos")]
 fn keychain_key() -> Option<String> {
     // Reading through Security.framework keeps the item's ACL bound to Hex's
     // signed identity; no external helper is involved.
-    let key = security_framework::passwords::get_generic_password(
-        KEYCHAIN_SERVICE,
-        KEYCHAIN_ACCOUNT,
-    )
-    .ok()?;
+    let key =
+        security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+            .ok()?;
     let key = String::from_utf8(key).ok()?;
     let key = key.trim();
     (!key.is_empty()).then(|| key.to_owned())

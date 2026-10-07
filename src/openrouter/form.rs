@@ -63,17 +63,7 @@ impl AdvancedForm {
     pub fn apply(&self, base: &Config) -> Result<Config, String> {
         let mut config = base.clone();
         let base_url = self.base_url.trim().trim_end_matches('/');
-        // The bearer key and raw recordings travel in these requests; only
-        // loopback endpoints may stay on cleartext HTTP.
-        let loopback_http = base_url.starts_with("http://")
-            && ["http://localhost", "http://127.0.0.1", "http://[::1]"]
-                .iter()
-                .any(|prefix| base_url.starts_with(prefix));
-        if !(base_url.starts_with("https://") || loopback_http) {
-            return Err(
-                "API URL must use https:// (http:// is only allowed for localhost).".into(),
-            );
-        }
+        super::http::validate_url(base_url).map_err(|error| format!("API URL: {error}"))?;
         config.base_url = base_url.to_owned();
         config.transcription.attempt_timeout_seconds =
             number(&self.attempt_timeout_seconds, "Attempt timeout", 1, 600)?;
@@ -111,19 +101,23 @@ pub fn set_model(base: &Config, slot: usize, model: Option<&str>) -> Result<Conf
         return Err(format!("At most {MAX_FALLBACKS} fallback models."));
     }
     let mut config = base.clone();
-    let models = &mut config.transcription.models;
     match model.map(str::trim) {
         None | Some("") if slot == 0 => return Err("Choose a primary model.".into()),
         None | Some("") => {
-            if slot < models.len() {
-                models.remove(slot);
+            if slot < config.transcription.models.len() {
+                config.transcription.models.remove(slot);
             }
         }
         Some(model) => {
             if model.chars().any(char::is_whitespace) {
                 return Err("Model ids cannot contain spaces.".into());
             }
-            if let Some(existing) = models.iter().position(|current| current == model)
+            let model = crate::providers::ModelRef::parse(model).key();
+            if let Some(existing) = config
+                .transcription
+                .models
+                .iter()
+                .position(|current| crate::providers::ModelRef::parse(current).key() == model)
                 && existing != slot
             {
                 return Err(if existing == 0 {
@@ -132,10 +126,26 @@ pub fn set_model(base: &Config, slot: usize, model: Option<&str>) -> Result<Conf
                     format!("{model} is already fallback {existing}.")
                 });
             }
-            if slot < models.len() {
-                models[slot] = model.to_owned();
+            if config
+                .transcription
+                .models
+                .get(slot)
+                .is_some_and(|current| crate::providers::ModelRef::parse(current).key() == model)
+            {
+                return Ok(config);
+            }
+            let previous = config
+                .transcription
+                .models
+                .get(slot)
+                .or_else(|| config.transcription.models.first())
+                .cloned();
+            crate::providers::initialize_model(&mut config, &model, previous.as_deref());
+            crate::providers::validate_profiles(&config.transcription.model_options)?;
+            if slot < config.transcription.models.len() {
+                config.transcription.models[slot] = model;
             } else {
-                models.push(model.to_owned());
+                config.transcription.models.push(model);
             }
         }
     }
@@ -150,15 +160,6 @@ pub fn promote_model(base: &Config, slot: usize) -> Config {
         config.transcription.models.swap(slot - 1, slot);
     }
     config
-}
-
-pub fn set_language(base: &Config, language: &str) -> Result<Config, String> {
-    if !super::LANGUAGES.iter().any(|(code, _)| *code == language) {
-        return Err(format!("Unsupported language: {language}."));
-    }
-    let mut config = base.clone();
-    config.transcription.language = language.to_owned();
-    Ok(config)
 }
 
 pub fn remove_migrated_key(base: &Config, stored_key: &str) -> Result<Config, String> {
@@ -323,9 +324,38 @@ mod tests {
     }
 
     #[test]
-    fn languages_are_validated() {
-        let config = set_language(&Config::default(), "pt").unwrap();
-        assert_eq!(config.transcription.language, "pt");
-        assert!(set_language(&config, "xx").is_err());
+    fn replacement_initializes_compatible_profile_once_and_removal_keeps_it() {
+        use crate::providers::{ModelOptions, options};
+        let mut base = with_models(&["deepgram::nova-3"]);
+        base.transcription.model_options.insert(
+            "deepgram::nova-3".into(),
+            ModelOptions {
+                language: "pt".into(),
+                streaming: true,
+                smart_format: true,
+                ..ModelOptions::default()
+            },
+        );
+        let first = set_model(&base, 0, Some("openai::gpt-transcribe")).unwrap();
+        assert_eq!(options(&first, "openai::gpt-transcribe").language, "pt");
+        assert!(!options(&first, "openai::gpt-transcribe").streaming);
+        let restored = set_model(&first, 0, Some("deepgram::nova-3")).unwrap();
+        assert!(options(&restored, "deepgram::nova-3").streaming);
+        let added = set_model(&restored, 1, Some("deepgram::nova-2")).unwrap();
+        let removed = set_model(&added, 1, None).unwrap();
+        assert!(
+            removed
+                .transcription
+                .model_options
+                .contains_key("deepgram::nova-2")
+        );
+        assert!(
+            set_model(
+                &with_models(&["openai/model"]),
+                1,
+                Some("openrouter::openai/model")
+            )
+            .is_err()
+        );
     }
 }

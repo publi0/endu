@@ -293,7 +293,13 @@ mod tests {
             Presentation::Unchanged
         );
         assert_eq!(
-            state.update(true, false, true, true, now + SETTLE_WINDOW + RETRY_INTERVAL),
+            state.update(
+                true,
+                false,
+                true,
+                true,
+                now + SETTLE_WINDOW + RETRY_INTERVAL
+            ),
             Presentation::Unchanged
         );
     }
@@ -317,7 +323,13 @@ mod tests {
             Presentation::Rejoin
         );
         assert_eq!(
-            state.update(true, false, true, true, now + SETTLE_WINDOW * 2 + RETRY_INTERVAL),
+            state.update(
+                true,
+                false,
+                true,
+                true,
+                now + SETTLE_WINDOW * 2 + RETRY_INTERVAL
+            ),
             Presentation::Unchanged
         );
     }

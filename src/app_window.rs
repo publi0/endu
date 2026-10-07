@@ -64,6 +64,7 @@ actions!(
         QuitApplication,
         ShowHistory,
         ShowModels,
+        ShowProviders,
         ShowMicrophone,
         ShowPostProcessing,
         ShowHud,
@@ -263,6 +264,7 @@ pub enum PreviewPane {
     Settings,
     Microphone,
     Models,
+    Providers,
     PostProcessing,
     Hud,
     History,
@@ -284,6 +286,7 @@ enum Pane {
     Settings,
     Microphone,
     Models,
+    Providers,
     PostProcessing,
     Hud,
     History,
@@ -291,9 +294,10 @@ enum Pane {
 }
 
 impl Pane {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Settings,
         Self::Microphone,
+        Self::Providers,
         Self::Models,
         Self::PostProcessing,
         Self::Hud,
@@ -306,6 +310,7 @@ impl Pane {
             Self::Settings => "Settings",
             Self::Microphone => "Microphone",
             Self::Models => "Models",
+            Self::Providers => "Providers",
             Self::PostProcessing => "Post-processing",
             Self::Hud => "HUD",
             Self::History => "History",
@@ -318,6 +323,7 @@ impl Pane {
             Self::Settings => NavigationIcon::Settings,
             Self::Microphone => NavigationIcon::Microphone,
             Self::Models => NavigationIcon::Models,
+            Self::Providers => NavigationIcon::Providers,
             Self::PostProcessing => NavigationIcon::PostProcessing,
             Self::Hud => NavigationIcon::Hud,
             Self::History => NavigationIcon::History,
@@ -329,7 +335,7 @@ impl Pane {
         if !crate::onboarding::permission_warnings(status).is_empty() {
             Self::Settings
         } else if !status.api_key {
-            Self::Models
+            Self::Providers
         } else {
             self
         }
@@ -511,6 +517,8 @@ pub struct AppWindow {
     lower_volume_input: Entity<TextInput>,
     openrouter_settings: Entity<OpenRouterSettings>,
     openrouter_setup: Entity<OpenRouterSettings>,
+    providers: Entity<crate::providers_view::ProvidersView>,
+    shared_keywords: Entity<crate::vocabulary_view::VocabularyView>,
     statistics: Entity<StatisticsView>,
     hotkey_capture: HotkeyCaptureState,
     hotkey_capture_animation: ToggleSpring,
@@ -720,15 +728,69 @@ impl AppWindow {
         let paste_side = side(settings.paste_last_hotkey.as_ref());
         let openrouter_settings = crate::openrouter::settings_view::new(preview_mode, cx);
         let openrouter_setup = crate::openrouter::settings_view::new_key_setup(preview_mode, cx);
+        let providers = cx.new(|cx| crate::providers_view::ProvidersView::new(preview_mode, cx));
+        let shared_keywords = cx.new(|cx| {
+            crate::vocabulary_view::VocabularyView::for_models(
+                settings.vocabulary.clone(),
+                preview_mode,
+                cx,
+            )
+        });
+        shared_keywords.update(cx, |view, cx| {
+            view.set_models(&openrouter_settings.read(cx).config_snapshot(), cx)
+        });
+        subscriptions.push(cx.subscribe(
+            &shared_keywords,
+            |this, _, change: &crate::vocabulary_view::VocabularyChange, cx| {
+                this.update_vocabulary(change.0.clone(), cx);
+            },
+        ));
+        subscriptions.push(cx.observe(&shared_keywords, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.subscribe(
+            &openrouter_settings,
+            |this, _, change: &crate::openrouter::settings_view::ConfigChanged, cx| {
+                this.shared_keywords
+                    .update(cx, |view, cx| view.set_models(&change.0, cx));
+                this.providers
+                    .update(cx, |view, cx| view.refresh(change.0.clone(), cx));
+                cx.notify();
+            },
+        ));
+        subscriptions.push(cx.subscribe(
+            &providers,
+            |this, _, _: &crate::providers_view::ProvidersChanged, cx| {
+                let config = this.providers.read(cx).config_snapshot();
+                this.shared_keywords
+                    .update(cx, |view, cx| view.set_models(&config, cx));
+                if config != this.openrouter_settings.read(cx).config_snapshot() {
+                    this.openrouter_settings
+                        .update(cx, |view, cx| view.apply_imported_config(config, cx));
+                }
+                this.poll_setup(true);
+                cx.notify();
+            },
+        ));
         let hud_settings = cx.new(|cx| HudSettingsView::new(settings.hud, preview_mode, cx));
         let sound_settings =
             cx.new(|cx| SoundSettingsView::new(settings.effective_sound_volumes(), cx));
         let microphone_priority = cx.new(|cx| {
             MicrophonePriorityView::new(settings.microphone_priority.clone(), preview_mode, cx)
         });
-        let post_processing_view =
-            cx.new(|cx| PostProcessingView::new(settings.post_processing, cx));
+        let post_processing_view = cx.new(|cx| {
+            PostProcessingView::new(
+                settings.post_processing,
+                settings.vocabulary.clone(),
+                preview_mode,
+                cx,
+            )
+        });
         subscriptions.push(cx.observe(&post_processing_view, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.subscribe(
+            &post_processing_view,
+            |this, _, change: &crate::vocabulary_view::VocabularyChange, cx| {
+                this.update_vocabulary(change.0.clone(), cx);
+            },
+        ));
         subscriptions.push(cx.subscribe(
             &post_processing_view,
             |this, _, change: &PostProcessingChange, cx| {
@@ -816,6 +878,13 @@ impl AppWindow {
         subscriptions.push(cx.observe(&openrouter_settings, |_, _, cx| cx.notify()));
         subscriptions.push(
             cx.subscribe(&openrouter_setup, |this, _, event: &KeyChanged, cx| {
+                this.providers.update(cx, |view, cx| {
+                    view.sync_key_status(
+                        crate::providers::Provider::OpenRouter,
+                        event.0.clone(),
+                        cx,
+                    )
+                });
                 this.openrouter_settings.update(cx, |view, cx| {
                     view.sync_key_status(event.0.clone(), cx);
                 });
@@ -833,6 +902,7 @@ impl AppWindow {
             preview: preview_mode,
             pane: match preview.as_ref().map(|preview| preview.pane) {
                 Some(PreviewPane::Models) => Pane::Models,
+                Some(PreviewPane::Providers) => Pane::Providers,
                 Some(PreviewPane::PostProcessing) => Pane::PostProcessing,
                 Some(PreviewPane::Microphone) => Pane::Microphone,
                 Some(PreviewPane::Hud) => Pane::Hud,
@@ -876,6 +946,8 @@ impl AppWindow {
             lower_volume_input,
             openrouter_settings,
             openrouter_setup,
+            providers,
+            shared_keywords,
             statistics: cx.new(|_| StatisticsView::new(preview_mode)),
             hotkey_capture: HotkeyCaptureState::Idle,
             hotkey_capture_animation: ToggleSpring::new(false),
@@ -972,6 +1044,7 @@ impl AppWindow {
     }
 
     fn select_pane(&mut self, pane: Pane, cx: &mut Context<Self>) {
+        self.providers.update(cx, |view, cx| view.close_pickers(cx));
         self.cancel_hotkey_capture(cx);
         self.openrouter_settings
             .update(cx, |view, cx| view.close_pickers(cx));
@@ -989,9 +1062,12 @@ impl AppWindow {
                 view.refresh();
                 cx.notify();
             }),
-            Pane::Settings | Pane::Microphone | Pane::Models | Pane::PostProcessing | Pane::Hud => {
-                self.permission_refresh_at = Instant::now()
-            }
+            Pane::Settings
+            | Pane::Microphone
+            | Pane::Models
+            | Pane::Providers
+            | Pane::PostProcessing
+            | Pane::Hud => self.permission_refresh_at = Instant::now(),
         }
         cx.notify();
     }
@@ -1006,6 +1082,10 @@ impl AppWindow {
 
     pub(crate) fn show_microphone(&mut self, cx: &mut Context<Self>) {
         self.select_pane(Pane::Microphone, cx);
+    }
+
+    pub(crate) fn show_providers(&mut self, cx: &mut Context<Self>) {
+        self.select_pane(Pane::Providers, cx);
     }
 
     pub(crate) fn show_models(&mut self, cx: &mut Context<Self>) {
@@ -1034,7 +1114,10 @@ impl AppWindow {
                 && (Instant::now() < self.permission_refresh_at
                     || !self.setup_visible
                         && self.listener_start.is_none()
-                        && !matches!(self.pane, Pane::Settings | Pane::Microphone | Pane::Models)
+                        && !matches!(
+                            self.pane,
+                            Pane::Settings | Pane::Microphone | Pane::Models | Pane::Providers
+                        )
                         && self.setup_status.api_key)
         {
             return false;
@@ -1213,7 +1296,55 @@ impl AppWindow {
     }
 
     /// Flush valid drafts before a window or app exit removes its focus tree.
+    fn update_vocabulary(
+        &mut self,
+        vocabulary: crate::vocabulary::Vocabulary,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_settings(SettingControl::PostProcessing, cx, |settings| {
+            settings.vocabulary = vocabulary
+        });
+        let accepted = self.settings.vocabulary.clone();
+        let error = self.feedback_error(SettingControl::PostProcessing);
+        if error.is_none() && !self.preview && accepted.remote_hints && !accepted.terms.is_empty() {
+            crate::openrouter::vocabulary_support::schedule(false);
+        }
+        self.shared_keywords.update(cx, |view, cx| {
+            view.set_preferences(accepted.clone(), error.clone(), cx)
+        });
+        self.post_processing_view
+            .update(cx, |view, cx| view.set_vocabulary(accepted, error, cx));
+    }
+
     pub(crate) fn finish_editing(&mut self, cx: &mut Context<Self>) {
+        if let Some(candidate) = self.shared_keywords.update(cx, |view, cx| view.pending(cx)) {
+            match candidate {
+                Ok(candidate) => self.update_vocabulary(candidate, cx),
+                Err(error) => {
+                    let accepted = self.settings.vocabulary.clone();
+                    self.shared_keywords.update(cx, |view, cx| {
+                        view.set_preferences(accepted, Some(error), cx)
+                    });
+                }
+            }
+        }
+        self.providers
+            .update(cx, |view, cx| view.finish_editing(cx));
+        let pending = self
+            .post_processing_view
+            .update(cx, |view, cx| view.pending_vocabulary(cx));
+        if let Some(candidate) = pending {
+            match candidate {
+                Ok(candidate) => self.update_vocabulary(candidate, cx),
+                Err(error) => {
+                    let accepted = self.settings.vocabulary.clone();
+                    self.post_processing_view.update(cx, |view, cx| {
+                        view.set_vocabulary(accepted, Some(error), cx)
+                    });
+                }
+            }
+        }
+
         if self.lower_volume_input.read(cx).has_pending_edit() {
             self.save_lower_volume(cx);
         }
@@ -1483,12 +1614,17 @@ impl AppWindow {
         self.recovery_copied = false;
         if let Some(store) = &self.recovery {
             self.recovery_error = (if self.preview {
-                store.retry_with_preferences(id, self.settings.post_processing, |_| {
-                    Ok(crate::openrouter::transcribe::Transcription {
-                        text: "Recovered preview dictation.".into(),
-                        report: None,
-                    })
-                })
+                store.retry_with_processing(
+                    id,
+                    self.settings.post_processing,
+                    crate::vocabulary::Snapshot::new(self.settings.vocabulary.clone()),
+                    |_| {
+                        Ok(crate::openrouter::transcribe::Transcription {
+                            text: "Recovered preview dictation.".into(),
+                            report: None,
+                        })
+                    },
+                )
             } else {
                 store.retry(id)
             })
@@ -1727,7 +1863,23 @@ impl AppWindow {
                         if !meta.is_empty() {
                             meta.push_str(" · ");
                         }
-                        meta.push_str(model.rsplit('/').next().unwrap_or(model));
+                        meta.push_str(&crate::providers::ModelRef::parse(model).label());
+                    }
+                    if let Some(execution) = entry.transcription.as_ref().and_then(|report| {
+                        report
+                            .executions
+                            .iter()
+                            .rev()
+                            .find(|request| request.outcome == "success")
+                    }) {
+                        meta.push_str(if execution.streaming {
+                            " · streaming"
+                        } else {
+                            " · recorded"
+                        });
+                        if execution.keyword_count > 0 {
+                            meta.push_str(" · keywords");
+                        }
                     }
                     if entry
                         .transcription
@@ -2071,8 +2223,10 @@ impl AppWindow {
                         if let Some(bundle) = crate::update_check::bundle_path() {
                             this.finish_editing(cx);
                             if !crate::update_check::relaunch_and_quit(&bundle) {
-                                this.update_error =
-                                    Some("Could not schedule the relaunch. Quit Hex and reopen it.".into());
+                                this.update_error = Some(
+                                    "Could not schedule the relaunch. Quit Hex and reopen it."
+                                        .into(),
+                                );
                                 cx.notify();
                             }
                         }
@@ -2668,7 +2822,10 @@ impl AppWindow {
     /// would use right now, so the effective choice is visible at the top of
     /// the pane instead of only in the channel and level rows below.
     fn input_device_description(&self) -> String {
-        match (&self.microphone_description, &self.microphone_description_error) {
+        match (
+            &self.microphone_description,
+            &self.microphone_description_error,
+        ) {
             (Some(description), _) => {
                 let mode = if self.settings.microphone.is_some() {
                     "Fixed"
@@ -3031,7 +3188,7 @@ impl AppWindow {
 
     /// A banner over every pane while dictation cannot work for lack of a key.
     fn render_key_notice(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.setup_visible || self.setup_status.api_key || self.pane == Pane::Models {
+        if self.setup_visible || self.setup_status.api_key || self.pane == Pane::Providers {
             return None;
         }
         Some(
@@ -3061,18 +3218,18 @@ impl AppWindow {
                                 .border_color(rgb(ACCENT))
                                 .pl_3()
                                 .child(settings_copy(
-                                    "Add your OpenRouter key to start dictating",
-                                    "Hex transcribes through OpenRouter. The key is stored in your Keychain.",
+                                    "Connect a provider to start dictating",
+                                    "Add a key in Providers, then choose its models in Models. Keys stay in your Keychain.",
                                 )),
                         )
                         .child(
-                            compact_button("Open Models")
+                            compact_button("Open Providers")
                                 .id("open-key-models")
                                 .flex_none()
                                 .bg(rgb(ACCENT))
                                 .text_color(rgb(TEXT))
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.select_pane(Pane::Models, cx);
+                                    this.select_pane(Pane::Providers, cx);
                                     this.focus_pane(window);
                                 })),
                         ),
@@ -3112,11 +3269,17 @@ impl AppWindow {
         cx.notify();
     }
 
-    fn render_models(&self) -> AnyElement {
+    fn render_models(&self, cx: &Context<Self>) -> AnyElement {
         configuration_pane(
             "Models",
             "models-scroll",
-            div().child(self.openrouter_settings.clone()),
+            div().child(self.openrouter_settings.clone()).when(
+                crate::providers::has_keyword_support(
+                    &self.openrouter_settings.read(cx).config_snapshot(),
+                    !self.preview,
+                ),
+                |pane| pane.child(self.shared_keywords.clone()),
+            ),
         )
     }
 
@@ -3169,6 +3332,7 @@ impl AppWindow {
     fn key_operation_pending(&self, cx: &App) -> bool {
         self.openrouter_settings.read(cx).has_key_operation()
             || self.openrouter_setup.read(cx).has_key_operation()
+            || self.providers.read(cx).has_key_operation(cx)
     }
 
     fn import_preferences(&mut self, cx: &mut Context<Self>) {
@@ -3280,6 +3444,11 @@ impl AppWindow {
             view.close_picker(cx);
             view.set_preferences(priority, None, cx);
         });
+        self.shared_keywords
+            .update(cx, |view, cx| view.set_models(&imported.config, cx));
+        self.providers.update(cx, |view, cx| {
+            view.apply_imported_config(imported.config.clone(), cx)
+        });
         self.openrouter_setup.update(cx, |view, cx| {
             view.apply_imported_config(imported.config.clone(), cx)
         });
@@ -3289,6 +3458,12 @@ impl AppWindow {
         let preferences = self.settings.post_processing;
         self.post_processing_view
             .update(cx, |view, cx| view.set_preferences(preferences, None, cx));
+        let vocabulary = self.settings.vocabulary.clone();
+        self.shared_keywords.update(cx, |view, cx| {
+            view.set_preferences(vocabulary.clone(), None, cx)
+        });
+        self.post_processing_view
+            .update(cx, |view, cx| view.set_vocabulary(vocabulary, None, cx));
         self.refresh_microphone_description();
         // While the preferences window is open its Dock icon stays available;
         // the existing close/drop path applies the imported background setting.
@@ -3477,7 +3652,7 @@ impl AppWindow {
                         ))
                         .child(self.setting_row(SettingControl::Trim,
                             "Trim silence",
-                            "Cuts silence and long pauses before sending, so less audio is billed. Recordings with no speech are not sent",
+                            "Trims completed clips before upload. Live streaming sends continuous audio, including pauses",
                             trim_control,
                         ))
                         .child(
@@ -3824,7 +3999,7 @@ impl AppWindow {
                                     .text_size(px(12.0))
                                     .line_height(px(19.0))
                                     .text_color(rgb(MUTED))
-                                    .child("Tap the shortcut to keep recording and tap again to stop, or hold and release. Hex trims silence, transcribes through OpenRouter, and pastes the text once these permissions and your key are in place."),
+                                    .child("Tap the shortcut to keep recording and tap again to stop, or hold and release. Hex trims silence, transcribes with your selected provider, and pastes the text once these permissions and your key are in place."),
                             ),
                     )
                     .when(!permission_rows.is_empty(), |setup| {
@@ -3845,19 +4020,25 @@ impl AppWindow {
                         div()
                             .mx_7()
                             .pb_6()
-                            .child(setup_group_label("OPENROUTER"))
+                            .child(setup_group_label("PROVIDER"))
                             .child(if status.api_key {
                                 div()
                                     .border_t_1()
                                     .border_color(rgb(LINE))
                                     .child(setup_row(
-                                        "OpenRouter API key",
+                                        "Provider ready",
                                         "Choose models and fallbacks in Models.",
                                         setup_ready_badge(),
                                     ))
                                     .into_any_element()
                             } else {
-                                self.openrouter_setup.clone().into_any_element()
+                                div().child(self.openrouter_setup.clone())
+                                    .child(compact_button("Choose another provider").id("setup-choose-provider")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.setup_visible = false;
+                                            this.select_pane(Pane::Providers, cx);
+                                            this.focus_pane(window);
+                                        }))).into_any_element()
                             }),
                     ),
             )
@@ -3886,7 +4067,12 @@ impl Render for AppWindow {
             match self.pane {
                 Pane::Settings => self.render_settings(window, cx),
                 Pane::Microphone => self.render_microphone(window, cx),
-                Pane::Models => self.render_models(),
+                Pane::Models => self.render_models(cx),
+                Pane::Providers => configuration_pane(
+                    "Providers",
+                    "providers-scroll",
+                    div().child(self.providers.clone()),
+                ),
                 Pane::PostProcessing => self.post_processing_view.clone().into_any_element(),
                 Pane::Hud => self.hud_settings.clone().into_any_element(),
                 Pane::History => {
@@ -3938,6 +4124,11 @@ impl Render for AppWindow {
             }))
             .on_action(cx.listener(|this, _: &ShowMicrophone, window, cx| {
                 this.select_pane(Pane::Microphone, cx);
+                this.focus_pane(window);
+                window.activate_window();
+            }))
+            .on_action(cx.listener(|this, _: &ShowProviders, window, cx| {
+                this.select_pane(Pane::Providers, cx);
                 this.focus_pane(window);
                 window.activate_window();
             }))
@@ -4029,6 +4220,18 @@ fn preview_history() -> Option<History> {
     );
     let now = now_ms();
     let report = |model: &str, latency_ms, failed: &[&str], recorded_ms, sent_ms| StepReport {
+        executions: if model.contains("::") {
+            let selected = crate::providers::ModelRef::parse(model);
+            vec![crate::openrouter::report::ExecutionReport {
+                provider: selected.provider.label().into(),
+                model: selected.model.into(),
+                streaming: true,
+                keyword_count: 3,
+                outcome: "success".into(),
+            }]
+        } else {
+            Vec::new()
+        },
         model: Some(model.into()),
         latency_ms,
         failed: failed.iter().map(|model| (*model).into()).collect(),
@@ -4060,7 +4263,7 @@ fn preview_history() -> Option<History> {
             4 * 60 * 1_000,
             "Remember to validate the artifact before publishing the release, and double-check that the notes mention the new model pickers.",
             Some("Messages"),
-            report("openai/whisper-large-v3-turbo", 710, &[], 9_400, 6_100),
+            report("deepgram::nova-3", 310, &[], 9_400, 9_400),
         ),
     ];
     for (age_ms, text, application, transcription) in fixtures {
@@ -5182,7 +5385,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn models_has_its_own_navigation_and_reuses_the_key_editor(cx: &mut gpui::TestAppContext) {
+    fn models_and_providers_have_distinct_navigation_and_keep_key_state(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let (view, cx) = cx.add_window_view(preview_fixture);
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
@@ -5195,6 +5400,9 @@ mod tests {
                 assert!(view.render_key_notice(cx).is_some());
                 view.show_models(cx);
                 assert_eq!(view.pane, Pane::Models);
+                assert!(view.render_key_notice(cx).is_some());
+                view.show_providers(cx);
+                assert_eq!(view.pane, Pane::Providers);
                 assert!(view.render_key_notice(cx).is_none());
                 view.show_history(cx);
                 view.show_models(cx);
@@ -5260,6 +5468,73 @@ mod tests {
             });
         });
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn provider_options_and_shared_keywords_stay_in_sync_across_panes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(preview_fixture);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let mut config = view.openrouter_settings.read(cx).config_snapshot();
+                config.transcription.models = vec![
+                    "deepgram::nova-2".into(),
+                    "acme/no-hints".into(),
+                    "openai::gpt-transcribe".into(),
+                ];
+                assert!(crate::providers::has_keyword_support(&config, false));
+                view.openrouter_settings.update(cx, |editor, cx| {
+                    editor.apply_imported_config(config.clone(), cx);
+                    cx.emit(crate::openrouter::settings_view::ConfigChanged(config));
+                });
+                let vocabulary = crate::vocabulary::Vocabulary {
+                    terms: vec!["Nimbus-Files".into()],
+                    ..Default::default()
+                };
+                view.shared_keywords.update(cx, |_, cx| {
+                    cx.emit(crate::vocabulary_view::VocabularyChange(vocabulary))
+                });
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(view.settings.vocabulary.terms, vec!["Nimbus-Files"]);
+                assert_eq!(
+                    view.providers.read(cx).config_snapshot(),
+                    view.openrouter_settings.read(cx).config_snapshot()
+                );
+                let mut config = view.providers.read(cx).config_snapshot();
+                config.transcription.models.pop();
+                assert!(!crate::providers::has_keyword_support(&config, false));
+                config.transcription.model_options.insert(
+                    "deepgram::nova-2".into(),
+                    crate::providers::ModelOptions {
+                        language: "pt".into(),
+                        streaming: true,
+                        ..Default::default()
+                    },
+                );
+                view.providers.update(cx, |editor, cx| {
+                    editor.apply_imported_config(config, cx);
+                    cx.emit(crate::providers_view::ProvidersChanged);
+                });
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(view.settings.vocabulary.terms, vec!["Nimbus-Files"]);
+                let config = view.openrouter_settings.read(cx).config_snapshot();
+                assert!(!crate::providers::has_keyword_support(&config, false));
+                assert!(crate::providers::options(&config, "deepgram::nova-2").streaming);
+                view.show_providers(cx);
+                assert_eq!(view.pane, Pane::Providers);
+                view.show_models(cx);
+                assert_eq!(view.pane, Pane::Models);
+            })
+        });
     }
 
     #[gpui::test]
@@ -5374,7 +5649,7 @@ mod tests {
     }
 
     #[test]
-    fn reopening_targets_models_for_a_missing_key_and_settings_for_permissions() {
+    fn reopening_targets_providers_for_a_missing_key_and_settings_for_permissions() {
         let ready = SetupStatus {
             microphone: PermissionState::Ready,
             input_monitoring: PermissionState::Ready,
@@ -5388,7 +5663,7 @@ mod tests {
                 api_key: false,
                 ..ready
             }),
-            Pane::Models
+            Pane::Providers
         );
         assert_eq!(
             Pane::Statistics.on_reopen(SetupStatus {

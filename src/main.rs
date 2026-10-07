@@ -45,6 +45,8 @@ mod microphone;
 #[cfg(target_os = "macos")]
 mod microphone_priority_view;
 #[cfg(target_os = "macos")]
+mod model_options_view;
+#[cfg(target_os = "macos")]
 mod onboarding;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod openrouter;
@@ -64,6 +66,9 @@ mod post_processing;
 mod post_processing_view;
 #[cfg(target_os = "macos")]
 mod preferences_transfer;
+mod providers;
+#[cfg(target_os = "macos")]
+mod providers_view;
 #[cfg(target_os = "macos")]
 mod recording_environment;
 #[cfg(target_os = "macos")]
@@ -78,6 +83,9 @@ mod suppression;
 mod text_input;
 #[cfg(target_os = "macos")]
 mod update_check;
+mod vocabulary;
+#[cfg(target_os = "macos")]
+mod vocabulary_view;
 #[cfg(target_os = "macos")]
 mod volume_fade;
 
@@ -92,7 +100,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 #[cfg(target_os = "macos")]
 #[derive(Parser)]
-#[command(version, about = "Voice dictation transcribed through OpenRouter")]
+#[command(version, about = "Voice dictation with native speech providers")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -101,6 +109,8 @@ struct Cli {
 #[cfg(target_os = "macos")]
 #[derive(Subcommand)]
 enum Command {
+    /// Verify vocabulary parameter support using a short built-in sample.
+    ValidateVocabulary,
     /// Run the desktop app (the default).
     App {
         /// Override the configured microphone preference order.
@@ -148,6 +158,7 @@ enum AppPreviewTarget {
     Settings,
     Microphone,
     Models,
+    Providers,
     PostProcessing,
     Hud,
     History,
@@ -164,6 +175,13 @@ fn main() -> Result<()> {
         preview_dictation: false,
     });
     match command {
+        Command::ValidateVocabulary => {
+            let config = openrouter::load_config()?;
+            for (model, status) in openrouter::vocabulary_support::validate(&config, true) {
+                println!("{model}: {status}");
+            }
+            Ok(())
+        }
         Command::App {
             device,
             preview_dictation,
@@ -222,6 +240,7 @@ fn main() -> Result<()> {
                 }
                 AppPreviewTarget::History => app_window::PreviewPane::History,
                 AppPreviewTarget::Models => app_window::PreviewPane::Models,
+                AppPreviewTarget::Providers => app_window::PreviewPane::Providers,
                 AppPreviewTarget::PostProcessing => app_window::PreviewPane::PostProcessing,
                 AppPreviewTarget::Microphone => app_window::PreviewPane::Microphone,
                 AppPreviewTarget::Hud => app_window::PreviewPane::Hud,

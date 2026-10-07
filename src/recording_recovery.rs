@@ -381,10 +381,15 @@ impl RecordingRecovery {
     }
 
     pub fn retry(&self, id: &str) -> io::Result<()> {
-        self.retry_with_preferences(
+        let vocabulary = crate::vocabulary::Snapshot::current();
+        let remote = vocabulary.clone();
+        self.retry_with_processing(
             id,
             crate::post_processing::Preferences::current(),
-            crate::openrouter::transcribe::transcribe,
+            vocabulary,
+            move |samples| {
+                crate::openrouter::transcribe::transcribe_with_vocabulary(samples, &remote)
+            },
         )
     }
 
@@ -401,10 +406,26 @@ impl RecordingRecovery {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn retry_with_preferences(
         &self,
         id: &str,
         preferences: crate::post_processing::Preferences,
+        transcribe: impl FnOnce(&[f32]) -> color_eyre::Result<Transcription> + Send + 'static,
+    ) -> io::Result<()> {
+        self.retry_with_processing(
+            id,
+            preferences,
+            crate::vocabulary::Snapshot::default(),
+            transcribe,
+        )
+    }
+
+    pub(crate) fn retry_with_processing(
+        &self,
+        id: &str,
+        preferences: crate::post_processing::Preferences,
+        vocabulary: crate::vocabulary::Snapshot,
         transcribe: impl FnOnce(&[f32]) -> color_eyre::Result<Transcription> + Send + 'static,
     ) -> io::Result<()> {
         self.audio_path(id)?;
@@ -435,7 +456,7 @@ impl RecordingRecovery {
                     id: entry.id.clone(),
                     retry: true,
                 };
-                store.run_retry(entry, preferences, transcribe);
+                store.run_retry(entry, preferences, vocabulary, transcribe);
             });
         if let Err(error) = spawned {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -478,6 +499,7 @@ impl RecordingRecovery {
         &self,
         mut entry: RecoveryEntry,
         preferences: crate::post_processing::Preferences,
+        vocabulary: crate::vocabulary::Snapshot,
         transcribe: impl FnOnce(&[f32]) -> color_eyre::Result<Transcription>,
     ) {
         let samples = match self.read_audio(&entry.id) {
@@ -501,10 +523,8 @@ impl RecordingRecovery {
         let result = transcribe(&samples);
         match result {
             Ok(transcription) if !transcription.text.trim().is_empty() => {
-                let text = preferences
-                    .process(transcription.text.trim())
-                    .trim()
-                    .to_owned();
+                let formatted = preferences.process(transcription.text.trim());
+                let text = vocabulary.restore(formatted.trim()).text;
                 if text.is_empty() {
                     self.finish_failure(entry, "Post-processing removed all text. Change its settings before Retry; the saved audio was kept.");
                     return;
@@ -866,6 +886,38 @@ mod tests {
         wait(&store);
         assert_eq!(store.entries("")[0].text.as_deref(), Some("olá joão"));
         assert!(!store.audio_path(&id).unwrap().exists());
+    }
+
+    #[test]
+    fn retry_restores_the_snapshotted_vocabulary_after_formatting() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let id = failed(&store);
+        let preferences = crate::post_processing::Preferences {
+            lowercase: true,
+            remove_punctuation: true,
+            ..Default::default()
+        };
+        let vocabulary = crate::vocabulary::Snapshot::new(crate::vocabulary::Vocabulary {
+            terms: vec!["Nimbus-Files".into()],
+            approximate: true,
+            ..Default::default()
+        });
+        store
+            .retry_with_processing(&id, preferences, vocabulary, |_| {
+                Ok(Transcription {
+                    text: "MIMBUSFILES!".into(),
+                    report: None,
+                })
+            })
+            .unwrap();
+        wait(&store);
+        assert_eq!(store.entries("")[0].text.as_deref(), Some("Nimbus-Files"));
+        assert!(!store.audio_path(&id).unwrap().exists());
+        assert_eq!(
+            fixture.store().entries("")[0].text.as_deref(),
+            Some("Nimbus-Files")
+        );
     }
 
     #[test]

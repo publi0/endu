@@ -138,10 +138,10 @@ pub(crate) fn record_completion_at(directory: &Path) -> color_eyre::Result<()> {
     Ok(())
 }
 
-/// Permission health plus whether an OpenRouter key is available. The key
+/// Permission health plus whether a selected provider key is available. The key
 /// lookup may touch the Keychain, so callers poll this off the hot path.
 pub fn status() -> SetupStatus {
-    status_with_api_key(crate::openrouter::is_configured())
+    status_with_api_key(crate::providers::is_configured())
 }
 
 pub fn status_with_api_key(api_key: bool) -> SetupStatus {
