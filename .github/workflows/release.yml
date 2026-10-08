@@ -1,18 +1,12 @@
 name: Release
 
+# A release is a version change in Cargo.toml. Code-only pushes never start a
+# run; use workflow_dispatch to finish an interrupted release or repair the cask.
 on:
   push:
     branches: [main]
     paths:
       - "Cargo.toml"
-      - "Cargo.lock"
-      - "build.rs"
-      - "src/**"
-      - "native/**"
-      - "app/**"
-      - "resources/**"
-      - "scripts/**"
-      - ".github/workflows/release.yml"
   workflow_dispatch:
 
 permissions:
@@ -23,8 +17,52 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
+  # Decide on Linux in seconds, so non-release Cargo.toml edits never wait for
+  # a macOS runner and never queue ahead of a real release.
+  plan:
     if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      needed: ${{ steps.decide.outputs.needed }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Select the Cargo version
+        id: plan
+        run: python3 scripts/release.py plan
+      - name: Decide whether a macOS release run is needed
+        id: decide
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+          BUILD: ${{ steps.plan.outputs.build }}
+          SKIP: ${{ steps.plan.outputs.skip }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$SKIP" = "true" ]; then
+            needed=false
+          elif [ "$EVENT" = "workflow_dispatch" ] || [ "$BUILD" = "true" ]; then
+            needed=true
+          elif grep -qx "  version \"$VERSION\"" Casks/hex-openrouter.rb; then
+            # Published and already in the cask: nothing to build or repair.
+            needed=false
+          else
+            needed=true
+          fi
+          echo "needed=$needed" >> "$GITHUB_OUTPUT"
+          echo "Release run needed for $VERSION: $needed"
+
+  release:
+    needs: plan
+    if: needs.plan.outputs.needed == 'true'
     runs-on: macos-26
     timeout-minutes: 90
     env:

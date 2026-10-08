@@ -402,6 +402,11 @@ tests, integration tests, or other validation jobs to GitHub Actions.** Do
 not call `scripts/check-local.sh` or any test suite from a workflow. All of
 those steps belong to the local pre-commit process above.
 
+The workflow starts only when `Cargo.toml` changes on `main` or by manual
+dispatch, never for code-only pushes. An Ubuntu `plan` job decides first; the
+macOS job runs only to publish an unpublished version, repair its cask, or on
+manual dispatch. Use dispatch to finish an interrupted release.
+
 The package version in `Cargo.toml` is the release version. Keep its package
 entry in `Cargo.lock` in sync. Publish only when that version is not already
 published: `3.0.0` becomes tag `v3.0.0`, title `Hex 3.0.0`, and asset
