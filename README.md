@@ -305,7 +305,7 @@ resolver a condição, o aviso é atualizado.
 | **OpenAI** | GPT Transcribe e modelos GPT-4o/Whisper por upload; GPT Live Transcribe por WebSocket. Nomes são enviados como keywords ou prompt conforme o modelo. |
 | **Deepgram** | Nova-3 e Nova-2, por upload ou streaming. Nova-3 aceita keyterms; formatação, pontuação e números têm controles próprios. |
 | **ElevenLabs** | Scribe v2 por upload e Scribe v2 Realtime por WebSocket, com keyterms e opção de remover hesitações. |
-| **Microsoft** | MAI-Transcribe 2 por upload, com vocabulário e estilo limpo/verbatim; MAI-Transcribe 2 Streaming por WebSocket, usando um deployment do Azure. |
+| **Microsoft** | MAI-Transcribe 2 por upload, com vocabulário e estilo limpo/verbatim; MAI-Transcribe 2 Streaming pelo protocolo Azure Speech, usando o mesmo recurso e a mesma chave. |
 | **Grok (xAI)** | Grok Voice Transcribe 2.0 por upload ou streaming, com keyterms e controles de formatação e hesitações. |
 | **Google** | Gemini 3.5 Transcribe e Transcribe Live com chave do AI Studio, vocabulário e Smart transcription. |
 | **Meta** | Muse Voice Transcribe 1.0 por upload ou streaming, com keywords e indicação de idioma. |
@@ -324,12 +324,15 @@ essas funções são oferecidas juntas pela API. No **Grok**, a formatação de 
 exige um idioma explícito compatível; em Auto, essa preferência continua salva para uso posterior.
 
 Na **Microsoft**, cadastre a chave do recurso Azure. Em **Providers → Advanced → Microsoft**,
-para upload, informe **Batch endpoint**
-(`https://<recurso>.cognitiveservices.azure.com`). Para streaming, informe **Streaming endpoint**
-(`https://<recurso>.services.ai.azure.com`) e o nome de **Deployment**.
-Os endpoints são locais e não entram na exportação de preferências. O botão **Test** da
-Microsoft requer o endpoint de upload e valida a chave sem enviar áudio; o acesso ao deployment
-é verificado quando ele é usado. O modelo de streaming não anuncia keywords sem suporte documentado.
+informe **Resource endpoint** (`https://<recurso>.cognitiveservices.azure.com`).
+O endpoint e a chave são compartilhados pelo upload e pelo streaming. O streaming usa
+o protocolo do Azure Speech SDK, seleciona `mai-transcribe-2-streaming` diretamente
+e não requer criar um deployment no Foundry. Escolha uma região que ofereça os dois
+modelos na rota Speech; Southeast Asia foi validada para ambos.
+Configurações existentes com um **Deployment** explícito mantêm a integração
+Foundry Realtime e seus campos avançados; limpar esse campo ativa a rota Speech.
+Os endpoints são locais e não entram na exportação de preferências. O botão **Test**
+valida a chave sem enviar áudio. O modelo de streaming não envia keywords sem suporte documentado.
 
 Uma chave salva mostra somente os últimos quatro caracteres, com **Test** e
 **Remove**. Clique no indicador da chave para substituí-la. O teste verifica acesso à conta; não garante saldo,

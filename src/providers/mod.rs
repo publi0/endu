@@ -10,6 +10,7 @@ mod meta;
 mod model_notices;
 pub use model_notices::model_notices;
 mod microsoft;
+mod microsoft_speech;
 pub use microsoft::{MicrosoftConfig, microsoft_endpoint};
 pub mod streaming;
 

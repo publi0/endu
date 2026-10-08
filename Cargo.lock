@@ -7159,7 +7159,7 @@ dependencies = [
 
 [[package]]
 name = "voice-control"
-version = "3.4.0"
+version = "3.4.1"
 dependencies = [
  "arboard",
  "block2",
@@ -7190,6 +7190,7 @@ dependencies = [
  "security-framework-sys",
  "serde",
  "serde_json",
+ "time",
  "tracing",
  "tracing-subscriber",
  "tungstenite",
@@ -7197,6 +7198,7 @@ dependencies = [
  "unicode-segmentation",
  "ureq",
  "url",
+ "uuid",
 ]
 
 [[package]]

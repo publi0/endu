@@ -234,9 +234,7 @@ pub fn check_key(provider: Provider, config: &Config) -> Result<String> {
     // Resolve and validate destination before looking up any credentials.
     let endpoint = if provider == Provider::Microsoft {
         if config.microsoft.endpoint.is_empty() {
-            bail!(
-                "A separate Microsoft key test needs the Batch endpoint. Streaming checks the key when connecting to its deployment."
-            );
+            bail!("Enter the Microsoft resource endpoint in Providers to test this key.");
         }
         let mut root = super::microsoft_endpoint(config, false).map_err(|e| eyre!("{e}"))?;
         root.set_path("/sts/v1.0/issueToken");

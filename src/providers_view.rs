@@ -81,9 +81,6 @@ impl ProvidersView {
         let loaded = if preview {
             let mut config = Config::default();
             config.microsoft.endpoint = "https://hex-preview.cognitiveservices.azure.com".into();
-            config.microsoft.streaming_endpoint =
-                "https://hex-preview.services.ai.azure.com".into();
-            config.microsoft.deployment = "mai-transcribe-preview".into();
             Ok(config)
         } else {
             crate::openrouter::load_config()
@@ -317,41 +314,49 @@ impl ProvidersView {
         let fields = [
             (
                 MicrosoftField::Batch,
-                "Batch endpoint",
-                "HTTPS resource root for recorded audio",
+                "Resource endpoint",
+                "One Azure resource and key for recorded audio and streaming",
             ),
             (
                 MicrosoftField::Streaming,
-                "Streaming endpoint",
-                "HTTPS resource root for live transcription",
+                "Foundry Realtime endpoint",
+                "Used by your existing deployment; clear Deployment to use the shared resource",
             ),
             (
                 MicrosoftField::Deployment,
                 "Deployment",
-                "Deployment name for live transcription",
+                "Optional Foundry Realtime deployment; leave empty to use Speech streaming",
             ),
         ];
-        div().children(fields.into_iter().map(|(field, title, description)| {
-            let index = field.index();
-            div()
-                .child(settings_row(
-                    title,
-                    description,
+        div().children(
+            fields
+                .into_iter()
+                .filter(|(field, _, _)| {
+                    matches!(field, MicrosoftField::Batch)
+                        || !self.config.microsoft.uses_speech_streaming()
+                })
+                .map(|(field, title, description)| {
+                    let index = field.index();
                     div()
-                        .debug_selector(move || format!("microsoft-connection-{index}"))
-                        .w(px(SETTINGS_CONTROL_WIDTH))
-                        .flex_none()
-                        .child(self.microsoft[index].clone()),
-                ))
-                .children(self.microsoft_errors[index].clone().map(|error| {
-                    div()
-                        .px_4()
-                        .pb_3()
-                        .text_size(px(11.0))
-                        .text_color(rgb(NEGATIVE))
-                        .child(error)
-                }))
-        }))
+                        .child(settings_row(
+                            title,
+                            description,
+                            div()
+                                .debug_selector(move || format!("microsoft-connection-{index}"))
+                                .w(px(SETTINGS_CONTROL_WIDTH))
+                                .flex_none()
+                                .child(self.microsoft[index].clone()),
+                        ))
+                        .children(self.microsoft_errors[index].clone().map(|error| {
+                            div()
+                                .px_4()
+                                .pb_3()
+                                .text_size(px(11.0))
+                                .text_color(rgb(NEGATIVE))
+                                .child(error)
+                        }))
+                }),
+        )
     }
 
     pub fn close_pickers(&mut self, cx: &mut Context<Self>) {
@@ -370,7 +375,7 @@ impl Render for ProvidersView {
             .microsoft_errors
             .iter()
             .zip([
-                "Microsoft batch endpoint",
+                "Microsoft resource endpoint",
                 "Microsoft streaming endpoint",
                 "Microsoft deployment",
             ])
@@ -599,7 +604,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn microsoft_connection_edits_validate_on_blur_and_enter_escape_cancels(
+    fn microsoft_legacy_connection_edits_validate_on_blur_and_enter_escape_cancels(
         cx: &mut gpui::TestAppContext,
     ) {
         use gpui::Focusable;
@@ -607,6 +612,15 @@ mod tests {
         cx.update(|cx| cx.bind_keys(crate::text_input::key_bindings()));
         let (view, cx) = cx.add_window_view(|_, cx| ProvidersView::new(true, cx));
         cx.simulate_resize(gpui::size(px(760.0), px(2400.0)));
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let mut config = view.config.clone();
+                config.microsoft.streaming_endpoint =
+                    "https://hex-preview.services.ai.azure.com".into();
+                config.microsoft.deployment = "existing-deployment".into();
+                view.refresh(config, cx);
+            })
+        });
         let changes = Rc::new(RefCell::new(0));
         let recorded = changes.clone();
         let _subscription = cx.update(|_, cx| {
@@ -773,6 +787,22 @@ mod tests {
         cx.run_until_parked();
         let expanded = cx.debug_bounds("providers-advanced").unwrap();
         assert!(expanded.size.height > collapsed.size.height);
+        let shared = cx.debug_bounds("microsoft-connection-0").unwrap();
+        assert_eq!(shared.size.width, px(SETTINGS_CONTROL_WIDTH));
+        assert_eq!(shared.size.height, px(crate::desktop_ui::CONTROL_HEIGHT));
+        assert!(cx.debug_bounds("microsoft-connection-1").is_none());
+        assert!(cx.debug_bounds("microsoft-connection-2").is_none());
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let mut config = view.config.clone();
+                config.microsoft.streaming_endpoint =
+                    "https://hex-preview.services.ai.azure.com".into();
+                config.microsoft.deployment = "existing-deployment".into();
+                view.refresh(config, cx);
+            })
+        });
+        cx.run_until_parked();
+        let expanded = cx.debug_bounds("providers-advanced").unwrap();
         for selector in [
             "provider-key-0",
             "provider-key-1",

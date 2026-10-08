@@ -181,6 +181,12 @@ not reintroduce seams for them.
   Native Microsoft/Google model IDs remain distinct from identically named OpenRouter
   routes. Azure resource endpoints/deployment stay local across preference imports and
   never enter exports. Validate Azure HTTPS roots before resolving the Microsoft key.
+  Microsoft streaming defaults to the Speech SDK-compatible custom resource route,
+  sharing the batch endpoint/key. Only an explicitly populated legacy deployment
+  selects Foundry Realtime. Speech frames correlate X-RequestId, retain only final
+  phrases, and require Finish, EndOfDictation and turn.end before releasing text.
+  A phrase final or socket close alone is never a completed recording. Preserve
+  cancellation, bounded text retention and exact audio accounting on this route.
   Google uses the AI Studio key and dedicated Transcribe API with store:false for unary
   requests; do not persist Interactions or upload permanent files. Smart transcription
   is one atomic Google option. Grok formatting requires a supported explicit language;

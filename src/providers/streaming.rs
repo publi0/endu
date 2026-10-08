@@ -639,13 +639,25 @@ fn endpoint(
     if model.provider == Provider::Microsoft {
         // Validate the resource before resolving credentials. Only the documented
         // Azure root is configurable; protocol path/query are supplied here.
-        let mut url = super::microsoft_endpoint(config, true).map_err(|_| {
-            failure("Configure the Microsoft streaming resource and deployment in Providers.")
-        })?;
+        let mut url = super::microsoft_endpoint(config, true)
+            .map_err(|_| failure("Configure the Microsoft resource endpoint in Providers."))?;
         url.set_scheme("wss")
             .map_err(|_| failure("Invalid Microsoft streaming endpoint."))?;
-        url.set_path("/mai/v1/realtime");
-        url.set_query(Some("intent=transcription"));
+        if config.microsoft.uses_speech_streaming() {
+            // Speech SDK 1.52's custom-resource route. This shares the batch
+            // resource/key and selects MAI through speech.context, without a
+            // separately provisioned Foundry Realtime model deployment.
+            url.set_path("/stt/speech/universal/v2");
+            url.query_pairs_mut().append_pair("format", "simple");
+            if options.language != "auto" {
+                let language = super::bcp47_language(&options.language)
+                    .ok_or_else(|| failure("Unsupported Microsoft language hint."))?;
+                url.query_pairs_mut().append_pair("language", language);
+            }
+        } else {
+            url.set_path("/mai/v1/realtime");
+            url.set_query(Some("intent=transcription"));
+        }
         return Ok(url);
     }
     let base = match model.provider {
@@ -1442,6 +1454,7 @@ impl Write for SocketIo {
 struct Connection {
     socket: WebSocket<MaybeTlsStream<SocketIo>>,
     protocol: Protocol,
+    speech: Option<super::microsoft_speech::SpeechProtocol>,
     encoder: PcmEncoder,
     model: String,
     keyword_count: usize,
@@ -1476,6 +1489,11 @@ impl Connection {
             .map_err(|_| failure("Invalid streaming model options."))?;
         let keywords = streaming_keywords(model, vocabulary);
         let url = endpoint(config, model, &options, &keywords)?;
+        let speech = (model.provider == Provider::Microsoft
+            && config.microsoft.uses_speech_streaming())
+        .then(|| {
+            super::microsoft_speech::SpeechProtocol::new(uuid::Uuid::new_v4().simple().to_string())
+        });
         // Validation above is preflight. From credential resolution onward this
         // is an attempted provider request, even when authentication fails before
         // bytes reach the wire (the UI deliberately calls these attempts).
@@ -1493,7 +1511,14 @@ impl Connection {
             .map_err(|_| failure("Could not create streaming request."))?;
         if model.provider != Provider::Meta {
             let (header, value) = authentication(model.provider, &key)?;
-            request.headers_mut().insert(header, value);
+            request.headers_mut().insert(
+                if speech.is_some() {
+                    "Ocp-Apim-Subscription-Key"
+                } else {
+                    header
+                },
+                value,
+            );
         }
         let host = url
             .host_str()
@@ -1584,12 +1609,22 @@ impl Connection {
             completed: None,
             wire_frames: 0,
             sent_samples: control.sent_samples.clone(),
-            pending_setup: (model.provider == Provider::Microsoft)
+            pending_setup: (model.provider == Provider::Microsoft && speech.is_none())
                 .then(|| microsoft_session_update(config, &options)),
             activity_started: false,
             pacing_started: None,
             control: control.clone(),
+            speech,
         };
+        if let Some(speech) = &connection.speech {
+            for frame in speech.setup() {
+                connection.wire(frame)?;
+            }
+            // Speech has no configuration acknowledgement. Audio begins after
+            // setup, while SpeechProtocol separately requires the server's
+            // turn.start, EndOfDictation, and turn.end before releasing text.
+            connection.protocol.ready = true;
+        }
         match model.provider {
             Provider::Meta => {
                 let setup = super::meta::handshake(model.model, &options, &keywords, &key)
@@ -1616,8 +1651,11 @@ impl Connection {
         Ok(connection)
     }
     fn json(&mut self, value: Value) -> Result<()> {
+        self.wire(Message::Text(value.to_string().into()))
+    }
+    fn wire(&mut self, message: Message) -> Result<()> {
         self.socket
-            .send(Message::Text(value.to_string().into()))
+            .send(message)
             .map_err(|error| websocket_failure("Streaming write failed.", &error))?;
         self.last_send = Instant::now();
         Ok(())
@@ -1646,11 +1684,20 @@ impl Connection {
             self.protocol.provider,
             self.encoder.source.saturating_add(samples.len()),
         )?;
-        if matches!(self.protocol.provider, Provider::Grok | Provider::Meta) {
-            // Both APIs require real-time-paced PCM packets. Pace on this
-            // socket worker; capture keeps its bounded nonblocking producer.
+        if self.speech.is_some()
+            || matches!(self.protocol.provider, Provider::Grok | Provider::Meta)
+        {
+            // Grok/Meta run at real time; Speech permits SDK-style 2x catch-up.
+            // Pace only on this worker; capture remains nonblocking.
             let target = *self.pacing_started.get_or_insert_with(Instant::now)
-                + Duration::from_secs_f64(self.wire_frames as f64 / 16_000.0);
+                + Duration::from_secs_f64(
+                    self.wire_frames as f64
+                        / if self.speech.is_some() {
+                            32_000.0
+                        } else {
+                            16_000.0
+                        },
+                );
             let control = self.control.clone();
             while Instant::now() < target {
                 self.poll(deadline, &control)?;
@@ -1665,7 +1712,10 @@ impl Connection {
             return Ok(());
         }
         let frames = pcm.len() / 2;
-        match self.protocol.provider {
+        if let Some(speech) = &self.speech {
+            self.wire(speech.audio(&pcm))?;
+        } else {
+            match self.protocol.provider {
             Provider::OpenAi | Provider::Microsoft => self.json(json!({"type":"input_audio_buffer.append","audio":crate::openrouter::transcribe::encode_base64(&pcm)})),
             Provider::ElevenLabs => self.json(json!({"message_type":"input_audio_chunk","audio_base_64":crate::openrouter::transcribe::encode_base64(&pcm),"commit":false,"sample_rate":16000})),
             Provider::Google => self.json(json!({"realtimeInput":{"audio":{"data":crate::openrouter::transcribe::encode_base64(&pcm),"mimeType":"audio/pcm;rate=16000"}}})),
@@ -1676,6 +1726,7 @@ impl Connection {
             }
             _ => Err(failure("Unsupported streaming provider.")),
         }?;
+        }
         self.wire_frames += frames;
         let logical = if self.protocol.provider == Provider::OpenAi {
             self.wire_frames * 2 / 3
@@ -1690,6 +1741,10 @@ impl Connection {
         let pcm = self.encoder.push(&[], true)?;
         self.send_pcm(pcm)?;
         self.protocol.finishing = true;
+        if let Some(speech) = &mut self.speech {
+            let frame = speech.finish();
+            return self.wire(frame);
+        }
         self.json(finish_message(self.protocol.provider)?)
     }
     fn keep_alive(&mut self) -> Result<()> {
@@ -1705,9 +1760,16 @@ impl Connection {
         self.set_deadline(deadline);
         let result = match self.socket.read() {
             Ok(Message::Text(text)) => {
-                let value: Value = serde_json::from_str(&text)
-                    .map_err(|_| failure("Invalid streaming response."))?;
-                self.protocol.event(&value)
+                if let Some(speech) = &mut self.speech {
+                    speech.event(&text).map_err(failure)
+                } else {
+                    let value: Value = serde_json::from_str(&text)
+                        .map_err(|_| failure("Invalid streaming response."))?;
+                    self.protocol.event(&value)
+                }
+            }
+            Ok(Message::Binary(_)) if self.speech.is_some() => {
+                Err(failure("Unexpected Microsoft Speech binary response."))
             }
             Ok(Message::Binary(bytes)) if self.protocol.provider == Provider::Google => {
                 let value: Value = serde_json::from_slice(&bytes)
@@ -2040,6 +2102,34 @@ mod tests {
         config.microsoft.streaming_endpoint = "https://fixture.services.ai.azure.com".into();
         config.microsoft.deployment = "fixture-mai-deployment".into();
         config
+    }
+
+    #[test]
+    fn microsoft_speech_streams_with_only_the_shared_resource_and_preserves_auto_language() {
+        let mut config = Config::default();
+        config.microsoft.endpoint = "https://fixture.cognitiveservices.azure.com".into();
+        let model = ModelRef::parse("microsoft::MAI-Transcribe-2-Streaming");
+        for (language, expected) in [("auto", None), ("pt", Some("pt-BR")), ("en", Some("en-US"))] {
+            let options = ModelOptions {
+                language: language.into(),
+                ..Default::default()
+            };
+            let url = endpoint(&config, model, &options, &["not supported".into()]).unwrap();
+            assert_eq!(url.host_str(), Some("fixture.cognitiveservices.azure.com"));
+            assert_eq!(url.path(), "/stt/speech/universal/v2");
+            assert_eq!(url.scheme(), "wss");
+            assert_eq!(
+                url.query_pairs()
+                    .find(|(key, _)| key == "language")
+                    .map(|(_, v)| v.into_owned())
+                    .as_deref(),
+                expected
+            );
+            assert!(!url.as_str().contains("not supported"));
+            assert!(!url.as_str().contains("deployment"));
+        }
+        config.microsoft.endpoint = "https://fixture.cognitiveservices.azure.com.evil.test".into();
+        assert!(endpoint(&config, model, &ModelOptions::default(), &[]).is_err());
     }
 
     #[test]

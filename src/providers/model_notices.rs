@@ -42,11 +42,15 @@ pub fn model_notices(config: &Config, id: &str) -> Vec<ModelNotice> {
         let requirement = match model.model {
             "MAI-Transcribe-2" => Some((
                 false,
-                "Check the Microsoft batch endpoint and settings in Providers → Advanced → Microsoft.",
+                "Check the Microsoft resource endpoint in Providers → Advanced → Microsoft.",
             )),
             "MAI-Transcribe-2-Streaming" => Some((
                 true,
-                "Check the Microsoft streaming endpoint and deployment in Providers → Advanced → Microsoft.",
+                if config.microsoft.uses_speech_streaming() {
+                    "Check the Microsoft resource endpoint in Providers → Advanced → Microsoft."
+                } else {
+                    "Check the Microsoft Realtime endpoint and deployment in Providers → Advanced → Microsoft."
+                },
             )),
             _ => None,
         };
@@ -199,11 +203,11 @@ mod tests {
         }
         config.microsoft.endpoint = "https://fixture.cognitiveservices.azure.com".into();
         assert!(model_notices(&config, "microsoft::MAI-Transcribe-2").is_empty());
-        assert!(!model_notices(&config, "microsoft::MAI-Transcribe-2-Streaming").is_empty());
+        assert!(model_notices(&config, "microsoft::MAI-Transcribe-2-Streaming").is_empty());
         config.microsoft.streaming_endpoint = "https://fixture.services.ai.azure.com".into();
         assert!(
-            !model_notices(&config, "microsoft::MAI-Transcribe-2-Streaming").is_empty(),
-            "deployment is still missing"
+            model_notices(&config, "microsoft::MAI-Transcribe-2-Streaming").is_empty(),
+            "Speech streaming shares the batch resource without a deployment"
         );
         config.microsoft.deployment = "fixture-deployment".into();
         assert!(model_notices(&config, "microsoft::MAI-Transcribe-2-Streaming").is_empty());

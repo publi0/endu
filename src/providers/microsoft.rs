@@ -12,6 +12,12 @@ pub struct MicrosoftConfig {
 }
 
 impl MicrosoftConfig {
+    /// Speech uses the same resource and key as batch. Retain explicitly
+    /// configured Foundry Realtime deployments for existing installations.
+    pub fn uses_speech_streaming(&self) -> bool {
+        self.deployment.is_empty()
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         for (endpoint, streaming) in [(&self.endpoint, false), (&self.streaming_endpoint, true)] {
             if !endpoint.is_empty() {
@@ -69,16 +75,14 @@ fn resource_root(value: &str, streaming: bool) -> Result<Url, String> {
 /// Return only a validated root; adapters append their documented protocol paths.
 pub fn microsoft_endpoint(config: &Config, streaming: bool) -> Result<Url, String> {
     config.microsoft.validate()?;
-    if streaming && config.microsoft.deployment.is_empty() {
-        return Err("Enter the MAI streaming deployment name in Providers.".into());
-    }
+    let realtime = streaming && !config.microsoft.uses_speech_streaming();
     resource_root(
-        if streaming {
+        if realtime {
             &config.microsoft.streaming_endpoint
         } else {
             &config.microsoft.endpoint
         },
-        streaming,
+        realtime,
     )
 }
 
@@ -121,7 +125,10 @@ mod tests {
         config.microsoft.endpoint = "https://fixture.cognitiveservices.azure.com".into();
         assert!(microsoft_endpoint(&config, false).is_ok());
         config.microsoft.streaming_endpoint = "https://fixture.services.ai.azure.com".into();
-        assert!(microsoft_endpoint(&config, true).is_err());
+        assert_eq!(
+            microsoft_endpoint(&config, true).unwrap(),
+            microsoft_endpoint(&config, false).unwrap()
+        );
         config.microsoft.deployment = "MAI-Transcribe-2-Streaming".into();
         assert!(microsoft_endpoint(&config, true).is_ok());
         config.microsoft.deployment = "injected\nname".into();
