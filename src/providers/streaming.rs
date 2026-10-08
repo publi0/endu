@@ -286,6 +286,9 @@ pub struct LiveCapture {
     control: Arc<SessionControl>,
     queued: usize,
     invalid: Option<&'static str>,
+    /// The worker already returned (for example without a key). Its own error
+    /// is the result; audio is no longer sent and no other reason is invented.
+    worker_ended: bool,
 }
 
 impl LiveCapture {
@@ -342,6 +345,7 @@ impl LiveCapture {
             result: Some(result),
             control,
             queued: 0,
+            worker_ended: false,
             invalid: (!admitted)
                 .then_some("Streaming session limit reached; using the complete recording."),
         }
@@ -349,7 +353,7 @@ impl LiveCapture {
 
     /// `prefix` is the exact immutable prefix of the eventual untrimmed clip.
     pub fn push_prefix(&mut self, prefix: &[f32]) {
-        if self.invalid.is_some() {
+        if self.invalid.is_some() || self.worker_ended {
             return;
         }
         if prefix.len() < self.queued {
@@ -364,18 +368,20 @@ impl LiveCapture {
         // Keep sub-packet samples in Recording until a full 100 ms block exists.
         // Otherwise a 3 ms native callback would turn the 3.2 s queue into 96 ms.
         for samples in remaining.chunks_exact(BLOCK) {
-            if self
-                .audio
-                .try_send(AudioBlock {
-                    start: self.queued,
-                    samples: samples.to_vec(),
-                })
-                .is_err()
-            {
-                self.invalidate("Streaming audio fell behind; using the complete recording.");
-                break;
+            match self.audio.try_send(AudioBlock {
+                start: self.queued,
+                samples: samples.to_vec(),
+            }) {
+                Ok(()) => self.queued += samples.len(),
+                Err(mpsc::TrySendError::Full(_)) => {
+                    self.invalidate("Streaming audio fell behind; using the complete recording.");
+                    break;
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    self.worker_ended = true;
+                    break;
+                }
             }
-            self.queued += samples.len();
         }
     }
 
@@ -385,7 +391,9 @@ impl LiveCapture {
     }
 
     pub fn finish(mut self, samples: &[f32]) -> PendingLive {
-        if samples.len() < self.queued {
+        if self.worker_ended {
+            // Keep the worker's own result rather than a generic sealing error.
+        } else if samples.len() < self.queued {
             self.invalidate("A delayed input boundary invalidated the live transcript.");
         } else if self.invalid.is_none() {
             let tail = &samples[self.queued..];
@@ -2118,6 +2126,7 @@ mod tests {
             result: Some(result),
             control: SessionControl::new(None, None),
             queued: 0,
+            worker_ended: false,
             invalid: None,
         };
         (live, audio_rx, seal_rx, send_result)
