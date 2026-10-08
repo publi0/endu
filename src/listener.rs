@@ -486,8 +486,12 @@ pub fn listen(
             }
         }
 
-        // The audio projection only drives the HUD meter while recording.
-        if let Some(audio) = input.recv_timeout(Duration::from_millis(20))?
+        // The audio projection only drives the HUD meter while recording. Take
+        // the newest chunk: a cold-start boundary drain slows this loop, and
+        // reading one chunk per turn would let stale audio crowd out every
+        // current level.
+        let audio = input.recv_timeout(Duration::from_millis(20))?;
+        if let Some(audio) = input.latest_recognition(audio)
             && audio.is_current(input.recognition_generation())
             && hotkey.is_recording()
             && let Some(indicator) = &indicator

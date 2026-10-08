@@ -336,6 +336,17 @@ impl DictationAudio {
         }
     }
 
+    /// Newest queued meter audio, dropping older chunks. The meter only needs
+    /// the latest level, and consuming one chunk per listener turn lets the
+    /// projection overflow whenever that loop is slower than the device.
+    pub fn latest_recognition(&self, first: Option<RecognitionAudio>) -> Option<RecognitionAudio> {
+        let mut latest = first;
+        while let Ok(audio) = self.recognition.try_recv() {
+            latest = Some(audio);
+        }
+        latest
+    }
+
     pub fn try_recv_event(&self) -> Option<DictationAudioEvent> {
         while let Ok(event) = self.events.try_recv() {
             let generation = match &event {
@@ -869,6 +880,69 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn meter_reads_the_newest_chunk_and_frees_the_backlog() {
+        let (mut owner, input, samples) = owner_for_test(true);
+        let at = capture_time();
+        for index in 1..=8u64 {
+            samples
+                .send((
+                    vec![index as f32 / 100.0; 480],
+                    at + Duration::from_millis(10 * index),
+                ))
+                .unwrap();
+            let event = owner.input.recv_timeout(Duration::from_millis(100), false);
+            owner.handle_input(event);
+        }
+        let first = input.recv_timeout(Duration::from_millis(100)).unwrap();
+        let latest = input.latest_recognition(first).expect("queued meter audio");
+        assert_eq!(latest.samples[0], 0.08);
+        assert!(latest.is_current(input.recognition_generation()));
+        drop(latest);
+        assert_eq!(
+            input
+                .state
+                .outstanding_recognition_frames
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
+    fn cold_open_delivers_current_meter_audio_while_recording() {
+        let (mut owner, input, _unused_samples) = owner_for_test(false);
+        owner.release_while_idle = true;
+        let (pending, opened) = RecoveringAudioInput::pending_for_test();
+        owner.input = pending;
+        let at = capture_time();
+        start(&mut owner, at);
+        owner.reconcile_input();
+        // The listener invalidates older meter audio right after accepting the press.
+        let _ = control(&mut owner, |reply| Command::InvalidateRecognition { reply });
+        input.discard_recognition_backlog();
+        let (replacement, samples) = crate::audio::AudioInput::channel_for_test();
+        opened.send((0, Ok(replacement))).unwrap();
+        let event = owner.input.recv_timeout(Duration::ZERO, false);
+        assert!(matches!(event, RecoveringAudioInputEvent::Reopened));
+        owner.handle_input(event);
+        owner.reconcile_input();
+        while input.try_recv_event().is_some() {}
+        input.discard_recognition_backlog();
+        for index in 1..=5u64 {
+            samples
+                .send((vec![0.1; 480], at + Duration::from_millis(10 * index)))
+                .unwrap();
+            let event = owner.input.recv_timeout(Duration::from_millis(100), false);
+            owner.handle_input(event);
+        }
+        let audio = input
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap()
+            .expect("cold-opened capture must feed the HUD meter");
+        assert!(audio.is_current(input.recognition_generation()));
+        assert!(input.is_recording());
     }
 
     #[test]

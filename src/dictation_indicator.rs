@@ -1070,6 +1070,40 @@ mod tests {
     }
 
     #[test]
+    fn cold_and_warm_recordings_react_to_voice_in_rendered_frames() {
+        for cold in [false, true] {
+            let mut renderer = MetalRenderer::new().expect("local macOS checks require Metal");
+            if cold {
+                renderer.handle(DictationIndicatorEvent::Preparing);
+                let start = Instant::now();
+                for frame in 1..=10 {
+                    renderer.draw_with(start + Duration::from_millis(16 * frame), |_| None);
+                }
+            }
+            renderer.handle(DictationIndicatorEvent::Started);
+            let start = Instant::now();
+            for frame in 1..=30u64 {
+                renderer.handle(DictationIndicatorEvent::Meter {
+                    average: 0.05,
+                    peak: 0.3,
+                });
+                renderer.last_meter = Some(start + Duration::from_millis(16 * frame));
+                renderer.draw_with(start + Duration::from_millis(16 * frame), |_| None);
+            }
+            assert!(
+                renderer.average.value > 0.2,
+                "cold={cold} average={}",
+                renderer.average.value
+            );
+            assert!(
+                renderer.width.value > CAPSULE_WIDTH + 1.0,
+                "cold={cold} width={}",
+                renderer.width.value
+            );
+        }
+    }
+
+    #[test]
     fn voice_reaction_only_uses_fresh_samples_from_an_active_recording() {
         let mut renderer = MetalRenderer::new().expect("local macOS checks require Metal");
         let meter = DictationIndicatorEvent::Meter {
