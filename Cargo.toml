@@ -1,6 +1,6 @@
 [package]
 name = "voice-control"
-version = "3.5.0"
+version = "3.6.0"
 edition = "2024"
 default-run = "voice-control"
 license = "MIT"
@@ -38,7 +38,6 @@ url = "2.5"
 unicode-segmentation = "1.13.3"
 unicode-properties = { version = "0.1.4", default-features = false, features = ["general-category"] }
 time = { version = "0.3.55", features = ["formatting"] }
-uuid = { version = "1.27.0", features = ["v4"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 arboard = { version = "3.6.1", default-features = false }
@@ -50,7 +49,6 @@ gpui-symbols = { version = "0.6.1", default-features = false, features = ["compo
 metal = "0.33.0"
 objc2 = "0.6.4"
 security-framework = "3.7.0"
-security-framework-sys = "2.17.0"
 objc2-app-kit = "0.3.2"
 objc2-core-audio = "0.3.2"
 objc2-core-foundation = "0.3.2"
