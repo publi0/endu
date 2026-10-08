@@ -13,6 +13,17 @@ use crate::openrouter::{self, Config, KeyStatus};
 enum CachedKey {
     Found(String),
     Missing(Instant),
+    /// The item exists but macOS refused it (Deny, Cancel, or no reply). Asking
+    /// again on a timer would stack Keychain prompts, so only a user action
+    /// (Test, save, remove) clears this.
+    Unavailable,
+}
+
+/// Outcome of reading one secret. Only `Found` ever involved decrypting it.
+pub(crate) enum KeychainRead {
+    Found(String),
+    Missing,
+    Unavailable,
 }
 
 static CACHE: LazyLock<Mutex<BTreeMap<Provider, CachedKey>>> =
@@ -60,21 +71,38 @@ pub fn api_key(provider: Provider, config: &Config) -> Result<String> {
                 provider.label()
             );
         }
+        Some(CachedKey::Unavailable) => bail!(unavailable_message(provider.label())),
         _ => {}
     }
     match read_keychain(provider) {
-        Some(key) => {
+        KeychainRead::Found(key) => {
             cache.insert(provider, CachedKey::Found(key.clone()));
             Ok(key)
         }
-        None => {
+        KeychainRead::Missing => {
             cache.insert(provider, CachedKey::Missing(Instant::now()));
             bail!(
                 "{} API key not found. Add it in Providers.",
                 provider.label()
             )
         }
+        KeychainRead::Unavailable => {
+            cache.insert(provider, CachedKey::Unavailable);
+            bail!(unavailable_message(provider.label()))
+        }
     }
+}
+
+pub(crate) fn unavailable_message(provider: &str) -> String {
+    format!(
+        "macOS did not allow Hex to read the {provider} key. Open Providers and press Test to allow access."
+    )
+}
+
+/// Last four characters, for recognising a key without showing it.
+pub(crate) fn key_suffix(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    chars[chars.len().saturating_sub(4)..].iter().collect()
 }
 
 pub fn key_status(provider: Provider, config: &Config) -> KeyStatus {
@@ -87,18 +115,27 @@ pub fn key_status(provider: Provider, config: &Config) -> KeyStatus {
     if std::env::var(provider.env()).is_ok_and(|key| !key.trim().is_empty()) {
         return KeyStatus::Environment;
     }
-    invalidate(provider);
-    match api_key(provider, config) {
-        Ok(key) => KeyStatus::Keychain(
-            key.chars()
-                .rev()
-                .take(4)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect(),
-        ),
-        Err(_) => KeyStatus::Missing,
+    // Status is shown on every launch and refresh, so it must never decrypt the
+    // secret: after an update macOS would ask for the login password per item.
+    if let Some(CachedKey::Found(key)) = CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&provider)
+    {
+        return KeyStatus::Keychain(key_suffix(key));
+    }
+    if keychain_item_exists(provider.id()) {
+        KeyStatus::Keychain(String::new())
+    } else {
+        KeyStatus::Missing
+    }
+}
+
+/// Forget a refused read so the next explicit user action may ask macOS again.
+fn retry_unavailable(provider: Provider) {
+    let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
+    if matches!(cache.get(&provider), Some(CachedKey::Unavailable)) {
+        cache.remove(&provider);
     }
 }
 
@@ -123,12 +160,16 @@ pub fn store_keychain_key(provider: Provider, key: &str) -> Result<()> {
     let key = validate_key(provider, key)?;
     store_native(provider, key)?;
     invalidate(provider);
-    if read_keychain(provider).as_deref() != Some(key) {
+    if !matches!(read_keychain(provider), KeychainRead::Found(saved) if saved == key) {
         bail!(
             "The Keychain did not confirm the saved {} key.",
             provider.label()
         );
     }
+    CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(provider, CachedKey::Found(key.to_owned()));
     Ok(())
 }
 
@@ -141,7 +182,7 @@ pub fn delete_keychain_key(provider: Provider) -> Result<()> {
     }
     delete_native(provider)?;
     invalidate(provider);
-    if read_keychain(provider).is_some() {
+    if keychain_item_exists(provider.id()) {
         bail!("The {} key is still in the Keychain.", provider.label());
     }
     Ok(())
@@ -171,20 +212,56 @@ fn delete_native(provider: Provider) -> Result<()> {
     Ok(())
 }
 
+fn read_keychain(provider: Provider) -> KeychainRead {
+    match read_secret(provider.id()) {
+        KeychainRead::Found(key) => validate_key(provider, &key)
+            .map_or(KeychainRead::Missing, |key| {
+                KeychainRead::Found(key.to_owned())
+            }),
+        other => other,
+    }
+}
+
+/// Decrypts one secret, which may show a Keychain prompt. Call only when the
+/// key is needed for a request or an explicit user action.
 #[cfg(target_os = "macos")]
-fn read_keychain(provider: Provider) -> Option<String> {
-    let bytes = security_framework::passwords::get_generic_password(
-        openrouter::KEYCHAIN_SERVICE,
-        provider.id(),
-    )
-    .ok()?;
-    let key = String::from_utf8(bytes).ok()?;
-    validate_key(provider, &key).ok().map(str::to_owned)
+pub(crate) fn read_secret(account: &str) -> KeychainRead {
+    match security_framework::passwords::get_generic_password(openrouter::KEYCHAIN_SERVICE, account)
+    {
+        Ok(bytes) => String::from_utf8(bytes)
+            .ok()
+            .map(|key| key.trim().to_owned())
+            .filter(|key| !key.is_empty())
+            .map_or(KeychainRead::Missing, KeychainRead::Found),
+        Err(error) if error.code() == security_framework_sys::base::errSecItemNotFound => {
+            KeychainRead::Missing
+        }
+        Err(_) => KeychainRead::Unavailable,
+    }
+}
+
+/// Whether an item exists, from its attributes alone. Attributes are not
+/// protected by the item's access list, so this never shows a prompt.
+#[cfg(target_os = "macos")]
+pub(crate) fn keychain_item_exists(account: &str) -> bool {
+    use security_framework::item::{ItemClass, ItemSearchOptions};
+    ItemSearchOptions::new()
+        .class(ItemClass::generic_password())
+        .service(openrouter::KEYCHAIN_SERVICE)
+        .account(account)
+        .load_attributes(true)
+        .limit(1)
+        .search()
+        .is_ok_and(|results| !results.is_empty())
 }
 
 #[cfg(not(target_os = "macos"))]
-fn read_keychain(_provider: Provider) -> Option<String> {
-    None
+pub(crate) fn read_secret(_account: &str) -> KeychainRead {
+    KeychainRead::Missing
+}
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn keychain_item_exists(_account: &str) -> bool {
+    false
 }
 #[cfg(not(target_os = "macos"))]
 fn store_native(_provider: Provider, _key: &str) -> Result<()> {
@@ -231,6 +308,7 @@ pub fn check_key(provider: Provider, config: &Config) -> Result<String> {
     if provider == Provider::OpenRouter {
         return openrouter::check_key(config);
     }
+    retry_unavailable(provider);
     // Resolve and validate destination before looking up any credentials.
     let endpoint = if provider == Provider::Microsoft {
         if config.microsoft.endpoint.is_empty() {
@@ -310,6 +388,36 @@ fn check_status(provider: Provider, status: u16) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_keychain_read_waits_for_an_explicit_retry() {
+        let provider = Provider::ElevenLabs;
+        CACHE
+            .lock()
+            .unwrap()
+            .insert(provider, CachedKey::Unavailable);
+        // Status refreshes never clear a refusal; only an explicit retry does.
+        assert!(matches!(
+            CACHE.lock().unwrap().get(&provider),
+            Some(CachedKey::Unavailable)
+        ));
+        retry_unavailable(provider);
+        assert!(CACHE.lock().unwrap().get(&provider).is_none());
+        // A found key is never discarded by a retry.
+        CACHE
+            .lock()
+            .unwrap()
+            .insert(provider, CachedKey::Found("fixture-key-0000".into()));
+        retry_unavailable(provider);
+        assert!(matches!(
+            CACHE.lock().unwrap().get(&provider),
+            Some(CachedKey::Found(_))
+        ));
+        CACHE.lock().unwrap().remove(&provider);
+        assert_eq!(key_suffix("fixture-key-abcd"), "abcd");
+        assert!(unavailable_message("Deepgram").contains("press Test"));
+    }
+
     #[test]
     fn meta_accepts_its_documented_pipe_separated_key_without_relaxing_other_providers() {
         // https://dev.meta.ai/docs/authentication

@@ -1104,7 +1104,13 @@ impl OpenRouterSettings {
         let (badge, actions): (String, Vec<AnyElement>) = match &self.key_status {
             None => ("Checking…".into(), Vec::new()),
             Some(KeyStatus::Keychain(suffix)) => (
-                format!("Key saved · …{suffix}"),
+                // The suffix is known only once the key was read for a request,
+                // because reading it for display could show a Keychain prompt.
+                if suffix.is_empty() {
+                    "Key saved".into()
+                } else {
+                    format!("Key saved · …{suffix}")
+                },
                 vec![
                     button(self.action_label(KeyOperation::Test, "Test"), false)
                         .id("openrouter-test-key")

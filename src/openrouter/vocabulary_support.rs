@@ -314,11 +314,9 @@ pub fn validate(config: &Config, force: bool) -> Vec<(String, String)> {
     if models.is_empty() {
         return status();
     }
-    let key = if official(config) {
-        super::api_key(config).ok()
-    } else {
-        None
-    };
+    // Fresh cached evidence needs no key; reading it eagerly would show a
+    // Keychain prompt at launch after every update.
+    let mut key: Option<Option<String>> = None;
     for (index, model) in models.iter().enumerate() {
         #[cfg(target_os = "macos")]
         if crate::SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
@@ -385,7 +383,14 @@ pub fn validate(config: &Config, force: bool) -> Vec<(String, String)> {
                     };
                     result = if !force && let Some(entry) = existing {
                         entry.verification
-                    } else if let Some(key) = &key {
+                    } else if let Some(key) = key
+                        .get_or_insert_with(|| {
+                            official(config)
+                                .then(|| super::api_key(config).ok())
+                                .flatten()
+                        })
+                        .as_ref()
+                    {
                         let audio = super::transcribe::encode_base64(include_bytes!(
                             "../../resources/vocabulary-probe.wav"
                         ));

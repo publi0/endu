@@ -304,16 +304,20 @@ pub fn key_status(config: &Config) -> KeyStatus {
     {
         return KeyStatus::ConfigFile;
     }
-    forget_cached_key();
-    match api_key(config) {
-        Ok(key) => KeyStatus::Keychain(key_suffix(&key)),
-        Err(_) => KeyStatus::Missing,
+    // Never decrypt for status: after an update macOS asks for the login
+    // password once per item read, and status refreshes on every launch.
+    if let Some(CachedKey::Found(key)) = KEYCHAIN_KEY
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+    {
+        return KeyStatus::Keychain(crate::providers::keys::key_suffix(key));
     }
-}
-
-fn key_suffix(key: &str) -> String {
-    let chars: Vec<char> = key.chars().collect();
-    chars[chars.len().saturating_sub(4)..].iter().collect()
+    if crate::providers::keys::keychain_item_exists(KEYCHAIN_ACCOUNT) {
+        KeyStatus::Keychain(String::new())
+    } else {
+        KeyStatus::Missing
+    }
 }
 
 /// OpenRouter keys are URL-safe tokens; anything else is almost certainly a
@@ -346,9 +350,12 @@ pub fn store_keychain_key(key: &str) -> Result<()> {
     )
     .map_err(|error| color_eyre::eyre::eyre!("The Keychain did not accept the key: {error}"))?;
     forget_cached_key();
-    if keychain_key().as_deref() != Some(key) {
+    if !matches!(keychain_key(), KeychainRead::Found(saved) if saved == key) {
         bail!("The Keychain did not retain the key.");
     }
+    *KEYCHAIN_KEY
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(CachedKey::Found(key.to_owned()));
     Ok(())
 }
 
@@ -363,7 +370,7 @@ pub fn delete_keychain_key() -> Result<()> {
     {
         bail!("The Keychain refused the removal: {error}");
     }
-    if keychain_key().is_some() {
+    if crate::providers::keys::keychain_item_exists(KEYCHAIN_ACCOUNT) {
         bail!("The key is still in the Keychain.");
     }
     Ok(())
@@ -381,6 +388,15 @@ pub fn delete_keychain_key() -> Result<()> {
 
 /// Ask OpenRouter about the key in use. Blocking; makes one GET request.
 pub fn check_key(config: &Config) -> Result<String> {
+    // Testing is the explicit way to ask macOS again after a refused prompt.
+    {
+        let mut cached = KEYCHAIN_KEY
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if matches!(cached.as_ref(), Some(CachedKey::Unavailable)) {
+            *cached = None;
+        }
+    }
     let key = api_key(config)?;
     let response = http::get(&config.endpoint("key"), &key, Duration::from_secs(15))?;
     if response.status == 401 {
@@ -422,7 +438,11 @@ enum CachedKey {
     /// A recent lookup found nothing; avoid spawning `security` on every UI
     /// readiness check while the user has not stored a key yet.
     Missing(Instant),
+    /// macOS refused the read; never re-prompt on a timer.
+    Unavailable,
 }
+
+use crate::providers::keys::KeychainRead;
 
 static KEYCHAIN_KEY: Mutex<Option<CachedKey>> = Mutex::new(None);
 const MISSING_KEY_RECHECK: Duration = Duration::from_secs(5);
@@ -449,12 +469,19 @@ pub fn api_key(config: &Config) -> Result<String> {
     let recheck = match cached.as_ref() {
         Some(CachedKey::Found(key)) => return Ok(key.clone()),
         Some(CachedKey::Missing(at)) => at.elapsed() >= MISSING_KEY_RECHECK,
+        Some(CachedKey::Unavailable) => {
+            bail!(crate::providers::keys::unavailable_message("OpenRouter"))
+        }
         None => true,
     };
     if recheck {
         *cached = Some(match keychain_key() {
-            Some(key) => CachedKey::Found(key),
-            None => CachedKey::Missing(Instant::now()),
+            KeychainRead::Found(key) => CachedKey::Found(key),
+            KeychainRead::Missing => CachedKey::Missing(Instant::now()),
+            KeychainRead::Unavailable => {
+                *cached = Some(CachedKey::Unavailable);
+                bail!(crate::providers::keys::unavailable_message("OpenRouter"))
+            }
         });
         if let Some(CachedKey::Found(key)) = cached.as_ref() {
             return Ok(key.clone());
@@ -472,21 +499,10 @@ pub(crate) fn forget_cached_key() {
         .unwrap_or_else(|error| error.into_inner()) = None;
 }
 
-#[cfg(target_os = "macos")]
-fn keychain_key() -> Option<String> {
-    // Reading through Security.framework keeps the item's ACL bound to Hex's
-    // signed identity; no external helper is involved.
-    let key =
-        security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-            .ok()?;
-    let key = String::from_utf8(key).ok()?;
-    let key = key.trim();
-    (!key.is_empty()).then(|| key.to_owned())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn keychain_key() -> Option<String> {
-    None
+/// Reading through Security.framework keeps the item's ACL bound to Hex's
+/// signed identity; no external helper is involved.
+fn keychain_key() -> KeychainRead {
+    crate::providers::keys::read_secret(KEYCHAIN_ACCOUNT)
 }
 
 /// Short, single-line excerpt of a response body for error messages.
@@ -652,8 +668,11 @@ mod tests {
         assert!(validate_key("short").is_err());
         assert!(validate_key("sk-or-v1-0123456789 abcdef").is_err());
         assert!(validate_key("sk-or-v1-0123456789\"abcdef").is_err());
-        assert_eq!(key_suffix("sk-or-v1-abcd1234"), "1234");
-        assert_eq!(key_suffix("ab"), "ab");
+        assert_eq!(
+            crate::providers::keys::key_suffix("sk-or-v1-abcd1234"),
+            "1234"
+        );
+        assert_eq!(crate::providers::keys::key_suffix("ab"), "ab");
     }
 
     #[test]

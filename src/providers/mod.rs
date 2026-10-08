@@ -1,5 +1,5 @@
 //! Provider identities, model capabilities and persistent per-model options.
-use crate::openrouter::Config;
+use crate::openrouter::{Config, KeyStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::{LazyLock, RwLock};
@@ -509,7 +509,8 @@ pub fn is_configured() -> bool {
             (caps.batch || (caps.streaming && options(&c, id).streaming))
                 && (model.provider != Provider::Microsoft
                     || microsoft_endpoint(&c, !caps.batch).is_ok())
-                && keys::api_key(model.provider, &c).is_ok()
+                // Readiness never decrypts a key, so it cannot trigger Keychain prompts.
+                && !matches!(keys::key_status(model.provider, &c), KeyStatus::Missing)
         })
     })
 }
