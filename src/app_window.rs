@@ -561,6 +561,7 @@ pub struct AppWindow {
     history_copied: Option<u64>,
     pending_update: Option<String>,
     update_error: Option<String>,
+    update_restarting: bool,
     update_check_at: Option<Instant>,
 }
 
@@ -1044,6 +1045,7 @@ impl AppWindow {
             history_copied: None,
             pending_update: None,
             update_error: None,
+            update_restarting: false,
             update_check_at: None,
         };
         window.history_retention_picker_state.highlight = HistoryRetention::ALL
@@ -1534,42 +1536,89 @@ impl AppWindow {
                 .child(format!("Hex {}", env!("CARGO_PKG_VERSION")))
                 .into_any_element();
         };
+        let restarting = self.update_restarting;
         div()
             .flex_none()
-            .pl_2()
-            .h(px(30.0))
+            .p_3()
+            .rounded(px(PANEL_RADIUS))
+            .border_1()
+            .border_color(rgb(LINE))
+            .bg(rgb(SURFACE))
             .flex()
-            .items_center()
-            .gap(px(6.0))
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().size(px(7.0)).rounded_full().bg(rgb(ACCENT)))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT))
+                            .child("Update ready"),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .line_height(px(15.0))
+                    .text_color(rgb(MUTED))
+                    .child(format!(
+                        "Hex {version} is installed. Restart to start using it."
+                    )),
+            )
             .child(
                 div()
                     .id("update-restart")
+                    .h(px(28.0))
+                    .w_full()
                     .flex()
                     .items_center()
-                    .h(px(22.0))
-                    .px_2()
-                    .rounded(px(6.0))
-                    .text_size(px(11.0))
-                    .text_color(rgb(ACCENT))
-                    .hover(|button| button.bg(rgb(SURFACE_HOVER)))
-                    .child(format!("Restart to update to {version}"))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(bundle) = crate::update_check::bundle_path() {
-                            this.finish_editing(cx);
-                            if !crate::update_check::relaunch_and_quit(&bundle) {
-                                this.update_error = Some(
-                                    "Could not schedule the relaunch. Quit Hex and reopen it."
+                    .justify_center()
+                    .rounded(px(CONTROL_RADIUS))
+                    .bg(rgb(ACCENT))
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(0xffffff))
+                    .when(restarting, |button| button.opacity(0.6))
+                    .when(!restarting, |button| {
+                        button
+                            .hover(|button| button.opacity(0.88))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let Some(bundle) = crate::update_check::bundle_path() else {
+                                    this.update_error = Some(
+                                    "Hex is not running from its app bundle. Reopen it manually."
                                         .into(),
                                 );
+                                    cx.notify();
+                                    return;
+                                };
+                                this.finish_editing(cx);
+                                this.update_error = None;
+                                this.update_restarting =
+                                    crate::update_check::relaunch_and_quit(&bundle);
+                                if !this.update_restarting {
+                                    this.update_error = Some(
+                                        "Could not schedule the restart. Quit Hex and reopen it."
+                                            .into(),
+                                    );
+                                }
                                 cx.notify();
-                            }
-                        }
-                    })),
+                            }))
+                    })
+                    .child(if restarting {
+                        "Restarting…"
+                    } else {
+                        "Restart now"
+                    }),
             )
             .children(self.update_error.as_ref().map(|error| {
                 div()
-                    .pr_2()
-                    .text_size(px(10.0))
+                    .text_size(px(11.0))
+                    .line_height(px(15.0))
                     .text_color(rgb(NEGATIVE))
                     .child(error.clone())
             }))

@@ -2,9 +2,9 @@
 //!
 //! Homebrew replaces `/Applications/Hex.app` while the running process keeps
 //! executing the old binary. Comparing the on-disk bundle version with the
-//! compiled version lets the window offer a "Restart to update" action; the
-//! relaunch is scheduled with `open` just before quitting so the instance
-//! lock is released first.
+//! compiled version lets the window offer a "Restart to update" action. A
+//! detached helper waits for this process to exit and only then reopens the
+//! bundle, so the new process never meets the old instance or its lock.
 
 use std::path::{Path, PathBuf};
 
@@ -63,18 +63,41 @@ fn version_newer(candidate: &str, current: &str) -> bool {
     parse(candidate) > parse(current)
 }
 
-/// Schedules the app bundle to reopen right after this process exits, then
-/// quits. `open` waits for the bundle to become available, so the instance
-/// lock is released before the new process starts. Returns `false` when the
-/// relaunch could not be scheduled so the UI can surface the failure.
-pub fn relaunch_and_quit(bundle: &PathBuf) -> bool {
-    let result = std::process::Command::new("/usr/bin/open")
-        .arg("-a")
+/// Seconds the helper waits for this process to exit before reopening anyway.
+const RELAUNCH_WAIT_TENTHS: u32 = 300;
+
+/// A detached shell that waits for `pid` to exit, then runs `opener` on
+/// `bundle`. Arguments are positional, never interpolated into the script.
+fn relaunch_command(pid: u32, bundle: &Path, opener: &str) -> std::process::Command {
+    use std::os::unix::process::CommandExt;
+    let script = format!(
+        "pid=$1; app=$2; i=0\n\
+         while kill -0 \"$pid\" 2>/dev/null && [ \"$i\" -lt {RELAUNCH_WAIT_TENTHS} ]; do sleep 0.1; i=$((i+1)); done\n\
+         exec \"$3\" \"$app\""
+    );
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg(script)
+        .arg("hex-relaunch")
+        .arg(pid.to_string())
         .arg(bundle)
-        .spawn();
-    match result {
+        .arg(opener)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        // Its own process group: quitting Hex must not take the helper with it.
+        .process_group(0);
+    command
+}
+
+/// Reopens the app bundle once this process has exited, then quits. Opening
+/// it while this instance still runs would only reactivate the old process.
+/// Returns `false` when the helper could not start, so the UI can say so.
+pub fn relaunch_and_quit(bundle: &Path) -> bool {
+    match relaunch_command(std::process::id(), bundle, "/usr/bin/open").spawn() {
         Ok(child) => {
-            tracing::info!(pid = child.id(), "relaunch scheduled");
+            tracing::info!(helper = child.id(), "relaunch scheduled after exit");
             crate::desktop::request_quit();
             true
         }
@@ -88,6 +111,37 @@ pub fn relaunch_and_quit(bundle: &PathBuf) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relaunch_waits_for_the_old_process_to_exit() {
+        let folder = std::env::temp_dir().join(format!("hex-relaunch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        let marker = folder.join("reopened");
+        let mut old = std::process::Command::new("/bin/sleep")
+            .arg("0.6")
+            .spawn()
+            .unwrap();
+        let mut helper = relaunch_command(old.id(), &marker, "/usr/bin/touch")
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert!(!marker.exists(), "reopened while the old process was alive");
+        old.wait().unwrap();
+        assert!(helper.wait().unwrap().success());
+        assert!(marker.exists());
+        // A path with spaces and shell syntax stays one literal argument.
+        let tricky = folder.join("Hex $(touch pwned) ; x.app");
+        assert!(
+            relaunch_command(u32::MAX, &tricky, "/usr/bin/touch")
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(tricky.exists());
+        assert!(!folder.join("pwned").exists());
+        std::fs::remove_dir_all(folder).unwrap();
+    }
 
     #[test]
     fn semantic_versions_compare_component_wise() {
