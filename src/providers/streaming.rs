@@ -1505,20 +1505,46 @@ impl Connection {
             )
         })?;
         control.check(deadline)?;
+        // Speech custom domains redirect valid keys to a regional host. Exchange
+        // the key on the configured resource and authenticate there with a token.
+        let speech_session = if speech.is_some() {
+            Some(
+                super::microsoft::speech_session(
+                    config,
+                    &url,
+                    &key,
+                    Duration::from_secs(5).min(deadline.saturating_duration_since(Instant::now())),
+                )
+                .map_err(|message| {
+                    failure_kind(
+                        message,
+                        if message.contains("rejected the key") {
+                            ErrorKind::Auth
+                        } else {
+                            ErrorKind::Network
+                        },
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+        control.check(deadline)?;
+        let url = speech_session
+            .as_ref()
+            .map_or_else(|| url.clone(), |session| session.url.clone());
         let mut request = url
             .as_str()
             .into_client_request()
             .map_err(|_| failure("Could not create streaming request."))?;
-        if model.provider != Provider::Meta {
+        if let Some(session) = &speech_session {
+            let value =
+                tungstenite::http::HeaderValue::from_str(&format!("Bearer {}", session.token))
+                    .map_err(|_| failure("Microsoft returned an invalid Speech token."))?;
+            request.headers_mut().insert("Authorization", value);
+        } else if model.provider != Provider::Meta {
             let (header, value) = authentication(model.provider, &key)?;
-            request.headers_mut().insert(
-                if speech.is_some() {
-                    "Ocp-Apim-Subscription-Key"
-                } else {
-                    header
-                },
-                value,
-            );
+            request.headers_mut().insert(header, value);
         }
         let host = url
             .host_str()
