@@ -409,20 +409,6 @@ pub(crate) fn settings_section_label(label: &'static str) -> AnyElement {
         .into_any_element()
 }
 
-/// A label for a group nested inside a collapsible section. It is quieter
-/// than a section label so the group reads as part of its parent.
-pub(crate) fn settings_subsection_label(label: &'static str) -> AnyElement {
-    div()
-        .pt_4()
-        .pb_2()
-        .px_1()
-        .text_size(px(CONTROL_TEXT_SIZE))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(rgb(MUTED))
-        .child(label)
-        .into_any_element()
-}
-
 /// The chevron and label of a collapsible section. The caller owns focus,
 /// clicks and keys; the header only highlights its own label, never the row.
 pub(crate) fn disclosure_header(label: &'static str, detail: &'static str, open: bool) -> Div {

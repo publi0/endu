@@ -5,7 +5,7 @@
 <h1 align="center">Hex</h1>
 
 <p align="center">
-  Ditado por atalho para macOS, com OpenRouter, OpenAI, Deepgram, ElevenLabs, Microsoft, Grok, Google e Meta.
+  Ditado por atalho para macOS, com OpenRouter, OpenAI, Deepgram, ElevenLabs, Grok, Google e Meta.
 </p>
 
 ## Instalação rápida
@@ -305,7 +305,6 @@ resolver a condição, o aviso é atualizado.
 | **OpenAI** | GPT Transcribe e modelos GPT-4o/Whisper por upload; GPT Live Transcribe por WebSocket. Nomes são enviados como keywords ou prompt conforme o modelo. |
 | **Deepgram** | Nova-3 e Nova-2, por upload ou streaming. Nova-3 aceita keyterms; formatação, pontuação e números têm controles próprios. |
 | **ElevenLabs** | Scribe v2 por upload e Scribe v2 Realtime por WebSocket, com keyterms e opção de remover hesitações. |
-| **Microsoft** | MAI-Transcribe 2 por upload, com vocabulário e estilo limpo/verbatim; MAI-Transcribe 2 Streaming pelo protocolo Azure Speech, usando o mesmo recurso e a mesma chave. |
 | **Grok (xAI)** | Grok Voice Transcribe 2.0 por upload ou streaming, com keyterms e controles de formatação e hesitações. |
 | **Google** | Gemini 3.5 Transcribe e Transcribe Live com chave do AI Studio, vocabulário e Smart transcription. |
 | **Meta** | Muse Voice Transcribe 1.0 por upload ou streaming, com keywords e indicação de idioma. |
@@ -323,16 +322,9 @@ No **Google**, use uma chave do [AI Studio](https://aistudio.google.com/apikey).
 essas funções são oferecidas juntas pela API. No **Grok**, a formatação de números
 exige um idioma explícito compatível; em Auto, essa preferência continua salva para uso posterior.
 
-Na **Microsoft**, cadastre a chave do recurso Azure. Em **Providers → Advanced → Microsoft**,
-informe **Resource endpoint** (`https://<recurso>.cognitiveservices.azure.com`).
-O endpoint e a chave são compartilhados pelo upload e pelo streaming. O streaming usa
-o protocolo do Azure Speech SDK, seleciona `mai-transcribe-2-streaming` diretamente
-e não requer criar um deployment no Foundry. Escolha uma região que ofereça os dois
-modelos na rota Speech; Southeast Asia foi validada para ambos.
-Configurações existentes com um **Deployment** explícito mantêm a integração
-Foundry Realtime e seus campos avançados; limpar esse campo ativa a rota Speech.
-Os endpoints são locais e não entram na exportação de preferências. O botão **Test**
-valida a chave sem enviar áudio. O modelo de streaming não envia keywords sem suporte documentado.
+O provider nativo da **Microsoft** foi removido. Cadeias salvas com modelos
+`microsoft::` passam a ignorá-los, e as estatísticas antigas aparecem como
+"Microsoft (removed)". A rota `microsoft/mai-transcribe-2` do OpenRouter continua disponível.
 
 Uma chave salva mostra somente os últimos quatro caracteres, com **Test** e
 **Remove**. Clique no indicador da chave para substituí-la. O teste verifica acesso à conta; não garante saldo,
@@ -401,7 +393,7 @@ sendo do OpenRouter. Providers diretos usam `provider::modelo`:
 ```
 
 Prefira o Keychain. As variáveis `OPENROUTER_API_KEY`, `OPENAI_API_KEY`,
-`DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`, `AZURE_MAI_API_KEY`, `XAI_API_KEY` e
+`DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`, `XAI_API_KEY` e
 `GEMINI_API_KEY` e `MODEL_API_KEY` (Meta) têm precedência sobre a chave salva do provider correspondente.
 Apenas o OpenRouter preserva a compatibilidade com o antigo
 campo `api_key` no arquivo. Chaves e endpoints não entram na exportação.
@@ -409,7 +401,6 @@ campo `api_key` no arquivo. Chaves e endpoints não entram na exportação.
 Contratos oficiais: [OpenAI file transcription](https://developers.openai.com/api/docs/guides/speech-to-text),
 [OpenAI realtime](https://developers.openai.com/api/docs/guides/realtime-transcription),
 [Deepgram live audio](https://developers.deepgram.com/reference/speech-to-text/listen-streaming),
-[Microsoft MAI](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/mai-transcribe),
 [Grok STT](https://docs.x.ai/developers/rest-api-reference/inference/speech-to-text),
 [Gemini Transcribe](https://ai.google.dev/gemini-api/docs/transcribe),
 [Gemini Live Transcribe](https://ai.google.dev/gemini-api/docs/live-api/live-transcribe),
@@ -584,9 +575,15 @@ Os arquivos locais ficam em `~/Library/Application Support/hex-openrouter`:
 | `logs/live.ndjson` e `logs/process.log` | Eventos e diagnósticos. O log de eventos inclui texto colado e aplicativo em foco; erros podem incluir detalhes retornados pelo provedor. |
 
 Desligar ou limpar o **History** não desliga nem limpa os logs. Considere seu
-conteúdo antes de compartilhá-los para diagnóstico. As chaves são acessadas diretamente pelo Security.framework e ficam somente
-na memória dos transportes, sem aparecer nos argumentos de processos. O app
-não altera automaticamente o acesso de itens antigos do Keychain. Os logs são
+conteúdo antes de compartilhá-los para diagnóstico. As chaves são salvas e lidas
+pela ferramenta `/usr/bin/security` da Apple, recebendo o segredo pela entrada
+padrão, e ficam somente na memória dos transportes, sem aparecer nos argumentos
+de processos. Como o Hex é autoassinado, acessar o Keychain diretamente faria o
+macOS pedir a senha a cada atualização; a identidade da ferramenta não muda.
+Em troca, qualquer programa do seu usuário pode pedir essas chaves à mesma
+ferramenta. Na primeira leitura de uma chave antiga, o macOS pergunta uma última
+vez: escolha **Sempre permitir**. O app não altera automaticamente o acesso de
+itens antigos do Keychain. Os logs são
 privados ao usuário e têm rotação ao iniciar; traces internos de HTTP/WebSocket
 são bloqueados para não registrar headers, áudio ou URLs contendo keywords.
 

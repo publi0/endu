@@ -36,7 +36,6 @@ impl CatalogModel {
             self.provider,
             model.provider.label(),
             match model.provider {
-                Provider::Microsoft => "Azure",
                 Provider::Meta => "Facebook Muse",
                 _ => "",
             },
@@ -306,12 +305,10 @@ mod tests {
     fn provider_aliases_and_portuguese_capabilities_are_searchable() {
         assert!(native("grok::grok-voice-transcribe-2.0").matches("xAI clean format", false));
         assert!(native("grok::grok-voice-transcribe-2.0").matches("xa", false));
-        let mai = native("microsoft::MAI-Transcribe-2");
-        assert!(mai.matches("AZURE ARQUIVO LIMPEZA VOCABULÁRIO", false));
-        assert!(mai.matches("azu vocabulario", false));
-        assert!(mai.matches("azure vocabulA\u{0301}rio", false));
-        assert!(native("microsoft::MAI-Transcribe-2-Streaming").matches("azure streaming", false));
-        assert!(!mai.matches("azure streaming", false));
+        let nova = native("deepgram::nova-3");
+        assert!(nova.matches("DEEPGRAM ARQUIVO VOCABULÁRIO", false));
+        assert!(nova.matches("deep vocabulario", false));
+        assert!(nova.matches("deepgram vocabulA\u{0301}rio", false));
         assert!(native("deepgram::nova-3").matches("formatação pontuação números", false));
         assert!(native("openai::gpt-transcribe").matches("contexto temperatura", false));
     }

@@ -56,10 +56,8 @@ use hotkey_pane::*;
 
 const WINDOW_WIDTH: f32 = 880.0;
 const WINDOW_HEIGHT: f32 = 640.0;
-const MINIMUM_WIDTH: f32 = 860.0;
-const MINIMUM_HEIGHT: f32 = 480.0;
-/// The window's last frame, kept in the app's user defaults rather than the
-/// exported settings file, like any macOS window position.
+/// The window's last position, kept in the app's user defaults rather than the
+/// exported settings file. Its size is fixed.
 const WINDOW_FRAME_KEY: &str = "HexMainWindowFrame";
 const HOTKEY_MIN_WIDTH: f32 = 148.0;
 const HOTKEY_SIDE_SELECTOR_WIDTH: f32 = 150.0;
@@ -269,9 +267,8 @@ fn open_new(
                 appears_transparent: true,
                 ..Default::default()
             }),
-            is_resizable: !preview_mode,
+            is_resizable: false,
             is_minimizable: true,
-            window_min_size: Some(size(px(MINIMUM_WIDTH), px(MINIMUM_HEIGHT))),
             tabbing_identifier: preview_mode.then(|| "hex-preview".into()),
             ..Default::default()
         },
@@ -301,15 +298,14 @@ fn save_window_bounds(bounds: Bounds<gpui::Pixels>) {
 
 fn format_window_frame(bounds: Bounds<gpui::Pixels>) -> String {
     format!(
-        "{},{},{},{}",
+        "{},{}",
         f32::from(bounds.origin.x).round(),
-        f32::from(bounds.origin.y).round(),
-        f32::from(bounds.size.width).round(),
-        f32::from(bounds.size.height).round()
+        f32::from(bounds.origin.y).round()
     )
 }
 
-/// Restores a saved frame, never smaller than the window's minimum size.
+/// Restores the saved position at the fixed window size. Hex 3.5.0 also saved
+/// a size; only its position is kept.
 fn parse_window_frame(value: &str) -> Option<Bounds<gpui::Pixels>> {
     let values: Vec<f32> = value
         .split(',')
@@ -320,12 +316,12 @@ fn parse_window_frame(value: &str) -> Option<Bounds<gpui::Pixels>> {
                 .filter(|value: &f32| value.is_finite())
         })
         .collect::<Option<_>>()?;
-    let [x, y, width, height] = values.as_slice() else {
+    let (&[x, y] | &[x, y, _, _]) = values.as_slice() else {
         return None;
     };
     Some(Bounds::new(
-        gpui::point(px(*x), px(*y)),
-        size(px(width.max(MINIMUM_WIDTH)), px(height.max(MINIMUM_HEIGHT))),
+        gpui::point(px(x), px(y)),
+        size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)),
     ))
 }
 
@@ -808,12 +804,9 @@ impl AppWindow {
         let openrouter_settings = crate::openrouter::settings_view::new(preview_mode, cx);
         let openrouter_setup = crate::openrouter::settings_view::new_key_setup(preview_mode, cx);
         let providers = cx.new(|cx| crate::providers_view::ProvidersView::new(preview_mode, cx));
-        let mut config = openrouter_settings.read(cx).config_snapshot();
+        let config = openrouter_settings.read(cx).config_snapshot();
         if preview_mode {
-            // Keep the chain fixture while sharing local connection fixtures
-            // with Providers; no real endpoint or credential is read.
-            config.microsoft = providers.read(cx).config_snapshot().microsoft;
-            openrouter_settings.update(cx, |view, cx| view.refresh_config(config.clone(), cx));
+            // Keep the chain fixture in Providers; no real credential is read.
             providers.update(cx, |view, cx| view.refresh(config.clone(), cx));
         }
         let model_options =
@@ -2168,13 +2161,16 @@ mod tests {
     use gpui::Focusable;
 
     #[test]
-    fn saved_window_frames_round_trip_and_respect_the_minimum_size() {
-        let bounds = Bounds::new(gpui::point(px(120.0), px(80.0)), size(px(900.0), px(650.0)));
-        assert_eq!(format_window_frame(bounds), "120,80,900,650");
-        assert_eq!(parse_window_frame("120,80,900,650"), Some(bounds));
-        let tiny = parse_window_frame("0,0,10,10").unwrap();
-        assert_eq!(tiny.size, size(px(MINIMUM_WIDTH), px(MINIMUM_HEIGHT)));
-        for invalid in ["", "1,2,3", "1,2,3,4,5", "a,b,c,d", "NaN,0,900,650"] {
+    fn saved_window_positions_round_trip_at_the_fixed_size() {
+        let bounds = Bounds::new(
+            gpui::point(px(120.0), px(80.0)),
+            size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)),
+        );
+        assert_eq!(format_window_frame(bounds), "120,80");
+        assert_eq!(parse_window_frame("120,80"), Some(bounds));
+        // A 3.5.0 frame keeps its position but never its size.
+        assert_eq!(parse_window_frame("120,80,1400,1000"), Some(bounds));
+        for invalid in ["", "1", "1,2,3", "1,2,3,4,5", "a,b", "NaN,0"] {
             assert_eq!(parse_window_frame(invalid), None, "{invalid}");
         }
     }
@@ -2329,7 +2325,7 @@ mod tests {
     #[gpui::test]
     fn reset_restores_both_shortcuts_and_reenables_paste_last(cx: &mut gpui::TestAppContext) {
         let (view, cx) = cx.add_window_view(preview_fixture);
-        cx.simulate_resize(size(px(MINIMUM_WIDTH), px(MINIMUM_HEIGHT)));
+        cx.simulate_resize(size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)));
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.settings.paste_last_hotkey = None;
@@ -2360,7 +2356,7 @@ mod tests {
         for selector in ["reset-hotkey-0", "reset-hotkey-1"] {
             let bounds = cx.debug_bounds(selector).unwrap();
             assert!(
-                bounds.left() >= px(SIDEBAR_WIDTH) && bounds.right() <= px(MINIMUM_WIDTH),
+                bounds.left() >= px(SIDEBAR_WIDTH) && bounds.right() <= px(WINDOW_WIDTH),
                 "{selector}: {bounds:?}"
             );
         }
@@ -2961,18 +2957,14 @@ mod tests {
     }
 
     #[gpui::test]
-    fn closing_flushes_microsoft_and_advanced_drafts_before_export_and_model_sync(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn closing_flushes_advanced_drafts_before_export_and_model_sync(cx: &mut gpui::TestAppContext) {
         let (view, cx) = cx.add_window_view(preview_fixture);
-        let endpoint = "https://edited-close.cognitiveservices.azure.com";
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.show_providers(cx);
-                // Create both drafts without focus changes flushing either first.
-                // Helpers emit the same Changed events as the TextInput controls.
+                // The helper emits the same Changed event as the TextInput control.
                 view.providers.update(cx, |providers, cx| {
-                    providers.stage_connection_and_timeout_drafts(endpoint, "67", cx);
+                    providers.stage_timeout_draft("67", cx);
                 });
             })
         });
@@ -2980,23 +2972,16 @@ mod tests {
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 let before = view.providers.read(cx).config_snapshot();
-                assert_ne!(before.microsoft.endpoint, endpoint);
                 assert_ne!(before.transcription.attempt_timeout_seconds, 67);
                 // The same synchronous path is used by close, quit and export.
                 view.finish_editing(cx);
                 let saved = view.openrouter_settings.read(cx).config_snapshot();
-                assert_eq!(saved.microsoft.endpoint, endpoint);
                 assert_eq!(saved.transcription.attempt_timeout_seconds, 67);
                 assert_eq!(view.providers.read(cx).config_snapshot(), saved);
                 assert_eq!(view.model_options.read(cx).config_snapshot(), saved);
 
                 let bytes =
                     crate::preferences_transfer::export_bytes(&view.settings, &saved).unwrap();
-                let encoded = std::str::from_utf8(&bytes).unwrap();
-                assert!(
-                    !encoded.contains("edited-close"),
-                    "local endpoints must not travel"
-                );
                 let transferred = crate::preferences_transfer::preview_bundle(
                     crate::preferences_transfer::decode(&bytes).unwrap(),
                     &view.settings,
@@ -3004,7 +2989,6 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(transferred.config.transcription.attempt_timeout_seconds, 67);
-                assert_eq!(transferred.config.microsoft, saved.microsoft);
                 view.show_models(cx);
                 assert_eq!(view.pane, Pane::Models);
             })
@@ -3014,7 +2998,6 @@ mod tests {
         cx.update(|_, cx| {
             let view = view.read(cx);
             let saved = view.openrouter_settings.read(cx).config_snapshot();
-            assert_eq!(saved.microsoft.endpoint, endpoint);
             assert_eq!(saved.transcription.attempt_timeout_seconds, 67);
             assert_eq!(view.providers.read(cx).config_snapshot(), saved);
             assert_eq!(view.model_options.read(cx).config_snapshot(), saved);

@@ -6,8 +6,8 @@ A slim macOS fork of HEX: tap a shortcut to lock recording or hold and release,
 trim the silence, send
 the clip to a speech provider with an ordered fallback chain, and paste the
 transcript. Settings, Microphone, Providers, Models, Post-processing, HUD, History, and Statistics are the panes.
-Keys and advanced request limits belong in Providers. Microsoft resource endpoints
-and deployment are grouped inside the collapsed Advanced section. Explain credential
+Keys and advanced request limits belong in Providers; request limits and the API
+URL are grouped inside the collapsed Advanced section. Explain credential
 storage once above the provider list; keep source-specific warnings beside each key.
 Use one section note for shared instructions and comparison periods. Do not repeat
 selected preset values as subtitles; retain exact custom values and specific warnings.
@@ -124,10 +124,16 @@ not reintroduce seams for them.
   Accessibility, and a usable configured model/provider key are ready.
 - `Release microphone while idle` opens the device on the shortcut with no
   pre-roll and closes it once capture is idle.
-- API keys never reach argv, logs, or temporary files. Keychain operations use
-  Security.framework directly; native HTTPS/WebSocket transports hold credentials
-  in memory. Preserve existing items; do not delete/recreate keys or claim that
-  updating a value retroactively narrows a legacy item’s access list.
+- API keys never reach argv, logs, or temporary files. Secrets are saved, read
+  and removed through Apple's `/usr/bin/security -i`, one command on stdin, with
+  the secret quoted only after validation and returned on stdout. Hex is
+  self-signed without a Team ID, so items it accessed directly were bound to each
+  build and prompted after every update; the tool's identity never changes. This
+  is a deliberate trade-off: any process of the user can ask the same tool for
+  the items. Item existence checks read attributes through Security.framework
+  and never decrypt. Native HTTPS/WebSocket transports hold credentials in memory.
+  Preserve existing items; do not delete/recreate keys or claim that updating a
+  value retroactively narrows a legacy item’s access list.
   Each provider has a separate Keychain account under the existing service.
   Every network transport validates the parsed URL host before resolving keys:
   HTTPS is required except for loopback HTTP. Prefixes such as localhost.evil,
@@ -178,15 +184,11 @@ not reintroduce seams for them.
   source options only once, never overwrite a profile on reselection/removal.
   Compatible streaming/formatting/cleanup toggles default on; explicit persisted
   false stays off. Newly supported target capabilities start with their defaults.
-  Native Microsoft/Google model IDs remain distinct from identically named OpenRouter
-  routes. Azure resource endpoints/deployment stay local across preference imports and
-  never enter exports. Validate Azure HTTPS roots before resolving the Microsoft key.
-  Microsoft streaming defaults to the Speech SDK-compatible custom resource route,
-  sharing the batch endpoint/key. Only an explicitly populated legacy deployment
-  selects Foundry Realtime. Speech frames correlate X-RequestId, retain only final
-  phrases, and require Finish, EndOfDictation and turn.end before releasing text.
-  A phrase final or socket close alone is never a completed recording. Preserve
-  cancellation, bounded text retention and exact audio accounting on this route.
+  Native Google model IDs remain distinct from identically named OpenRouter routes.
+  The native Microsoft provider was removed on purpose; do not reintroduce it.
+  Saved `microsoft::` IDs are dropped on load and never fall through to OpenRouter;
+  their recorded statistics stay in a separate "Microsoft (removed)" row. The
+  OpenRouter `microsoft/mai-transcribe-2` route is still OpenRouter.
   Google uses the AI Studio key and dedicated Transcribe API with store:false for unary
   requests; do not persist Interactions or upload permanent files. Smart transcription
   is one atomic Google option. Grok formatting requires a supported explicit language;

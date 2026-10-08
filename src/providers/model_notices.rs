@@ -1,7 +1,7 @@
 //! Per-model notices for selected primary/fallback rows. Pure configuration
 //! inspection: no runtime globals, credentials, file access, or network calls.
 
-use super::{ModelRef, Provider, microsoft_endpoint, options};
+use super::{ModelRef, Provider, options};
 use crate::openrouter::{AUTO_LANGUAGE, Config};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,32 +34,6 @@ pub fn model_notices(config: &Config, id: &str) -> Vec<ModelNotice> {
             notices.push(ModelNotice {
                 text,
                 is_error: false,
-            });
-        }
-    }
-
-    if model.provider == Provider::Microsoft {
-        let requirement = match model.model {
-            "MAI-Transcribe-2" => Some((
-                false,
-                "Check the Microsoft resource endpoint in Providers → Advanced → Microsoft.",
-            )),
-            "MAI-Transcribe-2-Streaming" => Some((
-                true,
-                if config.microsoft.uses_speech_streaming() {
-                    "Check the Microsoft resource endpoint in Providers → Advanced → Microsoft."
-                } else {
-                    "Check the Microsoft Realtime endpoint and deployment in Providers → Advanced → Microsoft."
-                },
-            )),
-            _ => None,
-        };
-        if let Some((streaming, text)) = requirement
-            && microsoft_endpoint(config, streaming).is_err()
-        {
-            notices.push(ModelNotice {
-                text,
-                is_error: true,
             });
         }
     }
@@ -190,48 +164,11 @@ mod tests {
     }
 
     #[test]
-    fn microsoft_notices_follow_the_correct_endpoint_and_disappear_when_configured() {
-        let mut config = Config::default();
-        for id in [
-            "microsoft::MAI-Transcribe-2",
-            "microsoft::MAI-Transcribe-2-Streaming",
-        ] {
-            let notices = model_notices(&config, id);
-            assert_eq!(notices.len(), 1);
-            assert!(notices[0].is_error);
-            assert!(notices[0].text.contains("Providers → Advanced → Microsoft"));
-        }
-        config.microsoft.endpoint = "https://fixture.cognitiveservices.azure.com".into();
-        assert!(model_notices(&config, "microsoft::MAI-Transcribe-2").is_empty());
-        assert!(model_notices(&config, "microsoft::MAI-Transcribe-2-Streaming").is_empty());
-        config.microsoft.streaming_endpoint = "https://fixture.services.ai.azure.com".into();
-        assert!(
-            model_notices(&config, "microsoft::MAI-Transcribe-2-Streaming").is_empty(),
-            "Speech streaming shares the batch resource without a deployment"
-        );
-        config.microsoft.deployment = "fixture-deployment".into();
-        assert!(model_notices(&config, "microsoft::MAI-Transcribe-2-Streaming").is_empty());
-        config.microsoft.streaming_endpoint =
-            "https://fixture.services.ai.azure.com.evil.test".into();
-        assert!(model_notices(&config, "microsoft::MAI-Transcribe-2-Streaming")[0].is_error);
-        for id in [
-            "microsoft/mai-transcribe-2",
-            "microsoft::unknown",
-            "openrouter::microsoft/mai-transcribe-2",
-        ] {
-            assert!(model_notices(&config, id).is_empty());
-        }
-    }
-
-    #[test]
     fn streaming_off_is_an_error_only_for_known_realtime_only_models() {
         let mut config = Config::default();
-        config.microsoft.streaming_endpoint = "https://fixture.services.ai.azure.com".into();
-        config.microsoft.deployment = "fixture-deployment".into();
         for id in [
             "openai::gpt-live-transcribe",
             "elevenlabs::scribe_v2_realtime",
-            "microsoft::MAI-Transcribe-2-Streaming",
             "google::gemini-3.5-transcribe-live",
         ] {
             profile(

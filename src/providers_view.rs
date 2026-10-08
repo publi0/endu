@@ -1,15 +1,11 @@
 //! Provider credentials and global request limits.
 
-use crate::desktop_ui::{
-    LINE, MUTED, NEGATIVE, SETTINGS_CONTROL_WIDTH, settings_panel, settings_row,
-    settings_section_label,
-};
+use crate::desktop_ui::{LINE, MUTED, NEGATIVE, settings_panel, settings_section_label};
 use crate::openrouter::{
     Config, KeyStatus,
     settings_view::{self, ConfigChanged, KeyChanged, OpenRouterSettings},
 };
 use crate::providers::Provider;
-use crate::text_input::{Changed, Dismissed, EditFinished, Submitted, TextInput};
 use gpui::{
     Context, Entity, EventEmitter, IntoElement, Render, Subscription, Window, div, prelude::*, px,
     rgb,
@@ -19,57 +15,11 @@ use gpui::{
 /// the configuration snapshot when it receives this event.
 pub struct ProvidersChanged;
 
-#[derive(Clone, Copy)]
-enum MicrosoftField {
-    Batch,
-    Streaming,
-    Deployment,
-}
-
-impl MicrosoftField {
-    const ALL: [Self; 3] = [Self::Batch, Self::Streaming, Self::Deployment];
-
-    fn index(self) -> usize {
-        match self {
-            Self::Batch => 0,
-            Self::Streaming => 1,
-            Self::Deployment => 2,
-        }
-    }
-
-    fn value(self, config: &Config) -> &str {
-        match self {
-            Self::Batch => &config.microsoft.endpoint,
-            Self::Streaming => &config.microsoft.streaming_endpoint,
-            Self::Deployment => &config.microsoft.deployment,
-        }
-    }
-
-    fn set(self, config: &mut Config, value: &str) {
-        match self {
-            Self::Batch => config.microsoft.endpoint = value.into(),
-            Self::Streaming => config.microsoft.streaming_endpoint = value.into(),
-            Self::Deployment => config.microsoft.deployment = value.into(),
-        }
-    }
-
-    fn placeholder(self) -> &'static str {
-        match self {
-            Self::Batch => "https://resource.cognitiveservices.azure.com",
-            Self::Streaming => "https://resource.services.ai.azure.com",
-            Self::Deployment => "Deployment name",
-        }
-    }
-}
-
 pub struct ProvidersView {
     preview: bool,
     config: Config,
     keys: Vec<(Provider, Entity<OpenRouterSettings>)>,
     availability: Vec<Provider>,
-    microsoft: [Entity<TextInput>; 3],
-    microsoft_dirty: [bool; 3],
-    microsoft_errors: [Option<String>; 3],
     global: Entity<OpenRouterSettings>,
     error: Option<String>,
     _subscriptions: Vec<Subscription>,
@@ -79,9 +29,7 @@ impl EventEmitter<ProvidersChanged> for ProvidersView {}
 impl ProvidersView {
     pub fn new(preview: bool, cx: &mut Context<Self>) -> Self {
         let loaded = if preview {
-            let mut config = Config::default();
-            config.microsoft.endpoint = "https://hex-preview.cognitiveservices.azure.com".into();
-            Ok(config)
+            Ok(Config::default())
         } else {
             crate::openrouter::load_config()
         };
@@ -107,29 +55,6 @@ impl ProvidersView {
             key.update(cx, |view, cx| view.refresh_config(config.clone(), cx));
         }
         let mut subscriptions = Vec::new();
-        let microsoft = MicrosoftField::ALL.map(|field| {
-            let input = cx.new(|cx| {
-                TextInput::new(cx, field.placeholder(), field.value(&config)).commit_on_blur()
-            });
-            subscriptions.push(cx.subscribe(&input, move |this, _, _: &Changed, cx| {
-                this.microsoft_dirty[field.index()] = true;
-                this.microsoft_errors[field.index()] = None;
-                cx.notify();
-            }));
-            subscriptions.push(cx.subscribe(&input, move |this, _, _: &Submitted, cx| {
-                this.save_microsoft(field, cx);
-            }));
-            subscriptions.push(cx.subscribe(&input, move |this, _, _: &EditFinished, cx| {
-                this.save_microsoft(field, cx);
-            }));
-            subscriptions.push(cx.subscribe(&input, move |this, _, _: &Dismissed, cx| {
-                this.microsoft_dirty[field.index()] = false;
-                this.microsoft_errors[field.index()] = None;
-                this.load_microsoft(cx);
-                cx.notify();
-            }));
-            input
-        });
         for (_, key) in &keys {
             subscriptions.push(cx.observe(key, |this, _, cx| {
                 // Initial asynchronous lookups notify without KeyChanged.
@@ -173,9 +98,6 @@ impl ProvidersView {
             } else {
                 Vec::new()
             },
-            microsoft,
-            microsoft_dirty: [false; 3],
-            microsoft_errors: std::array::from_fn(|_| None),
             global,
             error,
             _subscriptions: subscriptions,
@@ -206,7 +128,6 @@ impl ProvidersView {
     pub fn refresh(&mut self, config: Config, cx: &mut Context<Self>) {
         self.config = config.clone();
         self.error = None;
-        self.load_microsoft(cx);
         self.global
             .update(cx, |view, cx| view.refresh_config(config.clone(), cx));
         for (_, key) in &self.keys {
@@ -217,9 +138,6 @@ impl ProvidersView {
     pub fn apply_imported_config(&mut self, config: Config, cx: &mut Context<Self>) {
         self.config = config.clone();
         self.error = None;
-        self.microsoft_dirty = [false; 3];
-        self.microsoft_errors = std::array::from_fn(|_| None);
-        self.load_microsoft(cx);
         self.global.update(cx, |view, cx| {
             view.apply_imported_config(config.clone(), cx)
         });
@@ -243,16 +161,7 @@ impl ProvidersView {
         cx.notify();
     }
     #[cfg(test)]
-    pub(crate) fn stage_connection_and_timeout_drafts(
-        &mut self,
-        endpoint: &str,
-        timeout: &str,
-        cx: &mut Context<Self>,
-    ) {
-        self.microsoft[MicrosoftField::Batch.index()].update(cx, |input, cx| {
-            input.set_text(endpoint, cx);
-            cx.emit(Changed);
-        });
+    pub(crate) fn stage_timeout_draft(&mut self, timeout: &str, cx: &mut Context<Self>) {
         self.global
             .update(cx, |view, cx| view.stage_attempt_timeout_draft(timeout, cx));
     }
@@ -261,104 +170,9 @@ impl ProvidersView {
         for (_, key) in &self.keys {
             key.update(cx, |view, cx| view.finish_editing(cx));
         }
-        for field in MicrosoftField::ALL {
-            self.save_microsoft(field, cx);
-        }
         self.global.update(cx, |view, cx| view.finish_editing(cx));
         self.refresh(self.global.read(cx).config_snapshot(), cx);
     }
-    fn load_microsoft(&mut self, cx: &mut Context<Self>) {
-        for field in MicrosoftField::ALL {
-            if !self.microsoft_dirty[field.index()] {
-                let value = field.value(&self.config).to_owned();
-                self.microsoft[field.index()].update(cx, |input, cx| input.set_text(value, cx));
-            }
-        }
-    }
-
-    fn save_microsoft(&mut self, field: MicrosoftField, cx: &mut Context<Self>) {
-        let index = field.index();
-        if !self.microsoft_dirty[index] {
-            return;
-        }
-        let value = self.microsoft[index].read(cx).text().trim().to_owned();
-        let edit = |base: &Config| {
-            let mut config = base.clone();
-            field.set(&mut config, &value);
-            config.microsoft.validate()?;
-            Ok::<_, String>(config)
-        };
-        let saved = if self.preview {
-            edit(&self.config)
-        } else {
-            crate::openrouter::update_config(|base| {
-                edit(base).map_err(|error| color_eyre::eyre::eyre!("{error}"))
-            })
-            .map_err(|error| format!("{error:#}"))
-        };
-        match saved {
-            Ok(config) => {
-                self.microsoft_dirty[index] = false;
-                self.microsoft_errors[index] = None;
-                self.refresh(config, cx);
-                cx.emit(ProvidersChanged);
-            }
-            Err(error) => {
-                self.microsoft_errors[index] = Some(error);
-                cx.notify();
-            }
-        }
-    }
-
-    fn render_microsoft(&self) -> gpui::Div {
-        let fields = [
-            (
-                MicrosoftField::Batch,
-                "Resource endpoint",
-                "One Azure resource and key for recorded audio and streaming",
-            ),
-            (
-                MicrosoftField::Streaming,
-                "Foundry Realtime endpoint",
-                "Used by your existing deployment; clear Deployment to use the shared resource",
-            ),
-            (
-                MicrosoftField::Deployment,
-                "Deployment",
-                "Optional Foundry Realtime deployment; leave empty to use Speech streaming",
-            ),
-        ];
-        div().children(
-            fields
-                .into_iter()
-                .filter(|(field, _, _)| {
-                    matches!(field, MicrosoftField::Batch)
-                        || !self.config.microsoft.uses_speech_streaming()
-                })
-                .map(|(field, title, description)| {
-                    let index = field.index();
-                    div()
-                        .child(settings_row(
-                            title,
-                            description,
-                            div()
-                                .debug_selector(move || format!("microsoft-connection-{index}"))
-                                .w(px(SETTINGS_CONTROL_WIDTH))
-                                .flex_none()
-                                .child(self.microsoft[index].clone()),
-                        ))
-                        .children(self.microsoft_errors[index].clone().map(|error| {
-                            div()
-                                .px_4()
-                                .pb_3()
-                                .text_size(px(11.0))
-                                .text_color(rgb(NEGATIVE))
-                                .child(error)
-                        }))
-                }),
-        )
-    }
-
     pub fn close_pickers(&mut self, cx: &mut Context<Self>) {
         self.global.update(cx, |view, cx| view.close_pickers(cx));
     }
@@ -366,25 +180,7 @@ impl ProvidersView {
 
 impl Render for ProvidersView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let microsoft = div()
-            .child(crate::desktop_ui::settings_subsection_label(
-                "Microsoft Azure Speech",
-            ))
-            .child(settings_panel().child(self.render_microsoft()))
-            .into_any_element();
-        let microsoft_errors = self
-            .microsoft_errors
-            .iter()
-            .zip([
-                "Microsoft resource endpoint",
-                "Microsoft streaming endpoint",
-                "Microsoft deployment",
-            ])
-            .filter_map(|(error, field)| error.as_ref().map(|error| format!("{field}: {error}")))
-            .collect();
-        let advanced = self.global.update(cx, |view, cx| {
-            view.render_advanced(Some(microsoft), microsoft_errors, cx)
-        });
+        let advanced = self.global.update(cx, |view, cx| view.render_advanced(cx));
         div()
             .debug_selector(|| "providers-credentials-and-limits".into())
             .children(self.error.clone().map(|error| {
@@ -446,14 +242,10 @@ mod tests {
     }
 
     #[gpui::test]
-    fn advanced_keyboard_access_and_collapsed_errors_preserve_microsoft_drafts(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        use gpui::Focusable;
+    fn advanced_opens_and_closes_from_the_keyboard(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| cx.bind_keys(crate::text_input::key_bindings()));
-        let (fixture, cx) =
+        let (_fixture, cx) =
             cx.add_window_view(|_, cx| KeyboardFixture(cx.new(|cx| ProvidersView::new(true, cx))));
-        let view = cx.update(|_, cx| fixture.read(cx).0.clone());
         cx.simulate_resize(gpui::size(px(760.0), px(2400.0)));
         cx.update(|window, _| window.activate_window());
         cx.run_until_parked();
@@ -463,69 +255,19 @@ mod tests {
             window.blur();
             window.focus_next();
         });
-        cx.simulate_keystrokes("enter");
-        cx.simulate_event(gpui::KeyUpEvent {
-            keystroke: gpui::Keystroke::parse("enter").unwrap(),
-        });
-        cx.run_until_parked();
-        assert!(cx.debug_bounds("providers-advanced").unwrap().size.height > collapsed.size.height);
-        cx.simulate_keystrokes("tab tab tab tab tab tab");
-        cx.update(|window, cx| {
-            assert!(
-                view.read(cx).microsoft[0]
-                    .focus_handle(cx)
-                    .is_focused(window)
-            )
-        });
-        let saved = "https://keyboard.cognitiveservices.azure.com";
-        cx.simulate_keystrokes("cmd-a");
-        cx.simulate_input(saved);
-        cx.simulate_keystrokes("tab");
-        cx.run_until_parked();
-        cx.update(|_, cx| assert_eq!(view.read(cx).config.microsoft.endpoint, saved));
-
-        cx.simulate_keystrokes("shift-tab cmd-a");
-        cx.simulate_input("http://invalid.cognitiveservices.azure.com");
-        let header = cx.debug_bounds("openrouter-advanced").unwrap();
-        cx.simulate_click(header.center(), gpui::Modifiers::default());
-        cx.run_until_parked();
-        assert!(
-            cx.debug_bounds("advanced-collapsed-feedback")
-                .unwrap()
-                .size
-                .height
-                > px(0.0)
-        );
-        cx.update(|window, cx| {
-            let view = view.read(cx);
-            assert!(!view.microsoft[0].focus_handle(cx).is_focused(window));
-            assert_eq!(view.config.microsoft.endpoint, saved);
-            assert_eq!(
-                view.microsoft[0].read(cx).text(),
-                "http://invalid.cognitiveservices.azure.com"
-            );
-            assert!(view.microsoft_errors[0].is_some());
-        });
-        // Reopen through the retained header focus. The error moves back to
-        // the field instead of appearing twice, and the invalid draft remains.
-        cx.simulate_keystrokes("space");
-        cx.simulate_event(gpui::KeyUpEvent {
-            keystroke: gpui::Keystroke::parse("space").unwrap(),
-        });
-        cx.run_until_parked();
-        assert_eq!(
-            cx.debug_bounds("advanced-collapsed-feedback")
-                .unwrap()
-                .size
-                .height,
-            px(0.0)
-        );
-        cx.update(|_, cx| {
-            assert_eq!(
-                view.read(cx).microsoft[0].read(cx).text(),
-                "http://invalid.cognitiveservices.azure.com"
-            )
-        });
+        for key in ["enter", "space"] {
+            cx.simulate_keystrokes(key);
+            cx.simulate_event(gpui::KeyUpEvent {
+                keystroke: gpui::Keystroke::parse(key).unwrap(),
+            });
+            cx.run_until_parked();
+            let height = cx.debug_bounds("providers-advanced").unwrap().size.height;
+            if key == "enter" {
+                assert!(height > collapsed.size.height);
+            } else {
+                assert_eq!(height, collapsed.size.height);
+            }
+        }
     }
 
     #[gpui::test]
@@ -605,228 +347,19 @@ mod tests {
     }
 
     #[gpui::test]
-    fn microsoft_legacy_connection_edits_validate_on_blur_and_enter_escape_cancels(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        use gpui::Focusable;
-        use std::{cell::RefCell, rc::Rc};
-        cx.update(|cx| cx.bind_keys(crate::text_input::key_bindings()));
-        let (view, cx) = cx.add_window_view(|_, cx| ProvidersView::new(true, cx));
-        cx.simulate_resize(gpui::size(px(760.0), px(2400.0)));
-        cx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                let mut config = view.config.clone();
-                config.microsoft.streaming_endpoint =
-                    "https://hex-preview.services.ai.azure.com".into();
-                config.microsoft.deployment = "existing-deployment".into();
-                view.refresh(config, cx);
-            })
-        });
-        let changes = Rc::new(RefCell::new(0));
-        let recorded = changes.clone();
-        let _subscription = cx.update(|_, cx| {
-            cx.subscribe(&view, move |_, _: &ProvidersChanged, _| {
-                *recorded.borrow_mut() += 1;
-            })
-        });
-        cx.update(|window, _| window.activate_window());
-        cx.run_until_parked();
-        let header = cx.debug_bounds("openrouter-advanced").unwrap();
-        cx.simulate_click(header.center(), gpui::Modifiers::default());
-        cx.run_until_parked();
-        cx.update(|window, cx| view.read(cx).microsoft[0].focus_handle(cx).focus(window));
-        cx.simulate_keystrokes("cmd-a");
-        cx.simulate_input("https://edited.cognitiveservices.azure.com");
-        cx.update(|_, cx| {
-            assert!(
-                view.read(cx)
-                    .config
-                    .microsoft
-                    .endpoint
-                    .contains("hex-preview")
-            )
-        });
-        cx.update(|window, _| window.blur());
-        cx.run_until_parked();
-        cx.update(|_, cx| {
-            assert_eq!(
-                view.read(cx).config.microsoft.endpoint,
-                "https://edited.cognitiveservices.azure.com"
-            );
-            assert_eq!(
-                view.read(cx).global.read(cx).config_snapshot(),
-                view.read(cx).config
-            );
-        });
-        assert_eq!(*changes.borrow(), 1);
-        cx.update(|window, cx| view.read(cx).microsoft[1].focus_handle(cx).focus(window));
-        cx.simulate_keystrokes("cmd-a");
-        cx.simulate_input("http://unsafe.services.ai.azure.com");
-        cx.simulate_keystrokes("enter");
-        cx.run_until_parked();
-        cx.update(|_, cx| {
-            assert!(view.read(cx).microsoft_errors[1].is_some());
-            assert!(
-                view.read(cx)
-                    .config
-                    .microsoft
-                    .streaming_endpoint
-                    .starts_with("https://hex-preview")
-            );
-            assert_eq!(
-                view.read(cx).microsoft[1].read(cx).text(),
-                "http://unsafe.services.ai.azure.com"
-            );
-        });
-        assert_eq!(*changes.borrow(), 1);
-        cx.update(|window, cx| view.read(cx).microsoft[1].focus_handle(cx).focus(window));
-        cx.simulate_keystrokes("escape");
-        cx.update(|_, cx| {
-            assert!(!view.read(cx).microsoft_dirty[1]);
-            assert!(view.read(cx).microsoft_errors[1].is_none());
-            assert_eq!(
-                view.read(cx).microsoft[1].read(cx).text(),
-                view.read(cx).config.microsoft.streaming_endpoint
-            );
-        });
-        cx.update(|window, cx| view.read(cx).microsoft[2].focus_handle(cx).focus(window));
-        cx.simulate_keystrokes("cmd-a");
-        cx.simulate_input("MAI-Custom-Deployment");
-        cx.simulate_keystrokes("enter");
-        cx.update(|window, _| window.blur());
-        cx.run_until_parked();
-        assert_eq!(*changes.borrow(), 2, "Enter plus blur commits one change");
-        cx.update(|_, cx| {
-            assert_eq!(
-                view.read(cx).config.microsoft.deployment,
-                "MAI-Custom-Deployment"
-            )
-        });
-        // Collapsing Advanced is also an edit boundary: do not lose a draft
-        // or leave a hidden input focused.
-        cx.update(|window, cx| view.read(cx).microsoft[2].focus_handle(cx).focus(window));
-        cx.simulate_keystrokes("cmd-a");
-        cx.simulate_input("Saved-On-Collapse");
-        let header = cx.debug_bounds("openrouter-advanced").unwrap();
-        cx.simulate_click(header.center(), gpui::Modifiers::default());
-        cx.run_until_parked();
-        cx.update(|window, cx| {
-            assert_eq!(
-                view.read(cx).config.microsoft.deployment,
-                "Saved-On-Collapse"
-            );
-            assert!(
-                !view.read(cx).microsoft[2]
-                    .focus_handle(cx)
-                    .is_focused(window)
-            );
-        });
-        assert_eq!(*changes.borrow(), 3);
-    }
-
-    #[gpui::test]
-    fn microsoft_drafts_survive_refresh_and_flush_but_import_discards_them(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let (view, cx) = cx.add_window_view(|_, cx| ProvidersView::new(true, cx));
-        cx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.microsoft[0].update(cx, |input, cx| {
-                    input.set_text("https://draft.cognitiveservices.azure.com", cx)
-                });
-                view.microsoft_dirty[0] = true;
-                view.microsoft[2].update(cx, |input, cx| input.set_text("Draft-Deployment", cx));
-                view.microsoft_dirty[2] = true;
-                let mut config = view.config_snapshot();
-                config.transcription.attempt_timeout_seconds = 47;
-                view.refresh(config, cx);
-                assert_eq!(view.microsoft[2].read(cx).text(), "Draft-Deployment");
-                view.finish_editing(cx);
-                assert_eq!(
-                    view.config.microsoft.endpoint,
-                    "https://draft.cognitiveservices.azure.com"
-                );
-                assert_eq!(view.config.microsoft.deployment, "Draft-Deployment");
-                assert_eq!(view.config.transcription.attempt_timeout_seconds, 47);
-                assert_eq!(view.global.read(cx).config_snapshot(), view.config);
-                view.microsoft[2].update(cx, |input, cx| input.set_text("Obsolete-Draft", cx));
-                view.microsoft_dirty[2] = true;
-                let mut imported = view.config_snapshot();
-                imported.microsoft.deployment = "Imported-Local-Connection".into();
-                view.apply_imported_config(imported.clone(), cx);
-                view.finish_editing(cx);
-                assert_eq!(view.config, imported);
-                assert_eq!(
-                    view.microsoft[2].read(cx).text(),
-                    "Imported-Local-Connection"
-                );
-                assert!(!view.microsoft_dirty.iter().any(|dirty| *dirty));
-            })
-        });
-        cx.run_until_parked();
-    }
-
-    #[gpui::test]
-    fn microsoft_controls_are_collapsed_inside_advanced_with_standard_metrics(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn advanced_is_collapsed_below_every_provider_key(cx: &mut gpui::TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, cx| ProvidersView::new(true, cx));
         cx.simulate_resize(gpui::size(px(760.0), px(2400.0)));
         cx.run_until_parked();
         cx.update(|_, cx| assert_eq!(view.read(cx).keys.len(), Provider::ALL.len()));
-        assert!(cx.debug_bounds("microsoft-connection-0").is_none());
         let collapsed = cx.debug_bounds("providers-advanced").unwrap();
         let header = cx.debug_bounds("openrouter-advanced").unwrap();
-        assert_eq!(
-            cx.debug_bounds("advanced-collapsed-feedback")
-                .unwrap()
-                .size
-                .height,
-            px(0.0),
-        );
+        assert_eq!(Provider::ALL.len(), 7);
+        let last_key = cx.debug_bounds("provider-key-6").unwrap();
+        assert!(collapsed.top() >= last_key.bottom());
         cx.simulate_click(header.center(), gpui::Modifiers::default());
         cx.run_until_parked();
-        let expanded = cx.debug_bounds("providers-advanced").unwrap();
-        assert!(expanded.size.height > collapsed.size.height);
-        let shared = cx.debug_bounds("microsoft-connection-0").unwrap();
-        assert_eq!(shared.size.width, px(SETTINGS_CONTROL_WIDTH));
-        assert_eq!(shared.size.height, px(crate::desktop_ui::CONTROL_HEIGHT));
-        assert!(cx.debug_bounds("microsoft-connection-1").is_none());
-        assert!(cx.debug_bounds("microsoft-connection-2").is_none());
-        cx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                let mut config = view.config.clone();
-                config.microsoft.streaming_endpoint =
-                    "https://hex-preview.services.ai.azure.com".into();
-                config.microsoft.deployment = "existing-deployment".into();
-                view.refresh(config, cx);
-            })
-        });
-        cx.run_until_parked();
-        let expanded = cx.debug_bounds("providers-advanced").unwrap();
-        for selector in [
-            "provider-key-0",
-            "provider-key-1",
-            "provider-key-2",
-            "provider-key-3",
-            "provider-key-4",
-            "provider-key-5",
-            "provider-key-6",
-            "provider-key-7",
-        ] {
-            assert!(cx.debug_bounds(selector).is_some());
-        }
-        for selector in [
-            "microsoft-connection-0",
-            "microsoft-connection-1",
-            "microsoft-connection-2",
-        ] {
-            let bounds = cx.debug_bounds(selector).unwrap();
-            assert_eq!(bounds.size.width, px(SETTINGS_CONTROL_WIDTH));
-            assert_eq!(bounds.size.height, px(crate::desktop_ui::CONTROL_HEIGHT));
-            assert!(bounds.top() >= expanded.top() && bounds.bottom() <= expanded.bottom());
-            assert!(bounds.top() >= cx.debug_bounds("provider-key-6").unwrap().bottom());
-        }
+        assert!(cx.debug_bounds("providers-advanced").unwrap().size.height > collapsed.size.height);
         cx.simulate_click(header.center(), gpui::Modifiers::default());
         cx.run_until_parked();
         assert_eq!(

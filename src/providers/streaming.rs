@@ -633,40 +633,11 @@ fn run_live(
     }
 }
 
-fn endpoint(
-    config: &Config,
-    model: ModelRef<'_>,
-    options: &ModelOptions,
-    keywords: &[String],
-) -> Result<url::Url> {
+fn endpoint(model: ModelRef<'_>, options: &ModelOptions, keywords: &[String]) -> Result<url::Url> {
     if model.provider == Provider::Meta {
         // Validate the model/language before DNS or credential resolution.
         super::meta::settings(model.model, options, "PCM_16KHZ", keywords)
             .map_err(|_| failure("Invalid Muse Voice model or language hint."))?;
-    }
-    if model.provider == Provider::Microsoft {
-        // Validate the resource before resolving credentials. Only the documented
-        // Azure root is configurable; protocol path/query are supplied here.
-        let mut url = super::microsoft_endpoint(config, true)
-            .map_err(|_| failure("Configure the Microsoft resource endpoint in Providers."))?;
-        url.set_scheme("wss")
-            .map_err(|_| failure("Invalid Microsoft streaming endpoint."))?;
-        if config.microsoft.uses_speech_streaming() {
-            // Speech SDK 1.52's custom-resource route. This shares the batch
-            // resource/key and selects MAI through speech.context, without a
-            // separately provisioned Foundry Realtime model deployment.
-            url.set_path("/stt/speech/universal/v2");
-            url.query_pairs_mut().append_pair("format", "simple");
-            if options.language != "auto" {
-                let language = super::bcp47_language(&options.language)
-                    .ok_or_else(|| failure("Unsupported Microsoft language hint."))?;
-                url.query_pairs_mut().append_pair("language", language);
-            }
-        } else {
-            url.set_path("/mai/v1/realtime");
-            url.set_query(Some("intent=transcription"));
-        }
-        return Ok(url);
     }
     let base = match model.provider {
         Provider::OpenAi => "wss://api.openai.com/v1/realtime?intent=transcription",
@@ -677,7 +648,6 @@ fn endpoint(
         Provider::Google => {
             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
         }
-        Provider::Microsoft => unreachable!("Microsoft endpoint handled above"),
         Provider::OpenRouter => {
             return Err(failure(
                 "OpenRouter does not support live transcription here.",
@@ -789,23 +759,7 @@ fn session_update(model: &str, options: &ModelOptions, keywords: &[String]) -> V
 }
 
 fn streaming_keywords(model: ModelRef<'_>, vocabulary: &Snapshot) -> Vec<String> {
-    // MAI streaming documents language/model only, independently of batch hints.
-    if model.provider == Provider::Microsoft {
-        Vec::new()
-    } else {
-        super::batch::keywords(model, vocabulary)
-    }
-}
-
-fn microsoft_session_update(config: &Config, options: &ModelOptions) -> Value {
-    let mut transcription = json!({"model": config.microsoft.deployment});
-    if options.language != "auto" {
-        transcription["language"] = json!(options.language);
-    }
-    json!({"type":"session.update","session":{"type":"transcription","audio":{"input":{
-        "format":{"type":"audio/pcm","rate":16000}, "transcription":transcription,
-        "turn_detection":null,"noise_reduction":null
-    }}}})
+    super::batch::keywords(model, vocabulary)
 }
 
 fn google_setup(model: &str, options: &ModelOptions, keywords: &[String]) -> Value {
@@ -834,7 +788,6 @@ fn authentication(
         return Err(failure("Meta authenticates in its first session frame."));
     }
     let (header, value) = match provider {
-        Provider::Microsoft => ("api-key", key.to_owned()),
         Provider::Google => ("x-goog-api-key", key.to_owned()),
         Provider::ElevenLabs => ("xi-api-key", key.to_owned()),
         Provider::Deepgram => ("authorization", format!("Token {key}")),
@@ -848,7 +801,7 @@ fn authentication(
 
 fn finish_message(provider: Provider) -> Result<Value> {
     match provider {
-        Provider::OpenAi | Provider::Microsoft => Ok(json!({"type":"input_audio_buffer.commit"})),
+        Provider::OpenAi => Ok(json!({"type":"input_audio_buffer.commit"})),
         Provider::ElevenLabs => Ok(
             json!({"message_type":"input_audio_chunk","audio_base_64":"","commit":true,"sample_rate":16000}),
         ),
@@ -1056,8 +1009,6 @@ struct Protocol {
     provider: Provider,
     ready: bool,
     finishing: bool,
-    created: bool,
-    setup_sent: bool,
     google_text: String,
     google_finished: bool,
     google_turn_complete: bool,
@@ -1073,8 +1024,6 @@ impl Protocol {
             provider,
             ready: provider == Provider::Deepgram,
             finishing: false,
-            created: false,
-            setup_sent: false,
             google_text: String::new(),
             google_finished: false,
             google_turn_complete: false,
@@ -1250,37 +1199,6 @@ impl Protocol {
                 }
                 if kind == "Metadata" && self.finishing {
                     return self.joined().map(Some);
-                }
-            }
-            Provider::Microsoft => {
-                if kind == "session.created" {
-                    self.created = true;
-                }
-                if kind == "session.updated" {
-                    if !self.created || !self.setup_sent {
-                        return Err(failure(
-                            "Microsoft acknowledged an unexpected streaming setup.",
-                        ));
-                    }
-                    self.ready = true;
-                }
-                if self.finishing && kind == "input_audio_buffer.committed" {
-                    self.commit_item = event["item_id"].as_str().map(str::to_owned);
-                }
-                if kind == "conversation.item.input_audio_transcription.completed" {
-                    if !self.finishing {
-                        return Err(failure("The streaming provider committed before Finish."));
-                    }
-                    if let (Some(expected), Some(actual)) =
-                        (&self.commit_item, event["item_id"].as_str())
-                        && expected != actual
-                    {
-                        return Err(failure(
-                            "Microsoft returned a final for a different audio item.",
-                        ));
-                    }
-                    // MAI explicitly documents completed events without item_id.
-                    return final_text(event.get("transcript")).map(Some);
                 }
             }
             Provider::Grok => {
@@ -1462,7 +1380,6 @@ impl Write for SocketIo {
 struct Connection {
     socket: WebSocket<MaybeTlsStream<SocketIo>>,
     protocol: Protocol,
-    speech: Option<super::microsoft_speech::SpeechProtocol>,
     encoder: PcmEncoder,
     model: String,
     keyword_count: usize,
@@ -1470,7 +1387,6 @@ struct Connection {
     completed: Option<String>,
     wire_frames: usize,
     sent_samples: Arc<AtomicUsize>,
-    pending_setup: Option<Value>,
     activity_started: bool,
     pacing_started: Option<Instant>,
     control: Arc<SessionControl>,
@@ -1496,12 +1412,7 @@ impl Connection {
             .validate()
             .map_err(|_| failure("Invalid streaming model options."))?;
         let keywords = streaming_keywords(model, vocabulary);
-        let url = endpoint(config, model, &options, &keywords)?;
-        let speech = (model.provider == Provider::Microsoft
-            && config.microsoft.uses_speech_streaming())
-        .then(|| {
-            super::microsoft_speech::SpeechProtocol::new(uuid::Uuid::new_v4().simple().to_string())
-        });
+        let url = endpoint(model, &options, &keywords)?;
         // Validation above is preflight. From credential resolution onward this
         // is an attempted provider request, even when authentication fails before
         // bytes reach the wire (the UI deliberately calls these attempts).
@@ -1513,44 +1424,12 @@ impl Connection {
             )
         })?;
         control.check(deadline)?;
-        // Speech custom domains redirect valid keys to a regional host. Exchange
-        // the key on the configured resource and authenticate there with a token.
-        let speech_session = if speech.is_some() {
-            Some(
-                super::microsoft::speech_session(
-                    config,
-                    &url,
-                    &key,
-                    Duration::from_secs(5).min(deadline.saturating_duration_since(Instant::now())),
-                )
-                .map_err(|message| {
-                    failure_kind(
-                        message,
-                        if message.contains("rejected the key") {
-                            ErrorKind::Auth
-                        } else {
-                            ErrorKind::Network
-                        },
-                    )
-                })?,
-            )
-        } else {
-            None
-        };
         control.check(deadline)?;
-        let url = speech_session
-            .as_ref()
-            .map_or_else(|| url.clone(), |session| session.url.clone());
         let mut request = url
             .as_str()
             .into_client_request()
             .map_err(|_| failure("Could not create streaming request."))?;
-        if let Some(session) = &speech_session {
-            let value =
-                tungstenite::http::HeaderValue::from_str(&format!("Bearer {}", session.token))
-                    .map_err(|_| failure("Microsoft returned an invalid Speech token."))?;
-            request.headers_mut().insert("Authorization", value);
-        } else if model.provider != Provider::Meta {
+        if model.provider != Provider::Meta {
             let (header, value) = authentication(model.provider, &key)?;
             request.headers_mut().insert(header, value);
         }
@@ -1643,22 +1522,10 @@ impl Connection {
             completed: None,
             wire_frames: 0,
             sent_samples: control.sent_samples.clone(),
-            pending_setup: (model.provider == Provider::Microsoft && speech.is_none())
-                .then(|| microsoft_session_update(config, &options)),
             activity_started: false,
             pacing_started: None,
             control: control.clone(),
-            speech,
         };
-        if let Some(speech) = &connection.speech {
-            for frame in speech.setup() {
-                connection.wire(frame)?;
-            }
-            // Speech has no configuration acknowledgement. Audio begins after
-            // setup, while SpeechProtocol separately requires the server's
-            // turn.start, EndOfDictation, and turn.end before releasing text.
-            connection.protocol.ready = true;
-        }
         match model.provider {
             Provider::Meta => {
                 let setup = super::meta::handshake(model.model, &options, &keywords, &key)
@@ -1718,20 +1585,11 @@ impl Connection {
             self.protocol.provider,
             self.encoder.source.saturating_add(samples.len()),
         )?;
-        if self.speech.is_some()
-            || matches!(self.protocol.provider, Provider::Grok | Provider::Meta)
-        {
-            // Grok/Meta run at real time; Speech permits SDK-style 2x catch-up.
-            // Pace only on this worker; capture remains nonblocking.
+        if matches!(self.protocol.provider, Provider::Grok | Provider::Meta) {
+            // Grok/Meta run at real time. Pace only on this worker; capture
+            // remains nonblocking.
             let target = *self.pacing_started.get_or_insert_with(Instant::now)
-                + Duration::from_secs_f64(
-                    self.wire_frames as f64
-                        / if self.speech.is_some() {
-                            32_000.0
-                        } else {
-                            16_000.0
-                        },
-                );
+                + Duration::from_secs_f64(self.wire_frames as f64 / 16_000.0);
             let control = self.control.clone();
             while Instant::now() < target {
                 self.poll(deadline, &control)?;
@@ -1746,11 +1604,9 @@ impl Connection {
             return Ok(());
         }
         let frames = pcm.len() / 2;
-        if let Some(speech) = &self.speech {
-            self.wire(speech.audio(&pcm))?;
-        } else {
+        {
             match self.protocol.provider {
-            Provider::OpenAi | Provider::Microsoft => self.json(json!({"type":"input_audio_buffer.append","audio":crate::openrouter::transcribe::encode_base64(&pcm)})),
+            Provider::OpenAi => self.json(json!({"type":"input_audio_buffer.append","audio":crate::openrouter::transcribe::encode_base64(&pcm)})),
             Provider::ElevenLabs => self.json(json!({"message_type":"input_audio_chunk","audio_base_64":crate::openrouter::transcribe::encode_base64(&pcm),"commit":false,"sample_rate":16000})),
             Provider::Google => self.json(json!({"realtimeInput":{"audio":{"data":crate::openrouter::transcribe::encode_base64(&pcm),"mimeType":"audio/pcm;rate=16000"}}})),
             Provider::Deepgram | Provider::Grok | Provider::Meta => {
@@ -1775,10 +1631,6 @@ impl Connection {
         let pcm = self.encoder.push(&[], true)?;
         self.send_pcm(pcm)?;
         self.protocol.finishing = true;
-        if let Some(speech) = &mut self.speech {
-            let frame = speech.finish();
-            return self.wire(frame);
-        }
         self.json(finish_message(self.protocol.provider)?)
     }
     fn keep_alive(&mut self) -> Result<()> {
@@ -1794,16 +1646,9 @@ impl Connection {
         self.set_deadline(deadline);
         let result = match self.socket.read() {
             Ok(Message::Text(text)) => {
-                if let Some(speech) = &mut self.speech {
-                    speech.event(&text).map_err(failure)
-                } else {
-                    let value: Value = serde_json::from_str(&text)
-                        .map_err(|_| failure("Invalid streaming response."))?;
-                    self.protocol.event(&value)
-                }
-            }
-            Ok(Message::Binary(_)) if self.speech.is_some() => {
-                Err(failure("Unexpected Microsoft Speech binary response."))
+                let value: Value = serde_json::from_str(&text)
+                    .map_err(|_| failure("Invalid streaming response."))?;
+                self.protocol.event(&value)
             }
             Ok(Message::Binary(bytes)) if self.protocol.provider == Provider::Google => {
                 let value: Value = serde_json::from_slice(&bytes)
@@ -1839,13 +1684,6 @@ impl Connection {
         }?;
         if result.is_some() {
             self.completed = result;
-        }
-        if self.protocol.provider == Provider::Microsoft
-            && self.protocol.created
-            && let Some(setup) = self.pending_setup.take()
-        {
-            self.json(setup)?;
-            self.protocol.setup_sent = true;
         }
         Ok(())
     }
@@ -1958,7 +1796,7 @@ mod tests {
         };
         let model = ModelRef::parse("meta::muse-voice-transcribe-1.0");
         let words = ["Nimbus Files".into()];
-        let url = endpoint(&Config::default(), model, &options, &words).unwrap();
+        let url = endpoint(model, &options, &words).unwrap();
         assert_eq!(url.as_str(), "wss://api.meta.ai/v1/asr/realtime");
         assert!(authentication(Provider::Meta, "fixture-only-key").is_err());
         assert!(!query_keywords(Provider::Meta));
@@ -1982,7 +1820,6 @@ mod tests {
         assert!(encoder.push(&[], true).unwrap().is_empty());
         assert!(
             endpoint(
-                &Config::default(),
                 model,
                 &ModelOptions {
                     language: "ru".into(),
@@ -2132,120 +1969,6 @@ mod tests {
         (live, audio_rx, seal_rx, send_result)
     }
 
-    fn microsoft_config() -> Config {
-        let mut config = Config::default();
-        config.microsoft.streaming_endpoint = "https://fixture.services.ai.azure.com".into();
-        config.microsoft.deployment = "fixture-mai-deployment".into();
-        config
-    }
-
-    #[test]
-    fn microsoft_speech_streams_with_only_the_shared_resource_and_preserves_auto_language() {
-        let mut config = Config::default();
-        config.microsoft.endpoint = "https://fixture.cognitiveservices.azure.com".into();
-        let model = ModelRef::parse("microsoft::MAI-Transcribe-2-Streaming");
-        for (language, expected) in [("auto", None), ("pt", Some("pt-BR")), ("en", Some("en-US"))] {
-            let options = ModelOptions {
-                language: language.into(),
-                ..Default::default()
-            };
-            let url = endpoint(&config, model, &options, &["not supported".into()]).unwrap();
-            assert_eq!(url.host_str(), Some("fixture.cognitiveservices.azure.com"));
-            assert_eq!(url.path(), "/stt/speech/universal/v2");
-            assert_eq!(url.scheme(), "wss");
-            assert_eq!(
-                url.query_pairs()
-                    .find(|(key, _)| key == "language")
-                    .map(|(_, v)| v.into_owned())
-                    .as_deref(),
-                expected
-            );
-            assert!(!url.as_str().contains("not supported"));
-            assert!(!url.as_str().contains("deployment"));
-        }
-        config.microsoft.endpoint = "https://fixture.cognitiveservices.azure.com.evil.test".into();
-        assert!(endpoint(&config, model, &ModelOptions::default(), &[]).is_err());
-    }
-
-    #[test]
-    fn microsoft_streaming_uses_validated_resource_and_distinct_auth_without_keywords() {
-        let config = microsoft_config();
-        let model = ModelRef::parse("microsoft::MAI-Transcribe-2-Streaming");
-        let options = ModelOptions {
-            language: "pt".into(),
-            prompt: "ignored context".into(),
-            smart_format: true,
-            no_verbatim: true,
-            ..Default::default()
-        };
-        let url = endpoint(&config, model, &options, &["never-sent".into()]).unwrap();
-        assert_eq!(
-            url.as_str(),
-            "wss://fixture.services.ai.azure.com/mai/v1/realtime?intent=transcription"
-        );
-        assert!(endpoint(&Config::default(), model, &options, &[]).is_err());
-        let mut invalid = config.clone();
-        invalid.microsoft.streaming_endpoint =
-            "https://fixture.services.ai.azure.com.evil.test".into();
-        assert!(endpoint(&invalid, model, &options, &[]).is_err());
-        let setup = microsoft_session_update(&config, &options);
-        let input = &setup["session"]["audio"]["input"];
-        assert_eq!(input["format"], json!({"type":"audio/pcm","rate":16000}));
-        assert_eq!(
-            input["transcription"],
-            json!({"model":"fixture-mai-deployment","language":"pt"})
-        );
-        assert!(input["turn_detection"].is_null());
-        assert!(input["noise_reduction"].is_null());
-        let vocabulary = Snapshot::new(crate::vocabulary::Vocabulary {
-            terms: vec!["Never Sent".into()],
-            ..Default::default()
-        });
-        assert!(streaming_keywords(model, &vocabulary).is_empty());
-        let (header, value) = authentication(Provider::Microsoft, "fixture-api-key").unwrap();
-        assert_eq!(header, "api-key");
-        assert_eq!(value.to_str().unwrap(), "fixture-api-key");
-        assert!(value.is_sensitive());
-    }
-
-    #[test]
-    fn microsoft_waits_for_created_and_setup_ack_then_accepts_full_final_without_item_id() {
-        let mut protocol = Protocol::new(Provider::Microsoft);
-        assert!(protocol.event(&json!({"type":"session.updated"})).is_err());
-        assert!(
-            protocol
-                .event(&json!({"type":"session.created","session":{"id":"fixture"}}))
-                .unwrap()
-                .is_none()
-        );
-        assert!(protocol.created);
-        assert!(!protocol.ready);
-        protocol.setup_sent = true;
-        protocol.event(&json!({"type":"session.updated"})).unwrap();
-        assert!(protocol.ready);
-        for event in [
-            json!({"type":"conversation.item.input_audio_transcription.delta","delta":"never paste"}),
-            json!({"type":"conversation.item.input_audio_transcription.intermediate","intermediate":"preview"}),
-        ] {
-            assert!(protocol.event(&event).unwrap().is_none());
-        }
-        assert!(protocol.event(&json!({"type":"conversation.item.input_audio_transcription.completed","transcript":"early"})).is_err());
-        protocol.finishing = true;
-        assert!(
-            protocol
-                .event(&json!({"type":"input_audio_buffer.committed"}))
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(protocol.event(&json!({"type":"conversation.item.input_audio_transcription.completed","transcript":"Whole dictation"})).unwrap(), Some("Whole dictation".into()));
-        assert_eq!(
-            finish_message(Provider::Microsoft).unwrap(),
-            json!({"type":"input_audio_buffer.commit"})
-        );
-        protocol.commit_item = Some("ours".into());
-        assert!(protocol.event(&json!({"type":"conversation.item.input_audio_transcription.completed","item_id":"other","transcript":"wrong"})).is_err());
-    }
-
     #[test]
     fn grok_format_and_keywords_are_encoded_only_for_supported_options() {
         let model = ModelRef::parse("grok::grok-voice-transcribe-2.0");
@@ -2256,13 +1979,7 @@ mod tests {
                 no_verbatim: true,
                 ..Default::default()
             };
-            let url = endpoint(
-                &Config::default(),
-                model,
-                &options,
-                &["Name & Sons".into(), "Other".into()],
-            )
-            .unwrap();
+            let url = endpoint(model, &options, &["Name & Sons".into(), "Other".into()]).unwrap();
             assert_eq!(url.host_str(), Some("api.x.ai"));
             assert!(
                 url.query_pairs()
@@ -2557,7 +2274,7 @@ mod tests {
             prompt: "must not become system instruction".into(),
             ..Default::default()
         };
-        let url = endpoint(&Config::default(), model, &options, &[]).unwrap();
+        let url = endpoint(model, &options, &[]).unwrap();
         assert_eq!(url.host_str(), Some("generativelanguage.googleapis.com"));
         assert!(url.query().is_none());
         let setup = google_setup(model.model, &options, &["Nimbus Files".into()]);
@@ -2684,7 +2401,6 @@ mod tests {
         assert_eq!(session_lifetime(Provider::Google), Duration::from_secs(600));
         assert!(validate_audio_length(Provider::Google, 600 * 16_000).is_ok());
         assert!(validate_audio_length(Provider::Google, 600 * 16_000 + 1).is_err());
-        assert!(validate_audio_length(Provider::Microsoft, 600 * 16_000 + 1).is_ok());
         let mut protocol = Protocol::new(Provider::Google);
         let error = protocol.event(&json!({"error":{"code":400,"message":"invalid customVocabulary: PRIVATE_PAYLOAD"}})).unwrap_err();
         let typed = error.downcast_ref::<LiveError>().unwrap();
@@ -2822,7 +2538,6 @@ mod tests {
         assert!(query_keywords(Provider::Grok));
         assert!(!query_keywords(Provider::Google));
         assert!(!query_keywords(Provider::OpenAi));
-        assert!(!query_keywords(Provider::Microsoft));
     }
 
     #[test]
@@ -3067,29 +2782,14 @@ mod tests {
     fn endpoints_encode_keywords_and_reject_unsupported_automatic_language() {
         let options = ModelOptions::default();
         let terms = vec!["A&B / name".into(), "Other name".into()];
-        let url = endpoint(
-            &Config::default(),
-            ModelRef::parse("deepgram::nova-3"),
-            &options,
-            &terms,
-        )
-        .unwrap();
+        let url = endpoint(ModelRef::parse("deepgram::nova-3"), &options, &terms).unwrap();
         assert_eq!(url.query_pairs().filter(|(k, _)| k == "keyterm").count(), 2);
         assert!(
             url.query_pairs()
                 .any(|(k, v)| k == "language" && v == "multi")
         );
-        assert!(
-            endpoint(
-                &Config::default(),
-                ModelRef::parse("deepgram::nova-2"),
-                &options,
-                &[]
-            )
-            .is_err()
-        );
+        assert!(endpoint(ModelRef::parse("deepgram::nova-2"), &options, &[]).is_err());
         let url = endpoint(
-            &Config::default(),
             ModelRef::parse("elevenlabs::scribe_v2_realtime"),
             &options,
             &terms,

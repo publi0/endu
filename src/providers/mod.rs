@@ -9,9 +9,6 @@ pub mod keys;
 mod meta;
 mod model_notices;
 pub use model_notices::model_notices;
-mod microsoft;
-mod microsoft_speech;
-pub use microsoft::{MicrosoftConfig, microsoft_endpoint};
 pub mod streaming;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -21,18 +18,16 @@ pub enum Provider {
     OpenAi,
     Deepgram,
     ElevenLabs,
-    Microsoft,
     Grok,
     Google,
     Meta,
 }
 impl Provider {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 7] = [
         Self::OpenRouter,
         Self::OpenAi,
         Self::Deepgram,
         Self::ElevenLabs,
-        Self::Microsoft,
         Self::Grok,
         Self::Google,
         Self::Meta,
@@ -43,7 +38,6 @@ impl Provider {
             Self::OpenAi => "openai",
             Self::Deepgram => "deepgram",
             Self::ElevenLabs => "elevenlabs",
-            Self::Microsoft => "microsoft",
             Self::Grok => "grok",
             Self::Google => "google",
             Self::Meta => "meta",
@@ -55,7 +49,6 @@ impl Provider {
             Self::OpenAi => "OpenAI",
             Self::Deepgram => "Deepgram",
             Self::ElevenLabs => "ElevenLabs",
-            Self::Microsoft => "Microsoft",
             Self::Grok => "Grok (xAI)",
             Self::Google => "Google",
             Self::Meta => "Meta",
@@ -67,7 +60,6 @@ impl Provider {
             Self::OpenAi => "https://platform.openai.com/api-keys",
             Self::Deepgram => "https://console.deepgram.com/",
             Self::ElevenLabs => "https://elevenlabs.io/app/settings/api-keys",
-            Self::Microsoft => "https://ai.azure.com/",
             Self::Grok => "https://console.x.ai/",
             Self::Google => "https://aistudio.google.com/apikey",
             Self::Meta => "https://dev.meta.ai/",
@@ -79,7 +71,6 @@ impl Provider {
             Self::OpenAi => "OPENAI_API_KEY",
             Self::Deepgram => "DEEPGRAM_API_KEY",
             Self::ElevenLabs => "ELEVENLABS_API_KEY",
-            Self::Microsoft => "AZURE_MAI_API_KEY",
             Self::Grok => "XAI_API_KEY",
             Self::Google => "GEMINI_API_KEY",
             Self::Meta => "MODEL_API_KEY",
@@ -125,6 +116,12 @@ pub struct ModelRef<'a> {
     pub provider: Provider,
     pub model: &'a str,
 }
+/// Hex 3.5 and earlier offered native Microsoft models. Saved chains drop
+/// them on load; they must never fall through to an OpenRouter request.
+pub fn is_retired_model(id: &str) -> bool {
+    id.starts_with("microsoft::")
+}
+
 impl<'a> ModelRef<'a> {
     pub fn parse(id: &'a str) -> Self {
         for provider in Provider::ALL {
@@ -292,26 +289,6 @@ fn build_native_models() -> Vec<NativeModel> {
                 batch: false,
                 streaming: true,
                 ..scribe
-            },
-        },
-        NativeModel {
-            provider: Provider::Microsoft,
-            id: "MAI-Transcribe-2",
-            name: "MAI-Transcribe 2",
-            capabilities: Capabilities {
-                batch: true,
-                keywords: true,
-                no_verbatim: true,
-                ..Capabilities::default()
-            },
-        },
-        NativeModel {
-            provider: Provider::Microsoft,
-            id: "MAI-Transcribe-2-Streaming",
-            name: "MAI-Transcribe 2 Streaming",
-            capabilities: Capabilities {
-                streaming: true,
-                ..Capabilities::default()
             },
         },
         NativeModel {
@@ -507,8 +484,6 @@ pub fn is_configured() -> bool {
             let model = ModelRef::parse(id);
             let caps = model.capabilities();
             (caps.batch || (caps.streaming && options(&c, id).streaming))
-                && (model.provider != Provider::Microsoft
-                    || microsoft_endpoint(&c, !caps.batch).is_ok())
                 // Readiness never decrypts a key, so it cannot trigger Keychain prompts.
                 && !matches!(keys::key_status(model.provider, &c), KeyStatus::Missing)
         })
@@ -536,20 +511,6 @@ mod tests {
                 true,
                 true,
                 true,
-            ),
-            (
-                "microsoft::MAI-Transcribe-2",
-                Provider::Microsoft,
-                true,
-                false,
-                true,
-            ),
-            (
-                "microsoft::MAI-Transcribe-2-Streaming",
-                Provider::Microsoft,
-                false,
-                true,
-                false,
             ),
             (
                 "grok::grok-voice-transcribe-2.0",

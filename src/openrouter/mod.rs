@@ -85,7 +85,6 @@ pub struct Config {
     /// OpenRouter-compatible API root.
     pub base_url: String,
     pub transcription: TranscriptionConfig,
-    pub microsoft: crate::providers::MicrosoftConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -120,7 +119,6 @@ impl Default for Config {
             api_key: None,
             base_url: "https://openrouter.ai/api/v1".into(),
             transcription: TranscriptionConfig::default(),
-            microsoft: Default::default(),
         }
     }
 }
@@ -168,10 +166,6 @@ pub fn config_path() -> Result<PathBuf> {
 pub fn load_config() -> Result<Config> {
     let path = config_path()?;
     let config = load_config_at(&path)?;
-    config
-        .microsoft
-        .validate()
-        .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
     crate::providers::validate_profiles(&config.transcription.model_options)
         .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
     crate::providers::apply_runtime(&config);
@@ -187,6 +181,7 @@ pub(crate) fn load_config_at(path: &Path) -> Result<Config> {
 fn load_config_at_unlocked(path: &Path) -> Result<Config> {
     match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(drop_retired_models)
             .wrap_err_with(|| format!("invalid OpenRouter config at {}", path.display())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let config = Config::default();
@@ -198,6 +193,20 @@ fn load_config_at_unlocked(path: &Path) -> Result<Config> {
         Err(error) => Err(error)
             .wrap_err_with(|| format!("could not read OpenRouter config at {}", path.display())),
     }
+}
+
+/// Older files may name the removed native Microsoft models or carry its
+/// `microsoft` connection block. Serde ignores the block; the models and
+/// their option profiles are dropped so they never reach a request.
+fn drop_retired_models(mut config: Config) -> Config {
+    let transcription = &mut config.transcription;
+    transcription
+        .models
+        .retain(|id| !crate::providers::is_retired_model(id));
+    transcription
+        .model_options
+        .retain(|id, _| !crate::providers::is_retired_model(id));
+    config
 }
 
 fn write_template(path: &Path, config: &Config) -> Result<()> {
@@ -249,10 +258,6 @@ fn config_temporary_path(path: &Path) -> PathBuf {
 }
 
 pub(crate) fn save_config_at(path: &Path, config: &Config) -> Result<()> {
-    config
-        .microsoft
-        .validate()
-        .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
     crate::providers::validate_profiles(&config.transcription.model_options)
         .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
     let parent = path
@@ -338,17 +343,12 @@ pub fn validate_key(key: &str) -> Result<&str> {
 
 /// Store the key in the login Keychain. Blocking.
 ///
-/// Uses Security.framework directly so the item's ACL binds to Hex's signed
-/// identity instead of the globally invokable `/usr/bin/security` helper.
+/// Goes through `/usr/bin/security`, like every provider key, so access
+/// survives Hex updates without new password prompts.
 #[cfg(target_os = "macos")]
 pub fn store_keychain_key(key: &str) -> Result<()> {
     let key = validate_key(key)?;
-    security_framework::passwords::set_generic_password(
-        KEYCHAIN_SERVICE,
-        KEYCHAIN_ACCOUNT,
-        key.as_bytes(),
-    )
-    .map_err(|error| color_eyre::eyre::eyre!("The Keychain did not accept the key: {error}"))?;
+    crate::providers::keys::store_secret(KEYCHAIN_ACCOUNT, key)?;
     forget_cached_key();
     if !matches!(keychain_key(), KeychainRead::Found(saved) if saved == key) {
         bail!("The Keychain did not retain the key.");
@@ -362,14 +362,9 @@ pub fn store_keychain_key(key: &str) -> Result<()> {
 /// Remove the key from the login Keychain. Blocking.
 #[cfg(target_os = "macos")]
 pub fn delete_keychain_key() -> Result<()> {
-    let result =
-        security_framework::passwords::delete_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT);
+    let result = crate::providers::keys::delete_secret(KEYCHAIN_ACCOUNT);
     forget_cached_key();
-    if let Err(error) = &result
-        && error.code() != security_framework_sys::base::errSecItemNotFound
-    {
-        bail!("The Keychain refused the removal: {error}");
-    }
+    result?;
     if crate::providers::keys::keychain_item_exists(KEYCHAIN_ACCOUNT) {
         bail!("The key is still in the Keychain.");
     }
@@ -499,8 +494,7 @@ pub(crate) fn forget_cached_key() {
         .unwrap_or_else(|error| error.into_inner()) = None;
 }
 
-/// Reading through Security.framework keeps the item's ACL bound to Hex's
-/// signed identity; no external helper is involved.
+/// Reads through `/usr/bin/security`, shared with every provider key.
 fn keychain_key() -> KeychainRead {
     crate::providers::keys::read_secret(KEYCHAIN_ACCOUNT)
 }
@@ -531,6 +525,27 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn configs_from_microsoft_versions_load_without_its_models() {
+        let dir = temp_dir("retired-microsoft");
+        let path = dir.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            br#"{"transcription":{"models":["microsoft::MAI-Transcribe-2","openai/whisper-1","microsoft/mai-transcribe-2"],
+                "model_options":{"microsoft::MAI-Transcribe-2-Streaming":{"streaming":true}}},
+              "microsoft":{"endpoint":"https://old.cognitiveservices.azure.com","deployment":"old"}}"#,
+        )
+        .unwrap();
+        let config = load_config_at(&path).unwrap();
+        // The OpenRouter route with the same vendor stays; only native IDs go.
+        assert_eq!(
+            config.transcription.models,
+            ["openai/whisper-1", "microsoft/mai-transcribe-2"]
+        );
+        assert!(config.transcription.model_options.is_empty());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

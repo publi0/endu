@@ -42,7 +42,6 @@ pub fn keywords(model: ModelRef<'_>, vocabulary: &Snapshot) -> Vec<String> {
         Provider::Deepgram => (100, 400, usize::MAX, usize::MAX),
         Provider::ElevenLabs if model.model.ends_with("_realtime") => (50, 4_000, 20, 5),
         Provider::ElevenLabs => (1_000, 128_000, 49, 5),
-        Provider::Microsoft => (2_000, 256_000, usize::MAX, usize::MAX),
         Provider::Grok => (100, 128_000, 50, usize::MAX),
         Provider::Google => (1_000, 128_000, usize::MAX, usize::MAX),
         // Meta publishes no term cap. Keep Hex's shared dictionary bounds;
@@ -262,34 +261,6 @@ fn request(
             Ok(Request {
                 provider: model.provider,
                 url: "https://api.elevenlabs.io/v1/speech-to-text".into(),
-                content_type,
-                body,
-                keyword_count: terms.len(),
-            })
-        }
-        Provider::Microsoft => {
-            // https://learn.microsoft.com/azure/ai-services/speech-service/mai-transcribe
-            // Follow the current REST example, including the explicit enhanced-mode switch.
-            let mut definition = json!({"enhancedMode": {
-                "enabled": true,
-                "model": "MAI-Transcribe-2",
-                "modelOptions": {"transcribeStyle": if options.no_verbatim { "clean" } else { "verbatim" }}
-            }});
-            if let Some(locale) = super::bcp47_language(&options.language) {
-                definition["locales"] = json!([locale]);
-            }
-            if !terms.is_empty() {
-                definition["phraseList"] = json!({"phrases": terms});
-            }
-            let mut url = super::microsoft_endpoint(config, false)
-                .map_err(|_| eyre!("Configure a valid Microsoft Speech endpoint in Providers."))?;
-            url.set_path("/speechtotext/transcriptions:transcribe");
-            url.set_query(Some("api-version=2025-10-15"));
-            let (content_type, body) =
-                multipart_audio(&[("definition", definition.to_string())], wav, "audio");
-            Ok(Request {
-                provider: model.provider,
-                url: url.into(),
                 content_type,
                 body,
                 keyword_count: terms.len(),
@@ -576,7 +547,6 @@ fn parse(provider: Provider, body: &[u8]) -> Result<(String, Usage)> {
     } else {
         match provider {
             Provider::Deepgram => value.pointer("/results/channels/0/alternatives/0/transcript"),
-            Provider::Microsoft => value.pointer("/combinedPhrases/0/text"),
             Provider::Meta => value.get("transcript"),
             _ => value.get("text"),
         }
@@ -619,7 +589,6 @@ fn keywords_rejected(
         Provider::OpenAi if model.model == "gpt-transcribe" => body.contains("keywords"),
         Provider::OpenAi => body.contains("prompt"),
         Provider::Deepgram | Provider::ElevenLabs | Provider::Grok => body.contains("keyterm"),
-        Provider::Microsoft => body.contains("phraselist") || body.contains("phrases"),
         Provider::Google => {
             body.contains("custom_vocabulary")
                 || body.contains("customvocabulary")
@@ -1602,24 +1571,6 @@ mod tests {
             .contains(&format!("name=\"{name}\"\r\n\r\n{value}\r\n"))
     }
 
-    fn microsoft_config(models: &[&str]) -> Config {
-        let mut config = config(models);
-        config.microsoft.endpoint = "https://fixture.cognitiveservices.azure.com".into();
-        config
-    }
-
-    fn definition(request: &Request) -> Value {
-        let body = String::from_utf8_lossy(&request.body);
-        let value = body
-            .split("name=\"definition\"\r\n\r\n")
-            .nth(1)
-            .unwrap()
-            .split("\r\n")
-            .next()
-            .unwrap();
-        serde_json::from_str(value).unwrap()
-    }
-
     fn telemetry_config(models: &[&str]) -> Config {
         let mut config = config(models);
         config.transcription.trim_silence = false;
@@ -1885,11 +1836,19 @@ mod tests {
     fn local_preflight_is_excluded_but_auth_attempt_and_native_route_identity_are_preserved() {
         take_samples();
         let mut config = telemetry_config(&[
-            "microsoft::MAI-Transcribe-2",
+            "meta::muse-voice-transcribe-1.0",
             "openai::gpt-live-transcribe",
             "openai::gpt-transcribe",
             "openai/gpt-transcribe",
         ]);
+        // An unsupported explicit language hint fails before any request.
+        config.transcription.model_options.insert(
+            "meta::muse-voice-transcribe-1.0".into(),
+            ModelOptions {
+                language: "ru".into(),
+                ..Default::default()
+            },
+        );
         config.transcription.model_options.insert(
             "openai::gpt-live-transcribe".into(),
             ModelOptions {
@@ -1947,7 +1906,7 @@ mod tests {
             samples[0]
                 .failures
                 .iter()
-                .any(|failure| failure.model == "microsoft::MAI-Transcribe-2")
+                .any(|failure| failure.model == "meta::muse-voice-transcribe-1.0")
         );
     }
 
@@ -2233,8 +2192,8 @@ mod tests {
     }
 
     #[test]
-    fn microsoft_grok_and_google_follow_their_native_batch_contracts() {
-        let config = microsoft_config(&[]);
+    fn grok_and_google_follow_their_native_batch_contracts() {
+        let config = config(&[]);
         let vocabulary = vocabulary(&["Synthetic Nimbus"]);
         let hints = HintPlan::default();
         let options = ModelOptions {
@@ -2243,38 +2202,6 @@ mod tests {
             temperature: Some(0.5),
             ..Default::default()
         };
-        let microsoft = request(
-            &config,
-            ModelRef::parse("microsoft::MAI-Transcribe-2"),
-            &options,
-            b"WAV_FIXTURE",
-            &vocabulary,
-            &hints,
-            false,
-        )
-        .unwrap();
-        assert_eq!(
-            microsoft.url,
-            "https://fixture.cognitiveservices.azure.com/speechtotext/transcriptions:transcribe?api-version=2025-10-15"
-        );
-        let definition = definition(&microsoft);
-        assert_eq!(definition["enhancedMode"]["enabled"], true);
-        assert_eq!(definition["enhancedMode"]["model"], "MAI-Transcribe-2");
-        assert_eq!(
-            definition["enhancedMode"]["modelOptions"]["transcribeStyle"],
-            "clean"
-        );
-        assert_eq!(definition["locales"], json!(["pt-BR"]));
-        assert_eq!(
-            definition["phraseList"]["phrases"],
-            json!(["Synthetic Nimbus"])
-        );
-        assert!(
-            String::from_utf8_lossy(&microsoft.body)
-                .contains("name=\"audio\"; filename=\"clip.wav\"")
-        );
-        assert_eq!(microsoft.keyword_count, 1);
-
         let grok = request(
             &config,
             ModelRef::parse("grok::grok-voice-transcribe-2.0"),
@@ -2324,7 +2251,7 @@ mod tests {
             body["generation_config"]["transcription_config"],
             json!({"mode":"smart","language_codes":["pt-BR"],"custom_vocabulary":["Synthetic Nimbus"]})
         );
-        for request in [&microsoft, &grok, &google] {
+        for request in [&grok, &google] {
             let body = String::from_utf8_lossy(&request.body);
             for absent in [
                 "NOT_SUPPORTED_CONTEXT",
@@ -2342,7 +2269,7 @@ mod tests {
 
     #[test]
     fn new_provider_options_preserve_false_auto_and_whole_keyword_limits() {
-        let config = microsoft_config(&[]);
+        let config = config(&[]);
         let vocabulary = vocabulary(&["Synthetic Nimbus"]);
         let hints = HintPlan::default();
         let options = ModelOptions {
@@ -2351,7 +2278,6 @@ mod tests {
             ..Default::default()
         };
         for id in [
-            "microsoft::MAI-Transcribe-2",
             "grok::grok-voice-transcribe-2.0",
             "google::gemini-3.5-transcribe",
         ] {
@@ -2368,14 +2294,6 @@ mod tests {
             assert_eq!(request.keyword_count, 0);
             assert!(!String::from_utf8_lossy(&request.body).contains("Synthetic Nimbus"));
             match request.provider {
-                Provider::Microsoft => {
-                    let body = definition(&request);
-                    assert!(body.get("locales").is_none());
-                    assert_eq!(
-                        body["enhancedMode"]["modelOptions"]["transcribeStyle"],
-                        "verbatim"
-                    );
-                }
                 Provider::Grok => {
                     assert!(field(&request, "format", "false"));
                     assert!(field(&request, "filler_words", "true"));
@@ -2435,15 +2353,6 @@ mod tests {
     #[test]
     fn new_response_parsers_reject_empty_partial_and_nontranscript_google_content() {
         assert_eq!(
-            parse(
-                Provider::Microsoft,
-                br#"{"combinedPhrases":[{"text":" hello "}]}"#
-            )
-            .unwrap()
-            .0,
-            "hello"
-        );
-        assert_eq!(
             parse(Provider::Grok, br#"{"text":" hello "}"#).unwrap().0,
             "hello"
         );
@@ -2452,7 +2361,7 @@ mod tests {
         assert_eq!(text, "hello\nworld");
         assert_eq!(usage.tokens, 42);
         for (provider, body) in [
-            (Provider::Microsoft, r#"{"combinedPhrases":[{"text":" "}]}"#),
+            (Provider::Meta, r#"{"transcript":" "}"#),
             (Provider::Grok, r#"{"text":""}"#),
             (
                 Provider::Google,
@@ -2476,16 +2385,23 @@ mod tests {
     #[test]
     fn new_provider_hint_rejection_empty_response_and_configuration_errors_keep_fallback() {
         let ids = [
-            "microsoft::MAI-Transcribe-2",
+            "meta::muse-voice-transcribe-1.0",
             "grok::grok-voice-transcribe-2.0",
             "google::gemini-3.5-transcribe",
         ];
-        let mut config = microsoft_config(&ids);
+        let mut config = config(&ids);
         let vocabulary = vocabulary(&["Synthetic Nimbus"]);
         let hints = HintPlan::default();
-        for valid_endpoint in [true, false] {
-            if !valid_endpoint {
-                config.microsoft.endpoint = "https://PRIVATE_MARKER.evil.test".into();
+        for valid_options in [true, false] {
+            if !valid_options {
+                // An unsupported explicit language fails before any request.
+                config.transcription.model_options.insert(
+                    ids[0].into(),
+                    ModelOptions {
+                        language: "ru".into(),
+                        ..Default::default()
+                    },
+                );
             }
             let mut progress = Progress::default();
             let mut calls = Vec::new();
@@ -2494,8 +2410,8 @@ mod tests {
                 &mut |request, _| {
                     calls.push((request.provider, request.keyword_count));
                     (Ok(match request.provider {
-                        Provider::Microsoft if request.keyword_count > 0 => response(422,"phraseList unsupported PRIVATE_MARKER",None),
-                        Provider::Microsoft => response(200,r#"{"combinedPhrases":[{"text":""}]}"#,None),
+                        Provider::Meta if request.keyword_count > 0 => response(422,"keywords unsupported PRIVATE_MARKER",None),
+                        Provider::Meta => response(200,r#"{"transcript":""}"#,None),
                         Provider::Grok => response(503,"PRIVATE_MARKER",None),
                         Provider::Google => response(200,r#"{"status":"completed","steps":[{"type":"model_output","content":[{"type":"text","text":"done"}]}]}"#,None),
                         _ => panic!("unexpected provider"),
@@ -2510,12 +2426,12 @@ mod tests {
                     .iter()
                     .any(|failure| failure.detail.contains("PRIVATE_MARKER"))
             );
-            if valid_endpoint {
+            if valid_options {
                 assert_eq!(
                     calls,
                     [
-                        (Provider::Microsoft, 1),
-                        (Provider::Microsoft, 0),
+                        (Provider::Meta, 1),
+                        (Provider::Meta, 0),
                         (Provider::Grok, 1),
                         (Provider::Google, 1)
                     ]
@@ -2536,11 +2452,10 @@ mod tests {
 
     #[test]
     fn new_provider_hint_rejection_only_retries_fields_that_were_sent() {
-        let config = microsoft_config(&[]);
+        let config = config(&[]);
         let vocabulary = vocabulary(&["Synthetic Nimbus"]);
         let hints = HintPlan::default();
         for (id, field) in [
-            ("microsoft::MAI-Transcribe-2", "phraseList"),
             ("grok::grok-voice-transcribe-2.0", "keyterm"),
             ("google::gemini-3.5-transcribe", "custom_vocabulary"),
         ] {

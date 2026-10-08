@@ -39,7 +39,6 @@ pub fn validate_key(provider: Provider, key: &str) -> Result<&str> {
         || !key.bytes().all(|byte| {
             byte.is_ascii_alphanumeric()
                 || matches!(byte, b'-' | b'_' | b'.')
-                || (provider == Provider::Microsoft && matches!(byte, b'+' | b'/' | b'='))
                 // Meta Model API keys use LLM|account|secret; these pipes are
                 // data in HTTPS headers/JSON, never shell arguments.
                 || (provider == Provider::Meta && byte == b'|')
@@ -190,26 +189,98 @@ pub fn delete_keychain_key(provider: Provider) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn store_native(provider: Provider, key: &str) -> Result<()> {
-    security_framework::passwords::set_generic_password(
-        openrouter::KEYCHAIN_SERVICE,
-        provider.id(),
-        key.as_bytes(),
-    )
-    .map_err(|_| eyre!("The Keychain did not accept the key."))
+    store_secret(provider.id(), key)
 }
 
 #[cfg(target_os = "macos")]
 fn delete_native(provider: Provider) -> Result<()> {
-    let result = security_framework::passwords::delete_generic_password(
-        openrouter::KEYCHAIN_SERVICE,
-        provider.id(),
-    );
-    if let Err(error) = result
-        && error.code() != security_framework_sys::base::errSecItemNotFound
-    {
-        bail!("Could not remove the key from the Keychain.");
+    delete_secret(provider.id())
+}
+
+// Hex is self-signed without a Team ID, so macOS binds Keychain items that Hex
+// itself creates or reads to the exact build and asks for the login password
+// after every update. Items are therefore owned and read by Apple's
+// `/usr/bin/security`, whose identity never changes. Secrets only travel
+// through its stdin and stdout pipes, never argv, files or diagnostics. Any
+// process of this user can ask the same tool for the item; that trade-off was
+// chosen deliberately to stop the prompts.
+const SECURITY_TOOL: &str = "/usr/bin/security";
+/// `security` exits with this status when no matching item exists.
+const SECURITY_NOT_FOUND: i32 = 44;
+
+/// One `security -i` command. Accounts are fixed provider ids and secrets are
+/// already validated, but both are checked again so nothing can break out of
+/// the quoted argument the tool parses from stdin.
+fn security_command(action: &str, account: &str, secret: Option<&str>) -> Result<String> {
+    let plain = |value: &str| {
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    };
+    if !plain(account) || !plain(openrouter::KEYCHAIN_SERVICE) {
+        bail!("Invalid Keychain account.");
     }
-    Ok(())
+    let mut command = format!("{action} -s {} -a {account}", openrouter::KEYCHAIN_SERVICE);
+    if let Some(secret) = secret {
+        if secret.is_empty()
+            || !secret.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'-' | b'_' | b'.' | b'+' | b'/' | b'=' | b'|')
+            })
+        {
+            bail!("The key has an invalid format.");
+        }
+        command.push_str(&format!(" -w \"{secret}\""));
+    }
+    command.push('\n');
+    Ok(command)
+}
+
+#[cfg(target_os = "macos")]
+fn run_security(command: &str) -> Option<std::process::Output> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    if cfg!(test) {
+        return None;
+    }
+    let mut child = Command::new(SECURITY_TOOL)
+        .arg("-i")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    // Dropping stdin after the one command ends the interactive session.
+    let written = child
+        .stdin
+        .take()
+        .is_some_and(|mut stdin| stdin.write_all(command.as_bytes()).is_ok());
+    let output = child.wait_with_output().ok()?;
+    written.then_some(output)
+}
+
+/// Saves or replaces one secret in an item owned by `/usr/bin/security`.
+#[cfg(target_os = "macos")]
+pub(crate) fn store_secret(account: &str, secret: &str) -> Result<()> {
+    let command = security_command("add-generic-password -U", account, Some(secret))?;
+    match run_security(&command) {
+        Some(output) if output.status.success() => Ok(()),
+        _ => bail!("The Keychain did not accept the key."),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn delete_secret(account: &str) -> Result<()> {
+    let command = security_command("delete-generic-password", account, None)?;
+    match run_security(&command) {
+        Some(output)
+            if output.status.success() || output.status.code() == Some(SECURITY_NOT_FOUND) =>
+        {
+            Ok(())
+        }
+        _ => bail!("Could not remove the key from the Keychain."),
+    }
 }
 
 fn read_keychain(provider: Provider) -> KeychainRead {
@@ -222,21 +293,23 @@ fn read_keychain(provider: Provider) -> KeychainRead {
     }
 }
 
-/// Decrypts one secret, which may show a Keychain prompt. Call only when the
-/// key is needed for a request or an explicit user action.
+/// Decrypts one secret through `/usr/bin/security`. The first read of an item
+/// that an older Hex created asks once; "Always Allow" lets the tool read it
+/// across every later update. Call only when the key is needed for a request
+/// or an explicit user action.
 #[cfg(target_os = "macos")]
 pub(crate) fn read_secret(account: &str) -> KeychainRead {
-    match security_framework::passwords::get_generic_password(openrouter::KEYCHAIN_SERVICE, account)
-    {
-        Ok(bytes) => String::from_utf8(bytes)
+    let Ok(command) = security_command("find-generic-password -w", account, None) else {
+        return KeychainRead::Missing;
+    };
+    match run_security(&command) {
+        Some(output) if output.status.success() => String::from_utf8(output.stdout)
             .ok()
             .map(|key| key.trim().to_owned())
             .filter(|key| !key.is_empty())
             .map_or(KeychainRead::Missing, KeychainRead::Found),
-        Err(error) if error.code() == security_framework_sys::base::errSecItemNotFound => {
-            KeychainRead::Missing
-        }
-        Err(_) => KeychainRead::Unavailable,
+        Some(output) if output.status.code() == Some(SECURITY_NOT_FOUND) => KeychainRead::Missing,
+        _ => KeychainRead::Unavailable,
     }
 }
 
@@ -278,7 +351,6 @@ pub(crate) fn authorization(provider: Provider, key: &str) -> (&'static str, Str
     match provider {
         Provider::Deepgram => ("Authorization", format!("Token {key}")),
         Provider::ElevenLabs => ("xi-api-key", key.into()),
-        Provider::Microsoft => ("Ocp-Apim-Subscription-Key", key.into()),
         Provider::Google => ("x-goog-api-key", key.into()),
         Provider::OpenRouter | Provider::OpenAi | Provider::Grok | Provider::Meta => {
             ("Authorization", format!("Bearer {key}"))
@@ -292,9 +364,6 @@ fn check_endpoint(provider: Provider) -> &'static str {
         Provider::Grok => "https://api.x.ai/v1/models",
         Provider::Meta => "https://api.meta.ai/v1/models",
         Provider::Google => "https://generativelanguage.googleapis.com/v1beta/models",
-        Provider::Microsoft => {
-            unreachable!("Azure token checks require a validated resource endpoint")
-        }
         Provider::Deepgram => "https://api.deepgram.com/v1/auth/token",
         Provider::ElevenLabs => "https://api.elevenlabs.io/v1/user",
         Provider::OpenRouter => unreachable!("OpenRouter key checks retain their existing adapter"),
@@ -310,17 +379,8 @@ pub fn check_key(provider: Provider, config: &Config) -> Result<String> {
     }
     retry_unavailable(provider);
     // Resolve and validate destination before looking up any credentials.
-    let endpoint = if provider == Provider::Microsoft {
-        if config.microsoft.endpoint.is_empty() {
-            bail!("Enter the Microsoft resource endpoint in Providers to test this key.");
-        }
-        let mut root = super::microsoft_endpoint(config, false).map_err(|e| eyre!("{e}"))?;
-        root.set_path("/sts/v1.0/issueToken");
-        root.to_string()
-    } else {
-        check_endpoint(provider).into()
-    };
-    openrouter::http::validate_url(&endpoint)?;
+    let endpoint = check_endpoint(provider);
+    openrouter::http::validate_url(endpoint)?;
     let key = api_key(provider, config)?;
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
@@ -331,16 +391,7 @@ pub fn check_key(provider: Provider, config: &Config) -> Result<String> {
             .build(),
     );
     let (name, value) = authorization(provider, &key);
-    let response = if provider == Provider::Microsoft {
-        // The documented Speech STS exchange checks the key without sending audio.
-        agent
-            .post(&endpoint)
-            .header(name, value)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .send_empty()
-    } else {
-        agent.get(&endpoint).header(name, value).call()
-    };
+    let response = agent.get(endpoint).header(name, value).call();
     let mut response =
         response.map_err(|_| eyre!("Could not reach {} to check the key.", provider.label()))?;
     let status = response.status().as_u16();
@@ -354,13 +405,6 @@ pub fn check_key(provider: Provider, config: &Config) -> Result<String> {
         .limit(2 * 1024 * 1024)
         .read_to_vec()
         .map_err(|_| eyre!("The key-check response could not be read safely."))?;
-    if provider == Provider::Microsoft {
-        // Never return or cache the short-lived token from the check.
-        if body.is_empty() {
-            bail!("The provider returned an empty key-check response.");
-        }
-        return Ok(message);
-    }
     if !serde_json::from_slice::<serde_json::Value>(&body).is_ok_and(|body| body.is_object()) {
         bail!("The provider returned an invalid key-check response.");
     }
@@ -388,6 +432,34 @@ fn check_status(provider: Provider, status: u16) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security_tool_commands_quote_only_validated_values() {
+        assert_eq!(
+            security_command("find-generic-password -w", "openrouter", None).unwrap(),
+            "find-generic-password -w -s hex-openrouter -a openrouter\n"
+        );
+        assert_eq!(
+            security_command("add-generic-password -U", "meta", Some("LLM|abc+/=._-9")).unwrap(),
+            "add-generic-password -U -s hex-openrouter -a meta -w \"LLM|abc+/=._-9\"\n"
+        );
+        for secret in [
+            "",
+            "with space",
+            "quote\"break",
+            "back\\slash",
+            "new\nline",
+            "semi;colon",
+        ] {
+            assert!(
+                security_command("add-generic-password -U", "openai", Some(secret)).is_err(),
+                "{secret:?}"
+            );
+        }
+        for account in ["", "open router", "a;b", "a\"b"] {
+            assert!(security_command("delete-generic-password", account, None).is_err());
+        }
+    }
 
     #[test]
     fn a_refused_keychain_read_waits_for_an_explicit_retry() {
@@ -449,10 +521,6 @@ mod tests {
         );
         assert_eq!(Provider::Meta.env(), "MODEL_API_KEY");
         assert_eq!(
-            authorization(Provider::Microsoft, "fixture"),
-            ("Ocp-Apim-Subscription-Key", "fixture".into())
-        );
-        assert_eq!(
             authorization(Provider::Google, "fixture"),
             ("x-goog-api-key", "fixture".into())
         );
@@ -465,7 +533,6 @@ mod tests {
             "https://generativelanguage.googleapis.com/v1beta/models"
         );
         assert_eq!(check_endpoint(Provider::Grok), "https://api.x.ai/v1/models");
-        assert_eq!(Provider::Microsoft.env(), "AZURE_MAI_API_KEY");
         assert_eq!(Provider::Google.env(), "GEMINI_API_KEY");
         assert_eq!(Provider::Grok.env(), "XAI_API_KEY");
     }

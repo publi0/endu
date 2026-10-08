@@ -36,6 +36,14 @@ pub struct ComparisonRow {
     pub metrics: RequestTotals,
 }
 
+/// Requests recorded for the removed native Microsoft provider keep their own
+/// row; parsing their IDs today would wrongly attribute them to OpenRouter.
+const RETIRED_PROVIDER: &str = "Microsoft (removed)";
+
+fn retired(id: &str) -> bool {
+    crate::providers::is_retired_model(id)
+}
+
 fn selected_mode(requests: &ModelRequests, mode: Mode) -> RequestTotals {
     match mode {
         Mode::All => requests.combined(),
@@ -52,6 +60,7 @@ pub fn observed_providers(totals: &Totals) -> Vec<Provider> {
         .chain(totals.models.keys())
         .chain(totals.model_latency.keys())
         .chain(totals.errors.values().flat_map(|models| models.keys()))
+        .filter(|id| !retired(id))
         .map(|id| ModelRef::parse(id).provider)
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -61,7 +70,11 @@ pub fn observed_providers(totals: &Totals) -> Vec<Provider> {
 pub fn combined_requests(totals: &Totals, mode: Mode, provider: Option<Provider>) -> RequestTotals {
     let mut combined = RequestTotals::default();
     for (id, requests) in &totals.details.requests {
-        if provider.is_none_or(|provider| ModelRef::parse(id).provider == provider) {
+        let matches = match provider {
+            None => true,
+            Some(provider) => !retired(id) && ModelRef::parse(id).provider == provider,
+        };
+        if matches {
             combined.merge(&selected_mode(requests, mode));
         }
     }
@@ -78,11 +91,34 @@ pub fn comparison_rows(
     let mut rows = BTreeMap::<String, ComparisonRow>::new();
     for (id, requests) in &totals.details.requests {
         let model = ModelRef::parse(id);
-        if provider.is_some_and(|provider| model.provider != provider) {
+        let is_retired = retired(id);
+        if provider.is_some_and(|provider| is_retired || model.provider != provider) {
             continue;
         }
         let metrics = selected_mode(requests, mode);
         if metrics.attempts == 0 {
+            continue;
+        }
+        if is_retired {
+            let (key, label) = match group {
+                Group::Provider => ("microsoft".to_owned(), RETIRED_PROVIDER.to_owned()),
+                Group::Model => (
+                    id.clone(),
+                    format!(
+                        "{RETIRED_PROVIDER} · {}",
+                        id.strip_prefix("microsoft::").unwrap_or(id)
+                    ),
+                ),
+            };
+            rows.entry(key.clone())
+                .or_insert_with(|| ComparisonRow {
+                    id: key,
+                    label,
+                    provider: None,
+                    metrics: RequestTotals::default(),
+                })
+                .metrics
+                .merge(&metrics);
             continue;
         }
         let key = match group {
@@ -202,13 +238,14 @@ mod tests {
                 .attempts,
             4
         );
+        let removed = rows.iter().find(|row| row.id == "microsoft").unwrap();
+        assert_eq!(removed.metrics.attempts, 3);
+        assert_eq!(removed.label, "Microsoft (removed)");
+        assert_eq!(removed.provider, None);
+        // The OpenRouter row counts only its own route, never the removed IDs.
         assert_eq!(
-            rows.iter()
-                .find(|row| row.id == "microsoft")
-                .unwrap()
-                .metrics
-                .attempts,
-            3
+            combined_requests(&totals, Mode::All, Some(Provider::OpenRouter)).attempts,
+            4
         );
         let google = rows.iter().find(|row| row.id == "google").unwrap();
         assert_eq!(google.metrics.latency.average_ms(), Some(1_100 / 3));
@@ -226,7 +263,7 @@ mod tests {
         let recorded = combined_requests(&totals, Mode::Recorded, Some(Provider::Google));
         assert_eq!(recorded.attempts, 1);
         assert_eq!(recorded.latency.average_ms(), Some(900));
-        assert!(combined_requests(&totals, Mode::Live, Some(Provider::Microsoft)).attempts == 0);
+        assert_eq!(combined_requests(&totals, Mode::All, None).attempts, 15);
     }
 
     #[test]

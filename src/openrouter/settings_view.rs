@@ -1760,19 +1760,10 @@ impl OpenRouterSettings {
         cx.notify();
     }
 
-    pub(crate) fn render_advanced(
-        &mut self,
-        extra: Option<AnyElement>,
-        extra_errors: Vec<String>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    pub(crate) fn render_advanced(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let header = crate::desktop_ui::disclosure_header(
             "ADVANCED",
-            if extra.is_some() {
-                "Request limits, API URL and Microsoft resource"
-            } else {
-                "Request limits and API URL"
-            },
+            "Request limits and API URL",
             self.advanced_open,
         )
         .id("openrouter-advanced")
@@ -1809,17 +1800,7 @@ impl OpenRouterSettings {
         let collapsed_feedback = div()
             .debug_selector(|| "advanced-collapsed-feedback".into())
             .when(!self.advanced_open, |feedback| {
-                feedback
-                    .children(self.render_error(Scope::Advanced))
-                    .children(extra_errors.into_iter().map(|error| {
-                        div()
-                            .px_1()
-                            .pt_2()
-                            .text_size(px(11.0))
-                            .line_height(px(16.0))
-                            .text_color(rgb(NEGATIVE))
-                            .child(error)
-                    }))
+                feedback.children(self.render_error(Scope::Advanced))
             });
         let header = div().flex().child(header);
         if !self.advanced_open {
@@ -1858,9 +1839,6 @@ impl OpenRouterSettings {
         div()
             .child(header)
             .child(collapsed_feedback)
-            .when(extra.is_some(), |section| {
-                section.child(crate::desktop_ui::settings_subsection_label("Requests"))
-            })
             .child(
                 settings_panel()
                     .child(settings_row(
@@ -1891,7 +1869,6 @@ impl OpenRouterSettings {
                     .child(footer),
             )
             .children(self.render_message(Scope::Advanced))
-            .children(extra)
             .into_any_element()
     }
 }
@@ -1994,7 +1971,7 @@ impl Render for OpenRouterSettings {
                 let row = self.render_key_row(cx).border_b_0();
                 return div().child(row).into_any_element();
             }
-            ViewMode::Global => return self.render_advanced(None, Vec::new(), cx),
+            ViewMode::Global => return self.render_advanced(cx),
             ViewMode::Models => {}
         }
         let models = self.render_models_panel(cx);
@@ -2098,50 +2075,6 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("model-slot-2").unwrap().size.height < before);
-    }
-
-    #[gpui::test]
-    fn microsoft_connection_notice_updates_on_the_selected_fallback(cx: &mut gpui::TestAppContext) {
-        let (view, cx) = cx.add_window_view(|_, cx| OpenRouterSettings::new(false, true, cx));
-        cx.simulate_resize(gpui::size(px(760.0), px(1800.0)));
-        cx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.config.transcription.models = vec![
-                    "deepgram::nova-3".into(),
-                    "microsoft::MAI-Transcribe-2-Streaming".into(),
-                ];
-                cx.notify();
-            })
-        });
-        cx.run_until_parked();
-        let initial = cx.debug_bounds("model-slot-1").unwrap().size.height;
-        assert!(cx.debug_bounds("model-notice-copy-1").unwrap().size.height > px(0.0));
-        cx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                let mut config = view.config_snapshot();
-                config.microsoft.streaming_endpoint =
-                    "https://fixture.services.ai.azure.com".into();
-                view.refresh_config(config, cx);
-                assert!(
-                    view.render_model_notices(1, &view.config.transcription.models[1])
-                        .is_some()
-                );
-            })
-        });
-        cx.run_until_parked();
-        cx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                let mut config = view.config_snapshot();
-                config.microsoft.deployment = "fixture-deployment".into();
-                view.refresh_config(config, cx);
-                assert!(
-                    view.render_model_notices(1, &view.config.transcription.models[1])
-                        .is_none()
-                );
-            })
-        });
-        cx.run_until_parked();
-        assert!(cx.debug_bounds("model-slot-1").unwrap().size.height < initial);
     }
 
     #[gpui::test]

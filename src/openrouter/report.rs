@@ -288,6 +288,10 @@ pub fn duration_label(ms: u64) -> String {
 }
 
 fn provider_label(id: &str) -> String {
+    if id == "microsoft" {
+        // Older History entries name the removed native Microsoft provider.
+        return "Microsoft (removed)".into();
+    }
     crate::providers::Provider::ALL
         .into_iter()
         .find(|provider| provider.id() == id)
