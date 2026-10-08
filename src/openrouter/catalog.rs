@@ -49,6 +49,9 @@ impl CatalogModel {
                     .iter()
                     .any(|(_, label)| search_text(label).starts_with(word))
                 || [
+                    // Earlier badge names stay searchable by prefix.
+                    ("streaming", capabilities.streaming),
+                    ("file", capabilities.batch),
                     ("punctuation", capabilities.punctuate),
                     ("numerals", capabilities.numerals),
                     ("temperature", capabilities.temperature),
@@ -68,9 +71,8 @@ fn capability_term(
         "streaming" | "live" | "realtime" | "stream" | "tempo-real" | "vivo" => {
             capabilities.streaming
         }
-        "batch" | "file" | "upload" | "arquivo" | "arquivos" | "gravado" | "gravacao" => {
-            capabilities.batch
-        }
+        "batch" | "recorded" | "file" | "upload" | "arquivo" | "arquivos" | "gravado"
+        | "gravacao" => capabilities.batch,
         "keywords" | "keyword" | "keyterms" | "keyterm" | "vocabulary" | "vocabulario"
         | "palavras-chave" | "termos" => capabilities.keywords || verified_keywords,
         "context" | "prompt" | "contexto" | "instrucoes" => capabilities.prompt,
@@ -146,10 +148,10 @@ pub fn capability_badges(id: &str, verified_keywords: bool) -> Vec<(&'static str
     let caps = crate::providers::ModelRef::parse(id).capabilities();
     let mut labels = Vec::new();
     if caps.batch {
-        labels.push(("doc", "File"));
+        labels.push(("doc", "Recorded"));
     }
     if caps.streaming {
-        labels.push(("bolt.fill", "Streaming"));
+        labels.push(("bolt.fill", "Live"));
     }
     if caps.keywords || verified_keywords {
         labels.push(("number", "Keywords"));
@@ -478,7 +480,7 @@ mod tests {
         assert!(
             capability_badges("deepgram::nova-3", false)
                 .iter()
-                .any(|(_, label)| *label == "Streaming")
+                .any(|(_, label)| *label == "Live")
         );
     }
 }

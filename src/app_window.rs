@@ -3217,14 +3217,16 @@ impl AppWindow {
                         "Last analyzed recording: {source} · {:.1} s",
                         report.duration_ms as f64 / 1_000.0
                     ),
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_end()
-                        .text_size(px(11.0))
-                        .text_color(rgb(TEXT_SOFT))
-                        .child(format!("RMS {}", db(report.levels.rms_dbfs())))
-                        .child(format!("Peak {}", db(report.levels.peak_dbfs()))),
+                    level_meter(
+                        report.levels.rms_dbfs(),
+                        report.levels.peak_dbfs(),
+                        report.levels.warning().is_none(),
+                        format!(
+                            "RMS {} · Peak {}",
+                            db(report.levels.rms_dbfs()),
+                            db(report.levels.peak_dbfs())
+                        ),
+                    ),
                 )
                 .border_b_0(),
             )
@@ -4770,6 +4772,65 @@ fn detail_row(label: &'static str, value: impl Into<String>) -> AnyElement {
                 .line_height(px(18.0))
                 .text_color(rgb(TEXT_SOFT))
                 .child(value.into()),
+        )
+        .into_any_element()
+}
+
+/// Average and peak level on a −60…0 dBFS scale, with a plain verdict first.
+fn level_meter(rms: Option<f64>, peak: Option<f64>, good: bool, values: String) -> AnyElement {
+    const WIDTH: f32 = 160.0;
+    let position = |value: Option<f64>| {
+        value.map_or(0.0, |value| {
+            ((value + 60.0) / 60.0).clamp(0.0, 1.0) as f32 * WIDTH
+        })
+    };
+    let tone = if good { POSITIVE } else { NEGATIVE };
+    div()
+        .flex()
+        .flex_col()
+        .items_end()
+        .gap_1()
+        .child(
+            div()
+                .text_size(px(12.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(tone))
+                .child(if good { "Good level" } else { "Check level" }),
+        )
+        .child(
+            div()
+                .relative()
+                .w(px(WIDTH))
+                .h(px(6.0))
+                .rounded_full()
+                .bg(rgb(SURFACE_SELECTED))
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .h_full()
+                        .w(px(position(rms)))
+                        .rounded_full()
+                        .bg(rgb(tone)),
+                )
+                .when(peak.is_some(), |meter| {
+                    meter.child(
+                        div()
+                            .absolute()
+                            .top(px(-2.0))
+                            .left(px((position(peak) - 1.0).max(0.0)))
+                            .w(px(2.0))
+                            .h(px(10.0))
+                            .bg(rgb(TEXT_SOFT)),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .text_size(px(10.0))
+                .text_color(rgb(FAINT))
+                .child(values),
         )
         .into_any_element()
 }
