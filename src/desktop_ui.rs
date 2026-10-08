@@ -149,6 +149,7 @@ pub(crate) const TEXT_SOFT: u32 = 0xb8b8b8;
 pub(crate) const MUTED: u32 = 0x858585;
 pub(crate) const FAINT: u32 = 0x626262;
 pub(crate) const NEGATIVE: u32 = 0xc98f89;
+pub(crate) const POSITIVE: u32 = 0x8fbf98;
 
 pub(crate) const CONTROL_HEIGHT: f32 = 32.0;
 pub(crate) const CONTROL_TEXT_SIZE: f32 = 12.0;

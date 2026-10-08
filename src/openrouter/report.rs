@@ -98,66 +98,163 @@ impl StepReport {
         }
     }
 
-    /// `(label, value)` rows for the History detail view.
-    pub fn history_rows(&self) -> Vec<(&'static str, String)> {
-        let mut rows = vec![
-            ("Reported cost", self.cost_summary()),
-            (
-                "Model",
-                format!(
-                    "{} · {} ms",
-                    self.model.as_deref().unwrap_or("unknown"),
-                    self.latency_ms
-                ),
-            ),
-        ];
-        for execution in &self.executions {
-            let mode = if execution.streaming {
-                "Live streaming"
-            } else {
-                "After recording"
+    /// Every request in order, labelled by why it was sent, for the History detail view.
+    pub fn attempts(&self) -> Vec<AttemptView> {
+        let show_cost = self.executions.len() > 1 || self.omitted_executions > 0;
+        let mut attempts: Vec<AttemptView> = if self.executions.is_empty() {
+            // Older History kept only the answering model and the failures before it.
+            let legacy = |id: &str, succeeded| {
+                let model = crate::providers::ModelRef::parse(id);
+                AttemptView {
+                    provider: model.provider.label().into(),
+                    model: model.model.into(),
+                    streaming: None,
+                    keyword_count: None,
+                    succeeded,
+                    step: AttemptStep::First,
+                    cost: None,
+                }
             };
-            let cost = if self.executions.len() > 1 || self.omitted_executions > 0 {
-                format!(
-                    " · {}",
-                    valid_cost(execution.cost_usd)
-                        .map(format_cost)
-                        .unwrap_or_else(|| "Cost not reported".into())
-                )
+            self.failed
+                .iter()
+                .map(|id| legacy(id, false))
+                .chain(self.model.as_deref().map(|id| legacy(id, true)))
+                .collect()
+        } else {
+            self.executions
+                .iter()
+                .map(|execution| AttemptView {
+                    provider: provider_label(&execution.provider),
+                    model: execution.model.clone(),
+                    streaming: Some(execution.streaming),
+                    keyword_count: Some(execution.keyword_count),
+                    succeeded: execution.outcome == "success",
+                    step: AttemptStep::First,
+                    cost: show_cost.then(|| {
+                        valid_cost(execution.cost_usd)
+                            .map(format_cost)
+                            .unwrap_or_else(|| "Cost not reported".into())
+                    }),
+                })
+                .collect()
+        };
+        for index in 1..attempts.len() {
+            let (before, after) = attempts.split_at_mut(index);
+            let previous = &before[index - 1];
+            let current = &mut after[0];
+            let same_model =
+                previous.provider == current.provider && previous.model == current.model;
+            current.step = if previous.succeeded {
+                AttemptStep::Continued
+            } else if !same_model {
+                AttemptStep::Fallback
+            } else if previous.streaming == Some(true) && current.streaming == Some(false) {
+                AttemptStep::Recovery
             } else {
-                String::new()
+                AttemptStep::Retry
             };
-            let keywords = if execution.keyword_count == 0 {
-                "No keywords sent".to_owned()
-            } else {
-                format!("{} keywords sent", execution.keyword_count)
-            };
-            rows.push((
-                "Attempt",
-                format!(
-                    "{} · {} · {mode} · {keywords} · {}{cost}",
-                    execution.provider, execution.model, execution.outcome
-                ),
-            ));
         }
-        if self.omitted_executions > 0 {
-            rows.push(("Attempts omitted", self.omitted_executions.to_string()));
-        }
-        if !self.failed.is_empty() {
-            rows.push(("Fell back from", self.failed.join(", ")));
-        }
-        if let Some(audio) = self.audio {
-            let mut value = format!("{} sent", seconds(audio.sent_ms));
-            if audio.sent_ms < audio.recorded_ms {
-                value.push_str(&format!(
-                    " of {} recorded (silence trimmed)",
-                    seconds(audio.recorded_ms)
-                ));
-            }
-            rows.push(("Audio", value));
-        }
-        rows
+        attempts
     }
+
+    /// One word for the History list when the answer needed more than one request.
+    pub fn recovery_badge(&self) -> Option<&'static str> {
+        let attempts = self.attempts();
+        if attempts
+            .iter()
+            .any(|attempt| attempt.step == AttemptStep::Fallback)
+        {
+            Some("Fallback")
+        } else if attempts
+            .iter()
+            .any(|attempt| matches!(attempt.step, AttemptStep::Retry | AttemptStep::Recovery))
+        {
+            Some("Retried")
+        } else {
+            None
+        }
+    }
+
+    /// `(value, detail)` for the audio summary, mentioning trimming only when it happened.
+    pub fn audio_summary(&self) -> Option<(String, Option<String>)> {
+        self.audio.map(|audio| {
+            let trimmed = (audio.sent_ms < audio.recorded_ms)
+                .then(|| format!("of {} recorded", seconds(audio.recorded_ms)));
+            (seconds(audio.sent_ms), trimmed)
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttemptStep {
+    /// The first request for this dictation.
+    First,
+    /// The same model again after it failed.
+    Retry,
+    /// The recorded clip after the live session on the same model failed.
+    Recovery,
+    /// The next model in the chain after the previous one failed.
+    Fallback,
+    /// A following chunk after a successful one.
+    Continued,
+}
+
+impl AttemptStep {
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            Self::First | Self::Continued => None,
+            Self::Retry => Some("Retry"),
+            Self::Recovery => Some("Recorded retry"),
+            Self::Fallback => Some("Fallback"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AttemptView {
+    pub provider: String,
+    pub model: String,
+    /// Unknown in History saved before requests were recorded individually.
+    pub streaming: Option<bool>,
+    pub keyword_count: Option<usize>,
+    pub succeeded: bool,
+    pub step: AttemptStep,
+    /// Shown per request only when the dictation made several.
+    pub cost: Option<String>,
+}
+
+impl AttemptView {
+    /// Secondary line: provider, transport and keyword use.
+    pub fn details(&self) -> String {
+        let mut parts = vec![self.provider.clone()];
+        match self.streaming {
+            Some(true) => parts.push("Live streaming".into()),
+            Some(false) => parts.push("After recording".into()),
+            None => {}
+        }
+        match self.keyword_count {
+            Some(0) | None => {}
+            Some(1) => parts.push("1 keyword".into()),
+            Some(count) => parts.push(format!("{count} keywords")),
+        }
+        parts.join(" · ")
+    }
+}
+
+/// Short human duration: milliseconds below a second, seconds above.
+pub fn duration_label(ms: u64) -> String {
+    match ms {
+        0..=999 => format!("{ms} ms"),
+        1_000..=9_999 => format!("{:.2} s", ms as f64 / 1_000.0),
+        _ => format!("{:.1} s", ms as f64 / 1_000.0),
+    }
+}
+
+fn provider_label(id: &str) -> String {
+    crate::providers::Provider::ALL
+        .into_iter()
+        .find(|provider| provider.id() == id)
+        .map_or_else(|| id.to_owned(), |provider| provider.label().to_owned())
 }
 
 /// Representative report for tests.
@@ -245,14 +342,24 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("terms"));
         let loaded: StepReport = serde_json::from_str(&json).unwrap();
-        let rows = loaded.history_rows();
-        assert_eq!(rows[0].1, "$0.000123 USD · partial (1 of 2 attempts)");
-        assert!(rows[2].1.contains("Live streaming"));
-        assert!(rows[2].1.contains("failed"));
-        assert!(rows[2].1.contains("Cost not reported"));
-        assert!(rows[3].1.contains("After recording"));
-        assert!(rows[3].1.contains("2 keywords sent"));
-        assert!(rows[3].1.contains("$0.000123 USD"));
+        assert_eq!(
+            loaded.cost_summary(),
+            "$0.000123 USD · partial (1 of 2 attempts)"
+        );
+        let attempts = loaded.attempts();
+        assert_eq!(
+            attempts[0].details(),
+            "Deepgram · Live streaming · 2 keywords"
+        );
+        assert!(!attempts[0].succeeded);
+        assert_eq!(attempts[0].cost.as_deref(), Some("Cost not reported"));
+        assert_eq!(
+            attempts[1].details(),
+            "OpenAI · After recording · 2 keywords"
+        );
+        assert_eq!(attempts[1].step, AttemptStep::Fallback);
+        assert_eq!(attempts[1].cost.as_deref(), Some("$0.000123 USD"));
+        assert_eq!(loaded.recovery_badge(), Some("Fallback"));
         assert_eq!(
             serde_json::from_str::<StepReport>(r#"{"latency_ms":123}"#)
                 .unwrap()
@@ -262,18 +369,19 @@ mod tests {
     }
 
     #[test]
-    fn rows_show_model_latency_fallbacks_and_trimming() {
+    fn legacy_reports_list_fallbacks_and_trimming_without_inventing_modes() {
+        let report = preview();
+        let attempts = report.attempts();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].model, "openai/whisper-large-v3-turbo");
+        assert_eq!(attempts[0].details(), "OpenRouter");
+        assert!(!attempts[0].succeeded);
+        assert_eq!(attempts[1].step, AttemptStep::Fallback);
+        assert!(attempts[1].succeeded);
+        assert_eq!(attempts[1].cost, None);
         assert_eq!(
-            preview().history_rows(),
-            [
-                ("Reported cost", "Not recorded".to_owned()),
-                ("Model", "openai/gpt-4o-mini-transcribe · 820 ms".to_owned()),
-                ("Fell back from", "openai/whisper-large-v3-turbo".to_owned()),
-                (
-                    "Audio",
-                    "6.1 s sent of 9.4 s recorded (silence trimmed)".to_owned()
-                ),
-            ]
+            report.audio_summary(),
+            Some(("6.1 s".to_owned(), Some("of 9.4 s recorded".to_owned())))
         );
     }
 
@@ -282,22 +390,74 @@ mod tests {
         let report = StepReport {
             model: Some("a/b".into()),
             latency_ms: 500,
-            failed: Vec::new(),
-            executions: Vec::new(),
-            omitted_executions: 0,
             audio: Some(AudioTrim {
                 recorded_ms: 3_000,
                 sent_ms: 3_000,
             }),
+            ..StepReport::default()
         };
+        assert_eq!(report.audio_summary(), Some(("3.0 s".to_owned(), None)));
+        assert_eq!(report.attempts().len(), 1);
+        assert_eq!(report.recovery_badge(), None);
+    }
+
+    fn execution(model: &str, streaming: bool, outcome: &str) -> ExecutionReport {
+        ExecutionReport {
+            provider: "deepgram".into(),
+            model: model.into(),
+            streaming,
+            outcome: outcome.into(),
+            ..ExecutionReport::default()
+        }
+    }
+
+    #[test]
+    fn attempts_distinguish_retry_recorded_retry_fallback_and_chunks() {
+        let report = StepReport {
+            executions: vec![
+                execution("nova-3", true, "failed"),
+                execution("nova-3", false, "failed"),
+                execution("nova-3", false, "failed"),
+                execution("nova-2", false, "success"),
+                execution("nova-2", false, "success"),
+            ],
+            ..StepReport::default()
+        };
+        let steps: Vec<_> = report.attempts().iter().map(|a| a.step).collect();
         assert_eq!(
-            report.history_rows(),
+            steps,
             [
-                ("Reported cost", "Not recorded".to_owned()),
-                ("Model", "a/b · 500 ms".to_owned()),
-                ("Audio", "3.0 s sent".to_owned()),
+                AttemptStep::First,
+                AttemptStep::Recovery,
+                AttemptStep::Retry,
+                AttemptStep::Fallback,
+                AttemptStep::Continued,
             ]
         );
+        assert_eq!(report.attempts()[0].provider, "Deepgram");
+        let retried = StepReport {
+            executions: vec![
+                execution("nova-3", false, "failed"),
+                execution("nova-3", false, "success"),
+            ],
+            ..StepReport::default()
+        };
+        assert_eq!(retried.recovery_badge(), Some("Retried"));
+        let chunks = StepReport {
+            executions: vec![
+                execution("nova-3", false, "success"),
+                execution("nova-3", false, "success"),
+            ],
+            ..StepReport::default()
+        };
+        assert_eq!(chunks.recovery_badge(), None);
+    }
+
+    #[test]
+    fn durations_read_in_the_natural_unit() {
+        assert_eq!(duration_label(820), "820 ms");
+        assert_eq!(duration_label(1_300), "1.30 s");
+        assert_eq!(duration_label(18_400), "18.4 s");
     }
 
     #[test]
