@@ -158,8 +158,11 @@ not reintroduce seams for them.
   request latencies as Finish-to-final and request-to-response respectively. Mark P95 as
   approximate and require twenty measured successful responses. Never assign old
   records a request mode, percentile or cost coverage they did not contain.
-  Missing reported cost is unknown; explicit zero is known. Do not invent price
-  estimates. Group native models by their true provider; a vendor/model route is
+  Missing reported cost is unknown; explicit zero is known. Providers that report
+  no cost get an estimate only from `providers::pricing`, the dated table of
+  published list prices, applied to the billed audio of a successful new request.
+  Keep estimates in their own fields, never inside reported cost, and always mark
+  them as estimated (≈). Failed requests stay unreported. Group native models by their true provider; a vendor/model route is
   still OpenRouter. Filters for request comparisons must not silently change the
   scope of overview cards. Load one consistent period snapshot off the UI thread,
   preserve unreadable statistics and discard stale asynchronous reloads.
@@ -236,8 +239,8 @@ not reintroduce seams for them.
   History stores actual provider/model/mode/keyword counts and attempt outcomes,
   never term/prompt contents; absent old metadata remains unknown.
   Preserve each request's provider-reported USD cost alongside its outcome,
-  including charged failures/retries. Missing cost is not zero; never estimate
-  historical prices. Mark sums as partial when coverage is incomplete, including
+  including charged failures/retries. Missing cost is not zero; never add an
+  estimate to entries recorded before estimates existed. Mark sums as partial when coverage is incomplete, including
   bounded-away executions, and do not round positive small costs to zero.
 - Vocabulary is snapshotted per accepted dictation and Retry. Apply existing
   formatting first, then restore canonical name spelling; carry its initial-case

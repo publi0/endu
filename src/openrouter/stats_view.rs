@@ -668,8 +668,17 @@ impl StatisticsView {
                 },
             ))
             .child(small_card(
-                "Reported cost (USD)",
-                cost.map_or_else(|| "—".into(), format_cost),
+                "Cost (USD)",
+                cost.map_or_else(
+                    || "—".into(),
+                    |(amount, estimated)| {
+                        if estimated {
+                            format!("≈ {}", format_cost(amount))
+                        } else {
+                            format_cost(amount)
+                        }
+                    },
+                ),
                 cost_detail,
             ));
         let details = &totals.details;
@@ -1317,24 +1326,41 @@ fn measured_latency(value: Option<u64>) -> String {
     value.map_or_else(|| "—".into(), format_latency)
 }
 
-fn overview_cost(totals: &Totals) -> (Option<f64>, String) {
+/// The period's cost and whether any part of it is estimated from published
+/// prices rather than reported by the provider.
+fn overview_cost(totals: &Totals) -> (Option<(f64, bool)>, String) {
     // Overview always covers the whole selected period. Comparison filters do
     // not enter this calculation, and the legacy total overlaps newer successes.
     let measured = stats_dashboard::combined_requests(totals, Mode::All, None);
-    if measured.cost_reports > 0 {
-        let mut coverage = format!(
-            "{} of {} detailed attempts reported cost",
-            format_count(measured.cost_reports),
-            format_count(measured.attempts)
-        );
+    if measured.cost_reports > 0 || measured.cost_estimates > 0 {
+        let mut coverage = match (measured.cost_reports, measured.cost_estimates) {
+            (reports, 0) => format!(
+                "{} of {} detailed attempts reported cost",
+                format_count(reports),
+                format_count(measured.attempts)
+            ),
+            (0, estimates) => format!(
+                "Estimated from list prices for {} of {} detailed attempts",
+                format_count(estimates),
+                format_count(measured.attempts)
+            ),
+            (reports, estimates) => format!(
+                "{} reported · ≈ {} estimated · {} of {} attempts",
+                format_cost(measured.reported_cost_usd),
+                format_cost(measured.estimated_cost_usd),
+                format_count(reports.saturating_add(estimates)),
+                format_count(measured.attempts)
+            ),
+        };
         if totals.dictations.saturating_add(totals.failed_dictations) > totals.details.dictations {
             coverage.push_str(" · older records excluded");
         }
-        return (Some(measured.reported_cost_usd), coverage);
+        let total = (measured.reported_cost_usd + measured.estimated_cost_usd).min(f64::MAX);
+        return (Some((total, measured.cost_estimates > 0)), coverage);
     }
     if totals.cost_usd.is_finite() && totals.cost_usd > 0.0 {
         return (
-            Some(totals.cost_usd),
+            Some((totals.cost_usd, false)),
             "Historical amounts only · no detailed cost reports".into(),
         );
     }
@@ -1635,11 +1661,12 @@ mod tests {
             "legacy cost only reflects successful responses"
         );
         let (cost, coverage) = overview_cost(&totals);
-        assert!((cost.unwrap() - 0.003).abs() < f64::EPSILON);
+        assert!((cost.unwrap().0 - 0.003).abs() < f64::EPSILON);
+        assert!(!cost.unwrap().1, "reported costs are not estimates");
         assert_eq!(coverage, "3 of 3 detailed attempts reported cost");
         assert_eq!(report.cost_summary(), "$0.003 USD");
         assert_eq!(
-            format_cost(cost.unwrap()),
+            format_cost(cost.unwrap().0),
             report.cost_summary().trim_end_matches(" USD")
         );
         let comparison =
@@ -1658,6 +1685,58 @@ mod tests {
     }
 
     #[test]
+    fn overview_cost_adds_marked_estimates_to_reported_costs() {
+        let sample = |attempts: Vec<AttemptSample>| Sample {
+            words: Some(1),
+            telemetry: Some(DictationTelemetry {
+                attempts,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut estimated = Totals::default();
+        estimated.add_sample(&sample(vec![
+            AttemptSample {
+                model: "deepgram::nova-3".into(),
+                mode: crate::openrouter::stats::RequestMode::Live,
+                success: true,
+                estimated_cost_usd: Some(0.004),
+                ..Default::default()
+            },
+            AttemptSample {
+                model: "grok::grok-voice-transcribe-2.0".into(),
+                error: Some(ErrorKind::Network),
+                ..Default::default()
+            },
+        ]));
+        let (amount, description) = overview_cost(&estimated);
+        assert_eq!(amount, Some((0.004, true)));
+        assert_eq!(
+            description,
+            "Estimated from list prices for 1 of 2 detailed attempts"
+        );
+        assert_eq!(estimated.estimated_cost_usd, 0.004);
+        assert_eq!(
+            estimated.cost_usd, 0.0,
+            "estimates never enter reported totals"
+        );
+
+        estimated.add_sample(&sample(vec![AttemptSample {
+            model: "openai/gpt-transcribe".into(),
+            success: true,
+            cost_usd: Some(0.001),
+            ..Default::default()
+        }]));
+        let (amount, description) = overview_cost(&estimated);
+        assert!((amount.unwrap().0 - 0.005).abs() < 1e-12);
+        assert!(amount.unwrap().1);
+        assert_eq!(
+            description,
+            "$0.001 reported · ≈ $0.004 estimated · 2 of 3 attempts"
+        );
+    }
+
+    #[test]
     fn overview_cost_keeps_legacy_separate_and_unknown_distinct_from_explicit_zero() {
         let legacy = Totals {
             dictations: 5,
@@ -1665,7 +1744,7 @@ mod tests {
             ..Default::default()
         };
         let (amount, description) = overview_cost(&legacy);
-        assert_eq!(amount, Some(1.25));
+        assert_eq!(amount, Some((1.25, false)));
         assert!(description.contains("Historical amounts only"));
         let mut mixed = legacy;
         mixed.add_sample(&Sample {
@@ -1685,7 +1764,7 @@ mod tests {
         assert_eq!(mixed.cost_usd, 1.25, "historical accounting remains intact");
         assert_eq!(
             amount,
-            Some(0.0),
+            Some((0.0, false)),
             "do not add overlapping historical totals to measured attempts"
         );
         assert!(description.contains("1 of 1 detailed attempts"));
@@ -1722,7 +1801,7 @@ mod tests {
             ..Default::default()
         });
         let (amount, description) = overview_cost(&measured);
-        assert_eq!(format_cost(amount.unwrap()), "$0.00000012");
+        assert_eq!(format_cost(amount.unwrap().0), "$0.00000012");
         assert_eq!(description, "1 of 2 detailed attempts reported cost");
         assert_ne!(format_cost(f64::MIN_POSITIVE), "$0.00");
     }

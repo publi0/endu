@@ -41,6 +41,15 @@ pub struct ExecutionReport {
         deserialize_with = "deserialize_cost"
     )]
     pub cost_usd: Option<f64>,
+    /// Hex's estimate from the provider's published price, only for a
+    /// successful request whose provider reported no cost. Never mixed into
+    /// `cost_usd` and never added to entries recorded before estimates existed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_cost"
+    )]
+    pub estimated_cost_usd: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -62,6 +71,7 @@ impl StepReport {
             execution.outcome = execution.outcome.chars().take(80).collect();
             execution.keyword_count = execution.keyword_count.min(2000);
             execution.cost_usd = valid_cost(execution.cost_usd);
+            execution.estimated_cost_usd = valid_cost(execution.estimated_cost_usd);
         }
         self.model = self.model.take().map(|model| bound(&model));
         self.failed.truncate(MAX_FAILED_MODELS);
@@ -69,12 +79,20 @@ impl StepReport {
         self
     }
 
-    /// Sum only reported costs, identifying incomplete coverage explicitly.
+    /// Sum reported costs, then estimates for requests that reported none,
+    /// marking estimates and incomplete coverage explicitly.
     pub fn cost_summary(&self) -> String {
+        let mut estimated = false;
         let costs: Vec<_> = self
             .executions
             .iter()
-            .filter_map(|execution| valid_cost(execution.cost_usd))
+            .filter_map(|execution| {
+                valid_cost(execution.cost_usd).or_else(|| {
+                    let estimate = valid_cost(execution.estimated_cost_usd);
+                    estimated |= estimate.is_some();
+                    estimate
+                })
+            })
             .collect();
         let total = self
             .executions
@@ -90,7 +108,11 @@ impl StepReport {
         if !sum.is_finite() {
             return "Exceeds display range; see individual attempts".into();
         }
-        let amount = format_cost(sum);
+        let amount = if estimated {
+            format!("≈ {} (estimated)", format_cost(sum))
+        } else {
+            format_cost(sum)
+        };
         if costs.len() == total {
             amount
         } else {
@@ -128,9 +150,15 @@ impl StepReport {
                     succeeded: execution.outcome == "success",
                     step: AttemptStep::First,
                     cost: show_cost.then(|| {
-                        valid_cost(execution.cost_usd)
-                            .map(format_cost)
-                            .unwrap_or_else(|| "Cost not reported".into())
+                        valid_cost(execution.cost_usd).map_or_else(
+                            || {
+                                valid_cost(execution.estimated_cost_usd).map_or_else(
+                                    || "Cost not reported".into(),
+                                    |cost| format!("≈ {} (estimated)", format_cost(cost)),
+                                )
+                            },
+                            format_cost,
+                        )
                     }),
                 })
                 .collect()
@@ -373,6 +401,7 @@ mod tests {
                     keyword_count: 2,
                     outcome: "failed".into(),
                     cost_usd: None,
+                    estimated_cost_usd: None,
                 },
                 ExecutionReport {
                     provider: "OpenAI".into(),
@@ -381,6 +410,7 @@ mod tests {
                     keyword_count: 2,
                     outcome: "success".into(),
                     cost_usd: Some(0.000_123),
+                    estimated_cost_usd: None,
                 },
             ],
             ..StepReport::default()
@@ -550,6 +580,37 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn estimates_fill_unreported_costs_and_are_always_labelled() {
+        let mut report = costs(&[None, None, Some(0.002)]);
+        report.executions[1].estimated_cost_usd = Some(0.003);
+        assert_eq!(
+            report.cost_summary(),
+            "≈ $0.005 USD (estimated) · partial (2 of 3 attempts)"
+        );
+        // A reported amount always wins over an estimate for the same request.
+        report.executions[2].estimated_cost_usd = Some(9.0);
+        assert!(report.cost_summary().starts_with("≈ $0.005 USD"));
+        let attempts = report.attempts();
+        assert_eq!(attempts[0].cost.as_deref(), Some("Cost not reported"));
+        assert_eq!(
+            attempts[1].cost.as_deref(),
+            Some("≈ $0.003 USD (estimated)")
+        );
+        assert_eq!(attempts[2].cost.as_deref(), Some("$0.002 USD"));
+        let restored: StepReport =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        assert_eq!(restored.executions[1].estimated_cost_usd, Some(0.003));
+        let older: ExecutionReport = serde_json::from_str(
+            r#"{"provider":"openai","model":"gpt-transcribe","streaming":false,"keyword_count":0,"outcome":"success"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            older.estimated_cost_usd, None,
+            "old entries are never estimated"
+        );
     }
 
     #[test]

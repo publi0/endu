@@ -151,6 +151,8 @@ pub struct AttemptSample {
     pub latency_ms: Option<u64>,
     pub keyword_count: usize,
     pub cost_usd: Option<f64>,
+    /// Published-price estimate for a successful request without a reported cost.
+    pub estimated_cost_usd: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -250,6 +252,9 @@ pub struct RequestTotals {
     pub keywords_sent: u64,
     pub reported_cost_usd: f64,
     pub cost_reports: u64,
+    /// Estimates from published prices, kept apart from reported costs.
+    pub estimated_cost_usd: f64,
+    pub cost_estimates: u64,
 }
 
 impl RequestTotals {
@@ -257,6 +262,10 @@ impl RequestTotals {
         if !self.reported_cost_usd.is_finite() || self.reported_cost_usd < 0.0 {
             self.reported_cost_usd = 0.0;
             self.cost_reports = 0;
+        }
+        if !self.estimated_cost_usd.is_finite() || self.estimated_cost_usd < 0.0 {
+            self.estimated_cost_usd = 0.0;
+            self.cost_estimates = 0;
         }
     }
 
@@ -288,6 +297,12 @@ impl RequestTotals {
         {
             add_cost(&mut self.reported_cost_usd, cost);
             self.cost_reports = self.cost_reports.saturating_add(1);
+        } else if let Some(cost) = attempt
+            .estimated_cost_usd
+            .filter(|cost| cost.is_finite() && *cost >= 0.0)
+        {
+            add_cost(&mut self.estimated_cost_usd, cost);
+            self.cost_estimates = self.cost_estimates.saturating_add(1);
         }
     }
 
@@ -301,6 +316,11 @@ impl RequestTotals {
         if other.cost_reports > 0 && add_cost(&mut self.reported_cost_usd, other.reported_cost_usd)
         {
             self.cost_reports = self.cost_reports.saturating_add(other.cost_reports);
+        }
+        if other.cost_estimates > 0
+            && add_cost(&mut self.estimated_cost_usd, other.estimated_cost_usd)
+        {
+            self.cost_estimates = self.cost_estimates.saturating_add(other.cost_estimates);
         }
         for (kind, count) in &other.errors {
             add_counter(self.errors.entry(kind.clone()).or_default(), *count);
@@ -416,6 +436,9 @@ pub struct Totals {
     pub latency_ms: u64,
     pub tokens: u64,
     pub cost_usd: f64,
+    /// Published-price estimates for successful requests without a reported
+    /// cost; absent (zero) for days recorded before estimates existed.
+    pub estimated_cost_usd: f64,
     /// Dictations that needed at least one fallback.
     pub fallbacks: u64,
     /// Successful dictations using each model; one dictation can use several.
@@ -437,6 +460,13 @@ impl Totals {
         if let Some(telemetry) = &sample.telemetry {
             self.details
                 .add_dictation(telemetry, sample.words.is_some());
+            for attempt in &telemetry.attempts {
+                if attempt.cost_usd.is_none()
+                    && let Some(cost) = attempt.estimated_cost_usd
+                {
+                    add_cost(&mut self.estimated_cost_usd, cost);
+                }
+            }
         }
         match sample.words {
             Some(words) => {
@@ -491,6 +521,7 @@ impl Totals {
         self.latency_ms = self.latency_ms.saturating_add(other.latency_ms);
         self.tokens = self.tokens.saturating_add(other.tokens);
         add_cost(&mut self.cost_usd, other.cost_usd);
+        add_cost(&mut self.estimated_cost_usd, other.estimated_cost_usd);
         self.fallbacks = self.fallbacks.saturating_add(other.fallbacks);
         for (model, count) in &other.models {
             add_counter(self.models.entry(model.clone()).or_default(), *count);

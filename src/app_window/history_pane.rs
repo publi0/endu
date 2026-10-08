@@ -850,6 +850,8 @@ pub(super) fn preview_history() -> Option<History> {
                 keyword_count: 3,
                 outcome: "success".into(),
                 cost_usd: None,
+                // A native preview request shows its published-price estimate.
+                estimated_cost_usd: Some(0.000_32),
             }]
         } else {
             let selected = crate::providers::ModelRef::parse(model);
@@ -862,6 +864,7 @@ pub(super) fn preview_history() -> Option<History> {
                     keyword_count: 0,
                     outcome: "failed".into(),
                     cost_usd: None,
+                    estimated_cost_usd: None,
                 })
                 .chain(std::iter::once(
                     crate::openrouter::report::ExecutionReport {
@@ -871,6 +874,7 @@ pub(super) fn preview_history() -> Option<History> {
                         keyword_count: 0,
                         outcome: "success".into(),
                         cost_usd: Some(0.000_123),
+                        estimated_cost_usd: None,
                     },
                 ))
                 .collect()

@@ -1466,7 +1466,13 @@ mod tests {
         assert!(report.executions[0].streaming);
         assert_eq!(report.executions[0].keyword_count, 1);
         assert_eq!(report.executions[0].cost_usd, None);
-        assert_eq!(report.cost_summary(), "Not reported");
+        // Deepgram reports no cost, so the successful request is estimated.
+        assert!(
+            report.executions[0]
+                .estimated_cost_usd
+                .is_some_and(|cost| cost > 0.0)
+        );
+        assert!(report.cost_summary().ends_with("(estimated)"));
         let reloaded =
             crate::recording_recovery::RecordingRecovery::open(directory.join("recovery")).unwrap();
         assert_eq!(reloaded.entries("").len(), 1);

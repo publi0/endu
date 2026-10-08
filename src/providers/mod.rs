@@ -8,6 +8,7 @@ pub mod batch;
 pub mod keys;
 mod meta;
 mod model_notices;
+pub mod pricing;
 pub use model_notices::model_notices;
 pub mod streaming;
 

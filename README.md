@@ -504,7 +504,7 @@ salvamento tentam restaurar as preferências anteriores. Arquivos maiores que
 ## History e Statistics
 
 **History** registra os ditados colados com sucesso: texto, aplicativo em
-foco, duração, latência, providers, modelos, fallbacks e corte de silêncio. Os detalhes de cada chamada mostram streaming durante a gravação ou envio posterior, quantidade de keywords enviadas, resultado da tentativa e custo em USD quando retornado pelo provider. A soma é marcada como parcial quando alguma tentativa não informa custo ou ultrapassa o limite de detalhes retidos. Custo ausente é diferente de zero; registros antigos não recebem estimativas nem metadados retroativos.
+foco, duração, latência, providers, modelos, fallbacks e corte de silêncio. Os detalhes de cada chamada mostram streaming durante a gravação ou envio posterior, quantidade de keywords enviadas, resultado da tentativa e custo em USD quando retornado pelo provider. Quando o provider não informa o custo (todos os nativos; só o OpenRouter informa), o Hex estima o valor de cada requisição bem-sucedida pelo preço de tabela publicado e pela duração do áudio enviado, sempre marcado com ≈ e "estimated". A tabela fica em `src/providers/pricing.rs`, com as fontes e a data da consulta. Tentativas com falha continuam sem custo. A soma é marcada como parcial quando alguma tentativa não tem custo ou ultrapassa o limite de detalhes retidos. Custo ausente é diferente de zero; registros antigos não recebem estimativas nem metadados retroativos.
 Tem busca, cópia e controles de retenção e limpeza. A retenção padrão é de
 **7 dias**, com limites adicionais de quantidade e tamanho. A atualização da
 versão 2.x preserva o texto e os relatórios de transcrição existentes.

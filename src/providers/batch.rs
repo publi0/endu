@@ -9,6 +9,7 @@ use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
 use serde_json::{Value, json};
 
+use super::pricing::{self, Billing};
 use super::{ModelOptions, ModelRef, Provider, keys, streaming};
 use crate::openrouter::http::Response;
 use crate::openrouter::report::{AudioTrim, ExecutionReport, StepReport};
@@ -611,6 +612,8 @@ struct Progress {
     failures: Vec<Failure>,
     executions: Vec<ExecutionReport>,
     telemetry: DictationTelemetry,
+    /// Audio and language of the request being recorded, for cost estimates.
+    billing: Billing,
 }
 
 impl Progress {
@@ -622,6 +625,11 @@ impl Progress {
         success: bool,
         cost_usd: Option<f64>,
     ) {
+        let mode = if streaming {
+            RequestMode::Live
+        } else {
+            RequestMode::Recorded
+        };
         self.executions.push(ExecutionReport {
             provider: model.provider.id().into(),
             model: model.model.into(),
@@ -629,7 +637,28 @@ impl Progress {
             keyword_count,
             outcome: if success { "success" } else { "failed" }.into(),
             cost_usd,
+            estimated_cost_usd: self.estimate(model, mode, keyword_count, success, cost_usd),
         });
+    }
+    /// Only successful requests without a reported cost are estimated: a
+    /// failed request's billing is unknown, so it stays "not reported".
+    fn estimate(
+        &self,
+        model: ModelRef<'_>,
+        mode: RequestMode,
+        keyword_count: usize,
+        success: bool,
+        reported: Option<f64>,
+    ) -> Option<f64> {
+        (success && reported.is_none())
+            .then(|| pricing::estimate(model, mode, self.billing, keyword_count))
+            .flatten()
+    }
+    fn bill(&mut self, audio_ms: u64, options: &ModelOptions) {
+        self.billing = Billing {
+            audio_ms,
+            auto_language: options.language.trim().is_empty() || options.language == AUTO_LANGUAGE,
+        };
     }
     fn attempt(
         &mut self,
@@ -641,6 +670,8 @@ impl Progress {
         retried: bool,
     ) {
         self.telemetry.retried |= retried;
+        let estimated_cost_usd =
+            self.estimate(model, mode, keyword_count, outcome.is_ok(), cost_usd);
         self.telemetry.attempts.push(AttemptSample {
             model: model.key(),
             mode,
@@ -649,6 +680,7 @@ impl Progress {
             latency_ms: outcome.ok(),
             keyword_count,
             cost_usd,
+            estimated_cost_usd,
         });
     }
     fn telemetry(&self, dictation_succeeded: bool) -> DictationTelemetry {
@@ -720,6 +752,7 @@ impl Chain<'_> {
             let model = ModelRef::parse(id);
             let capability = model.capabilities();
             let options = super::options(self.config, id);
+            progress.bill(duration_ms(samples.len()), &options);
             if options.validate().is_err() {
                 progress.fail(id, ErrorKind::Rejected, "invalid model options");
                 continue;
@@ -1151,6 +1184,7 @@ fn transcribe_configured(
             Ok(result) if !result.text.trim().is_empty() => {
                 check_cancelled(cancelled.as_deref())?;
                 sent_ms = duration_ms(sent_samples.load(Ordering::Acquire));
+                progress.bill(sent_ms, &super::options(config, &result.model));
                 progress.attempt(
                     ModelRef::parse(&result.model),
                     RequestMode::Live,
@@ -1576,6 +1610,46 @@ mod tests {
         config.transcription.trim_silence = false;
         config.transcription.chunk_seconds = 10;
         config
+    }
+
+    #[test]
+    fn native_successes_are_estimated_and_openrouter_keeps_only_reported_costs() {
+        for (id, body, reported) in [
+            ("openai::gpt-transcribe", r#"{"text":"native"}"#, false),
+            (
+                "openai/gpt-transcribe",
+                r#"{"text":"routed","usage":{"cost":0.001}}"#,
+                true,
+            ),
+        ] {
+            take_samples();
+            let config = telemetry_config(&[id]);
+            let result = transcribe_configured(
+                &[0.1; 160_000],
+                &Snapshot::default(),
+                None,
+                &config,
+                &mut |_, _| (Ok(response(200, body, None)), Duration::from_millis(5)),
+                &mut |_, _, _, _| panic!("no websocket"),
+                &mut |_| panic!("no retry"),
+            )
+            .unwrap();
+            let report = result.report.unwrap();
+            let execution = &report.executions[0];
+            let samples = take_samples();
+            let attempt = &samples[0].telemetry.as_ref().unwrap().attempts[0];
+            if reported {
+                assert_eq!(execution.cost_usd, Some(0.001));
+                assert_eq!(execution.estimated_cost_usd, None);
+                assert_eq!(attempt.estimated_cost_usd, None);
+            } else {
+                // Ten seconds at $0.0045 per minute.
+                let expected = 0.0045 * 10.0 / 60.0;
+                assert_eq!(execution.cost_usd, None);
+                assert!((execution.estimated_cost_usd.unwrap() - expected).abs() < 1e-12);
+                assert!((attempt.estimated_cost_usd.unwrap() - expected).abs() < 1e-12);
+            }
+        }
     }
 
     #[test]
