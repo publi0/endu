@@ -267,6 +267,7 @@ pub struct HudPreferences {
     pub transcription_color: HudColor,
     pub size: HudSize,
     pub brightness: HudBrightness,
+    pub voice_reactive: bool,
     pub screen: HudScreen,
     pub fixed_monitor: Option<MonitorId>,
     #[serde(deserialize_with = "deserialize_edge_distance")]
@@ -280,6 +281,7 @@ impl HudPreferences {
         transcription_color: HudColor::Blue,
         size: HudSize::Normal,
         brightness: HudBrightness::Normal,
+        voice_reactive: true,
         screen: HudScreen::Pointer,
         fixed_monitor: None,
         edge_distance: 12,
@@ -376,6 +378,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(preferences.size, HudSize::Normal);
+        assert!(preferences.voice_reactive);
         assert_eq!(preferences.size.scale(), 1.0);
         assert_eq!(preferences.brightness.factor(), 1.0);
         assert_eq!(preferences.edge_distance, 12);
@@ -384,6 +387,22 @@ mod tests {
         assert_eq!(preferences.position, HudPosition::Bottom);
         assert_eq!(preferences.recording_color, HudColor::Green);
         assert_eq!(preferences.transcription_color, HudColor::Purple);
+    }
+
+    #[test]
+    fn voice_reaction_defaults_on_and_preserves_an_explicit_opt_out() {
+        assert!(HudPreferences::default().voice_reactive);
+        for voice_reactive in [false, true] {
+            let preferences = HudPreferences {
+                voice_reactive,
+                ..Default::default()
+            };
+            let saved = serde_json::to_string(&preferences).unwrap();
+            assert_eq!(
+                serde_json::from_str::<HudPreferences>(&saved).unwrap(),
+                preferences
+            );
+        }
     }
 
     #[test]

@@ -156,6 +156,7 @@ pub struct OpenRouterSettings {
     picker: Option<ModelPicker>,
     model_focus: [FocusHandle; MAX_FALLBACKS + 1],
     advanced_open: bool,
+    advanced_focus: FocusHandle,
     advanced: AdvancedInputs,
     advanced_saved: AdvancedForm,
     advanced_dirty: bool,
@@ -266,6 +267,7 @@ impl OpenRouterSettings {
             picker: None,
             model_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             advanced_open: false,
+            advanced_focus: cx.focus_handle().tab_stop(true),
             advanced,
             advanced_saved: form,
             advanced_dirty: false,
@@ -711,7 +713,7 @@ impl OpenRouterSettings {
             return;
         }
         self.ensure_catalog(cx);
-        let search = cx.new(|cx| TextInput::picker(cx, "Search models or paste an id", ""));
+        let search = cx.new(|cx| TextInput::picker(cx, "Search name, provider or feature", ""));
         let subscriptions = vec![
             cx.subscribe(&search, |this, _, _: &Changed, cx| {
                 if let Some(picker) = &mut this.picker {
@@ -816,7 +818,9 @@ impl OpenRouterSettings {
         };
         let query = picker.search.read(cx).text();
         let catalog = catalog::available_catalog(self.catalog.models());
-        let mut choices = picker_choices(&catalog, query);
+        let mut choices = picker_choices(&catalog, query, |id| {
+            self.model_available(id) && self.verified_keywords(id)
+        });
         choices.retain(|choice| self.model_available(choice.id()));
         if query.is_empty()
             && let Some(current) = self.config.transcription.models.get(picker.slot)
@@ -1195,6 +1199,14 @@ impl OpenRouterSettings {
     }
 
     fn key_description(&self) -> &'static str {
+        if matches!(self.mode, ViewMode::Key(_))
+            && matches!(
+                self.key_status,
+                None | Some(KeyStatus::Keychain(_) | KeyStatus::Missing)
+            )
+        {
+            return "";
+        }
         match &self.key_status {
             None => "Looking for this provider’s key…",
             Some(KeyStatus::Keychain(_)) => "Stored in the macOS Keychain, never in a file",
@@ -1230,12 +1242,16 @@ impl OpenRouterSettings {
             })
     }
 
-    fn render_capabilities(&self, id: &str, width: f32, selector: String) -> gpui::Div {
-        let verified_keywords = !crate::providers::ModelRef::parse(id)
+    fn verified_keywords(&self, id: &str) -> bool {
+        !crate::providers::ModelRef::parse(id)
             .capabilities()
             .keywords
             && !self.preview
-            && super::vocabulary_support::has_verified_support(&self.config, id);
+            && super::vocabulary_support::has_verified_support(&self.config, id)
+    }
+
+    fn render_capabilities(&self, id: &str, width: f32, selector: String) -> gpui::Div {
+        let verified_keywords = self.verified_keywords(id);
         let debug_selector = selector.clone();
         div()
             .debug_selector(move || debug_selector.clone())
@@ -1342,6 +1358,40 @@ impl OpenRouterSettings {
             }))
             .children(menu.map(picker_popup))
             .into_any_element()
+    }
+
+    fn render_model_notices(&self, slot: usize, id: &str) -> Option<AnyElement> {
+        let notices = crate::providers::model_notices(&self.config, id);
+        if notices.is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .debug_selector(move || format!("model-notices-{slot}"))
+                .w_full()
+                .px_4()
+                .pb_3()
+                .flex()
+                .justify_end()
+                .child(
+                    div()
+                        .debug_selector(move || format!("model-notice-copy-{slot}"))
+                        .w(px(MODEL_BUTTON_WIDTH))
+                        .flex_none()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .children(notices.into_iter().map(|notice| {
+                            div()
+                                .whitespace_normal()
+                                .text_size(px(11.0))
+                                .line_height(px(16.0))
+                                .text_color(rgb(if notice.is_error { NEGATIVE } else { MUTED }))
+                                .child(notice.text)
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_picker(
@@ -1518,17 +1568,24 @@ impl OpenRouterSettings {
         let models = self.config.transcription.models.clone();
         let mut panel = settings_panel();
         let primary = self.render_model_button(0, models.first().map(String::as_str), cx);
+        let primary_notices = models
+            .first()
+            .and_then(|id| self.render_model_notices(0, id));
         panel = panel.child(
             self.row_message(
-                settings_row("Primary model", "Transcribes every dictation", primary)
+                settings_row("Primary model", "", primary)
+                    .when(primary_notices.is_some(), |row| row.pb_1())
                     .debug_selector(|| "model-row-0".into()),
                 Scope::Model(0),
                 self.picker.as_ref().is_none_or(|picker| picker.slot != 0),
-            ),
+            )
+            .debug_selector(|| "model-slot-0".into())
+            .children(primary_notices),
         );
         let fallbacks = models.len().saturating_sub(1).min(MAX_FALLBACKS);
         for (slot, model) in models.iter().enumerate().skip(1).take(fallbacks) {
             let button = self.render_model_button(slot, Some(model.as_str()), cx);
+            let notices = self.render_model_notices(slot, model);
             let control = div()
                 .flex_none()
                 .flex()
@@ -1557,19 +1614,18 @@ impl OpenRouterSettings {
                         } else {
                             "Fallback 2"
                         },
-                        if slot == 1 {
-                            "Used when the primary model fails"
-                        } else {
-                            "Used when fallback 1 also fails"
-                        },
+                        "",
                         control,
                     )
+                    .when(notices.is_some(), |row| row.pb_1())
                     .debug_selector(move || format!("model-row-{slot}")),
                     Scope::Model(slot),
                     self.picker
                         .as_ref()
                         .is_none_or(|picker| picker.slot != slot),
-                ),
+                )
+                .debug_selector(move || format!("model-slot-{slot}"))
+                .children(notices),
             );
         }
         if fallbacks < MAX_FALLBACKS && !models.is_empty() {
@@ -1645,9 +1701,25 @@ impl OpenRouterSettings {
             .into_any_element()
     }
 
-    fn render_advanced(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn toggle_advanced(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Moving focus commits the old input and leaves a reachable target
+        // after collapse; hidden inputs must never retain keyboard focus.
+        self.advanced_focus.focus(window);
+        self.advanced_open = !self.advanced_open;
+        cx.notify();
+    }
+
+    pub(crate) fn render_advanced(
+        &mut self,
+        extra: Option<AnyElement>,
+        extra_errors: Vec<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let header = div()
             .id("openrouter-advanced")
+            .debug_selector(|| "openrouter-advanced".into())
+            .track_focus(&self.advanced_focus)
+            .focus(|header| header.bg(rgb(SURFACE_SELECTED)))
             .pt_5()
             .pb_2()
             .px_1()
@@ -1658,15 +1730,57 @@ impl OpenRouterSettings {
             .text_size(px(11.0))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(rgb(FAINT))
-            .hover(|header| header.text_color(rgb(MUTED)))
+            .hover(|header| header.bg(rgb(SURFACE_HOVER)))
             .child(if self.advanced_open { "▾" } else { "▸" })
             .child("ADVANCED")
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.advanced_open = !this.advanced_open;
-                cx.notify();
+            .on_click(cx.listener(|this, event, window, cx| {
+                if matches!(event, gpui::ClickEvent::Mouse(_)) {
+                    this.toggle_advanced(window, cx);
+                }
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let modifiers = event.keystroke.modifiers;
+                if modifiers.platform || modifiers.control || modifiers.alt {
+                    return;
+                }
+                match event.keystroke.key.as_str() {
+                    "enter" | "space" => {
+                        if !event.is_held {
+                            this.toggle_advanced(window, cx);
+                        }
+                        cx.stop_propagation();
+                    }
+                    "tab" => {
+                        if modifiers.shift {
+                            window.focus_prev();
+                        } else {
+                            window.focus_next();
+                        }
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
             }));
+        let collapsed_feedback = div()
+            .debug_selector(|| "advanced-collapsed-feedback".into())
+            .when(!self.advanced_open, |feedback| {
+                feedback
+                    .children(self.render_error(Scope::Advanced))
+                    .children(extra_errors.into_iter().map(|error| {
+                        div()
+                            .px_1()
+                            .pt_2()
+                            .text_size(px(11.0))
+                            .line_height(px(16.0))
+                            .text_color(rgb(NEGATIVE))
+                            .child(error)
+                    }))
+            });
         if !self.advanced_open {
-            return header.into_any_element();
+            return div()
+                .child(header)
+                .child(collapsed_feedback)
+                .into_any_element();
         }
         let narrow = |input: &Entity<TextInput>| sized(input, NARROW_INPUT);
         let footer = div()
@@ -1675,14 +1789,8 @@ impl OpenRouterSettings {
             .py_3()
             .flex()
             .items_center()
-            .justify_between()
+            .justify_end()
             .gap_4()
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(rgb(FAINT))
-                    .child("Changes save when you leave a field."),
-            )
             .child(
                 div()
                     .flex()
@@ -1703,6 +1811,7 @@ impl OpenRouterSettings {
             );
         div()
             .child(header)
+            .child(collapsed_feedback)
             .child(
                 settings_panel()
                     .child(settings_row(
@@ -1733,17 +1842,25 @@ impl OpenRouterSettings {
                     .child(footer),
             )
             .children(self.render_message(Scope::Advanced))
+            .children(extra)
             .into_any_element()
     }
 }
 
 /// Catalog models matching `query`, then a custom-id choice when the query
 /// looks like an id the catalog does not list.
-fn picker_choices(catalog: &[CatalogModel], query: &str) -> Vec<PickerChoice> {
+fn picker_choices(
+    catalog: &[CatalogModel],
+    query: &str,
+    mut verified_keywords: impl FnMut(&str) -> bool,
+) -> Vec<PickerChoice> {
     let query = query.trim();
     let mut choices: Vec<PickerChoice> = catalog
         .iter()
-        .filter(|model| model.matches(query))
+        .filter(|model| {
+            model.matches(query, false)
+                || (verified_keywords(&model.id) && model.matches(query, true))
+        })
         .cloned()
         .map(PickerChoice::Catalog)
         .collect();
@@ -1805,7 +1922,7 @@ impl Render for OpenRouterSettings {
                 let row = self.render_key_row(cx).border_b_0();
                 return div().child(row).into_any_element();
             }
-            ViewMode::Global => return self.render_advanced(cx),
+            ViewMode::Global => return self.render_advanced(None, Vec::new(), cx),
             ViewMode::Models => {}
         }
         let models = self.render_models_panel(cx);
@@ -1821,7 +1938,7 @@ impl Render for OpenRouterSettings {
         .children(self.render_message(Scope::Configuration))
         .child(models)
         .child(div().px_1().pt_3().text_size(px(11.0)).text_color(rgb(FAINT))
-            .child("Models are tried in this order. Provider keys and request limits are in Providers."))
+            .child("Models are tried from top to bottom until one succeeds. Keys and request limits are in Providers."))
         .into_any_element()
     }
 }
@@ -1829,6 +1946,131 @@ impl Render for OpenRouterSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn feature_search_combines_terms_without_bypassing_provider_keys(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, cx| OpenRouterSettings::new(false, true, cx));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                for slot in 0..=MAX_FALLBACKS {
+                    view.set_available_providers(vec![Provider::Deepgram], cx);
+                    view.open_picker(slot, window, cx);
+                    let search = view.picker.as_ref().unwrap().search.clone();
+                    search.update(cx, |input, cx| input.set_text("  StReAmInG keywords  ", cx));
+                    let choices = view.picker_choices(cx);
+                    assert_eq!(choices.len(), 1);
+                    assert_eq!(choices[0].id(), "deepgram::nova-3");
+                    search.update(cx, |input, cx| input.set_text("google streaming", cx));
+                    assert!(view.picker_choices(cx).is_empty());
+                    view.set_available_providers(vec![Provider::Google], cx);
+                    let choices = view.picker_choices(cx);
+                    assert_eq!(choices.len(), 1);
+                    assert_eq!(choices[0].id(), "google::gemini-3.5-transcribe-live");
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn feature_search_uses_only_explicit_cached_keyword_evidence() {
+        let catalog = [model("fixture/unknown-route", "Unknown route")];
+        assert!(picker_choices(&catalog, "keywords", |_| false).is_empty());
+        assert_eq!(
+            picker_choices(&catalog, "keywords", |id| id == "fixture/unknown-route").len(),
+            1
+        );
+        assert!(picker_choices(&catalog, "keywords streaming", |_| true).is_empty());
+    }
+
+    #[gpui::test]
+    fn selected_notices_stay_under_their_own_primary_or_fallback_picker(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, cx| OpenRouterSettings::new(false, true, cx));
+        cx.simulate_resize(gpui::size(px(760.0), px(1800.0)));
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.config.transcription.models = vec![
+                    "elevenlabs::scribe_v2".into(),
+                    "deepgram::nova-3".into(),
+                    "elevenlabs::scribe_v2_realtime".into(),
+                ];
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("model-notices-1").is_none());
+        for (picker, note, row) in [
+            ("model-control-0", "model-notice-copy-0", "model-slot-0"),
+            ("model-control-2", "model-notice-copy-2", "model-slot-2"),
+        ] {
+            let picker = cx.debug_bounds(picker).unwrap();
+            let note = cx.debug_bounds(note).unwrap();
+            let row = cx.debug_bounds(row).unwrap();
+            assert_eq!(note.size.width, px(MODEL_BUTTON_WIDTH));
+            assert!((note.left() - picker.left()).abs() <= px(1.0));
+            assert!(note.top() >= picker.bottom());
+            assert!(note.bottom() <= row.bottom());
+        }
+        let before = cx.debug_bounds("model-slot-2").unwrap().size.height;
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.choose_model(2, Some("google::gemini-3.5-transcribe".into()), cx));
+                assert!(
+                    view.render_model_notices(2, &view.config.transcription.models[2])
+                        .is_none()
+                );
+            })
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("model-slot-2").unwrap().size.height < before);
+    }
+
+    #[gpui::test]
+    fn microsoft_connection_notice_updates_on_the_selected_fallback(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| OpenRouterSettings::new(false, true, cx));
+        cx.simulate_resize(gpui::size(px(760.0), px(1800.0)));
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.config.transcription.models = vec![
+                    "deepgram::nova-3".into(),
+                    "microsoft::MAI-Transcribe-2-Streaming".into(),
+                ];
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        let initial = cx.debug_bounds("model-slot-1").unwrap().size.height;
+        assert!(cx.debug_bounds("model-notice-copy-1").unwrap().size.height > px(0.0));
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let mut config = view.config_snapshot();
+                config.microsoft.streaming_endpoint =
+                    "https://fixture.services.ai.azure.com".into();
+                view.refresh_config(config, cx);
+                assert!(
+                    view.render_model_notices(1, &view.config.transcription.models[1])
+                        .is_some()
+                );
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let mut config = view.config_snapshot();
+                config.microsoft.deployment = "fixture-deployment".into();
+                view.refresh_config(config, cx);
+                assert!(
+                    view.render_model_notices(1, &view.config.transcription.models[1])
+                        .is_none()
+                );
+            })
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("model-slot-1").unwrap().size.height < initial);
+    }
 
     #[gpui::test]
     fn model_choices_only_include_providers_with_registered_keys(cx: &mut gpui::TestAppContext) {
@@ -2284,20 +2526,20 @@ mod tests {
             model("openai/whisper-1", "Whisper 1"),
             model("deepgram/nova-3", "Nova-3"),
         ];
-        assert_eq!(picker_choices(&catalog, "").len(), 2);
+        assert_eq!(picker_choices(&catalog, "", |_| false).len(), 2);
         assert_eq!(
-            picker_choices(&catalog, "nova"),
+            picker_choices(&catalog, "nova", |_| false),
             [PickerChoice::Catalog(catalog[1].clone())]
         );
         assert_eq!(
-            picker_choices(&catalog, "acme/new-model"),
+            picker_choices(&catalog, "acme/new-model", |_| false),
             [PickerChoice::Custom("acme/new-model".into())]
         );
         assert_eq!(
-            picker_choices(&catalog, "openai/whisper-1"),
+            picker_choices(&catalog, "openai/whisper-1", |_| false),
             [PickerChoice::Catalog(catalog[0].clone())]
         );
-        assert!(picker_choices(&catalog, "no such thing").is_empty());
-        assert!(picker_choices(&[], "acme/x y").is_empty());
+        assert!(picker_choices(&catalog, "no such thing", |_| false).is_empty());
+        assert!(picker_choices(&[], "acme/x y", |_| false).is_empty());
     }
 }

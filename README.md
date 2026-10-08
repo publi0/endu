@@ -248,6 +248,10 @@ ao trocar de Desktop ou entrar em tela cheia, sem tirar o foco do aplicativo.
 **Size** oferece Small, Normal e Large. **Brightness** oferece Subtle, Normal
 e Intense. Os padrões preservam o tamanho, o brilho e a animação existentes.
 
+**React to voice**, ligado por padrão, faz a cápsula de gravação reagir ao nível
+do microfone com uma expansão suave. Desligue para manter a largura estável.
+O efeito é apenas visual: não altera o áudio nem a transcrição.
+
 As cores de **Recording** e **Transcribing** são independentes. Cada uma tem
 seis opções: vermelho, laranja, verde, turquesa, azul e roxo. O padrão continua
 vermelho na gravação e azul na transcrição. A cápsula de preparação permanece
@@ -288,7 +292,12 @@ as opções por modelo e as keywords compartilhadas. Os seletores mostram
 somente modelos de providers com chave cadastrada. Remover uma chave não
 apaga a seleção nem o perfil salvo; o modelo fica sinalizado como indisponível.
 O provider aparece no nome do modelo; os indicadores de recursos mostram
-streaming, keywords e contexto quando disponíveis.
+streaming, keywords e contexto quando disponíveis. A busca aceita nome, ID,
+provider e recursos, combinando palavras: `google streaming`, `deepgram keywords`
+ou `batch`. Continua mostrando somente providers com chave cadastrada.
+Avisos de preço, configuração ou restrições aparecem abaixo do modelo selecionado,
+na linha do principal ou do fallback correspondente. Ao trocar o modelo ou
+resolver a condição, o aviso é atualizado.
 
 | Provider | Integração |
 | --- | --- |
@@ -305,7 +314,8 @@ No **Google**, use uma chave do [AI Studio](https://aistudio.google.com/apikey).
 essas funções são oferecidas juntas pela API. No **Grok**, a formatação de números
 exige um idioma explícito compatível; em Auto, essa preferência continua salva para uso posterior.
 
-Na **Microsoft**, cadastre a chave do recurso Azure. Para upload, informe **Batch endpoint**
+Na **Microsoft**, cadastre a chave do recurso Azure. Em **Providers → Advanced → Microsoft**,
+para upload, informe **Batch endpoint**
 (`https://<recurso>.cognitiveservices.azure.com`). Para streaming, informe **Streaming endpoint**
 (`https://<recurso>.services.ai.azure.com`) e o nome de **Deployment**.
 Os endpoints são locais e não entram na exportação de preferências. O botão **Test** da
@@ -339,6 +349,9 @@ mas o áudio pode já ter sido transmitido e cobrado. Falhas de rede, perda de
 blocos ou divergência na fronteira do atalho invalidam a resposta ao vivo. O
 Hex tenta transcrever o clipe final completo, respeitando os limites da cadeia.
 Nenhum texto parcial é colado.
+No Grok, os trechos que o provider marca como definitivos são preservados até
+a confirmação de fim da sessão, mesmo quando essa última mensagem não repete
+o texto. Uma pausa na fala não encerra o ditado nem dispara um novo envio.
 
 As opções são salvas ao mudar o controle. Campos de texto salvam ao perder o
 foco ou pressionar Return; **Esc** cancela a edição. Valores inválidos mantêm
@@ -487,7 +500,7 @@ salvamento tentam restaurar as preferências anteriores. Arquivos maiores que
 ## History e Statistics
 
 **History** registra os ditados colados com sucesso: texto, aplicativo em
-foco, duração, latência, providers, modelos, fallbacks e corte de silêncio. Os detalhes de cada chamada mostram streaming durante a gravação ou envio posterior, quantidade de keywords enviadas e resultado da tentativa. Registros antigos não inventam esses metadados.
+foco, duração, latência, providers, modelos, fallbacks e corte de silêncio. Os detalhes de cada chamada mostram streaming durante a gravação ou envio posterior, quantidade de keywords enviadas, resultado da tentativa e custo em USD quando retornado pelo provider. A soma é marcada como parcial quando alguma tentativa não informa custo ou ultrapassa o limite de detalhes retidos. Custo ausente é diferente de zero; registros antigos não recebem estimativas nem metadados retroativos.
 Tem busca, cópia e controles de retenção e limpeza. A retenção padrão é de
 **7 dias**, com limites adicionais de quantidade e tamanho. A atualização da
 versão 2.x preserva o texto e os relatórios de transcrição existentes.
@@ -520,6 +533,12 @@ uso confirmado de keywords e erros por tipo. Envios que falham sem confirmação
 são somados como keywords enviadas. Custos são apenas os valores retornados pelos
 providers: **sem informação** é diferente de custo zero. Não são aplicadas tabelas
 de preços estimadas.
+
+Quando há custos detalhados no período, o cartão **Reported cost** soma as
+tentativas, inclusive falhas com custo informado, e mostra a cobertura. Valores
+antigos sem detalhes ficam fora dessa soma; quando só há valores antigos, o
+cartão os identifica como históricos. Esses dois totais não são somados, pois
+podem representar as mesmas chamadas.
 
 Os totais antigos permanecem no resumo. Detalhes que não eram coletados, como modo
 de envio, cobertura de custo ou percentis, começam nos novos ditados; não são

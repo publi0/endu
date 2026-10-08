@@ -10,7 +10,7 @@ use gpui::{
 use crate::desktop_ui::{
     ACCENT, LINE, NEGATIVE, PANE_CONTENT_WIDTH, PickerState, SURFACE, SURFACE_HOVER,
     SURFACE_SELECTED, TEXT, TEXT_SOFT, compact_button, disclosure_button, pane_header,
-    picker_open_key, picker_popup, settings_panel, settings_row, settings_section_label,
+    picker_open_key, picker_popup, settings_panel, settings_row, settings_section_label, toggle,
 };
 use crate::hud_screen::{self, MonitorChoice};
 use crate::hud_settings::{
@@ -29,6 +29,7 @@ enum Section {
     Position,
     Size,
     Brightness,
+    VoiceReaction,
     Screen,
     Distance,
     Recording,
@@ -47,6 +48,7 @@ pub struct HudSettingsView {
     position_focus: [FocusHandle; 2],
     size_focus: [FocusHandle; 3],
     brightness_focus: [FocusHandle; 3],
+    voice_reaction_focus: FocusHandle,
     color_focus: [[FocusHandle; 6]; 2],
     distance_submit: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
@@ -100,6 +102,7 @@ impl HudSettingsView {
             position_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             size_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             brightness_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
+            voice_reaction_focus: cx.focus_handle().tab_stop(true),
             color_focus: std::array::from_fn(|_| {
                 std::array::from_fn(|_| cx.focus_handle().tab_stop(true))
             }),
@@ -162,6 +165,68 @@ impl HudSettingsView {
                 cx.notify();
             }
         }
+    }
+
+    fn toggle_voice_reaction(&mut self, cx: &mut Context<Self>) {
+        self.change(
+            Section::VoiceReaction,
+            HudPreferences {
+                voice_reactive: !self.preferences.voice_reactive,
+                ..self.preferences
+            },
+            cx,
+        );
+    }
+
+    fn voice_reaction_control(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("hud-voice-reaction")
+            .debug_selector(|| "hud-voice-reaction".into())
+            .track_focus(&self.voice_reaction_focus)
+            .w(px(crate::desktop_ui::SETTINGS_CONTROL_WIDTH))
+            .h(px(crate::desktop_ui::CONTROL_HEIGHT))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_end()
+            .rounded_sm()
+            .cursor_pointer()
+            .focus(|style| style.bg(rgb(SURFACE_HOVER)))
+            .child(toggle(if self.preferences.voice_reactive {
+                1.0
+            } else {
+                0.0
+            }))
+            .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                if matches!(event, ClickEvent::Mouse(_)) {
+                    this.voice_reaction_focus.focus(window);
+                    this.toggle_voice_reaction(cx);
+                }
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let modifiers = event.keystroke.modifiers;
+                if modifiers.platform || modifiers.control || modifiers.alt {
+                    return;
+                }
+                match event.keystroke.key.as_str() {
+                    "enter" | "space" => {
+                        if !event.is_held {
+                            this.toggle_voice_reaction(cx);
+                        }
+                        cx.stop_propagation();
+                    }
+                    "tab" => {
+                        if modifiers.shift {
+                            window.focus_prev();
+                        } else {
+                            window.focus_next();
+                        }
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }))
+            .into_any_element()
     }
 
     /// Window closing does not dispatch GPUI's next-frame blur listeners.
@@ -557,6 +622,7 @@ impl Render for HudSettingsView {
             },
             cx,
         );
+        let voice_reaction = self.voice_reaction_control(cx);
         let screen = self.screen_control(cx);
         let recording = self.palette(true, cx);
         let transcription = self.palette(false, cx);
@@ -609,6 +675,12 @@ impl Render for HudSettingsView {
                         "Brightness",
                         "Adjusts the light while keeping the current animation.",
                         brightness,
+                    ))
+                    .child(self.row(
+                        Section::VoiceReaction,
+                        "React to voice",
+                        "Pulse the recording capsule with your microphone level.",
+                        voice_reaction,
                     ))
                     .child(self.row(
                         Section::Recording,
@@ -692,6 +764,80 @@ mod tests {
         for value in ["", "-1", "161", "1.5", "99999999999"] {
             assert!(parse_distance(value).is_err());
         }
+    }
+
+    #[gpui::test]
+    fn voice_reaction_toggle_supports_mouse_keyboard_and_single_save(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let original = HudPreferences {
+            recording_color: HudColor::Green,
+            ..Default::default()
+        };
+        let (view, cx) = cx.add_window_view(|_, cx| HudSettingsView::new(original, true, cx));
+        cx.simulate_resize(gpui::size(px(760.0), px(1200.0)));
+        let changes = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let subscription = cx.update(|_, cx| {
+            let changes = changes.clone();
+            cx.subscribe(&view, move |view, event: &HudChange, cx| {
+                changes.borrow_mut().push(event.preferences);
+                view.update(cx, |view, cx| {
+                    view.set_preferences(event.preferences, None, cx)
+                });
+            })
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let control = cx.debug_bounds("hud-voice-reaction").unwrap();
+        cx.simulate_click(control.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(changes.borrow().len(), 1);
+        assert!(!changes.borrow()[0].voice_reactive);
+        assert_eq!(
+            changes.borrow()[0].recording_color,
+            original.recording_color
+        );
+
+        cx.simulate_keystrokes("enter");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+        });
+        assert_eq!(changes.borrow().len(), 2);
+        assert!(changes.borrow()[1].voice_reactive);
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: gpui::Keystroke::parse("space").unwrap(),
+            is_held: true,
+        });
+        assert_eq!(changes.borrow().len(), 2);
+        cx.simulate_keystrokes("space");
+        assert_eq!(changes.borrow().len(), 3);
+        assert!(!changes.borrow()[2].voice_reactive);
+        cx.simulate_keystrokes("tab");
+        cx.update(|window, cx| assert!(!view.read(cx).voice_reaction_focus.is_focused(window)));
+        drop(subscription);
+    }
+
+    #[gpui::test]
+    fn failed_voice_reaction_save_keeps_the_accepted_preference(cx: &mut gpui::TestAppContext) {
+        let (view, cx) =
+            cx.add_window_view(|_, cx| HudSettingsView::new(HudPreferences::default(), true, cx));
+        let subscription = cx.update(|_, cx| {
+            cx.subscribe(&view, |view, _: &HudChange, cx| {
+                view.update(cx, |view, cx| {
+                    view.set_preferences(view.preferences, Some("Could not save.".into()), cx);
+                });
+            })
+        });
+        cx.update(|window, cx| view.read(cx).voice_reaction_focus.focus(window));
+        cx.simulate_keystrokes("enter");
+        cx.update(|_, cx| {
+            assert!(view.read(cx).preferences.voice_reactive);
+            assert_eq!(
+                view.read(cx).error.as_ref().unwrap().0,
+                Section::VoiceReaction
+            );
+        });
+        drop(subscription);
     }
 
     #[gpui::test]

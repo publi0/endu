@@ -65,7 +65,7 @@ impl HistoryRetention {
 
 /// One retained successful dictation. Files from older builds keep their text
 /// and OpenRouter transcription report; removed features are ignored.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(from = "LoadedHistoryEntry")]
 pub struct HistoryEntry {
     pub id: u64,
@@ -547,6 +547,36 @@ mod tests {
     }
 
     #[test]
+    fn reported_request_costs_survive_storage_and_reload_without_changing_text() {
+        use crate::openrouter::report::ExecutionReport;
+        let path = temp_path("request-costs");
+        let mut store = HistoryStore::open(path.clone(), HistoryRetention::Week, 1_000);
+        let mut entry = draft("The retained transcript.");
+        let report = entry.transcription.as_mut().unwrap();
+        report.executions = [None, Some(0.0), Some(0.000_123)]
+            .into_iter()
+            .map(|cost_usd| ExecutionReport {
+                provider: "openrouter".into(),
+                model: "fixture/model".into(),
+                outcome: "success".into(),
+                cost_usd,
+                ..Default::default()
+            })
+            .collect();
+        let expected = entry.transcription.clone();
+        let id = store.record(entry, 1_000).unwrap().unwrap();
+        drop(store);
+        let reopened = HistoryStore::open(path, HistoryRetention::Week, 2_000);
+        let loaded = reopened.entry(id).unwrap();
+        assert_eq!(loaded.text, "The retained transcript.");
+        assert_eq!(loaded.transcription, expected);
+        assert_eq!(
+            loaded.transcription.as_ref().unwrap().cost_summary(),
+            "$0.000123 USD · partial (2 of 3 attempts)"
+        );
+    }
+
+    #[test]
     fn retention_prunes_expired_entries_on_open_and_write() {
         let path = temp_path("retention");
         let day_ms = 24 * 60 * 60 * 1_000;
@@ -858,6 +888,7 @@ mod tests {
                     recorded_ms: 9_400,
                     sent_ms: 6_100,
                 }),
+                omitted_executions: 0,
             }),
         };
 

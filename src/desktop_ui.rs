@@ -422,12 +422,14 @@ pub(crate) fn settings_copy(
                 .font_weight(FontWeight::SEMIBOLD)
                 .child(title),
         )
-        .child(
-            div()
-                .text_size(px(11.0))
-                .text_color(rgb(MUTED))
-                .child(description),
-        )
+        .when(!description.is_empty(), |copy| {
+            copy.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(MUTED))
+                    .child(description),
+            )
+        })
         .into_any_element()
 }
 

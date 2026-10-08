@@ -6,7 +6,12 @@ A slim macOS fork of HEX: tap a shortcut to lock recording or hold and release,
 trim the silence, send
 the clip to a speech provider with an ordered fallback chain, and paste the
 transcript. Settings, Microphone, Providers, Models, Post-processing, HUD, History, and Statistics are the panes.
-Keys and advanced request limits belong in Providers. Models contains the
+Keys and advanced request limits belong in Providers. Microsoft resource endpoints
+and deployment are grouped inside the collapsed Advanced section. Explain credential
+storage once above the provider list; keep source-specific warnings beside each key.
+Use one section note for shared instructions and comparison periods. Do not repeat
+selected preset values as subtitles; retain exact custom values and specific warnings.
+Models contains the
 primary/fallback chain, per-model language/streaming/options and shared keywords;
 device/channel choices, priority, input levels, capture mode, silence trimming
 and audio behavior while dictating belong in Microphone. Indicator position and
@@ -183,6 +188,18 @@ not reintroduce seams for them.
   Only explicit final acknowledgements may complete a live transcript. Google needs
   transcription completion as well as turn completion; neither interim transcription
   nor generated assistant content is dictation text. Missing completion falls back.
+  Grok can send definitive text in `transcript.partial` with `is_final=true`
+  before an empty `transcript.done`. Retain finalized segments, reconcile whole
+  utterances without duplication, and release the result only after Finish and
+  the terminal acknowledgement. Never promote an interim segment or socket close
+  to a completed transcript. Cover empty terminal text and absent confirmation
+  through the provider dispatcher so valid streaming never triggers a second upload.
+  Model search combines name, ID, provider and supported capabilities with AND
+  between terms. Exact capability words must not match a model name that lacks
+  that capability. Reuse cached keyword evidence; never probe on a search edit.
+  Model-specific prices, prerequisites and restrictions belong immediately below
+  that model's primary/fallback selector, not in a shared footer or every search
+  result. Keep them conditional and specific to the selected transport/model.
   Selectors filter on cached provider-key availability, never resolving keys or
   making requests during render. Missing keys hide choices but retain saved
   selections/profiles with an unavailable notice. Nova-2 with Auto language uses
@@ -202,6 +219,10 @@ not reintroduce seams for them.
   a final local silence check. Recovery WAV persistence happens after Finish.
   History stores actual provider/model/mode/keyword counts and attempt outcomes,
   never term/prompt contents; absent old metadata remains unknown.
+  Preserve each request's provider-reported USD cost alongside its outcome,
+  including charged failures/retries. Missing cost is not zero; never estimate
+  historical prices. Mark sums as partial when coverage is incomplete, including
+  bounded-away executions, and do not round positive small costs to zero.
 - Vocabulary is snapshotted per accepted dictation and Retry. Apply existing
   formatting first, then restore canonical name spelling; carry its initial-case
   policy into Paste Last. Unknown/ambiguous local matches remain unchanged.
@@ -249,6 +270,9 @@ not reintroduce seams for them.
   Ignore late readiness after cancellation or a newer capture. Preserve the
   red recording and blue transcription defaults, animation, and tone threshold;
   transitioning from preparation must not restart the entrance animation.
+  Voice reaction defaults on and only uses fresh meter samples during Recording.
+  It never changes captured audio; an explicit opt-out stays off across reloads
+  and preference transfers. Stale or invalid meter values must settle to rest.
   HUD choices apply only after successful saves, with old settings defaulting
   to Top/Red/Blue. Position uses visibleFrame to avoid the Dock; Paste Last's
   notice follows the same screen and edge. Palette changes affect the entire

@@ -117,6 +117,41 @@ pub(crate) fn fixture_error(status: Option<u16>, keywords_rejected: bool) -> col
     .into()
 }
 
+/// Replays the real Grok protocol offline through its capture/Finish boundary.
+#[cfg(test)]
+pub(crate) fn fixture_grok_live_result(
+    before_finish: &[Value],
+    after_finish: &[Value],
+) -> Result<LiveResult> {
+    let mut protocol = Protocol::new(Provider::Grok);
+    protocol.event(&json!({"type":"transcript.created"}))?;
+    for event in before_finish {
+        if protocol.event(event)?.is_some() {
+            return Err(fixture_error(None, false));
+        }
+    }
+    protocol.finishing = true;
+    for event in after_finish {
+        if let Some(text) = protocol.event(event)? {
+            return Ok(LiveResult {
+                text,
+                model: "grok::grok-voice-transcribe-2.0".into(),
+                keyword_count: 2,
+                latency_ms: 42,
+            });
+        }
+    }
+    Err(LiveError {
+        status: None,
+        keyword_count: 2,
+        keywords_rejected: false,
+        attempted: true,
+        error_kind: ErrorKind::InvalidResponse,
+        message: "Synthetic Grok stream ended without transcript.done.",
+    }
+    .into())
+}
+
 fn mark_attempt(mut error: color_eyre::Report, control: &SessionControl) -> color_eyre::Report {
     if let Some(error) = error.downcast_mut::<LiveError>() {
         error.attempted |= control.attempt_started.load(Ordering::Acquire);
@@ -795,6 +830,198 @@ fn finish_message(provider: Provider) -> Result<Value> {
     }
 }
 
+const MAX_GROK_FINALS: usize = 10_000;
+
+struct GrokFinal {
+    text: String,
+    utterance: bool,
+}
+
+/// Only provider-final text is retained. Timing identifies replays/corrections;
+/// equal words at different times are legitimate speech, never text duplicates.
+#[derive(Default)]
+struct GrokFinals {
+    timed: Option<bool>,
+    spans: BTreeMap<(u64, u64), GrokFinal>,
+    closed: Vec<String>,
+    open: Vec<String>,
+    bytes: usize,
+}
+impl GrokFinals {
+    fn retain(&mut self, event: &Value) -> Result<()> {
+        if event["is_final"].as_bool() != Some(true) {
+            return Ok(());
+        }
+        let text = event
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| grok_invalid("Grok returned a final without text."))?
+            .trim();
+        let utterance = match event.get("speech_final") {
+            None => false,
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| grok_invalid("Grok returned an invalid final marker."))?,
+        };
+        if text.is_empty() {
+            // An empty utterance boundary closes existing untimed chunks; the
+            // next utterance's stitched text must not replace the previous one.
+            if utterance && self.timed == Some(false) {
+                self.closed.append(&mut self.open);
+            }
+            return Ok(());
+        }
+        let span = grok_span(event)?;
+        let timed = span.is_some();
+        if self.timed.is_some_and(|previous| previous != timed) {
+            return Err(grok_invalid(
+                "Grok final events changed their timing representation.",
+            ));
+        }
+        self.timed = Some(timed);
+        if let Some(span) = span {
+            self.retain_timed(span, text, utterance)
+        } else {
+            self.retain_untimed(text, utterance)
+        }
+    }
+
+    fn retain_timed(&mut self, span: (u64, u64), text: &str, utterance: bool) -> Result<()> {
+        // A same-start final of the same class is a revision even when its
+        // duration is adjusted. It may not absorb any neighboring interval.
+        let revising = self
+            .spans
+            .iter()
+            .any(|(old_span, old)| old_span.0 == span.0 && old.utterance == utterance);
+        let mut replaced = Vec::new();
+        for (&old_span, old) in &self.spans {
+            if span.0 >= old_span.1 || old_span.0 >= span.1 {
+                continue;
+            }
+            if old.utterance && !utterance && old_span.0 <= span.0 && old_span.1 >= span.1 {
+                // A late chunk cannot overwrite its already stitched utterance.
+                return Ok(());
+            }
+            if (old_span.0 == span.0 && old.utterance == utterance)
+                || old_span == span
+                || (!revising
+                    && utterance
+                    && !old.utterance
+                    && span.0 <= old_span.0
+                    && span.1 >= old_span.1)
+            {
+                replaced.push(old_span);
+            } else {
+                return Err(grok_invalid(
+                    "Grok final transcript intervals overlap ambiguously.",
+                ));
+            }
+        }
+        let removed: usize = replaced.iter().map(|key| self.spans[key].text.len()).sum();
+        let bytes = self.bytes - removed + text.len();
+        let count = self.spans.len() - replaced.len() + 1;
+        grok_bound(bytes, count)?;
+        for key in replaced {
+            self.spans.remove(&key);
+        }
+        self.spans.insert(
+            span,
+            GrokFinal {
+                text: text.to_owned(),
+                utterance,
+            },
+        );
+        self.bytes = bytes;
+        Ok(())
+    }
+
+    fn retain_untimed(&mut self, text: &str, utterance: bool) -> Result<()> {
+        // Without timestamps the WebSocket arrival order is the only identity.
+        // Never deduplicate equal strings: the speaker may have repeated them.
+        let removed = if utterance {
+            self.open.iter().map(String::len).sum()
+        } else {
+            0
+        };
+        let bytes = self.bytes - removed + text.len();
+        let count = self.closed.len() + if utterance { 1 } else { self.open.len() + 1 };
+        grok_bound(bytes, count)?;
+        if utterance {
+            self.open.clear();
+            self.closed.push(text.to_owned());
+        } else {
+            self.open.push(text.to_owned());
+        }
+        self.bytes = bytes;
+        Ok(())
+    }
+
+    fn finish(&self, event: &Value) -> Result<String> {
+        match event.get("text") {
+            Some(Value::String(text)) if !text.trim().is_empty() => {
+                // xAI documents a nonempty done transcript as the full result.
+                // Do not guess tail/full semantics from textual prefixes.
+                return final_text(event.get("text"));
+            }
+            None | Some(Value::Null) | Some(Value::String(_)) => {}
+            Some(_) => {
+                return Err(grok_invalid(
+                    "Grok returned an invalid terminal transcript.",
+                ));
+            }
+        }
+        if self.timed == Some(true) {
+            Ok(self
+                .spans
+                .values()
+                .map(|part| part.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "))
+        } else {
+            Ok(self
+                .closed
+                .iter()
+                .chain(self.open.iter())
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(" "))
+        }
+    }
+}
+
+fn grok_invalid(message: &'static str) -> color_eyre::Report {
+    failure_kind(message, ErrorKind::InvalidResponse)
+}
+fn grok_bound(bytes: usize, parts: usize) -> Result<()> {
+    if parts > MAX_GROK_FINALS || bytes.saturating_add(parts.saturating_sub(1)) > MAX_TEXT {
+        return Err(grok_invalid(
+            "Grok final transcript exceeded its storage limit.",
+        ));
+    }
+    Ok(())
+}
+fn grok_span(event: &Value) -> Result<Option<(u64, u64)>> {
+    let (start, duration) = match (event.get("start"), event.get("duration")) {
+        (None, None) => return Ok(None),
+        (Some(start), Some(duration)) => (start.as_f64(), duration.as_f64()),
+        _ => return Err(grok_invalid("Grok final transcript timing is incomplete.")),
+    };
+    let start = start
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .ok_or_else(|| grok_invalid("Grok final transcript has invalid start timing."))?;
+    let duration = duration
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| grok_invalid("Grok final transcript has invalid duration."))?;
+    let first = (start * 16_000.0).round();
+    let last = ((start + duration) * 16_000.0).round();
+    if !last.is_finite() || last >= u64::MAX as f64 || last <= first {
+        return Err(grok_invalid(
+            "Grok final transcript timing is out of range.",
+        ));
+    }
+    Ok(Some((first as u64, last as u64)))
+}
+
 struct Protocol {
     provider: Provider,
     ready: bool,
@@ -807,6 +1034,7 @@ struct Protocol {
     commit_item: Option<String>,
     completed_items: BTreeMap<String, String>,
     segments: BTreeMap<(u64, u64), String>,
+    grok: GrokFinals,
 }
 impl Protocol {
     fn new(provider: Provider) -> Self {
@@ -822,6 +1050,7 @@ impl Protocol {
             commit_item: None,
             completed_items: BTreeMap::new(),
             segments: BTreeMap::new(),
+            grok: GrokFinals::default(),
         }
     }
     fn event(&mut self, event: &Value) -> Result<Option<String>> {
@@ -977,13 +1206,16 @@ impl Protocol {
                 if kind == "transcript.created" {
                     self.ready = true;
                 }
+                if kind == "transcript.partial" {
+                    self.grok.retain(event)?;
+                }
                 if kind == "transcript.done" {
                     if !self.finishing {
                         return Err(failure("The streaming provider committed before Finish."));
                     }
-                    // transcript.partial can itself say is_final/speech_final;
-                    // only transcript.done acknowledges audio.done for the clip.
-                    return final_text(event.get("text")).map(Some);
+                    // Finals may already have been delivered in partial events.
+                    // Only this terminal event authorizes releasing their text.
+                    return self.grok.finish(event).map(Some);
                 }
             }
             Provider::Google => {
@@ -1680,6 +1912,230 @@ mod tests {
         assert_eq!(name, "authorization");
         assert_eq!(value.to_str().unwrap(), "Bearer fixture-xai-key");
         assert!(value.is_sensitive());
+    }
+
+    #[test]
+    fn grok_final_partial_survives_an_empty_done() {
+        let before = [
+            json!({"type":"transcript.partial","is_final":true,"speech_final":true,"start":0.0,"duration":1.0,"text":"Confirmed words"}),
+        ];
+        let after = [json!({"type":"transcript.done","duration":1.0,"text":""})];
+        assert_eq!(
+            fixture_grok_live_result(&before, &after).unwrap().text,
+            "Confirmed words"
+        );
+    }
+
+    fn grok_segment(start: f64, duration: f64, text: &str, utterance: bool) -> Value {
+        json!({"type":"transcript.partial","is_final":true,"speech_final":utterance,"start":start,"duration":duration,"text":text})
+    }
+    fn empty_grok_done() -> Value {
+        json!({"type":"transcript.done","duration":20.0,"text":""})
+    }
+
+    #[test]
+    fn grok_stitched_utterance_replaces_only_its_covered_chunks() {
+        let before = [
+            grok_segment(0.0, 2.0, "First utterance.", true),
+            grok_segment(3.0, 3.0, "Old chunk", false),
+            grok_segment(6.0, 3.0, "second chunk", false),
+            grok_segment(3.0, 6.0, "Corrected second utterance.", true),
+            // A delayed already-covered chunk cannot undo the stitched result.
+            grok_segment(6.0, 3.0, "second chunk", false),
+        ];
+        assert_eq!(
+            fixture_grok_live_result(&before, &[empty_grok_done()])
+                .unwrap()
+                .text,
+            "First utterance. Corrected second utterance."
+        );
+    }
+
+    #[test]
+    fn grok_timing_orders_finals_and_preserves_legitimate_repeated_speech() {
+        let before = [
+            grok_segment(2.0, 1.0, "sim", true),
+            grok_segment(0.0, 1.0, "sim", true),
+            grok_segment(2.0, 1.0, "sim", true), // replay, not a third occurrence
+        ];
+        assert_eq!(
+            fixture_grok_live_result(&before, &[empty_grok_done()])
+                .unwrap()
+                .text,
+            "sim sim"
+        );
+        let corrected = [
+            grok_segment(0.0, 1.0, "old", false),
+            grok_segment(0.0, 1.0, "corrected", false),
+        ];
+        assert_eq!(
+            fixture_grok_live_result(&corrected, &[empty_grok_done()])
+                .unwrap()
+                .text,
+            "corrected"
+        );
+    }
+
+    #[test]
+    fn grok_same_start_same_class_revisions_can_adjust_duration_without_duplicates() {
+        for utterance in [false, true] {
+            let before = [
+                grok_segment(0.0, 1.0, "original", utterance),
+                grok_segment(0.0, 1.01, "expanded", utterance),
+                grok_segment(0.0, 0.99, "corrected", utterance),
+                grok_segment(2.0, 1.0, "next", utterance),
+            ];
+            assert_eq!(
+                fixture_grok_live_result(&before, &[empty_grok_done()])
+                    .unwrap()
+                    .text,
+                "corrected next"
+            );
+        }
+        for neighbor_utterance in [false, true] {
+            let mut finals = GrokFinals::default();
+            finals.retain(&grok_segment(0.0, 1.0, "A", true)).unwrap();
+            finals
+                .retain(&grok_segment(1.5, 1.0, "B", neighbor_utterance))
+                .unwrap();
+            assert!(
+                finals
+                    .retain(&grok_segment(0.0, 3.0, "revision crossing neighbor", true))
+                    .is_err()
+            );
+            assert_eq!(finals.finish(&empty_grok_done()).unwrap(), "A B");
+        }
+    }
+
+    #[test]
+    fn grok_interim_text_never_replaces_finals_and_done_full_is_authoritative() {
+        let before = [
+            grok_segment(0.0, 1.0, "Confirmed", true),
+            json!({"type":"transcript.partial","is_final":false,"speech_final":false,"start":0.0,"duration":2.0,"text":"PREVIEW must not paste"}),
+        ];
+        assert_eq!(
+            fixture_grok_live_result(&before, &[empty_grok_done()])
+                .unwrap()
+                .text,
+            "Confirmed"
+        );
+        let done =
+            json!({"type":"transcript.done","duration":2.0,"text":"Canonical full transcript"});
+        assert_eq!(
+            fixture_grok_live_result(&before, &[done]).unwrap().text,
+            "Canonical full transcript"
+        );
+        assert_eq!(
+            fixture_grok_live_result(&before, &[json!({"type":"transcript.done","duration":2.0})])
+                .unwrap()
+                .text,
+            "Confirmed"
+        );
+    }
+
+    #[test]
+    fn grok_untimed_finals_keep_arrival_order_without_text_deduplication() {
+        let partial = |text, utterance| json!({"type":"transcript.partial","is_final":true,"speech_final":utterance,"text":text});
+        let before = [
+            partial("wrong", false),
+            partial("chunk", false),
+            partial("sim", true),
+            partial("sim", true),
+        ];
+        assert_eq!(
+            fixture_grok_live_result(&before, &[empty_grok_done()])
+                .unwrap()
+                .text,
+            "sim sim"
+        );
+        let boundaries = [
+            partial("first", false),
+            partial("", true),
+            partial("second", false),
+            partial("corrected second", true),
+        ];
+        assert_eq!(
+            fixture_grok_live_result(&boundaries, &[empty_grok_done()])
+                .unwrap()
+                .text,
+            "first corrected second"
+        );
+    }
+
+    #[test]
+    fn grok_ambiguous_timing_fails_instead_of_silently_dropping_or_duplicating_text() {
+        for before in [
+            vec![
+                grok_segment(0.0, 3.0, "A", false),
+                grok_segment(2.0, 3.0, "B", false),
+            ],
+            vec![
+                grok_segment(0.0, 1.0, "A", true),
+                grok_segment(1.5, 1.0, "B", true),
+                grok_segment(0.0, 3.0, "colliding revision", true),
+            ],
+            vec![
+                grok_segment(0.0, 3.0, "A", false),
+                json!({"type":"transcript.partial","is_final":true,"text":"untimed"}),
+            ],
+            vec![grok_segment(-1.0, 3.0, "negative", true)],
+            vec![grok_segment(0.0, 0.0, "zero duration", true)],
+            vec![
+                json!({"type":"transcript.partial","is_final":true,"start":0.0,"text":"missing duration"}),
+            ],
+        ] {
+            assert!(fixture_grok_live_result(&before, &[empty_grok_done()]).is_err());
+        }
+        // An extending stitched final may replace covered chunks safely.
+        let valid = [
+            grok_segment(0.0, 1.0, "old chunk", false),
+            grok_segment(0.0, 2.0, "whole utterance", true),
+        ];
+        assert_eq!(
+            fixture_grok_live_result(&valid, &[empty_grok_done()])
+                .unwrap()
+                .text,
+            "whole utterance"
+        );
+    }
+
+    #[test]
+    fn grok_retained_finals_require_both_finish_and_terminal_confirmation() {
+        let final_event = grok_segment(0.0, 1.0, "must wait", true);
+        assert!(fixture_grok_live_result(std::slice::from_ref(&final_event), &[]).is_err());
+        assert!(fixture_grok_live_result(&[final_event.clone(), empty_grok_done()], &[]).is_err());
+        let mut protocol = Protocol::new(Provider::Grok);
+        assert!(protocol.event(&final_event).unwrap().is_none());
+        protocol.finishing = true;
+        assert!(protocol.closed().is_err());
+        assert_eq!(
+            protocol.event(&empty_grok_done()).unwrap(),
+            Some("must wait".into())
+        );
+    }
+
+    #[test]
+    fn grok_final_storage_is_bounded_before_done_without_losing_retained_entries() {
+        let mut finals = GrokFinals::default();
+        let text = "x".repeat(MAX_TEXT);
+        finals.retain(&grok_segment(0.0, 1.0, &text, true)).unwrap();
+        assert_eq!(finals.bytes, MAX_TEXT);
+        assert!(
+            finals
+                .retain(&grok_segment(2.0, 1.0, "overflow", true))
+                .is_err()
+        );
+        assert_eq!(finals.spans.len(), 1);
+        assert_eq!(finals.bytes, MAX_TEXT);
+        let mut finals = GrokFinals::default();
+        let event =
+            json!({"type":"transcript.partial","is_final":true,"speech_final":true,"text":"x"});
+        for _ in 0..MAX_GROK_FINALS {
+            finals.retain(&event).unwrap();
+        }
+        assert!(finals.retain(&event).is_err());
+        assert_eq!(finals.closed.len(), MAX_GROK_FINALS);
+        assert_eq!(finals.bytes, MAX_GROK_FINALS);
     }
 
     #[test]

@@ -1327,13 +1327,24 @@ mod tests {
                             assert_eq!(vocabulary.settings().terms, ["Nimbus-Files"]);
                             return crate::providers::batch::transcribe(samples, vocabulary, live);
                         }
-                        Ok(test_transcription(
-                            if context.application.as_deref() == Some("2") {
+                        let mut result =
+                            test_transcription(if context.application.as_deref() == Some("2") {
                                 "..."
                             } else {
                                 "Olá...  JOÃO."
-                            },
-                        ))
+                            });
+                        result
+                            .report
+                            .get_or_insert_with(StepReport::default)
+                            .executions
+                            .push(crate::openrouter::report::ExecutionReport {
+                                provider: "openrouter".into(),
+                                model: "fixture/model".into(),
+                                cost_usd: Some(0.000_123),
+                                outcome: "success".into(),
+                                ..Default::default()
+                            });
+                        Ok(result)
                     },
                 )
             },
@@ -1375,6 +1386,15 @@ mod tests {
             &state,
         );
         assert_eq!(history.search("").len(), 1);
+        assert_eq!(
+            history.search("")[0]
+                .transcription
+                .as_ref()
+                .unwrap()
+                .cost_summary(),
+            "$0.000123 USD",
+            "post-processing and Paste Last retain the original request cost once"
+        );
         let OutputJob::Completed { result, .. } = outputs.recv().unwrap() else {
             panic!("completed")
         };
@@ -1445,6 +1465,8 @@ mod tests {
         assert_eq!(report.executions[0].provider, "deepgram");
         assert!(report.executions[0].streaming);
         assert_eq!(report.executions[0].keyword_count, 1);
+        assert_eq!(report.executions[0].cost_usd, None);
+        assert_eq!(report.cost_summary(), "Not reported");
         let reloaded =
             crate::recording_recovery::RecordingRecovery::open(directory.join("recovery")).unwrap();
         assert_eq!(reloaded.entries("").len(), 1);

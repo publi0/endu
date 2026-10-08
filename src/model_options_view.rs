@@ -545,25 +545,6 @@ impl Render for ModelOptionsView {
         ));
         if let Some(id) = &self.selected {
             let caps = ModelRef::parse(id).capabilities();
-            if ModelRef::parse(id).provider == providers::Provider::Microsoft {
-                let streaming = caps.streaming && (!caps.batch || self.saved.streaming);
-                panel = panel.child(
-                    div()
-                        .debug_selector(|| "microsoft-connection-state".into())
-                        .when(providers::microsoft_endpoint(&self.config, streaming).is_err(), |state| {
-                            state.child(
-                                div()
-                                    .debug_selector(|| "microsoft-connection-required".into())
-                                    .px_4().py_3().text_size(px(11.0)).text_color(rgb(NEGATIVE))
-                                    .child(if streaming {
-                                        "Set a valid Microsoft streaming endpoint and deployment in Providers."
-                                    } else {
-                                        "Set a valid Microsoft batch endpoint in Providers."
-                                    }),
-                            )
-                        }),
-                );
-            }
             panel = panel.child(self.row(
                 Field::Language,
                 "Language",
@@ -571,7 +552,7 @@ impl Render for ModelOptionsView {
                 self.render_language(cx),
             ));
             if caps.streaming {
-                panel = panel.child(self.toggle_row(Field::Streaming, 0, "Streaming", if !ModelRef::parse(id).can_stream_language(&self.saved.language) { "Auto-detect uses recorded audio for Nova-2. Choose a language to stream." } else if caps.batch { "Transcribe while recording. Silence trimming applies only to recorded-audio requests." } else { "This model is realtime-only. Turning streaming off skips it in the fallback chain." }, self.saved.streaming, cx));
+                panel = panel.child(self.toggle_row(Field::Streaming, 0, "Streaming", "Transcribe while recording. Silence trimming applies only to recorded-audio requests.", self.saved.streaming, cx));
             }
             if caps.prompt {
                 panel = panel.child(
@@ -610,7 +591,7 @@ impl Render for ModelOptionsView {
                     } else {
                         "Smart formatting"
                     },
-                    formatting_description(ModelRef::parse(id).provider, &self.saved.language),
+                    formatting_description(ModelRef::parse(id).provider),
                     self.saved.smart_format,
                     cx,
                 ));
@@ -662,17 +643,9 @@ impl Render for ModelOptionsView {
     }
 }
 
-fn formatting_description(provider: providers::Provider, language: &str) -> &'static str {
+fn formatting_description(provider: providers::Provider) -> &'static str {
     if provider == providers::Provider::Google {
         "Remove fillers and repetitions and format the transcript together"
-    } else if provider == providers::Provider::Grok
-        && !providers::batch::grok_format_supported(language)
-    {
-        if language == crate::openrouter::AUTO_LANGUAGE {
-            "Auto leaves smart formatting off. Choose a supported language, such as Portuguese or English."
-        } else {
-            "Smart formatting is unavailable for this language. Choose a supported language, such as Portuguese or English."
-        }
     } else {
         "Let the provider format dates, amounts and similar expressions"
     }
@@ -760,59 +733,6 @@ mod tests {
     use gpui::Focusable;
 
     #[gpui::test]
-    fn microsoft_models_explain_missing_local_connection_fields(cx: &mut gpui::TestAppContext) {
-        let mut config = Config::default();
-        config.transcription.models = vec!["microsoft::MAI-Transcribe-2-Streaming".into()];
-        let (view, cx) = cx.add_window_view(|_, cx| ModelOptionsView::new(config, true, cx));
-        cx.run_until_parked();
-        assert!(
-            cx.debug_bounds("microsoft-connection-state")
-                .unwrap()
-                .size
-                .height
-                > px(0.0)
-        );
-        cx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                let mut config = view.config_snapshot();
-                config.microsoft.streaming_endpoint =
-                    "https://fixture.services.ai.azure.com".into();
-                view.refresh(config, cx);
-            })
-        });
-        cx.run_until_parked();
-        assert!(
-            cx.debug_bounds("microsoft-connection-state")
-                .unwrap()
-                .size
-                .height
-                > px(0.0),
-            "deployment is also required"
-        );
-        cx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                let mut config = view.config_snapshot();
-                config.microsoft.deployment = "MAI-Transcribe-2-Streaming".into();
-                view.refresh(config, cx);
-            })
-        });
-        cx.run_until_parked();
-        cx.update(|_, cx| {
-            assert!(providers::microsoft_endpoint(&view.read(cx).config_snapshot(), true).is_ok());
-        });
-        // GPUI retains removed debug selectors between frames. This persistent
-        // container is updated every frame, so zero height proves the warning
-        // no longer occupies layout rather than consulting a stale map entry.
-        assert_eq!(
-            cx.debug_bounds("microsoft-connection-state")
-                .unwrap()
-                .size
-                .height,
-            px(0.0),
-        );
-    }
-
-    #[gpui::test]
     fn provider_formatting_controls_follow_each_capability(cx: &mut gpui::TestAppContext) {
         let mut config = Config::default();
         let google = providers::native_models()
@@ -861,16 +781,6 @@ mod tests {
         ] {
             assert!(cx.debug_bounds(selector).is_some());
         }
-    }
-
-    #[test]
-    fn grok_formatting_explains_when_the_saved_toggle_cannot_apply() {
-        use providers::Provider;
-        assert!(formatting_description(Provider::Grok, "auto").contains("Auto leaves"));
-        assert!(formatting_description(Provider::Grok, "it").contains("unavailable"));
-        assert!(!formatting_description(Provider::Grok, "pt").contains("unavailable"));
-        assert!(!formatting_description(Provider::Grok, "en").contains("off"));
-        assert!(formatting_description(Provider::Google, "auto").contains("repetitions"));
     }
 
     fn fixture() -> Config {

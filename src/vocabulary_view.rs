@@ -491,7 +491,6 @@ impl Render for VocabularyView {
                 .any(|id| crate::providers::ModelRef::parse(id).provider == provider)
         };
         let routed = has_provider(crate::providers::Provider::OpenRouter);
-        let elevenlabs = has_provider(crate::providers::Provider::ElevenLabs);
         let editor = self.render_names(window, cx);
         let names = div().p_4().border_b_1().border_color(rgb(LINE))
             .child(div().text_size(px(13.0)).font_weight(gpui::FontWeight::SEMIBOLD)
@@ -506,7 +505,7 @@ impl Render for VocabularyView {
             panel = panel.child(self.rule(
                 0,
                 "Send keywords",
-                "Each request uses its model’s supported format and limits",
+                "Only terms that fit each model’s supported limits are sent",
                 self.preferences.remote_hints,
                 cx,
             ));
@@ -518,21 +517,65 @@ impl Render for VocabularyView {
                     .child(self.sample.clone())
                     .when(!result.is_empty(), |row| row.child(div().mt_2().text_size(px(12.0)).text_color(rgb(TEXT)).child(result))));
         }
-        div().child(settings_section_label(if self.remote { "KEYWORDS" } else { "LOCAL VOCABULARY" }))
+        div()
+            .child(settings_section_label(if self.remote {
+                "KEYWORDS"
+            } else {
+                "LOCAL VOCABULARY"
+            }))
             .child(panel)
-            .when(self.remote, |view| view
-                .child(div().mt_3().text_size(px(11.0)).text_color(rgb(MUTED))
-                    .child("Only terms that fit the selected model’s limits are sent."))
-                .when(elevenlabs, |view| view.child(div().mt_2().text_size(px(11.0)).text_color(rgb(MUTED))
-                    .child("ElevenLabs adds 20% for keyterms; more than 100 batch terms also introduce a 20-second minimum charge.")))
-                .when(routed, |view| view.child(div().mt_3().flex().items_center().justify_between()
-                    .child(div().text_size(px(11.0)).text_color(rgb(MUTED)).child(if self.preview { "OpenRouter support · isolated preview" } else { "OpenRouter support · cached verification" }))
-                    .child(compact_button("Recheck OpenRouter").id("vocabulary-recheck").track_focus(&self.focus[3])
-                        .on_click(cx.listener(|this, event, _, cx| { if matches!(event, gpui::ClickEvent::Mouse(_)) { this.recheck(cx); } }))
-                        .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                            if matches!(event.keystroke.key.as_str(), "enter" | "space") && !event.is_held { this.recheck(cx); cx.stop_propagation(); }
-                        })))))
-                .children(self.support.iter().filter(|(model, _)| self.models.contains(model)).map(|(model, status)| div().mt_2().text_size(px(11.0)).text_color(rgb(MUTED)).child(format!("{model} — {status}")))))
+            .when(self.remote, |view| {
+                view.when(routed, |view| {
+                    view.child(
+                        div()
+                            .mt_3()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(div().text_size(px(11.0)).text_color(rgb(MUTED)).child(
+                                if self.preview {
+                                    "OpenRouter support · isolated preview"
+                                } else {
+                                    "OpenRouter support · cached verification"
+                                },
+                            ))
+                            .child(
+                                compact_button("Recheck OpenRouter")
+                                    .id("vocabulary-recheck")
+                                    .track_focus(&self.focus[3])
+                                    .on_click(cx.listener(|this, event, _, cx| {
+                                        if matches!(event, gpui::ClickEvent::Mouse(_)) {
+                                            this.recheck(cx);
+                                        }
+                                    }))
+                                    .on_key_down(cx.listener(
+                                        |this, event: &gpui::KeyDownEvent, _, cx| {
+                                            if matches!(
+                                                event.keystroke.key.as_str(),
+                                                "enter" | "space"
+                                            ) && !event.is_held
+                                            {
+                                                this.recheck(cx);
+                                                cx.stop_propagation();
+                                            }
+                                        },
+                                    )),
+                            ),
+                    )
+                })
+                .children(
+                    self.support
+                        .iter()
+                        .filter(|(model, _)| self.models.contains(model))
+                        .map(|(model, status)| {
+                            div()
+                                .mt_2()
+                                .text_size(px(11.0))
+                                .text_color(rgb(MUTED))
+                                .child(format!("{model} — {status}"))
+                        }),
+                )
+            })
     }
 }
 

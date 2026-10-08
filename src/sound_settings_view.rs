@@ -214,8 +214,11 @@ fn nearest_level(volume: f32) -> usize {
 }
 
 fn volume_label(volume: f32) -> String {
-    if volume <= 0.0 {
-        return "Off".into();
+    if LEVELS
+        .iter()
+        .any(|level| (volume - level).abs() < f32::EPSILON)
+    {
+        return String::new();
     }
     let percent = format!("{:.2}", volume * 100.0);
     format!(
@@ -232,10 +235,10 @@ mod tests {
 
     #[test]
     fn imported_levels_are_displayed_without_rounding_to_presets() {
-        assert_eq!(volume_label(0.0), "Off");
+        assert_eq!(volume_label(0.0), "");
         assert_eq!(volume_label(0.6), "60% volume");
         assert_eq!(volume_label(0.375), "37.5% volume");
-        assert_eq!(volume_label(1.0), "100% volume");
+        assert_eq!(volume_label(1.0), "");
         assert_eq!(nearest_level(0.6), 2);
     }
 

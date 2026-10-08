@@ -614,6 +614,7 @@ impl Progress {
         streaming: bool,
         keyword_count: usize,
         success: bool,
+        cost_usd: Option<f64>,
     ) {
         self.executions.push(ExecutionReport {
             provider: model.provider.id().into(),
@@ -621,6 +622,7 @@ impl Progress {
             streaming,
             keyword_count,
             outcome: if success { "success" } else { "failed" }.into(),
+            cost_usd,
         });
     }
     fn attempt(
@@ -755,7 +757,7 @@ impl Chain<'_> {
                                 rate_retried || without_hints,
                             );
                             progress.telemetry.used_fallback |= model_index > 0;
-                            progress.execution(model, false, result.keyword_count, true);
+                            progress.execution(model, false, result.keyword_count, true, None);
                             return Ok(Success {
                                 text: result.text.trim().into(),
                                 model: id.into(),
@@ -772,7 +774,7 @@ impl Chain<'_> {
                                 None,
                                 rate_retried || without_hints,
                             );
-                            progress.execution(model, false, result.keyword_count, false);
+                            progress.execution(model, false, result.keyword_count, false, None);
                             progress.fail(
                                 id,
                                 ErrorKind::InvalidResponse,
@@ -800,6 +802,7 @@ impl Chain<'_> {
                                 false,
                                 live_error.map_or(0, |error| error.keyword_count),
                                 false,
+                                None,
                             );
                             if !without_hints
                                 && !keywords(model, self.vocabulary).is_empty()
@@ -851,7 +854,7 @@ impl Chain<'_> {
                 ) {
                     Ok(request) => request,
                     Err(_) => {
-                        progress.execution(model, false, 0, false);
+                        progress.execution(model, false, 0, false, None);
                         progress.fail(
                             id,
                             ErrorKind::Rejected,
@@ -867,16 +870,17 @@ impl Chain<'_> {
                     Ok(response) if response.is_success() => {
                         match parse(model.provider, &response.body) {
                             Ok((text, usage)) => {
+                                let cost = usage.cost_reported.then_some(usage.cost_usd);
                                 progress.attempt(
                                     model,
                                     RequestMode::Recorded,
                                     request.keyword_count,
                                     Ok(latency.as_millis() as u64),
-                                    usage.cost_reported.then_some(usage.cost_usd),
+                                    cost,
                                     rate_retried || without_hints,
                                 );
                                 progress.telemetry.used_fallback |= model_index > 0;
-                                progress.execution(model, false, request.keyword_count, true);
+                                progress.execution(model, false, request.keyword_count, true, cost);
                                 return Ok(Success {
                                     text,
                                     model: id.into(),
@@ -885,15 +889,22 @@ impl Chain<'_> {
                                 });
                             }
                             Err(_) => {
+                                let cost = response_cost(&response.body);
                                 progress.attempt(
                                     model,
                                     RequestMode::Recorded,
                                     request.keyword_count,
                                     Err(ErrorKind::InvalidResponse),
-                                    response_cost(&response.body),
+                                    cost,
                                     rate_retried || without_hints,
                                 );
-                                progress.execution(model, false, request.keyword_count, false);
+                                progress.execution(
+                                    model,
+                                    false,
+                                    request.keyword_count,
+                                    false,
+                                    cost,
+                                );
                                 progress.fail(
                                     id,
                                     ErrorKind::InvalidResponse,
@@ -903,15 +914,16 @@ impl Chain<'_> {
                         }
                     }
                     Ok(response) => {
+                        let cost = response_cost(&response.body);
                         progress.attempt(
                             model,
                             RequestMode::Recorded,
                             request.keyword_count,
                             Err(ErrorKind::from_status(response.status)),
-                            response_cost(&response.body),
+                            cost,
                             rate_retried || without_hints,
                         );
-                        progress.execution(model, false, request.keyword_count, false);
+                        progress.execution(model, false, request.keyword_count, false, cost);
                         if response.status == 401 {
                             keys::invalidate(model.provider);
                         }
@@ -972,7 +984,7 @@ impl Chain<'_> {
                                 rate_retried || without_hints,
                             );
                         }
-                        progress.execution(model, false, keyword_count, false);
+                        progress.execution(model, false, keyword_count, false, None);
                         progress.fail(
                             id,
                             kind,
@@ -1142,6 +1154,7 @@ fn transcribe_configured(
                     true,
                     result.keyword_count,
                     true,
+                    None,
                 );
                 model_latency
                     .entry(result.model.clone())
@@ -1167,6 +1180,7 @@ fn transcribe_configured(
                     true,
                     result.keyword_count,
                     false,
+                    None,
                 );
                 progress.fail(
                     &model_id,
@@ -1193,6 +1207,7 @@ fn transcribe_configured(
                     true,
                     live_error.map_or(0, |error| error.keyword_count),
                     false,
+                    None,
                 );
                 progress.fail(
                     &model_id,
@@ -1314,6 +1329,7 @@ fn transcribe_configured(
                 sent_ms,
             }),
             executions: progress.executions,
+            omitted_executions: 0,
         }),
     })
 }
@@ -1538,12 +1554,12 @@ mod tests {
                     Ok(match calls {
                         1 => response(
                             429,
-                            r#"{"error":"PRIVATE_RATE_LIMIT"}"#,
+                            r#"{"error":"PRIVATE_RATE_LIMIT","usage":{"cost":0.001}}"#,
                             Some(Duration::ZERO),
                         ),
                         2 => response(
                             422,
-                            r#"{"error":"keywords unsupported PRIVATE_HINT"}"#,
+                            r#"{"error":"keywords unsupported PRIVATE_HINT","usage":{"cost":0.002}}"#,
                             None,
                         ),
                         _ => response(
@@ -1562,6 +1578,17 @@ mod tests {
         assert_eq!(result.text, "complete");
         assert_eq!(calls, 3);
         assert_eq!(waits, 1);
+        let report = result.report.unwrap();
+        assert_eq!(report.omitted_executions, 0);
+        assert_eq!(
+            report
+                .executions
+                .iter()
+                .map(|request| request.cost_usd)
+                .collect::<Vec<_>>(),
+            [Some(0.001), Some(0.002), Some(0.0)],
+        );
+        assert!(!format!("{report:?}").contains("PRIVATE"));
         let samples = take_samples();
         assert_eq!(samples.len(), 1);
         let telemetry = samples[0].telemetry.as_ref().unwrap();
@@ -1603,7 +1630,7 @@ mod tests {
                 .iter()
                 .map(|attempt| attempt.cost_usd)
                 .collect::<Vec<_>>(),
-            [None, None, Some(0.0)]
+            [Some(0.001), Some(0.002), Some(0.0)]
         );
         assert!(
             telemetry
@@ -1631,7 +1658,7 @@ mod tests {
             },
         );
         let mut calls = 0;
-        transcribe_configured(
+        let result = transcribe_configured(
             &[0.1; 1600],
             &Snapshot::default(),
             None,
@@ -1651,6 +1678,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(calls, 2);
+        assert!(
+            result
+                .report
+                .unwrap()
+                .executions
+                .iter()
+                .all(|request| request.cost_usd.is_none())
+        );
         let samples = take_samples();
         assert_eq!(samples.len(), 1);
         let telemetry = samples[0].telemetry.as_ref().unwrap();
@@ -1733,6 +1768,75 @@ mod tests {
                     .all(|attempt| attempt.latency_ms.is_none())
             );
         }
+    }
+
+    #[test]
+    fn history_request_costs_preserve_retry_fallback_invalid_response_and_chunk_order() {
+        take_samples();
+        let config = telemetry_config(&[
+            "fixture/primary",
+            "openai::gpt-transcribe",
+            "deepgram::nova-3",
+        ]);
+        let audio = vec![0.1; 160_160];
+        assert_eq!(chunk_ranges(&audio, 160_000).len(), 2);
+        let mut calls = 0;
+        let result = transcribe_configured(
+            &audio, &Snapshot::default(), None, &config,
+            &mut |_, _| {
+                calls += 1;
+                (Ok(match calls {
+                    1 => response(429, r#"{"usage":{"cost":0.0001}}"#, Some(Duration::ZERO)),
+                    2 => response(503, r#"{"error":"PRIVATE_BODY","usage":{"cost":0.0002}}"#, None),
+                    3 => response(200, r#"{"text":" ","usage":{"cost":0.0003}}"#, None),
+                    4 => response(200, r#"{"results":{"channels":[{"alternatives":[{"transcript":"first"}]}]}}"#, None),
+                    5 => response(200, r#"{"text":"second","usage":{"cost":0.004}}"#, None),
+                    _ => panic!("unexpected request"),
+                }),Duration::from_millis(25))
+            },
+            &mut |_,_,_,_| panic!("no websocket"),
+            &mut |wait| assert_eq!(wait,Duration::ZERO),
+        ).unwrap();
+        assert_eq!(result.text, "first second");
+        assert_eq!(calls, 5);
+        let report = result.report.unwrap();
+        assert_eq!(report.omitted_executions, 0);
+        assert_eq!(
+            report
+                .executions
+                .iter()
+                .map(|request| (
+                    request.provider.as_str(),
+                    request.model.as_str(),
+                    request.outcome.as_str(),
+                    request.cost_usd
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("openrouter", "fixture/primary", "failed", Some(0.0001)),
+                ("openrouter", "fixture/primary", "failed", Some(0.0002)),
+                ("openai", "gpt-transcribe", "failed", Some(0.0003)),
+                ("deepgram", "nova-3", "success", None),
+                ("openrouter", "fixture/primary", "success", Some(0.004)),
+            ]
+        );
+        let samples = take_samples();
+        assert_eq!(samples.len(), 1);
+        let telemetry = samples[0].telemetry.as_ref().unwrap();
+        assert_eq!(
+            report
+                .executions
+                .iter()
+                .map(|request| request.cost_usd)
+                .collect::<Vec<_>>(),
+            telemetry
+                .attempts
+                .iter()
+                .map(|request| request.cost_usd)
+                .collect::<Vec<_>>()
+        );
+        assert!(telemetry.used_fallback && telemetry.retried);
+        assert!(!format!("{report:?}").contains("PRIVATE_BODY"));
     }
 
     #[test]
@@ -2753,6 +2857,12 @@ mod tests {
                 .all(|execution| !execution.streaming)
         );
         assert!(
+            progress
+                .executions
+                .iter()
+                .all(|execution| execution.cost_usd.is_none())
+        );
+        assert!(
             vocabulary.settings().remote_hints,
             "shared snapshot must not be changed by retry"
         );
@@ -2813,6 +2923,7 @@ mod tests {
         assert_eq!(report.latency_ms, 425);
         assert!(report.executions[0].streaming);
         assert_eq!(report.executions[0].keyword_count, 2);
+        assert_eq!(report.executions[0].cost_usd, None);
         let samples = take_samples();
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].words, Some(2));
@@ -2827,6 +2938,96 @@ mod tests {
             samples[0].model_latency["openai::gpt-live-transcribe"].total_ms,
             425
         );
+    }
+
+    #[test]
+    fn grok_finalized_segments_with_empty_done_remain_one_live_request() {
+        take_samples();
+        let config = telemetry_config(&["grok::grok-voice-transcribe-2.0"]);
+        let live_result = streaming::fixture_grok_live_result(
+            &[
+                json!({"type":"transcript.partial","is_final":true,"speech_final":false,"start":0.0,"duration":0.4,"text":"Nome"}),
+                json!({"type":"transcript.partial","is_final":true,"speech_final":true,"start":0.0,"duration":0.8,"text":"Nome correto"}),
+            ],
+            &[json!({"type":"transcript.done","duration":1.0,"text":""})],
+        );
+        let live = streaming::PendingLive::fixture(
+            config.clone(),
+            Snapshot::default(),
+            live_result,
+            16_000,
+        );
+        let result = transcribe_configured(
+            &[0.1; 16_000],
+            &Snapshot::default(),
+            Some(live),
+            &config,
+            &mut |_, _| panic!("valid Grok streaming must not resend the audio over HTTP"),
+            &mut |_, _, _, _| panic!("must not start another WebSocket"),
+            &mut |_| panic!("must not retry"),
+        )
+        .unwrap();
+        assert_eq!(result.text, "Nome correto");
+        let report = result.report.unwrap();
+        assert!(report.failed.is_empty());
+        assert_eq!(report.executions.len(), 1);
+        assert!(report.executions[0].streaming);
+        assert_eq!(report.executions[0].provider, "grok");
+        assert_eq!(report.executions[0].outcome, "success");
+        assert_eq!(report.executions[0].keyword_count, 2);
+        assert_eq!(report.executions[0].cost_usd, None);
+        let samples = take_samples();
+        assert_eq!(samples.len(), 1);
+        let telemetry = samples[0].telemetry.as_ref().unwrap();
+        assert_eq!(telemetry.attempts.len(), 1);
+        assert_eq!(telemetry.attempts[0].mode, RequestMode::Live);
+        assert!(telemetry.attempts[0].success);
+        assert!(!telemetry.live_recovered && !telemetry.used_fallback && !telemetry.retried);
+    }
+
+    #[test]
+    fn grok_segments_without_terminal_confirmation_still_recover_from_recording() {
+        take_samples();
+        let config = telemetry_config(&["grok::grok-voice-transcribe-2.0"]);
+        let incomplete = streaming::fixture_grok_live_result(
+            &[
+                json!({"type":"transcript.partial","is_final":true,"speech_final":true,"start":0.0,"duration":0.8,"text":"Incomplete utterance"}),
+            ],
+            &[],
+        );
+        assert!(incomplete.is_err());
+        let live = streaming::PendingLive::fixture(
+            config.clone(),
+            Snapshot::default(),
+            incomplete,
+            16_000,
+        );
+        let mut calls = 0;
+        let result = transcribe_configured(
+            &[0.1; 16_000],
+            &Snapshot::default(),
+            Some(live),
+            &config,
+            &mut |request, _| {
+                calls += 1;
+                assert_eq!(request.provider, Provider::Grok);
+                (
+                    Ok(response(200, r#"{"text":"Complete recording"}"#, None)),
+                    Duration::from_millis(30),
+                )
+            },
+            &mut |_, _, _, _| panic!("Grok supports HTTP recovery"),
+            &mut |_| panic!("no retry"),
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(result.text, "Complete recording");
+        let report = result.report.unwrap();
+        assert_eq!(report.executions.len(), 2);
+        assert!(report.executions[0].streaming);
+        assert_eq!(report.executions[0].outcome, "failed");
+        assert!(!report.executions[1].streaming);
+        assert_eq!(report.executions[1].outcome, "success");
     }
 
     #[test]

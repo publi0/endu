@@ -1,7 +1,8 @@
 //! Provider credentials and global request limits.
 
 use crate::desktop_ui::{
-    LINE, NEGATIVE, SETTINGS_CONTROL_WIDTH, settings_panel, settings_row, settings_section_label,
+    LINE, MUTED, NEGATIVE, SETTINGS_CONTROL_WIDTH, settings_panel, settings_row,
+    settings_section_label,
 };
 use crate::openrouter::{
     Config, KeyStatus,
@@ -359,7 +360,25 @@ impl ProvidersView {
 }
 
 impl Render for ProvidersView {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let microsoft = div()
+            .mt_4()
+            .child(settings_section_label("MICROSOFT"))
+            .child(settings_panel().child(self.render_microsoft()))
+            .into_any_element();
+        let microsoft_errors = self
+            .microsoft_errors
+            .iter()
+            .zip([
+                "Microsoft batch endpoint",
+                "Microsoft streaming endpoint",
+                "Microsoft deployment",
+            ])
+            .filter_map(|(error, field)| error.as_ref().map(|error| format!("{field}: {error}")))
+            .collect();
+        let advanced = self.global.update(cx, |view, cx| {
+            view.render_advanced(Some(microsoft), microsoft_errors, cx)
+        });
         div()
             .debug_selector(|| "providers-credentials-and-limits".into())
             .children(self.error.clone().map(|error| {
@@ -372,27 +391,136 @@ impl Render for ProvidersView {
             }))
             .child(settings_section_label("PROVIDER KEYS"))
             .child(
-                settings_panel().children(self.keys.iter().enumerate().map(
-                    |(index, (provider, key))| {
-                        div()
-                            .debug_selector(move || format!("provider-key-{index}"))
-                            .child(key.clone())
-                            .when(*provider == Provider::Microsoft, |row| {
-                                row.child(self.render_microsoft())
-                            })
-                            .when(index + 1 < self.keys.len(), |row| {
-                                row.border_b_1().border_color(rgb(LINE))
-                            })
-                    },
-                )),
+                div()
+                    .px_1()
+                    .mb_3()
+                    .text_size(px(11.0))
+                    .text_color(rgb(MUTED))
+                    .child("Keys added here are stored in the macOS Keychain."),
             )
-            .child(self.global.clone())
+            .child(settings_panel().children(self.keys.iter().enumerate().map(
+                |(index, (_, key))| {
+                    div()
+                        .debug_selector(move || format!("provider-key-{index}"))
+                        .child(key.clone())
+                        .when(index + 1 < self.keys.len(), |row| {
+                            row.border_b_1().border_color(rgb(LINE))
+                        })
+                },
+            )))
+            .child(
+                div()
+                    .debug_selector(|| "providers-advanced".into())
+                    .child(advanced),
+            )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct KeyboardFixture(Entity<ProvidersView>);
+    impl Render for KeyboardFixture {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            // AppWindow provides this same Tab traversal around Providers.
+            div()
+                .on_key_down(|event: &gpui::KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "tab" {
+                        if event.keystroke.modifiers.shift {
+                            window.focus_prev();
+                        } else {
+                            window.focus_next();
+                        }
+                        cx.stop_propagation();
+                    }
+                })
+                .child(self.0.clone())
+        }
+    }
+
+    #[gpui::test]
+    fn advanced_keyboard_access_and_collapsed_errors_preserve_microsoft_drafts(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::Focusable;
+        cx.update(|cx| cx.bind_keys(crate::text_input::key_bindings()));
+        let (fixture, cx) =
+            cx.add_window_view(|_, cx| KeyboardFixture(cx.new(|cx| ProvidersView::new(true, cx))));
+        let view = cx.update(|_, cx| fixture.read(cx).0.clone());
+        cx.simulate_resize(gpui::size(px(760.0), px(2400.0)));
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let collapsed = cx.debug_bounds("providers-advanced").unwrap();
+        // All fixture keys are saved, so Advanced is the first Tab stop.
+        cx.update(|window, _| {
+            window.blur();
+            window.focus_next();
+        });
+        cx.simulate_keystrokes("enter");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("providers-advanced").unwrap().size.height > collapsed.size.height);
+        cx.simulate_keystrokes("tab tab tab tab tab tab");
+        cx.update(|window, cx| {
+            assert!(
+                view.read(cx).microsoft[0]
+                    .focus_handle(cx)
+                    .is_focused(window)
+            )
+        });
+        let saved = "https://keyboard.cognitiveservices.azure.com";
+        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_input(saved);
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_eq!(view.read(cx).config.microsoft.endpoint, saved));
+
+        cx.simulate_keystrokes("shift-tab cmd-a");
+        cx.simulate_input("http://invalid.cognitiveservices.azure.com");
+        let header = cx.debug_bounds("openrouter-advanced").unwrap();
+        cx.simulate_click(header.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("advanced-collapsed-feedback")
+                .unwrap()
+                .size
+                .height
+                > px(0.0)
+        );
+        cx.update(|window, cx| {
+            let view = view.read(cx);
+            assert!(!view.microsoft[0].focus_handle(cx).is_focused(window));
+            assert_eq!(view.config.microsoft.endpoint, saved);
+            assert_eq!(
+                view.microsoft[0].read(cx).text(),
+                "http://invalid.cognitiveservices.azure.com"
+            );
+            assert!(view.microsoft_errors[0].is_some());
+        });
+        // Reopen through the retained header focus. The error moves back to
+        // the field instead of appearing twice, and the invalid draft remains.
+        cx.simulate_keystrokes("space");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("space").unwrap(),
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.debug_bounds("advanced-collapsed-feedback")
+                .unwrap()
+                .size
+                .height,
+            px(0.0)
+        );
+        cx.update(|_, cx| {
+            assert_eq!(
+                view.read(cx).microsoft[0].read(cx).text(),
+                "http://invalid.cognitiveservices.azure.com"
+            )
+        });
+    }
 
     #[gpui::test]
     fn preview_keys_are_isolated_and_status_sync_targets_one_provider(
@@ -488,6 +616,9 @@ mod tests {
         });
         cx.update(|window, _| window.activate_window());
         cx.run_until_parked();
+        let header = cx.debug_bounds("openrouter-advanced").unwrap();
+        cx.simulate_click(header.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
         cx.update(|window, cx| view.read(cx).microsoft[0].focus_handle(cx).focus(window));
         cx.simulate_keystrokes("cmd-a");
         cx.simulate_input("https://edited.cognitiveservices.azure.com");
@@ -556,6 +687,26 @@ mod tests {
                 "MAI-Custom-Deployment"
             )
         });
+        // Collapsing Advanced is also an edit boundary: do not lose a draft
+        // or leave a hidden input focused.
+        cx.update(|window, cx| view.read(cx).microsoft[2].focus_handle(cx).focus(window));
+        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_input("Saved-On-Collapse");
+        let header = cx.debug_bounds("openrouter-advanced").unwrap();
+        cx.simulate_click(header.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert_eq!(
+                view.read(cx).config.microsoft.deployment,
+                "Saved-On-Collapse"
+            );
+            assert!(
+                !view.read(cx).microsoft[2]
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+        });
+        assert_eq!(*changes.borrow(), 3);
     }
 
     #[gpui::test]
@@ -601,13 +752,27 @@ mod tests {
     }
 
     #[gpui::test]
-    fn seven_provider_rows_and_microsoft_controls_render_with_standard_metrics(
+    fn microsoft_controls_are_collapsed_inside_advanced_with_standard_metrics(
         cx: &mut gpui::TestAppContext,
     ) {
         let (view, cx) = cx.add_window_view(|_, cx| ProvidersView::new(true, cx));
         cx.simulate_resize(gpui::size(px(760.0), px(2400.0)));
         cx.run_until_parked();
         cx.update(|_, cx| assert_eq!(view.read(cx).keys.len(), 7));
+        assert!(cx.debug_bounds("microsoft-connection-0").is_none());
+        let collapsed = cx.debug_bounds("providers-advanced").unwrap();
+        let header = cx.debug_bounds("openrouter-advanced").unwrap();
+        assert_eq!(
+            cx.debug_bounds("advanced-collapsed-feedback")
+                .unwrap()
+                .size
+                .height,
+            px(0.0),
+        );
+        cx.simulate_click(header.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        let expanded = cx.debug_bounds("providers-advanced").unwrap();
+        assert!(expanded.size.height > collapsed.size.height);
         for selector in [
             "provider-key-0",
             "provider-key-1",
@@ -627,7 +792,27 @@ mod tests {
             let bounds = cx.debug_bounds(selector).unwrap();
             assert_eq!(bounds.size.width, px(SETTINGS_CONTROL_WIDTH));
             assert_eq!(bounds.size.height, px(crate::desktop_ui::CONTROL_HEIGHT));
+            assert!(bounds.top() >= expanded.top() && bounds.bottom() <= expanded.bottom());
+            assert!(bounds.top() >= cx.debug_bounds("provider-key-6").unwrap().bottom());
         }
+        cx.simulate_click(header.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            cx.debug_bounds("openrouter-advanced").unwrap().size.height,
+            header.size.height,
+            "Focusing the disclosure must not replace its typography",
+        );
+        assert_eq!(
+            cx.debug_bounds("advanced-collapsed-feedback")
+                .unwrap()
+                .size
+                .height,
+            px(0.0),
+        );
+        assert_eq!(
+            cx.debug_bounds("providers-advanced").unwrap().size.height,
+            collapsed.size.height
+        );
     }
 
     #[gpui::test]

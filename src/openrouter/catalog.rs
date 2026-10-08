@@ -20,15 +20,85 @@ pub struct CatalogModel {
 }
 
 impl CatalogModel {
-    pub fn matches(&self, query: &str) -> bool {
-        let query = query.trim().to_lowercase();
-        query.is_empty()
-            || query.split_whitespace().all(|word| {
-                self.id.to_lowercase().contains(word)
-                    || self.name.to_lowercase().contains(word)
-                    || self.provider.to_lowercase().contains(word)
-            })
+    pub fn matches(&self, query: &str, verified_keywords: bool) -> bool {
+        use crate::providers::{ModelRef, Provider};
+        let model = ModelRef::parse(&self.id);
+        let capabilities = model.capabilities();
+        let query = search_text(query);
+        let text = search_text(&format!(
+            "{} {} {} {} {}",
+            self.id,
+            self.name,
+            self.provider,
+            model.provider.label(),
+            if model.provider == Provider::Microsoft {
+                "Azure"
+            } else {
+                ""
+            },
+        ));
+        let badges = capability_badges(&self.id, verified_keywords);
+        query.split_whitespace().all(|word| {
+            // Whole capability terms are filters, even when an unsupported
+            // route's display name happens to contain that word (e.g. Live).
+            if let Some(supported) = capability_term(word, capabilities, verified_keywords) {
+                return supported;
+            }
+            text.contains(word)
+                || badges
+                    .iter()
+                    .any(|(_, label)| search_text(label).starts_with(word))
+                || [
+                    ("punctuation", capabilities.punctuate),
+                    ("numerals", capabilities.numerals),
+                    ("temperature", capabilities.temperature),
+                ]
+                .iter()
+                .any(|(label, supported)| *supported && label.starts_with(word))
+        })
     }
+}
+
+fn capability_term(
+    word: &str,
+    capabilities: crate::providers::Capabilities,
+    verified_keywords: bool,
+) -> Option<bool> {
+    Some(match word {
+        "streaming" | "live" | "realtime" | "stream" | "tempo-real" | "vivo" => {
+            capabilities.streaming
+        }
+        "batch" | "file" | "upload" | "arquivo" | "arquivos" | "gravado" | "gravacao" => {
+            capabilities.batch
+        }
+        "keywords" | "keyword" | "keyterms" | "keyterm" | "vocabulary" | "vocabulario"
+        | "palavras-chave" | "termos" => capabilities.keywords || verified_keywords,
+        "context" | "prompt" | "contexto" | "instrucoes" => capabilities.prompt,
+        "format" | "formatting" | "formato" | "formatacao" => capabilities.formatting,
+        "clean" | "cleanup" | "limpeza" | "limpar" => capabilities.no_verbatim,
+        "punctuation" | "punctuate" | "pontuacao" => capabilities.punctuate,
+        "numerals" | "numbers" | "digits" | "numeros" | "digitos" => capabilities.numerals,
+        "temperature" | "temperatura" => capabilities.temperature,
+        _ => return None,
+    })
+}
+
+fn search_text(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .filter_map(|character| {
+            Some(match character {
+                'á' | 'à' | 'â' | 'ã' | 'ä' => 'a',
+                'é' | 'è' | 'ê' | 'ë' => 'e',
+                'í' | 'ì' | 'î' | 'ï' => 'i',
+                'ó' | 'ò' | 'ô' | 'õ' | 'ö' => 'o',
+                'ú' | 'ù' | 'û' | 'ü' => 'u',
+                'ç' => 'c',
+                '\u{0300}'..='\u{036f}' => return None,
+                character => character,
+            })
+        })
+        .collect()
 }
 
 /// Native choices remain available even when the OpenRouter catalog is offline.
@@ -190,6 +260,130 @@ pub fn label(id: &str, catalog: &[CatalogModel]) -> String {
 mod tests {
     use super::*;
 
+    fn native(id: &str) -> CatalogModel {
+        native_catalog()
+            .into_iter()
+            .find(|model| model.id == id)
+            .unwrap()
+    }
+
+    #[test]
+    fn search_combines_provider_and_supported_capabilities_with_and() {
+        let google_live = native("google::gemini-3.5-transcribe-live");
+        let google_file = native("google::gemini-3.5-transcribe");
+        assert!(google_live.matches(" \tGOOGLE \n STREAMING  ", false));
+        assert!(google_live.matches("google live", false));
+        assert!(google_live.matches("google realtime", false));
+        assert!(google_live.matches("google stream", false));
+        assert!(!google_file.matches("google streaming", false));
+        assert!(google_file.matches("google batch upload file", false));
+        assert!(!google_live.matches("google file", false));
+        assert!(google_live.matches("goo stre keyw", false));
+        assert!(google_live.matches("\t \n", false));
+        assert!(native("deepgram::nova-3").matches("deepgram streaming keywords", false));
+        assert!(!native("deepgram::nova-2").matches("deepgram streaming keywords", false));
+        assert!(!google_live.matches("google streaming deepgram", false));
+    }
+
+    #[test]
+    fn provider_aliases_and_portuguese_capabilities_are_searchable() {
+        assert!(native("grok::grok-voice-transcribe-2.0").matches("xAI clean format", false));
+        assert!(native("grok::grok-voice-transcribe-2.0").matches("xa", false));
+        let mai = native("microsoft::MAI-Transcribe-2");
+        assert!(mai.matches("AZURE ARQUIVO LIMPEZA VOCABULÁRIO", false));
+        assert!(mai.matches("azu vocabulario", false));
+        assert!(mai.matches("azure vocabulA\u{0301}rio", false));
+        assert!(native("microsoft::MAI-Transcribe-2-Streaming").matches("azure streaming", false));
+        assert!(!mai.matches("azure streaming", false));
+        assert!(native("deepgram::nova-3").matches("formatação pontuação números", false));
+        assert!(native("openai::gpt-transcribe").matches("contexto temperatura", false));
+    }
+
+    #[test]
+    fn whole_capability_terms_do_not_match_unsupported_words_in_remote_names() {
+        let model = CatalogModel {
+            id: "acme/live-realtime-streaming-keywords-context-clean-formatting".into(),
+            name: "Live Streaming Keywords Context Clean Formatting Punctuation Numerals".into(),
+            provider: "OpenRouter · Acme".into(),
+        };
+        for word in [
+            "live",
+            "stream",
+            "streaming",
+            "realtime",
+            "keywords",
+            "keyterms",
+            "vocabulary",
+            "context",
+            "prompt",
+            "clean",
+            "cleanup",
+            "format",
+            "formatting",
+            "punctuation",
+            "numerals",
+        ] {
+            assert!(!model.matches(word, false), "{word} is a support filter");
+        }
+        assert!(
+            model.matches("acme/live", false),
+            "model IDs still support substrings"
+        );
+        assert!(model.matches("openrouter file temperature", false));
+        assert!(model.matches("openrouter keywords", true));
+        assert!(!model.matches("openrouter keywords streaming", true));
+        assert!(model.matches("keyw", true));
+        assert!(
+            !native("google::gemini-3.5-transcribe")
+                .matches("context temperature punctuation numerals clean", false)
+        );
+    }
+
+    #[test]
+    fn verified_keyword_evidence_and_badge_prefixes_share_the_same_contract() {
+        let model = CatalogModel {
+            id: "acme/transcribe".into(),
+            name: "Acme Transcribe".into(),
+            provider: "OpenRouter".into(),
+        };
+        assert!(!model.matches("keywords", false));
+        assert!(!model.matches("keyw", false));
+        assert!(model.matches("keywords", true));
+        assert!(model.matches("keyw", true));
+        assert_eq!(
+            model.matches("keywords", true),
+            capability_badges(&model.id, true)
+                .iter()
+                .any(|(_, label)| *label == "Keywords")
+        );
+        assert!(native("openai::gpt-transcribe").matches("cont temp", false));
+        assert!(native("deepgram::nova-3").matches("for punct num", false));
+        assert!(native("elevenlabs::scribe_v2").matches("cle", false));
+    }
+
+    #[test]
+    fn disabled_profile_options_do_not_remove_model_capabilities_from_search() {
+        use crate::providers::{ModelOptions, options};
+        let id = "deepgram::nova-3";
+        let mut config = Config::default();
+        config.transcription.model_options.insert(
+            id.into(),
+            ModelOptions {
+                streaming: false,
+                smart_format: false,
+                punctuate: false,
+                numerals: false,
+                ..Default::default()
+            },
+        );
+        let saved = options(&config, id);
+        assert!(!saved.streaming && !saved.smart_format && !saved.punctuate && !saved.numerals);
+        assert!(native(id).matches(
+            "deepgram streaming keywords formatting punctuation numerals",
+            false
+        ));
+    }
+
     #[test]
     fn catalog_entries_split_provider_and_sort() {
         let models = parse(
@@ -231,10 +425,10 @@ mod tests {
             name: "Whisper Large V3 Turbo".into(),
             provider: "OpenRouter · OpenAI".into(),
         };
-        assert!(model.matches(""));
-        assert!(model.matches("openai turbo"));
-        assert!(model.matches("WHISPER"));
-        assert!(!model.matches("whisper nova"));
+        assert!(model.matches("", false));
+        assert!(model.matches("openai turbo", false));
+        assert!(model.matches("WHISPER", false));
+        assert!(!model.matches("whisper nova", false));
     }
 
     #[test]

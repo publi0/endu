@@ -122,6 +122,8 @@ struct HudTransfer {
     transcription_color: HudColor,
     size: HudSize,
     brightness: HudBrightness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    voice_reactive: Option<bool>,
     screen: HudScreen,
     fixed_monitor: Option<MonitorId>,
     // Do not use HudPreferences's deserializer: imports reject, rather than clamp.
@@ -515,6 +517,7 @@ impl AppPreferences {
                 transcription_color: hud.transcription_color,
                 size: hud.size,
                 brightness: hud.brightness,
+                voice_reactive: Some(hud.voice_reactive),
                 screen: hud.screen,
                 fixed_monitor: hud.fixed_monitor,
                 edge_distance: hud.edge_distance,
@@ -583,6 +586,7 @@ impl AppPreferences {
             transcription_color: hud.transcription_color,
             size: hud.size,
             brightness: hud.brightness,
+            voice_reactive: hud.voice_reactive.unwrap_or(current.hud.voice_reactive),
             screen: hud.screen,
             fixed_monitor: hud.fixed_monitor,
             edge_distance: hud.edge_distance,
@@ -853,6 +857,33 @@ mod tests {
             assert_eq!(
                 export_bytes(&imported.settings, &imported.config).unwrap(),
                 bytes
+            );
+        }
+    }
+
+    #[test]
+    fn voice_reaction_exports_both_choices_and_legacy_imports_preserve_local_choice() {
+        for voice_reactive in [false, true] {
+            let mut source = settings();
+            source.hud.voice_reactive = voice_reactive;
+            let bytes = export_bytes(&source, &Config::default()).unwrap();
+            let mut local = settings();
+            local.hud.voice_reactive = !voice_reactive;
+            let imported = decode(&bytes).unwrap();
+            assert_eq!(
+                imported.app.apply_to(&local).hud.voice_reactive,
+                voice_reactive
+            );
+
+            let mut legacy: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            legacy["app"]["hud"]
+                .as_object_mut()
+                .unwrap()
+                .remove("voice_reactive");
+            let imported = decode(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+            assert_eq!(
+                imported.app.apply_to(&local).hud.voice_reactive,
+                local.hud.voice_reactive
             );
         }
     }

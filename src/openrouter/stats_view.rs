@@ -604,12 +604,7 @@ impl StatisticsView {
         let totals = &self.data.totals;
         let completed = totals.dictations.saturating_add(totals.failed_dictations);
         let previous = self.data.previous.as_ref();
-        let measured = stats_dashboard::combined_requests(totals, Mode::All, None);
-        let cost = if measured.cost_reports > 0 || totals.cost_usd > 0.0 {
-            Some(totals.cost_usd)
-        } else {
-            None
-        };
+        let (cost, cost_detail) = overview_cost(totals);
         let cards = div()
             .flex()
             .gap_3()
@@ -661,20 +656,17 @@ impl StatisticsView {
             .child(small_card(
                 "Reported cost",
                 cost.map_or_else(|| "—".into(), format_cost),
-                if measured.cost_reports > 0 {
-                    format!(
-                        "{} detailed cost reports",
-                        format_count(measured.cost_reports)
-                    )
-                } else if cost.is_some() {
-                    "Historical reported amounts".into()
-                } else {
-                    "No cost reports available".into()
-                },
+                cost_detail,
             ));
         div().flex_none().flex().flex_col().gap_3()
             .child(div().text_size(px(11.0)).text_color(rgb(MUTED))
                 .child(if self.period == Period::AllTime { "OVERVIEW · all retained days (up to 400)" } else { "OVERVIEW · selected period" }))
+            .children(match self.period {
+                Period::Today => Some(note("Changes compared with yesterday.")),
+                Period::Week => Some(note("Changes compared with the previous 7 days.")),
+                Period::Month => Some(note("Changes compared with the previous 30 days.")),
+                Period::AllTime => None,
+            })
             .child(cards).child(secondary)
             .child(note("Words are raw transcription output. Avg wait covers transcription, including failed dictations; queue and paste time are excluded. Audio is clip duration, not total upload traffic."))
             .child(compact_panel().flex_none().px_4().py_3()
@@ -807,9 +799,12 @@ impl StatisticsView {
             .child(div().px_4().py_3().child(note("Live sessions start during recording; recorded attempts start after it. Avg and ~P95 cover successful measured attempts: live is release to final, recorded is request to response. ~P95 is approximate and needs 20 measurements.")))
             .into_any_element()
     }
-    fn render_details(&self) -> AnyElement {
+    fn render_details(&self) -> Option<AnyElement> {
         let combined =
             stats_dashboard::combined_requests(&self.data.totals, self.mode, self.provider);
+        if combined.attempts == 0 {
+            return None;
+        }
         let mut kinds: Vec<_> = combined.errors.iter().collect();
         kinds.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
         let mut transport = compact_panel()
@@ -886,21 +881,19 @@ impl StatisticsView {
                     )
             }))
             .when(kinds.is_empty(), |panel| {
-                panel.child(empty_message(if combined.attempts == 0 {
-                    "No attempts match these filters."
-                } else {
-                    "No recorded attempt errors."
-                }))
+                panel.child(empty_message("No recorded attempt errors."))
             });
-        div()
-            .flex_none()
-            .flex()
-            .flex_wrap()
-            .items_start()
-            .gap_3()
-            .child(transport)
-            .child(errors)
-            .into_any_element()
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .flex_wrap()
+                .items_start()
+                .gap_3()
+                .child(transport)
+                .child(errors)
+                .into_any_element(),
+        )
     }
 }
 impl Render for StatisticsView {
@@ -925,7 +918,7 @@ impl Render for StatisticsView {
             ))
         } else {
             pane_content().gap_4().child(self.render_overview()).child(self.render_chart(cx))
-                .child(self.render_comparison(cx)).child(self.render_details())
+                .child(self.render_comparison(cx)).children(self.render_details())
                 .child(note("Daily aggregates only: no text or audio. Request details cover newly measured attempts; historical counts cannot reconstruct transport, retries or percentiles. Costs are provider-reported amounts, not a complete bill."))
         };
         div()
@@ -1023,7 +1016,7 @@ fn card(title: &'static str, value: String, detail: String) -> Div {
                 .text_color(rgb(TEXT))
                 .child(value),
         )
-        .child(note(detail))
+        .when(!detail.is_empty(), |card| card.child(note(detail)))
 }
 fn small_card(title: &'static str, value: String, detail: String) -> Div {
     div()
@@ -1086,18 +1079,18 @@ fn coverage(totals: &Totals) -> String {
 }
 fn trend(current: Option<u64>, previous: Option<u64>) -> String {
     match (current, previous) {
-        (_, None) => "No previous-period comparison".into(),
-        (None, _) => "No measurement this period".into(),
-        (Some(0), Some(0)) => "No change vs previous period".into(),
+        (_, None) => String::new(),
+        (None, _) => String::new(),
+        (Some(0), Some(0)) => "No change".into(),
         (Some(_), Some(0)) => "No prior baseline".into(),
         (Some(current), Some(previous)) => {
             let delta = (current as f64 / previous as f64 - 1.0) * 100.0;
             if delta.abs() < 0.5 {
-                "No change vs previous period".into()
+                "No change".into()
             } else if delta > 9_999.0 {
-                ">9,999% vs previous period".into()
+                ">9,999%".into()
             } else {
-                format!("{delta:+.0}% vs previous period")
+                format!("{delta:+.0}%")
             }
         }
     }
@@ -1126,6 +1119,38 @@ fn reported_cost(metrics: &RequestTotals) -> String {
     } else {
         format_cost(metrics.reported_cost_usd)
     }
+}
+
+fn overview_cost(totals: &Totals) -> (Option<f64>, String) {
+    // Overview always covers the whole selected period. Comparison filters do
+    // not enter this calculation, and the legacy total overlaps newer successes.
+    let measured = stats_dashboard::combined_requests(totals, Mode::All, None);
+    if measured.cost_reports > 0 {
+        let mut coverage = format!(
+            "{} of {} detailed attempts reported cost",
+            format_count(measured.cost_reports),
+            format_count(measured.attempts)
+        );
+        if totals.dictations.saturating_add(totals.failed_dictations) > totals.details.dictations {
+            coverage.push_str(" · older records excluded");
+        }
+        return (Some(measured.reported_cost_usd), coverage);
+    }
+    if totals.cost_usd.is_finite() && totals.cost_usd > 0.0 {
+        return (
+            Some(totals.cost_usd),
+            "Historical amounts only · no detailed cost reports".into(),
+        );
+    }
+    let detail = if measured.attempts > 0 {
+        format!(
+            "0 of {} detailed attempts reported cost",
+            format_count(measured.attempts)
+        )
+    } else {
+        "No cost reports available".into()
+    };
+    (None, detail)
 }
 fn format_count(value: u64) -> String {
     let digits = value.to_string();
@@ -1157,11 +1182,18 @@ fn format_cost(usd: f64) -> String {
     if !usd.is_finite() || usd < 0.0 {
         return "—".into();
     }
-    if usd > 0.0 && usd < 0.01 {
-        format!("{}{usd:.4}", "$")
-    } else {
-        format!("{}{usd:.2}", "$")
+    if usd == 0.0 {
+        return "$0.00".into();
     }
+    if !(0.000_000_000_001..1_000_000_000.0).contains(&usd) {
+        return format!("${usd:.6e}");
+    }
+    let precision = if usd < 0.000_001 { 12 } else { 6 };
+    let mut amount = format!("{usd:.precision$}");
+    while amount.ends_with('0') && amount.len() - amount.find('.').unwrap_or(0) > 3 {
+        amount.pop();
+    }
+    format!("${amount}")
 }
 fn short_day(day: &str) -> String {
     const MONTHS: [&str; 12] = [
@@ -1352,6 +1384,154 @@ mod tests {
     use super::*;
 
     #[test]
+    fn overview_reported_cost_matches_history_including_failed_attempts() {
+        use crate::openrouter::report::{ExecutionReport, StepReport};
+        let attempts = vec![
+            AttemptSample {
+                model: "fixture/primary".into(),
+                error: Some(ErrorKind::RateLimited),
+                cost_usd: Some(0.001),
+                ..Default::default()
+            },
+            AttemptSample {
+                model: "fixture/primary".into(),
+                error: Some(ErrorKind::Rejected),
+                cost_usd: Some(0.002),
+                ..Default::default()
+            },
+            AttemptSample {
+                model: "openai::gpt-transcribe".into(),
+                success: true,
+                cost_usd: Some(0.0),
+                ..Default::default()
+            },
+        ];
+        let report = StepReport {
+            executions: attempts
+                .iter()
+                .map(|attempt| {
+                    let model = ModelRef::parse(&attempt.model);
+                    ExecutionReport {
+                        provider: model.provider.id().into(),
+                        model: model.model.into(),
+                        cost_usd: attempt.cost_usd,
+                        outcome: if attempt.success { "success" } else { "failed" }.into(),
+                        ..Default::default()
+                    }
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut totals = Totals::default();
+        totals.add_sample(&Sample {
+            words: Some(1),
+            cost_usd: 0.0,
+            telemetry: Some(DictationTelemetry {
+                attempts,
+                used_fallback: true,
+                retried: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            totals.cost_usd, 0.0,
+            "legacy cost only reflects successful responses"
+        );
+        let (cost, coverage) = overview_cost(&totals);
+        assert!((cost.unwrap() - 0.003).abs() < f64::EPSILON);
+        assert_eq!(coverage, "3 of 3 detailed attempts reported cost");
+        assert_eq!(report.cost_summary(), "$0.003 USD");
+        assert_eq!(
+            format_cost(cost.unwrap()),
+            report.cost_summary().trim_end_matches(" USD")
+        );
+        let comparison =
+            stats_dashboard::combined_requests(&totals, Mode::Recorded, Some(Provider::OpenAi));
+        assert_eq!(comparison.reported_cost_usd, 0.0);
+        assert_eq!(comparison.cost_reports, 1);
+        assert_eq!(
+            stats_dashboard::combined_requests(&totals, Mode::Live, None).attempts,
+            0
+        );
+        assert_eq!(
+            overview_cost(&totals),
+            (cost, coverage),
+            "comparison scope must not change overview"
+        );
+    }
+
+    #[test]
+    fn overview_cost_keeps_legacy_separate_and_unknown_distinct_from_explicit_zero() {
+        let legacy = Totals {
+            dictations: 5,
+            cost_usd: 1.25,
+            ..Default::default()
+        };
+        let (amount, description) = overview_cost(&legacy);
+        assert_eq!(amount, Some(1.25));
+        assert!(description.contains("Historical amounts only"));
+        let mut mixed = legacy;
+        mixed.add_sample(&Sample {
+            words: Some(1),
+            telemetry: Some(DictationTelemetry {
+                attempts: vec![AttemptSample {
+                    model: "fixture/model".into(),
+                    success: true,
+                    cost_usd: Some(0.0),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let (amount, description) = overview_cost(&mixed);
+        assert_eq!(mixed.cost_usd, 1.25, "historical accounting remains intact");
+        assert_eq!(
+            amount,
+            Some(0.0),
+            "do not add overlapping historical totals to measured attempts"
+        );
+        assert!(description.contains("1 of 1 detailed attempts"));
+        assert!(description.contains("older records excluded"));
+
+        let mut measured = Totals::default();
+        measured.add_sample(&Sample {
+            words: Some(1),
+            telemetry: Some(DictationTelemetry {
+                attempts: vec![AttemptSample {
+                    model: "fixture/model".into(),
+                    success: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            overview_cost(&measured),
+            (None, "0 of 1 detailed attempts reported cost".into())
+        );
+        measured.add_sample(&Sample {
+            words: Some(1),
+            telemetry: Some(DictationTelemetry {
+                attempts: vec![AttemptSample {
+                    model: "fixture/model".into(),
+                    success: true,
+                    cost_usd: Some(0.000_000_12),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let (amount, description) = overview_cost(&measured);
+        assert_eq!(format_cost(amount.unwrap()), "$0.00000012");
+        assert_eq!(description, "1 of 2 detailed attempts reported cost");
+        assert_ne!(format_cost(f64::MIN_POSITIVE), "$0.00");
+    }
+
+    #[test]
     fn preview_periods_and_request_totals_are_coherent() {
         let week = preview_dashboard(Period::Week);
         let today = preview_dashboard(Period::Today);
@@ -1411,7 +1591,7 @@ mod tests {
         assert_eq!(percent(u64::MAX, 1), 100);
         assert_eq!(percent(u64::MAX, 0), 0);
         assert_eq!(format_cost(f64::INFINITY), "—");
-        assert_eq!(trend(Some(u64::MAX), Some(1)), ">9,999% vs previous period");
+        assert_eq!(trend(Some(u64::MAX), Some(1)), ">9,999%");
         assert!(
             coverage(&Totals {
                 dictations: u64::MAX,

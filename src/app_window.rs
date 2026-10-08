@@ -2148,6 +2148,9 @@ impl AppWindow {
                             .when_some(entry.application.clone(), |detail, application| {
                                 detail.child(detail_row("Application", application))
                             })
+                            .when(entry.transcription.is_none(), |detail| {
+                                detail.child(detail_row("Reported cost", "Not recorded"))
+                            })
                             .children(entry.transcription.iter().flat_map(|report| {
                                 report
                                     .history_rows()
@@ -4322,10 +4325,33 @@ fn preview_history() -> Option<History> {
                 streaming: true,
                 keyword_count: 3,
                 outcome: "success".into(),
+                cost_usd: None,
             }]
         } else {
-            Vec::new()
+            let selected = crate::providers::ModelRef::parse(model);
+            failed
+                .iter()
+                .map(|id| crate::openrouter::report::ExecutionReport {
+                    provider: "OpenRouter".into(),
+                    model: (*id).into(),
+                    streaming: false,
+                    keyword_count: 0,
+                    outcome: "failed".into(),
+                    cost_usd: None,
+                })
+                .chain(std::iter::once(
+                    crate::openrouter::report::ExecutionReport {
+                        provider: selected.provider.label().into(),
+                        model: selected.model.into(),
+                        streaming: false,
+                        keyword_count: 0,
+                        outcome: "success".into(),
+                        cost_usd: Some(0.000_123),
+                    },
+                ))
+                .collect()
         },
+        omitted_executions: 0,
         model: Some(model.into()),
         latency_ms,
         failed: failed.iter().map(|model| (*model).into()).collect(),

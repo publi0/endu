@@ -33,6 +33,9 @@ const HIDDEN_SCALE: f32 = 0.82;
 const HIDDEN_SOFTNESS: f32 = 4.0;
 const PROCESSING_MORPH_DURATION: Duration = Duration::from_millis(250);
 const RECORDING_FLASH_HALF_LIFE: Duration = Duration::from_millis(280);
+const METER_STALE_AFTER: Duration = Duration::from_millis(250);
+const VOICE_WIDTH_GAIN: f32 = 12.0;
+const VOICE_NOISE_FLOOR: f32 = 0.045;
 
 #[derive(Clone, Copy, Debug)]
 pub enum DictationIndicatorEvent {
@@ -496,6 +499,23 @@ fn recording_flash_for(phase: Phase, elapsed: Duration) -> f32 {
     }
 }
 
+fn visual_meter_level(level: f32, gain: f32) -> f32 {
+    if level.is_finite() {
+        (level * gain).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn recording_width(average: f32) -> f32 {
+    // The visual noise floor and gentle response do not modify captured audio.
+    let activity = ((visual_meter_level(average, 1.0) - VOICE_NOISE_FLOOR)
+        / (1.0 - VOICE_NOISE_FLOOR))
+        .clamp(0.0, 1.0)
+        .sqrt();
+    CAPSULE_WIDTH + VOICE_WIDTH_GAIN * activity
+}
+
 struct MetalRenderer {
     layer: MetalLayer,
     command_queue: CommandQueue,
@@ -513,6 +533,7 @@ struct MetalRenderer {
     size_factor: f32,
     target_average: f32,
     target_peak: f32,
+    last_meter: Option<Instant>,
     average: Spring,
     peak: Spring,
     width: Spring,
@@ -590,6 +611,7 @@ impl MetalRenderer {
             size_factor: 1.0,
             target_average: 0.0,
             target_peak: 0.0,
+            last_meter: None,
             average: Spring::new(0.0),
             peak: Spring::new(0.0),
             width: Spring::new(CAPSULE_WIDTH),
@@ -632,6 +654,7 @@ impl MetalRenderer {
                 self.completion_pending = false;
                 self.target_average = 0.0;
                 self.target_peak = 0.0;
+                self.last_meter = None;
                 self.average.reset(0.0);
                 self.peak.reset(0.0);
                 self.width.reset(CAPSULE_WIDTH);
@@ -641,8 +664,11 @@ impl MetalRenderer {
                 self.processing.reset(0.0);
             }
             DictationIndicatorEvent::Meter { average, peak } => {
-                self.target_average = (average * 9.0).clamp(0.0, 1.0);
-                self.target_peak = (peak * 3.0).clamp(0.0, 1.0);
+                if self.capture_phase == Some(CapturePhase::Recording) {
+                    self.target_average = visual_meter_level(average, 9.0);
+                    self.target_peak = visual_meter_level(peak, 3.0);
+                    self.last_meter = Some(now);
+                }
             }
             DictationIndicatorEvent::Submitted { job_id } => {
                 self.capture_phase = None;
@@ -767,6 +793,20 @@ impl MetalRenderer {
         self.draw_with(Instant::now(), |layer| layer.next_drawable())
     }
 
+    fn recording_meter(&self, now: Instant, enabled: bool) -> (f32, f32) {
+        if enabled
+            && matches!(self.phase, Phase::Recording)
+            && self.capture_phase == Some(CapturePhase::Recording)
+            && self
+                .last_meter
+                .is_some_and(|last| now.saturating_duration_since(last) < METER_STALE_AFTER)
+        {
+            (self.target_average, self.target_peak)
+        } else {
+            (0.0, 0.0)
+        }
+    }
+
     fn draw_with(
         &mut self,
         now: Instant,
@@ -787,6 +827,9 @@ impl MetalRenderer {
             .as_secs_f32()
             .min(1.0 / 20.0);
         self.last_frame = now;
+        let preferences = crate::hud_settings::current();
+        let (recording_average, recording_peak) =
+            self.recording_meter(now, preferences.voice_reactive);
         let elapsed = now.duration_since(self.phase_started);
         let terminal_finished = self
             .phase
@@ -801,7 +844,8 @@ impl MetalRenderer {
             self.exiting = true;
         }
         let target_width = match self.phase {
-            Phase::Preparing | Phase::Recording => CAPSULE_WIDTH,
+            Phase::Preparing => CAPSULE_WIDTH,
+            Phase::Recording => recording_width(recording_average),
             Phase::Transcribing => CAPSULE_HEIGHT,
             Phase::Hidden | Phase::Completed | Phase::Cancelled | Phase::Failed => self.width.value,
         };
@@ -813,8 +857,14 @@ impl MetalRenderer {
             }
         };
 
-        self.average.step_critical(self.target_average, dt, 22.0);
-        self.peak.step_critical(self.target_peak, dt, 26.0);
+        let (target_average, target_peak) =
+            if matches!(self.phase, Phase::Preparing | Phase::Recording) {
+                (recording_average, recording_peak)
+            } else {
+                (self.target_average, self.target_peak)
+            };
+        self.average.step_critical(target_average, dt, 22.0);
+        self.peak.step_critical(target_peak, dt, 26.0);
         self.width
             .step_critical(target_width, dt, GEOMETRY_ANGULAR_FREQUENCY);
         self.processing
@@ -860,7 +910,6 @@ impl MetalRenderer {
         let command_buffer = self.command_queue.new_command_buffer();
         let encoder = command_buffer.new_render_command_encoder(descriptor);
         encoder.set_render_pipeline_state(&self.pipeline);
-        let preferences = crate::hud_settings::current();
         let [recording_hue_shift, transcription_hue_shift] = preferences.hue_shifts();
         let uniforms = Uniforms {
             resolution: [
@@ -873,8 +922,16 @@ impl MetalRenderer {
             opacity: self.opacity.value.clamp(0.0, 1.0),
             scale: self.visual_scale.value.max(0.01),
             softness: self.softness.value.clamp(0.0, HIDDEN_SOFTNESS),
-            average: self.average.value.clamp(0.0, 1.0),
-            peak: self.peak.value.clamp(0.0, 1.0),
+            average: if preferences.voice_reactive {
+                self.average.value.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
+            peak: if preferences.voice_reactive {
+                self.peak.value.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
             processing: self.processing.value.clamp(0.0, 1.0),
             post_processing: 0.0,
             capturing: if self.capture_phase.is_some() {
@@ -967,6 +1024,87 @@ mod tests {
         };
         assert!((average - 0.5).abs() < f32::EPSILON);
         assert!((peak - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn voice_reaction_is_bounded_quiet_at_rest_and_rejects_invalid_levels() {
+        for level in [0.0, 0.01, VOICE_NOISE_FLOOR, -1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(recording_width(level), CAPSULE_WIDTH);
+        }
+        assert!(recording_width(0.15) > CAPSULE_WIDTH);
+        assert!(recording_width(0.5) > recording_width(0.15));
+        assert_eq!(recording_width(1.0), CAPSULE_WIDTH + VOICE_WIDTH_GAIN);
+        assert_eq!(recording_width(100.0), CAPSULE_WIDTH + VOICE_WIDTH_GAIN);
+        // Preserve the shader's viewport margins and the configured edge distance.
+        assert!(recording_width(1.0) < WINDOW_WIDTH - 32.0);
+    }
+
+    #[test]
+    fn voice_reaction_smoothly_expands_and_returns_to_rest_across_frame_rates() {
+        for rate in [30, 60, 120] {
+            let mut width = Spring::new(CAPSULE_WIDTH);
+            let loud_width = recording_width(1.0);
+            let mut previous = width.value;
+            for _ in 0..rate / 4 {
+                width.step_critical(loud_width, 1.0 / rate as f32, GEOMETRY_ANGULAR_FREQUENCY);
+                assert!((previous..=loud_width).contains(&width.value));
+                previous = width.value;
+            }
+            assert!(width.value > loud_width - 0.3);
+            // Let the existing velocity settle before checking the release curve.
+            for _ in 0..rate {
+                width.step_critical(loud_width, 1.0 / rate as f32, GEOMETRY_ANGULAR_FREQUENCY);
+            }
+            previous = width.value;
+            for _ in 0..rate / 2 {
+                width.step_critical(
+                    recording_width(0.0),
+                    1.0 / rate as f32,
+                    GEOMETRY_ANGULAR_FREQUENCY,
+                );
+                assert!((CAPSULE_WIDTH..=previous).contains(&width.value));
+                previous = width.value;
+            }
+            assert!(width.value < CAPSULE_WIDTH + 0.02);
+        }
+    }
+
+    #[test]
+    fn voice_reaction_only_uses_fresh_samples_from_an_active_recording() {
+        let mut renderer = MetalRenderer::new().expect("local macOS checks require Metal");
+        let meter = DictationIndicatorEvent::Meter {
+            average: 0.05,
+            peak: 0.2,
+        };
+        renderer.handle(DictationIndicatorEvent::Preparing);
+        renderer.handle(meter);
+        assert!(renderer.last_meter.is_none());
+        renderer.handle(DictationIndicatorEvent::Started);
+        renderer.handle(meter);
+        let sampled = renderer.last_meter.unwrap();
+        let (average, peak) = renderer.recording_meter(sampled, true);
+        assert!((average - 0.45).abs() < 0.0001);
+        assert!((peak - 0.6).abs() < 0.0001);
+        assert_eq!(renderer.recording_meter(sampled, false), (0.0, 0.0));
+        assert_eq!(
+            renderer.recording_meter(sampled + METER_STALE_AFTER, true),
+            (0.0, 0.0)
+        );
+
+        renderer.handle(DictationIndicatorEvent::Submitted { job_id: 7 });
+        renderer.handle(meter);
+        assert_eq!(renderer.recording_meter(sampled, true), (0.0, 0.0));
+        assert_eq!(renderer.last_meter, Some(sampled));
+        renderer.handle(DictationIndicatorEvent::Started);
+        assert_eq!(renderer.recording_meter(Instant::now(), true), (0.0, 0.0));
+        renderer.handle(DictationIndicatorEvent::Meter {
+            average: f32::NAN,
+            peak: f32::INFINITY,
+        });
+        assert_eq!(renderer.recording_meter(Instant::now(), true), (0.0, 0.0));
+        renderer.handle(meter);
+        renderer.handle(DictationIndicatorEvent::Cancelled);
+        assert_eq!(renderer.recording_meter(Instant::now(), true), (0.0, 0.0));
     }
 
     #[test]
