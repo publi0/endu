@@ -374,33 +374,114 @@ impl Render for MicrophonePriorityView {
                 self.picker_open
                     .then(|| picker_popup(self.render_picker(cx))),
             );
-        div().w_full().min_w_0()
+        div()
+            .w_full()
+            .min_w_0()
             .on_key_down(|event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "tab" {
-                    if event.keystroke.modifiers.shift { window.focus_prev(); } else { window.focus_next(); }
+                    if event.keystroke.modifiers.shift {
+                        window.focus_prev();
+                    } else {
+                        window.focus_next();
+                    }
                     cx.stop_propagation();
                 }
             })
-            .child(settings_row("Automatic priority", "Used when Input device is Automatic", add))
-            .children(self.preferences.iter().enumerate().map(|(index, preference)| {
-                let unavailable = self.catalog.as_ref().is_some_and(|catalog| !catalog.iter().any(|device| preference.matches(device)));
-                div().px_4().py_2().flex().items_center().gap_3().border_b_1().border_color(rgb(LINE))
-                    .child(div().flex_none().text_size(px(11.0)).text_color(rgb(MUTED)).child(format!("{}.", index + 1)))
-                    .child(div().flex_1().min_w_0().text_size(px(12.0)).text_color(rgb(TEXT))
-                        .child(div().truncate().child(preference.name.clone()))
-                        .when(unavailable, |row| row.child(div().text_size(px(10.0)).text_color(rgb(MUTED)).child("Disconnected — kept in this order"))))
-                    .child(div().flex_none().flex().gap_1()
-                        .child(self.row_button(index, 0, "↑", cx))
-                        .child(self.row_button(index, 1, "↓", cx))
-                        .child(self.row_button(index, 2, "Remove", cx)))
-            }))
-            .child(div().px_4().py_3().text_size(px(11.0)).text_color(rgb(MUTED))
-                .child(if self.preferences.is_empty() {
-                    "Using the existing automatic order: Universal Audio Thunderbolt, Studio Display Microphone, then the system fallback."
-                } else {
-                    "Unavailable microphones are skipped. The system fallback is tried after this list."
-                }))
-            .when(!self.picker_open, |panel| panel.children(self.save_error.as_ref().map(|error| error_note(error.clone()))))
+            .child(settings_row(
+                "Automatic priority",
+                "Used when Input device is Automatic",
+                add,
+            ))
+            .children(
+                self.preferences
+                    .iter()
+                    .enumerate()
+                    .map(|(index, preference)| {
+                        let unavailable = self.catalog.as_ref().is_some_and(|catalog| {
+                            !catalog.iter().any(|device| preference.matches(device))
+                        });
+                        div()
+                            .px_4()
+                            .py_2()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .border_b_1()
+                            .border_color(rgb(LINE))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(MUTED))
+                                    .child(format!("{}.", index + 1)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(TEXT))
+                                    .child(div().truncate().child(preference.name.clone()))
+                                    .when(unavailable, |row| {
+                                        row.child(
+                                            div()
+                                                .text_size(px(10.0))
+                                                .text_color(rgb(MUTED))
+                                                .child("Disconnected — kept in this order"),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .gap_1()
+                                    .child(self.row_button(index, 0, "↑", cx))
+                                    .child(self.row_button(index, 1, "↓", cx))
+                                    .child(self.row_button(index, 2, "Remove", cx)),
+                            )
+                    }),
+            )
+            .child(
+                div()
+                    .px_4()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(rgb(LINE))
+                    .text_size(px(11.0))
+                    .text_color(rgb(MUTED))
+                    .child(self.priority_note()),
+            )
+            .when(!self.picker_open, |panel| {
+                panel.children(
+                    self.save_error
+                        .as_ref()
+                        .map(|error| error_note(error.clone())),
+                )
+            })
+    }
+}
+
+impl MicrophonePriorityView {
+    fn priority_note(&self) -> String {
+        if !self.preferences.is_empty() {
+            return "Unavailable microphones are skipped. The system default is tried after this list.".into();
+        }
+        let connected = self
+            .catalog
+            .as_deref()
+            .map(crate::audio::legacy_automatic_preferences)
+            .unwrap_or_default();
+        if connected.is_empty() {
+            "Using the system default microphone. Add microphones to choose your own order.".into()
+        } else {
+            let names = connected
+                .iter()
+                .map(|device| device.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("Using {names} when connected, then the system default.")
+        }
     }
 }
 

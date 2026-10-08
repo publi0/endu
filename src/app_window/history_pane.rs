@@ -220,33 +220,54 @@ impl AppWindow {
                     .w_full()
                     .px_4()
                     .py_3()
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .gap_4()
                     .border_b_1()
                     .border_color(rgb(LINE))
                     .when(selected, |row| row.bg(rgb(SURFACE_SELECTED)))
                     .hover(|row| row.bg(rgb(SURFACE_HOVER)))
+                    // Same columns as a dictation row: text and details on the
+                    // left, age on the right.
                     .child(
                         div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(if entry.status == RecoveryStatus::Recovered {
-                                TEXT_SOFT
-                            } else {
-                                NEGATIVE
-                            }))
-                            .child(entry.title()),
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .line_height(px(18.0))
+                                    .truncate()
+                                    .text_color(rgb(if entry.status == RecoveryStatus::Recovered {
+                                        TEXT_SOFT
+                                    } else {
+                                        NEGATIVE
+                                    }))
+                                    .child(entry.title()),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .truncate()
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(FAINT))
+                                    .child(format!(
+                                        "{} · {} audio",
+                                        entry.application_label(),
+                                        crate::openrouter::report::seconds(entry.audio_ms),
+                                    )),
+                            ),
                     )
                     .child(
                         div()
-                            .mt_1()
-                            .w_full()
-                            .truncate()
+                            .flex_none()
                             .text_size(px(10.0))
                             .text_color(rgb(FAINT))
-                            .child(format!(
-                                "{} · {} audio · {}",
-                                entry.application_label(),
-                                crate::openrouter::report::seconds(entry.audio_ms),
-                                event_age(entry.timestamp_ms)
-                            )),
+                            .child(event_age(entry.timestamp_ms)),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected_recovery = Some(id.clone());
@@ -341,17 +362,18 @@ impl AppWindow {
             .child(div().mt_2().text_size(px(11.0)).text_color(rgb(MUTED))
                 .child(format!("{} audio · {}", crate::openrouter::report::seconds(entry.audio_ms), event_age(entry.timestamp_ms))))
             .child(div().mt_3().child(detail_row("Application", entry.application_label())))
-            .child(div().mt_4().child(actions))
-            .children(self.recovery_error.clone().map(|error| div().mt_3()
-                .text_size(px(12.0)).text_color(rgb(NEGATIVE)).child(error)))
+            // What happened comes before what to do about it.
             .children(entry.message.clone().map(|message| div().mt_5()
                 .child(section_label("Failure reason"))
                 .child(div().pt_2().text_size(px(12.0)).line_height(px(18.0)).text_color(rgb(NEGATIVE)).child(message))))
+            .children(entry.text.clone().map(|text| div().mt_5().text_size(px(13.0)).line_height(px(20.0)).child(text)))
+            .child(div().mt_5().child(actions))
+            .children(self.recovery_error.clone().map(|error| div().mt_3()
+                .text_size(px(12.0)).text_color(rgb(NEGATIVE)).child(error)))
             .child(div().mt_5().pt_4().border_t_1().border_color(rgb(LINE)).text_size(px(12.0)).text_color(rgb(TEXT_SOFT))
                 .child(if entry.volatile { "This recording is only in memory. Keep Hex open until it is recovered." }
                     else if recovered { "Recovered text is saved locally until you delete it. The temporary audio has been removed." }
                     else { "Audio is saved on this Mac until recovery or deletion. Retry uses your current Models settings and saves the text here, without automatic paste." }))
-            .children(entry.text.clone().map(|text| div().mt_5().text_size(px(13.0)).line_height(px(20.0)).child(text)))
             .into_any_element()
     }
 
@@ -513,7 +535,7 @@ impl AppWindow {
             .children(self.recovery.as_ref().and_then(RecordingRecovery::load_warning).map(|warning|
                 div().px_5().py_2().text_size(px(12.0)).text_color(rgb(NEGATIVE)).child(warning.to_owned())))
             .child(
-                pane_body().p_5().child(
+                pane_body().px_8().py_5().child(
                     pane_content()
                         .flex_row()
                         .gap_5()

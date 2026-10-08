@@ -17,6 +17,8 @@ static ENTER_TO_SUBMIT: AtomicBool = AtomicBool::new(false);
 static DOUBLE_TAP_ONLY: AtomicBool = AtomicBool::new(false);
 static RELEASE_MICROPHONE_WHILE_IDLE: AtomicBool = AtomicBool::new(false);
 static HOTKEYS: OnceLock<RwLock<RuntimeHotkeys>> = OnceLock::new();
+static PASTE_LAST_BINDING: RwLock<Option<HotkeyBinding>> = RwLock::new(None);
+static DICTATION_BINDING: RwLock<Option<HotkeyBinding>> = RwLock::new(None);
 static PASTE_KEY_CODE: OnceLock<u16> = OnceLock::new();
 static HOTKEY_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SETTINGS_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -615,6 +617,12 @@ impl AppSettings {
             .get_or_init(Default::default)
             .write()
             .unwrap_or_else(|error| error.into_inner()) = self.runtime_hotkeys();
+        *PASTE_LAST_BINDING
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = self.paste_last_hotkey.clone();
+        *DICTATION_BINDING
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(self.dictation_hotkey.clone());
         set_microphone_selection(
             self.microphone.as_deref(),
             self.microphone_channel.as_ref(),
@@ -729,6 +737,22 @@ pub fn runtime_hotkeys() -> RuntimeHotkeys {
         .unwrap_or_else(|error| error.into_inner())
 }
 
+/// The saved Paste Last shortcut, for menus and notices that name it.
+pub fn paste_last_binding() -> Option<HotkeyBinding> {
+    PASTE_LAST_BINDING
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+}
+
+/// The saved dictation shortcut, for the menu bar status line.
+pub fn dictation_binding() -> Option<HotkeyBinding> {
+    DICTATION_BINDING
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+}
+
 pub fn dictation_hotkey() -> RuntimeHotkey {
     runtime_hotkeys().dictation
 }
@@ -770,6 +794,15 @@ pub fn hide_application() {
         return;
     };
     NSApplication::sharedApplication(marker).hide(None);
+}
+
+/// The standard About panel reads the name, version and icon from the bundle.
+pub fn show_about_panel() {
+    let Some(marker) = MainThreadMarker::new() else {
+        tracing::warn!("cannot show the About panel outside the main thread");
+        return;
+    };
+    NSApplication::sharedApplication(marker).orderFrontStandardAboutPanel(None);
 }
 
 pub(crate) fn path() -> Result<PathBuf> {

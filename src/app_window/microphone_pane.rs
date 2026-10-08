@@ -586,7 +586,7 @@ impl AppWindow {
                             if self.settings.release_microphone_while_idle {
                                 "Opens on the shortcut: the orange indicator only shows while dictating, but the first syllable can be lost"
                             } else {
-                                "Keeps the microphone open so a short pre-roll catches the start of speech. Failed transcriptions keep their audio for recovery"
+                                "Keeps the microphone open so a short pre-roll catches the start of speech"
                             },
                             microphone_mode,
                         ))

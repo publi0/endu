@@ -13,18 +13,33 @@ use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 const WIDTH: f64 = 340.0;
 const HEIGHT: f64 = 76.0;
 
-fn notice_copy(copied_to_clipboard: bool) -> (&'static str, &'static str) {
+fn notice_copy(copied_to_clipboard: bool, paste_last: Option<&str>) -> (&'static str, String) {
     if copied_to_clipboard {
         (
             "Dictation copied",
-            "Auto-paste did not complete. Press ⌘V\nto paste the text in the app you choose.",
+            "Auto-paste did not complete. Press ⌘V\nto paste the text in the app you choose."
+                .into(),
+        )
+    } else if let Some(shortcut) = paste_last {
+        (
+            "Dictation ready",
+            format!(
+                "Auto-paste paused. Press {shortcut} to insert\nthe text in the app you choose."
+            ),
         )
     } else {
         (
             "Dictation ready",
-            "Auto-paste paused. Use Paste Last Dictation\nto insert the text in the app you choose.",
+            "Auto-paste paused. Use Paste Last Dictation in the\nmenu bar to insert the text in the app you choose."
+                .into(),
         )
     }
+}
+
+fn paste_last_shortcut() -> Option<String> {
+    crate::app_settings::paste_last_binding()
+        .filter(|binding| !binding.is_empty())
+        .map(|binding| binding.keycaps().concat())
 }
 
 pub struct PasteNotice {
@@ -104,9 +119,10 @@ impl PasteNotice {
     }
 
     pub fn show(&mut self, copied_to_clipboard: bool) {
-        let (title, detail) = notice_copy(copied_to_clipboard);
+        let shortcut = paste_last_shortcut();
+        let (title, detail) = notice_copy(copied_to_clipboard, shortcut.as_deref());
         self.title.setStringValue(&NSString::from_str(title));
-        self.detail.setStringValue(&NSString::from_str(detail));
+        self.detail.setStringValue(&NSString::from_str(&detail));
         self.position_on_selected_screen();
         self.until = Some(Instant::now() + Duration::from_secs(5));
         self.visibility.update(&mut self.window, true);
@@ -164,12 +180,20 @@ mod tests {
 
     #[test]
     fn notice_never_claims_the_clipboard_was_written_for_deferred_output() {
-        let copied = notice_copy(true);
-        let deferred = notice_copy(false);
+        let copied = notice_copy(true, Some("⌥⇧V"));
+        let deferred = notice_copy(false, None);
         assert_eq!(copied.0, "Dictation copied");
         assert!(copied.1.contains("⌘V"));
         assert_eq!(deferred.0, "Dictation ready");
         assert!(deferred.1.contains("Paste Last Dictation"));
         assert!(!deferred.1.contains("⌘V"));
+    }
+
+    #[test]
+    fn deferred_notice_names_the_saved_paste_last_shortcut() {
+        let (title, detail) = notice_copy(false, Some("⌥⇧V"));
+        assert_eq!(title, "Dictation ready");
+        assert!(detail.contains("Press ⌥⇧V"));
+        assert!(!detail.contains("⌘V"));
     }
 }

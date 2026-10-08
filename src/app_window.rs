@@ -54,12 +54,15 @@ mod setup_pane;
 use history_pane::*;
 use hotkey_pane::*;
 
-const WINDOW_WIDTH: f32 = 1040.0;
-const WINDOW_HEIGHT: f32 = 720.0;
+const WINDOW_WIDTH: f32 = 880.0;
+const WINDOW_HEIGHT: f32 = 640.0;
 const MINIMUM_WIDTH: f32 = 860.0;
-const MINIMUM_HEIGHT: f32 = 560.0;
+const MINIMUM_HEIGHT: f32 = 480.0;
+/// The window's last frame, kept in the app's user defaults rather than the
+/// exported settings file, like any macOS window position.
+const WINDOW_FRAME_KEY: &str = "HexMainWindowFrame";
 const HOTKEY_MIN_WIDTH: f32 = 148.0;
-const HOTKEY_SIDE_SELECTOR_WIDTH: f32 = 116.0;
+const HOTKEY_SIDE_SELECTOR_WIDTH: f32 = 150.0;
 const PERMISSION_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How often the sidebar footer re-reads the installed bundle version.
@@ -72,6 +75,7 @@ actions!(
         HideApplication,
         MinimizeWindow,
         QuitApplication,
+        ShowAbout,
         ShowHistory,
         ShowModels,
         ShowProviders,
@@ -247,7 +251,16 @@ fn open_new(
     cx: &mut App,
 ) -> gpui::Result<WindowHandle<AppWindow>> {
     let preview_mode = preview.is_some();
-    let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
+    let bounds = (!preview_mode)
+        .then(saved_window_bounds)
+        .flatten()
+        .filter(|bounds| {
+            // A frame from a disconnected display would open off screen.
+            cx.displays()
+                .iter()
+                .any(|display| display.bounds().contains(&bounds.center()))
+        })
+        .unwrap_or_else(|| Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx));
     let handle = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -267,6 +280,53 @@ fn open_new(
     *app_window.borrow_mut() = Some(handle);
     cx.activate(true);
     Ok(handle)
+}
+
+fn saved_window_bounds() -> Option<Bounds<gpui::Pixels>> {
+    let defaults = objc2_foundation::NSUserDefaults::standardUserDefaults();
+    let value = defaults.stringForKey(&objc2_foundation::NSString::from_str(WINDOW_FRAME_KEY))?;
+    parse_window_frame(&value.to_string())
+}
+
+fn save_window_bounds(bounds: Bounds<gpui::Pixels>) {
+    let value = objc2_foundation::NSString::from_str(&format_window_frame(bounds));
+    let defaults = objc2_foundation::NSUserDefaults::standardUserDefaults();
+    unsafe {
+        defaults.setObject_forKey(
+            Some(&value),
+            &objc2_foundation::NSString::from_str(WINDOW_FRAME_KEY),
+        )
+    };
+}
+
+fn format_window_frame(bounds: Bounds<gpui::Pixels>) -> String {
+    format!(
+        "{},{},{},{}",
+        f32::from(bounds.origin.x).round(),
+        f32::from(bounds.origin.y).round(),
+        f32::from(bounds.size.width).round(),
+        f32::from(bounds.size.height).round()
+    )
+}
+
+/// Restores a saved frame, never smaller than the window's minimum size.
+fn parse_window_frame(value: &str) -> Option<Bounds<gpui::Pixels>> {
+    let values: Vec<f32> = value
+        .split(',')
+        .map(|part| {
+            part.trim()
+                .parse()
+                .ok()
+                .filter(|value: &f32| value.is_finite())
+        })
+        .collect::<Option<_>>()?;
+    let [x, y, width, height] = values.as_slice() else {
+        return None;
+    };
+    Some(Bounds::new(
+        gpui::point(px(*x), px(*y)),
+        size(px(width.max(MINIMUM_WIDTH)), px(height.max(MINIMUM_HEIGHT))),
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -618,6 +678,11 @@ impl AppWindow {
             true
         });
         let mut subscriptions = vec![
+            cx.observe_window_bounds(native_window, move |_, window, _| {
+                if !preview_mode && let WindowBounds::Windowed(bounds) = window.window_bounds() {
+                    save_window_bounds(bounds);
+                }
+            }),
             cx.on_app_quit(|this, cx| {
                 this.finish_editing(cx);
                 async {}
@@ -1520,7 +1585,7 @@ impl AppWindow {
         // cadence instead of every render frame.
         if self.update_check_at.is_none_or(|at| Instant::now() >= at) {
             let pending = crate::update_check::pending_update();
-            crate::status_item::set_update_available(pending.is_some());
+            crate::status_item::set_pending_update(pending.clone());
             self.pending_update = pending;
             self.update_check_at = Some(Instant::now() + UPDATE_CHECK_INTERVAL);
         }
@@ -1879,6 +1944,9 @@ impl AppWindow {
                                     row.child(
                                         compact_button("Disable")
                                             .id("disable-paste-last-hotkey")
+                                            .flex_none()
+                                            .border_1()
+                                            .border_color(rgb(LINE))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.update_settings(SettingControl::PasteLast, cx, |settings| {
                                                     settings.paste_last_hotkey = None
@@ -2098,6 +2166,18 @@ mod tests {
     use super::preferences_pane::write_preferences_export_to;
     use super::*;
     use gpui::Focusable;
+
+    #[test]
+    fn saved_window_frames_round_trip_and_respect_the_minimum_size() {
+        let bounds = Bounds::new(gpui::point(px(120.0), px(80.0)), size(px(900.0), px(650.0)));
+        assert_eq!(format_window_frame(bounds), "120,80,900,650");
+        assert_eq!(parse_window_frame("120,80,900,650"), Some(bounds));
+        let tiny = parse_window_frame("0,0,10,10").unwrap();
+        assert_eq!(tiny.size, size(px(MINIMUM_WIDTH), px(MINIMUM_HEIGHT)));
+        for invalid in ["", "1,2,3", "1,2,3,4,5", "a,b,c,d", "NaN,0,900,650"] {
+            assert_eq!(parse_window_frame(invalid), None, "{invalid}");
+        }
+    }
 
     fn preview_fixture(window: &mut Window, cx: &mut Context<AppWindow>) -> AppWindow {
         AppWindow::new(

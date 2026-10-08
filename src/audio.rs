@@ -841,6 +841,20 @@ pub fn input_description(
     Ok(description)
 }
 
+/// Connected inputs that the built-in automatic order prefers before the
+/// macOS default when no explicit priority list exists.
+pub fn legacy_automatic_preferences(available: &[DevicePreference]) -> Vec<DevicePreference> {
+    AUTOMATIC_INPUT_DEVICE_PREFERENCES
+        .iter()
+        .filter_map(|query| {
+            available
+                .iter()
+                .find(|device| device.name.to_lowercase().contains(&query.to_lowercase()))
+                .cloned()
+        })
+        .collect()
+}
+
 fn automatic_device_indices(
     available: &[DevicePreference],
     preferences: &[DevicePreference],
@@ -848,15 +862,7 @@ fn automatic_device_indices(
 ) -> Vec<usize> {
     let legacy;
     let preferences = if preferences.is_empty() {
-        legacy = AUTOMATIC_INPUT_DEVICE_PREFERENCES
-            .iter()
-            .filter_map(|query| {
-                available
-                    .iter()
-                    .find(|device| device.name.to_lowercase().contains(&query.to_lowercase()))
-                    .cloned()
-            })
-            .collect::<Vec<_>>();
+        legacy = legacy_automatic_preferences(available);
         &legacy
     } else {
         preferences

@@ -1,6 +1,7 @@
 //! Shortcut controls, capture and binding rules.
 
 use super::*;
+use crate::desktop_ui::CONTROL_TEXT_SIZE;
 
 impl AppWindow {
     pub(super) fn render_hotkey_control(
@@ -99,7 +100,7 @@ impl AppWindow {
                     })
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(px(CONTROL_TEXT_SIZE))
                             .text_color(rgb(TEXT_SOFT))
                             .child(label),
                     )
@@ -115,7 +116,7 @@ impl AppWindow {
                             .flex()
                             .items_center()
                             .rounded(px(4.0))
-                            .text_size(px(11.0))
+                            .text_size(px(CONTROL_TEXT_SIZE))
                             .text_color(rgb(MUTED))
                             .hover(|button| {
                                 button.bg(rgb(SURFACE_HOVER)).text_color(rgb(TEXT_SOFT))
@@ -150,7 +151,7 @@ impl AppWindow {
                 .child(hotkey_keycaps(binding_keycaps, 1.0))
                 .child(
                     div()
-                        .text_size(px(11.0))
+                        .text_size(px(CONTROL_TEXT_SIZE))
                         .text_color(rgb(TEXT_SOFT))
                         .child("Change shortcut"),
                 )
@@ -214,7 +215,7 @@ impl AppWindow {
         side_animation.set_enabled(side.is_some());
         let side_position = side_animation.render_position(window).clamp(0.0, 1.0);
         let selected = side.unwrap_or(ModifierSide::Either);
-        let side_widths = [34.0, 44.0, 34.0];
+        let side_widths = [44.0, 56.0, 46.0];
         let side_selection_spring =
             &mut self.hotkey_side_selection_springs[hotkey_kind_index(kind)];
         side_selection_spring.set_target(hotkey_side_index(selected) as f32);
@@ -240,7 +241,6 @@ impl AppWindow {
                             let candidate = hotkey_side_binding(&self.settings, kind, side);
                             sliding_segmented_item(side_widths[index], selected == side)
                                 .id(("hotkey-side", hotkey_kind_index(kind) * 3 + index))
-                                .text_size(px(9.0))
                                 .when(candidate.is_none(), |item| item.opacity(0.35))
                                 .child(label)
                                 .on_click(cx.listener(move |this, _, _, cx| {

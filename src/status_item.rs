@@ -10,8 +10,8 @@ use objc2::runtime::{AnyObject, Bool, NSObjectProtocol, Sel};
 use objc2::{DefinedClass, MainThreadOnly, msg_send, sel};
 use objc2_app_kit::{
     NSAccessibility, NSAffineTransformNSAppKitAdditions, NSBezierPath, NSColor,
-    NSCompositingOperation, NSGraphicsContext, NSImage, NSMenu, NSMenuItem, NSStatusBar,
-    NSStatusItem, NSWorkspace,
+    NSCompositingOperation, NSEventModifierFlags, NSGraphicsContext, NSImage, NSMenu,
+    NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem, NSWorkspace,
 };
 use objc2_foundation::{
     MainThreadMarker, NSAffineTransform, NSObject, NSPoint, NSRect, NSSize, NSString,
@@ -229,12 +229,14 @@ impl IconImages {
 pub enum StatusItemAction {
     OpenSettings,
     OpenMicrophone,
+    OpenProviders,
     OpenPostProcessing,
     OpenModels,
     OpenHud,
     OpenHistory,
     OpenStatistics,
     PasteLast,
+    RestartToUpdate,
     Quit,
 }
 
@@ -255,6 +257,11 @@ objc2::define_class!(
         #[unsafe(method(openSettings:))]
         fn open_settings(&self, _sender: &AnyObject) {
             let _ = self.ivars().actions.try_send(StatusItemAction::OpenSettings);
+        }
+
+        #[unsafe(method(openProviders:))]
+        fn open_providers(&self, _sender: &AnyObject) {
+            let _ = self.ivars().actions.try_send(StatusItemAction::OpenProviders);
         }
 
         #[unsafe(method(openModels:))]
@@ -292,9 +299,21 @@ objc2::define_class!(
             let _ = self.ivars().actions.try_send(StatusItemAction::PasteLast);
         }
 
+        #[unsafe(method(restartToUpdate:))]
+        fn restart_to_update(&self, _sender: &AnyObject) {
+            let _ = self.ivars().actions.try_send(StatusItemAction::RestartToUpdate);
+        }
+
         #[unsafe(method(quit:))]
         fn quit(&self, _sender: &AnyObject) {
             let _ = self.ivars().actions.try_send(StatusItemAction::Quit);
+        }
+    }
+
+    unsafe impl NSMenuDelegate for StatusItemTarget {
+        #[unsafe(method(menuNeedsUpdate:))]
+        fn menu_needs_update(&self, _menu: &NSMenu) {
+            refresh_menu();
         }
     }
 );
@@ -308,7 +327,10 @@ impl StatusItemTarget {
 
 struct StatusItemController {
     item: Retained<NSStatusItem>,
+    status_line: Retained<NSMenuItem>,
+    permission_item: Retained<NSMenuItem>,
     paste_item: Retained<NSMenuItem>,
+    update_item: Retained<NSMenuItem>,
     images: IconImages,
     activity: IconActivity,
     phase: IconPhase,
@@ -317,7 +339,7 @@ struct StatusItemController {
     reduce_motion: bool,
     motion_checked_at: Instant,
     ready_to_paste: bool,
-    update_available: bool,
+    update_version: Option<String>,
     _menu: Retained<NSMenu>,
     _target: Retained<StatusItemTarget>,
 }
@@ -347,7 +369,11 @@ impl StatusItemController {
         );
         if self.last_frame != Some(frame) {
             if let Some(button) = self.item.button(mtm) {
-                button.setImage(Some(self.images.image(phase, frame, self.update_available)));
+                button.setImage(Some(self.images.image(
+                    phase,
+                    frame,
+                    self.update_version.is_some(),
+                )));
             }
             self.last_frame = Some(frame);
         }
@@ -360,7 +386,7 @@ impl StatusItemController {
             } else {
                 self.phase.label()
             };
-            let phase = if self.update_available {
+            let phase = if self.update_version.is_some() {
                 format!("{phase} · update available")
             } else {
                 phase.to_string()
@@ -384,6 +410,19 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
     let target = StatusItemTarget::new(actions, mtm);
     let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Hex"));
 
+    // The first rows say what Hex is doing and what, if anything, blocks it.
+    let status_line = add_item(&menu, &target, "Hex", sel!(openSettings:), mtm);
+    unsafe { status_line.setAction(None) };
+    status_line.setEnabled(false);
+    let permission_item = add_item(
+        &menu,
+        &target,
+        "Grant Permissions…",
+        sel!(openSettings:),
+        mtm,
+    );
+    permission_item.setHidden(true);
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
     let paste_item = add_item(
         &menu,
         &target,
@@ -392,21 +431,35 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
         mtm,
     );
     menu.addItem(&NSMenuItem::separatorItem(mtm));
-    add_item(&menu, &target, "Settings", sel!(openSettings:), mtm);
-    add_item(&menu, &target, "Microphone", sel!(openMicrophone:), mtm);
-    add_item(&menu, &target, "Models", sel!(openModels:), mtm);
+    add_item(&menu, &target, "History", sel!(openHistory:), mtm);
+    add_item(&menu, &target, "Statistics", sel!(openStatistics:), mtm);
+    let settings = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Settings"));
+    let general = add_item(&settings, &target, "General", sel!(openSettings:), mtm);
+    general.setKeyEquivalent(&NSString::from_str(","));
+    add_item(&settings, &target, "Microphone", sel!(openMicrophone:), mtm);
+    add_item(&settings, &target, "Providers", sel!(openProviders:), mtm);
+    add_item(&settings, &target, "Models", sel!(openModels:), mtm);
     add_item(
-        &menu,
+        &settings,
         &target,
         "Post-processing",
         sel!(openPostProcessing:),
         mtm,
     );
-    add_item(&menu, &target, "HUD", sel!(openHud:), mtm);
-    add_item(&menu, &target, "History", sel!(openHistory:), mtm);
-    add_item(&menu, &target, "Statistics", sel!(openStatistics:), mtm);
+    add_item(&settings, &target, "HUD", sel!(openHud:), mtm);
+    let settings_item = add_item(&menu, &target, "Settings", sel!(openSettings:), mtm);
+    settings_item.setSubmenu(Some(&settings));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
-    add_item(&menu, &target, "Quit Hex", sel!(quit:), mtm);
+    let update_item = add_item(
+        &menu,
+        &target,
+        "Restart to Update",
+        sel!(restartToUpdate:),
+        mtm,
+    );
+    update_item.setHidden(true);
+    let quit = add_item(&menu, &target, "Quit Hex", sel!(quit:), mtm);
+    quit.setKeyEquivalent(&NSString::from_str("q"));
 
     let item = NSStatusBar::systemStatusBar().statusItemWithLength(-2.0);
     let button = item
@@ -415,13 +468,17 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
     button.setImage(Some(&images.idle));
     button.setToolTip(Some(&NSString::from_str("Hex")));
     button.setAccessibilityLabel(Some(&NSString::from_str("Hex")));
+    menu.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*target)));
     item.setMenu(Some(&menu));
 
     let now = Instant::now();
     STATUS_ITEM.with(|status_item| {
         *status_item.borrow_mut() = Some(StatusItemController {
             item,
+            status_line,
+            permission_item,
             paste_item,
+            update_item,
             images,
             activity: IconActivity::default(),
             phase: IconPhase::Idle,
@@ -430,7 +487,7 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
             reduce_motion: NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion(),
             motion_checked_at: now,
             ready_to_paste: false,
-            update_available: false,
+            update_version: None,
             _menu: menu,
             _target: target,
         });
@@ -511,17 +568,123 @@ pub fn set_ready_to_paste(ready: bool) {
     });
 }
 
-/// Flags a newer installed bundle so the menu bar icon badges and the tooltip
-/// mention the update until the process exits into the new version.
-pub fn set_update_available(available: bool) {
+/// Rebuilds the dynamic rows just before the menu opens: the status line,
+/// missing permissions, the saved Paste Last shortcut and a pending update.
+/// Status menus do not handle key equivalents globally, so the shortcut only
+/// labels its item; the listener still owns the shortcut itself. Permission
+/// checks are preflight queries and never resolve provider keys.
+fn refresh_menu() {
+    let permissions_missing =
+        !crate::onboarding::permission_warnings(crate::onboarding::status_with_api_key(true))
+            .is_empty();
+    let dictation = crate::app_settings::dictation_binding()
+        .filter(|binding| !binding.is_empty())
+        .map(|binding| binding.keycaps().concat());
+    STATUS_ITEM.with(|controller| {
+        if let Some(controller) = controller.borrow().as_ref() {
+            controller
+                .status_line
+                .setTitle(&NSString::from_str(&status_headline(
+                    controller.phase,
+                    controller.ready_to_paste,
+                    permissions_missing,
+                    crate::app_settings::dictation_mode(),
+                    dictation.as_deref(),
+                )));
+            controller.permission_item.setHidden(!permissions_missing);
+            let (key, modifiers) =
+                paste_last_key_equivalent(crate::app_settings::paste_last_binding().as_ref())
+                    .unwrap_or_else(|| (String::new(), NSEventModifierFlags::empty()));
+            controller
+                .paste_item
+                .setKeyEquivalent(&NSString::from_str(&key));
+            controller
+                .paste_item
+                .setKeyEquivalentModifierMask(modifiers);
+            controller
+                .update_item
+                .setHidden(controller.update_version.is_none());
+            if let Some(version) = &controller.update_version {
+                controller
+                    .update_item
+                    .setTitle(&NSString::from_str(&format!(
+                        "Restart to Update to Hex {version}"
+                    )));
+            }
+        }
+    });
+}
+
+fn status_headline(
+    phase: IconPhase,
+    ready_to_paste: bool,
+    permissions_missing: bool,
+    mode: crate::app_settings::DictationMode,
+    dictation: Option<&str>,
+) -> String {
+    use crate::app_settings::DictationMode;
+    match phase {
+        IconPhase::Recording => return "Recording…".into(),
+        IconPhase::Processing => return "Transcribing…".into(),
+        IconPhase::Idle => {}
+    }
+    if permissions_missing {
+        return "Dictation needs permissions".into();
+    }
+    if ready_to_paste {
+        return "Dictation ready to paste".into();
+    }
+    match dictation {
+        Some(shortcut) => format!(
+            "{} {shortcut} to dictate",
+            match mode {
+                DictationMode::TapOrHold => "Tap or hold",
+                DictationMode::Hold => "Hold",
+                DictationMode::DoubleTap => "Double-tap",
+            }
+        ),
+        None => "Ready to dictate".into(),
+    }
+}
+
+fn paste_last_key_equivalent(
+    binding: Option<&crate::app_settings::HotkeyBinding>,
+) -> Option<(String, NSEventModifierFlags)> {
+    let binding = binding?;
+    let label = &binding.key.as_ref()?.label;
+    let mut characters = label.chars();
+    let character = characters.next()?;
+    if characters.next().is_some() || character.is_whitespace() {
+        return None;
+    }
+    let modifiers = binding.modifiers;
+    let mut flags = NSEventModifierFlags::empty();
+    for (enabled, flag) in [
+        (modifiers.control.is_some(), NSEventModifierFlags::Control),
+        (modifiers.option.is_some(), NSEventModifierFlags::Option),
+        (modifiers.shift.is_some(), NSEventModifierFlags::Shift),
+        (modifiers.command.is_some(), NSEventModifierFlags::Command),
+        (modifiers.function, NSEventModifierFlags::Function),
+    ] {
+        if enabled {
+            flags |= flag;
+        }
+    }
+    Some((character.to_lowercase().collect(), flags))
+}
+
+/// Records a newer installed bundle so the menu bar icon badges, the tooltip
+/// mentions it and the menu offers a restart until the process exits into the
+/// new version.
+pub fn set_pending_update(version: Option<String>) {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
     STATUS_ITEM.with(|controller| {
         if let Some(controller) = controller.borrow_mut().as_mut()
-            && controller.update_available != available
+            && controller.update_version != version
         {
-            controller.update_available = available;
+            controller.update_version = version;
             controller.last_frame = None;
             controller.update_icon(mtm, Instant::now());
             controller.update_label(mtm);
@@ -532,6 +695,73 @@ pub fn set_update_available(available: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paste_last_menu_item_shows_only_printable_shortcuts() {
+        let default = crate::app_settings::HotkeyBinding::paste_last_default();
+        let (key, flags) = paste_last_key_equivalent(Some(&default)).unwrap();
+        assert_eq!(key, "v");
+        assert_eq!(
+            flags,
+            NSEventModifierFlags::Option | NSEventModifierFlags::Shift
+        );
+        let modifier_only = crate::app_settings::HotkeyBinding::default();
+        assert!(paste_last_key_equivalent(Some(&modifier_only)).is_none());
+        let mut named = default.clone();
+        named.key.as_mut().unwrap().label = "Space".into();
+        assert!(paste_last_key_equivalent(Some(&named)).is_none());
+        assert!(paste_last_key_equivalent(None).is_none());
+    }
+
+    #[test]
+    fn status_line_reports_activity_before_setup_and_names_the_gesture() {
+        use crate::app_settings::DictationMode;
+        let headline = |phase, ready, missing, mode, shortcut| {
+            status_headline(phase, ready, missing, mode, shortcut)
+        };
+        assert_eq!(
+            headline(IconPhase::Recording, true, true, DictationMode::Hold, None),
+            "Recording…"
+        );
+        assert_eq!(
+            headline(
+                IconPhase::Processing,
+                false,
+                true,
+                DictationMode::Hold,
+                None
+            ),
+            "Transcribing…"
+        );
+        assert_eq!(
+            headline(IconPhase::Idle, true, true, DictationMode::Hold, Some("⌥")),
+            "Dictation needs permissions"
+        );
+        assert_eq!(
+            headline(IconPhase::Idle, true, false, DictationMode::Hold, Some("⌥")),
+            "Dictation ready to paste"
+        );
+        assert_eq!(
+            headline(
+                IconPhase::Idle,
+                false,
+                false,
+                DictationMode::TapOrHold,
+                Some("⌥")
+            ),
+            "Tap or hold ⌥ to dictate"
+        );
+        assert_eq!(
+            headline(
+                IconPhase::Idle,
+                false,
+                false,
+                DictationMode::DoubleTap,
+                None
+            ),
+            "Ready to dictate"
+        );
+    }
 
     #[test]
     fn capture_has_priority_and_last_finished_job_restores_idle() {

@@ -1190,11 +1190,16 @@ impl Element for TextElement {
         let viewport_width = bounds.size.width;
         let caret_x = line.x_for_index(input.cursor_offset());
         let margin = px(4.);
-        let mut scroll_x = input.scroll_x;
-        if caret_x < scroll_x + margin {
-            scroll_x = (caret_x - margin).max(px(0.));
-        } else if caret_x > scroll_x + viewport_width - margin {
-            scroll_x = caret_x - viewport_width + margin;
+        // Unfocused fields show their beginning, so a long URL reads from
+        // its scheme rather than from wherever editing last left the caret.
+        let mut scroll_x = px(0.);
+        if input.focus_handle.is_focused(window) {
+            scroll_x = input.scroll_x;
+            if caret_x < scroll_x + margin {
+                scroll_x = (caret_x - margin).max(px(0.));
+            } else if caret_x > scroll_x + viewport_width - margin {
+                scroll_x = caret_x - viewport_width + margin;
+            }
         }
         scroll_x = scroll_x.min((line.width - viewport_width).max(px(0.)));
 

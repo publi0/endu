@@ -117,19 +117,21 @@ impl AppWindow {
                         }
                         cx.notify();
                     })),
-                PermissionState::NeedsRequest | PermissionState::Ready => compact_button("Allow")
-                    .id("setup-microphone")
-                    .bg(rgb(SURFACE_SELECTED))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if !this.preview {
-                            crate::onboarding::request_microphone();
-                        }
-                        cx.notify();
-                    })),
+                PermissionState::NeedsRequest | PermissionState::Ready => {
+                    compact_button("Grant Access")
+                        .id("setup-microphone")
+                        .bg(rgb(SURFACE_SELECTED))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if !this.preview {
+                                crate::onboarding::request_microphone();
+                            }
+                            cx.notify();
+                        }))
+                }
             };
             permission_rows.push(setup_row(
                 "Microphone",
-                "Record while you hold the shortcut.",
+                "Capture your voice while you dictate.",
                 action.into_any_element(),
             ));
         }
@@ -175,11 +177,16 @@ impl AppWindow {
             .flex()
             .items_center()
             .justify_center()
+            .py_4()
             .bg(rgba(0x000000dd))
             .child(
+                // Scrolls instead of clipping when the window is shorter than
+                // the sheet with every permission still missing.
                 div()
                     .id("setup")
                     .w(px(640.0))
+                    .max_h_full()
+                    .overflow_y_scroll()
                     .rounded_lg()
                     .border_1()
                     .border_color(rgb(LINE))
@@ -235,12 +242,16 @@ impl AppWindow {
                                     .into_any_element()
                             } else {
                                 div().child(self.openrouter_setup.clone())
-                                    .child(compact_button("Choose another provider").id("setup-choose-provider")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.setup_visible = false;
-                                            this.select_pane(Pane::Providers, cx);
-                                            this.focus_pane(window);
-                                        }))).into_any_element()
+                                    .child(div().mt_2().flex().child(
+                                        compact_button("Use another provider…").id("setup-choose-provider")
+                                            .border_1()
+                                            .border_color(rgb(LINE))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.setup_visible = false;
+                                                this.select_pane(Pane::Providers, cx);
+                                                this.focus_pane(window);
+                                            })),
+                                    )).into_any_element()
                             }),
                     ),
             )
@@ -314,9 +325,9 @@ pub(super) const fn permission_warning_copy(kind: PermissionKind) -> (&'static s
 
 pub(super) const fn permission_action_label(action: PermissionAction) -> &'static str {
     match action {
-        PermissionAction::RequestMicrophone => "Allow",
         PermissionAction::OpenMicrophoneSettings => "Open Settings",
-        PermissionAction::OpenInputMonitoringSettings
+        PermissionAction::RequestMicrophone
+        | PermissionAction::OpenInputMonitoringSettings
         | PermissionAction::OpenAccessibilitySettings => "Grant Access",
     }
 }

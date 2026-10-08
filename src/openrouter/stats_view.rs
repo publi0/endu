@@ -128,6 +128,7 @@ pub struct StatisticsView {
     generation: u64,
     error: Option<String>,
     reset_armed: bool,
+    hovered_bar: Option<usize>,
 }
 impl StatisticsView {
     pub fn new(preview: bool) -> Self {
@@ -149,6 +150,7 @@ impl StatisticsView {
             generation: 0,
             error: None,
             reset_armed: false,
+            hovered_bar: None,
         };
         view.refresh();
         view
@@ -157,6 +159,7 @@ impl StatisticsView {
     pub fn refresh(&mut self) {
         if self.preview {
             self.data = preview_dashboard(self.period);
+            self.hovered_bar = None;
             if self.preview_cleared {
                 self.data.totals = Totals::default();
                 self.data.previous = self.data.previous.as_ref().map(|_| Totals::default());
@@ -184,6 +187,7 @@ impl StatisticsView {
         match result {
             Ok(data) => {
                 self.data = data;
+                self.hovered_bar = None;
                 self.error = None;
             }
             Err(error) => self.error = Some(error),
@@ -733,53 +737,122 @@ impl StatisticsView {
             .collect();
         let peak = values.iter().flatten().copied().max();
         let maximum = peak.unwrap_or(0);
-        let bars = values.iter().enumerate().map(|(index, value)| {
-            let height = value.map(|value| {
-                if maximum == 0 {
-                    1.0
-                } else {
-                    (value as f32 / maximum as f32 * CHART_HEIGHT).max(if value > 0 {
-                        3.0
-                    } else {
+        let hovered = self
+            .hovered_bar
+            .and_then(|index| Some((self.data.daily.get(index)?, *values.get(index)?)));
+        let headline = match hovered {
+            Some(((day, _), Some(value))) => {
+                format!("{} · {}", short_day(day), self.chart.format(value))
+            }
+            Some(((day, _), None)) => format!("{} · no measurement", short_day(day)),
+            None => peak.map_or_else(
+                || "No measurements".into(),
+                |value| format!("Peak {}", self.chart.format(value)),
+            ),
+        };
+        let gap = if values.len() > 14 { 3.0 } else { 8.0 };
+        let segments = self.segments(Segment::Chart, SETTINGS_CONTROL_WIDTH, cx);
+        let bars: Vec<_> = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let highlighted = self.hovered_bar == Some(index);
+                let height = value.map(|value| {
+                    if maximum == 0 {
                         1.0
-                    })
-                }
-            });
-            div()
-                .flex_1()
-                .min_w(px(2.0))
-                .h_full()
-                .flex()
-                .items_end()
-                .justify_center()
-                .child(
-                    div()
-                        .debug_selector(move || format!("statistics-bar-{index}"))
-                        .w_full()
-                        .max_w(px(if height.is_some() { 44.0 } else { 4.0 }))
-                        .h(px(height.unwrap_or(4.0)))
-                        .rounded_t(px(3.0))
-                        .bg(if value.is_none() {
-                            rgb(FAINT)
-                        } else if value.unwrap_or(0) > 0 {
-                            rgb(ACCENT)
+                    } else {
+                        (value as f32 / maximum as f32 * CHART_HEIGHT).max(if value > 0 {
+                            3.0
                         } else {
-                            rgb(LINE)
-                        }),
+                            1.0
+                        })
+                    }
+                });
+                // The whole column is the hover target, so short bars are as easy
+                // to inspect as tall ones; the header shows that day's value.
+                div()
+                    .id(("statistics-bar-column", index))
+                    .flex_1()
+                    .min_w(px(2.0))
+                    .h_full()
+                    .flex()
+                    .items_end()
+                    .justify_center()
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if *hovered {
+                            this.hovered_bar = Some(index);
+                        } else if this.hovered_bar == Some(index) {
+                            this.hovered_bar = None;
+                        }
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .debug_selector(move || format!("statistics-bar-{index}"))
+                            .w_full()
+                            .max_w(px(if height.is_some() { 44.0 } else { 4.0 }))
+                            .h(px(height.unwrap_or(4.0)))
+                            .rounded_t(px(3.0))
+                            .bg(if value.is_none() {
+                                rgb(FAINT)
+                            } else if value.unwrap_or(0) > 0 {
+                                rgb(ACCENT)
+                            } else {
+                                rgb(LINE)
+                            })
+                            .when(highlighted, |bar| bar.opacity(0.75)),
+                    )
+            })
+            .collect();
+        // A week fits a label under every bar; longer periods keep the ends.
+        let axis = if self.data.daily.len() <= 7 {
+            div()
+                .pt_2()
+                .flex()
+                .gap(px(gap))
+                .text_size(px(10.0))
+                .text_color(rgb(FAINT))
+                .children(self.data.daily.iter().enumerate().map(|(index, (day, _))| {
+                    div()
+                        .flex_1()
+                        .min_w(px(2.0))
+                        .flex()
+                        .justify_center()
+                        .when(self.hovered_bar == Some(index), |label| {
+                            label.text_color(rgb(TEXT_SOFT))
+                        })
+                        .child(weekday(day).unwrap_or_else(|| short_day(day)))
+                }))
+        } else {
+            div()
+                .pt_2()
+                .flex()
+                .justify_between()
+                .text_size(px(10.0))
+                .text_color(rgb(FAINT))
+                .child(
+                    self.data
+                        .daily
+                        .first()
+                        .map_or_else(String::new, |(day, _)| short_day(day)),
                 )
-        });
+                .child(
+                    self.data
+                        .daily
+                        .last()
+                        .map_or_else(String::new, |(day, _)| short_day(day)),
+                )
+        };
         compact_panel().debug_selector(|| "statistics-chart".into()).flex_none()
             .child(div().px_4().py_3().flex().flex_wrap().items_center().justify_between().gap_3()
                 .child(div().flex().flex_col().gap_1()
                     .child(div().text_size(px(12.0)).font_weight(FontWeight::SEMIBOLD).child(self.chart.title()))
-                    .child(note(peak.map_or_else(|| "No measurements".into(), |value| format!("Peak {}", self.chart.format(value))))))
-                .child(self.segments(Segment::Chart, SETTINGS_CONTROL_WIDTH, cx)))
+                    .child(note(headline)))
+                .child(segments))
             .child(div().px_4().pt_2().pb_3()
                 .child(div().debug_selector(|| "statistics-chart-plot".into()).h(px(CHART_HEIGHT)).flex_none().flex().items_end()
-                    .gap(px(if values.len() > 14 { 3.0 } else { 8.0 })).children(bars))
-                .child(div().pt_2().flex().justify_between().text_size(px(10.0)).text_color(rgb(FAINT))
-                    .child(self.data.daily.first().map_or_else(String::new, |(day, _)| short_day(day)))
-                    .child(self.data.daily.last().map_or_else(String::new, |(day, _)| short_day(day))))
+                    .gap(px(gap)).children(bars))
+                .child(axis)
                 .when(self.chart == Chart::Wait, |chart| chart.child(div().mt_2().child(note("Grey dots mean no wait measurement, rather than zero-latency dictations."))))
                 .when(self.period == Period::AllTime, |chart| chart.child(div().mt_2().child(note("Chart: last 30 days. Overview: all retained daily totals.")))))
             .into_any_element()
@@ -1307,6 +1380,16 @@ fn format_cost(usd: f64) -> String {
     }
     super::report::format_usd(usd)
 }
+/// "Mon" for a `YYYY-MM-DD` day, or `None` when the key is not a date.
+fn weekday(day: &str) -> Option<String> {
+    let mut parts = day.split('-');
+    let year = parts.next()?.parse().ok()?;
+    let month = time::Month::try_from(parts.next()?.parse::<u8>().ok()?).ok()?;
+    let date = time::Date::from_calendar_date(year, month, parts.next()?.parse().ok()?).ok()?;
+    let name = date.weekday().to_string();
+    Some(name.chars().take(3).collect())
+}
+
 fn short_day(day: &str) -> String {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -1772,6 +1855,23 @@ mod tests {
             assert_eq!(view.read(cx).mode, Mode::Live);
             assert_eq!(view.read(cx).data.totals, period_totals);
         });
+    }
+
+    #[gpui::test]
+    fn hovering_a_chart_day_names_it_and_labels_each_weekday(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| StatisticsView::new(true));
+        cx.simulate_resize(gpui::size(px(820.0), px(2400.0)));
+        cx.run_until_parked();
+        let bar = cx.debug_bounds("statistics-bar-3").unwrap();
+        cx.simulate_mouse_move(bar.center(), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_eq!(view.read(cx).hovered_bar, Some(3)));
+        let outside = cx.debug_bounds("statistics-chart").unwrap().origin;
+        cx.simulate_mouse_move(outside, None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_eq!(view.read(cx).hovered_bar, None));
+        assert_eq!(weekday("2026-10-08").as_deref(), Some("Thu"));
+        assert_eq!(weekday("not-a-day"), None);
     }
 
     #[gpui::test]

@@ -284,10 +284,11 @@ fn join_listener(worker: &Rc<RefCell<Option<JoinHandle<()>>>>) {
 
 fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
     use crate::app_window::{
-        CloseWindow, HideApplication, MinimizeWindow, QuitApplication, ShowHistory, ShowHud,
-        ShowMicrophone, ShowModels, ShowPostProcessing, ShowProviders, ShowSettings,
+        CloseWindow, HideApplication, MinimizeWindow, QuitApplication, ShowAbout, ShowHistory,
+        ShowHud, ShowMicrophone, ShowModels, ShowPostProcessing, ShowProviders, ShowSettings,
         ShowStatistics, ToggleFullscreen,
     };
+    use crate::text_input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
     cx.bind_keys([
         KeyBinding::new("cmd-w", CloseWindow, None),
         KeyBinding::new("cmd-q", QuitApplication, None),
@@ -295,14 +296,15 @@ fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
         KeyBinding::new("cmd-m", MinimizeWindow, None),
         KeyBinding::new("ctrl-cmd-f", ToggleFullscreen, None),
         KeyBinding::new("cmd-,", ShowSettings, None),
+        // Numbered shortcuts follow the sidebar order.
         KeyBinding::new("cmd-1", ShowSettings, None),
-        KeyBinding::new("cmd-2", ShowHistory, None),
-        KeyBinding::new("cmd-3", ShowStatistics, None),
+        KeyBinding::new("cmd-2", ShowMicrophone, None),
+        KeyBinding::new("cmd-3", ShowProviders, None),
         KeyBinding::new("cmd-4", ShowModels, None),
-        KeyBinding::new("cmd-5", ShowHud, None),
-        KeyBinding::new("cmd-6", ShowMicrophone, None),
-        KeyBinding::new("cmd-7", ShowPostProcessing, None),
-        KeyBinding::new("cmd-8", ShowProviders, None),
+        KeyBinding::new("cmd-5", ShowPostProcessing, None),
+        KeyBinding::new("cmd-6", ShowHud, None),
+        KeyBinding::new("cmd-7", ShowHistory, None),
+        KeyBinding::new("cmd-8", ShowStatistics, None),
     ]);
     cx.bind_keys(crate::text_input::key_bindings());
     let settings_ui = ui.clone();
@@ -348,10 +350,13 @@ fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
     });
     cx.on_action(|_: &QuitApplication, cx| cx.quit());
     cx.on_action(|_: &HideApplication, _| crate::app_settings::hide_application());
+    cx.on_action(|_: &ShowAbout, _| crate::app_settings::show_about_panel());
     cx.set_menus(vec![
         Menu {
             name: "Hex".into(),
             items: vec![
+                MenuItem::action("About Hex", ShowAbout),
+                MenuItem::separator(),
                 MenuItem::action("Settings", ShowSettings),
                 MenuItem::action("Microphone", ShowMicrophone),
                 MenuItem::action("Providers", ShowProviders),
@@ -372,6 +377,20 @@ fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
             name: "File".into(),
             items: vec![MenuItem::action("Close Window", CloseWindow)],
         },
+        // Text fields handle these through their own key context; the menu
+        // makes the commands discoverable and lets macOS validate them.
+        Menu {
+            name: "Edit".into(),
+            items: vec![
+                MenuItem::os_action("Undo", Undo, gpui::OsAction::Undo),
+                MenuItem::os_action("Redo", Redo, gpui::OsAction::Redo),
+                MenuItem::separator(),
+                MenuItem::os_action("Cut", Cut, gpui::OsAction::Cut),
+                MenuItem::os_action("Copy", Copy, gpui::OsAction::Copy),
+                MenuItem::os_action("Paste", Paste, gpui::OsAction::Paste),
+                MenuItem::os_action("Select All", SelectAll, gpui::OsAction::SelectAll),
+            ],
+        },
         Menu {
             name: "Window".into(),
             items: vec![
@@ -391,6 +410,9 @@ async fn drive_ui(
 ) {
     let mut indicator = indicator_enabled.then(DictationIndicatorUi::new);
     let mut paste_notice: Option<crate::paste_notice::PasteNotice> = None;
+    // The window also checks while open; this keeps the menu bar badge and
+    // restart item current for people who only use the menu bar.
+    let mut update_check_at = Instant::now();
     loop {
         if shutdown.load(Ordering::Relaxed) || QUIT_REQUESTED.swap(false, Ordering::Relaxed) {
             let _ = cx.update(|cx| cx.quit());
@@ -452,6 +474,11 @@ async fn drive_ui(
         }
         if ui.status_actions.is_some() {
             let _ = cx.update(|_| crate::status_item::animate());
+            if Instant::now() >= update_check_at {
+                update_check_at = Instant::now() + UPDATE_CHECK_INTERVAL;
+                let pending = crate::update_check::pending_update();
+                let _ = cx.update(|_| crate::status_item::set_pending_update(pending));
+            }
         }
         while let Some(action) = ui
             .status_actions
@@ -461,6 +488,9 @@ async fn drive_ui(
             let result = cx.update(|cx| match action {
                 StatusItemAction::OpenSettings => {
                     ui.open_pane(cx, |window, cx| window.show_settings(cx))
+                }
+                StatusItemAction::OpenProviders => {
+                    ui.open_pane(cx, |window, cx| window.show_providers(cx))
                 }
                 StatusItemAction::OpenModels => {
                     ui.open_pane(cx, |window, cx| window.show_models(cx))
@@ -481,6 +511,7 @@ async fn drive_ui(
                 StatusItemAction::PasteLast => {
                     let _ = ui.listener_controls.try_send(ListenerControl::PasteLast);
                 }
+                StatusItemAction::RestartToUpdate => restart_to_update(&ui, cx),
                 StatusItemAction::Quit => cx.quit(),
             });
             if let Err(error) = result {
@@ -489,6 +520,22 @@ async fn drive_ui(
             }
         }
         Timer::after(Duration::from_millis(16)).await;
+    }
+}
+
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Commits any field being edited, then hands off to the installed bundle.
+/// When that cannot start, the window's update notice explains why.
+fn restart_to_update(ui: &Ui, cx: &mut App) {
+    let window = *ui.app_window.borrow();
+    if let Some(window) = window {
+        let _ = window.update(cx, |view, _, cx| view.finish_editing(cx));
+    }
+    let restarted = crate::update_check::bundle_path()
+        .is_some_and(|bundle| crate::update_check::relaunch_and_quit(&bundle));
+    if !restarted {
+        ui.open_pane(cx, |window, cx| window.show_settings(cx));
     }
 }
 

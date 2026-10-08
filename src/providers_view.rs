@@ -367,8 +367,9 @@ impl ProvidersView {
 impl Render for ProvidersView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let microsoft = div()
-            .mt_4()
-            .child(settings_section_label("MICROSOFT"))
+            .child(crate::desktop_ui::settings_subsection_label(
+                "Microsoft Azure Speech",
+            ))
             .child(settings_panel().child(self.render_microsoft()))
             .into_any_element();
         let microsoft_errors = self

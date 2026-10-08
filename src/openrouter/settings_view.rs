@@ -1204,14 +1204,14 @@ impl OpenRouterSettings {
             .into_any_element()
     }
 
-    fn key_description(&self) -> &'static str {
+    fn key_description(&self) -> String {
         if matches!(self.mode, ViewMode::Key(_))
             && matches!(
                 self.key_status,
                 None | Some(KeyStatus::Keychain(_) | KeyStatus::Missing)
             )
         {
-            return "";
+            return key_usage(&self.config.transcription.models, self.key_provider);
         }
         match &self.key_status {
             None => "Looking for this provider’s key…",
@@ -1222,6 +1222,7 @@ impl OpenRouterSettings {
             Some(KeyStatus::Environment) => "Set by the environment; it overrides any saved key",
             Some(KeyStatus::Missing) => "Uses your macOS Keychain",
         }
+        .into()
     }
 
     fn render_key_row(&mut self, cx: &mut Context<Self>) -> gpui::Div {
@@ -1570,10 +1571,67 @@ impl OpenRouterSettings {
             .into_any_element()
     }
 
+    /// Up, down and remove share fixed columns in every chain row, with
+    /// empty slots where a move is impossible, so the buttons line up.
+    fn render_order_controls(
+        &self,
+        slot: usize,
+        chain_len: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let placeholder = || {
+            div()
+                .size(px(crate::desktop_ui::CONTROL_HEIGHT))
+                .flex_none()
+        };
+        let busy = self.busy();
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(if slot > 0 {
+                icon_button("↑", "Move up")
+                    .id(("openrouter-promote", slot))
+                    .when(busy, |button| button.opacity(0.5))
+                    .on_click(cx.listener(move |this, _, _, cx| this.promote_model(slot, cx)))
+                    .into_any_element()
+            } else {
+                placeholder().into_any_element()
+            })
+            .child(if slot + 1 < chain_len {
+                icon_button("↓", "Move down")
+                    .id(("openrouter-demote", slot))
+                    .when(busy, |button| button.opacity(0.5))
+                    .on_click(cx.listener(move |this, _, _, cx| this.promote_model(slot + 1, cx)))
+                    .into_any_element()
+            } else {
+                placeholder().into_any_element()
+            })
+            .child(if slot > 0 {
+                icon_button("✕", "Remove")
+                    .id(("openrouter-remove-model", slot))
+                    .when(busy, |button| button.opacity(0.5))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.choose_model(slot, None, cx);
+                    }))
+                    .into_any_element()
+            } else {
+                placeholder().into_any_element()
+            })
+    }
+
     fn render_models_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let models = self.config.transcription.models.clone();
         let mut panel = settings_panel();
-        let primary = self.render_model_button(0, models.first().map(String::as_str), cx);
+        let chain_len = models.len().min(MAX_FALLBACKS + 1);
+        let primary = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(self.render_order_controls(0, chain_len, cx))
+            .child(self.render_model_button(0, models.first().map(String::as_str), cx));
         let primary_notices = models
             .first()
             .and_then(|id| self.render_model_notices(0, id));
@@ -1597,20 +1655,7 @@ impl OpenRouterSettings {
                 .flex()
                 .items_center()
                 .gap_1()
-                .child(
-                    icon_button("↑", "Move up")
-                        .id(("openrouter-promote", slot))
-                        .when(self.busy(), |button| button.opacity(0.5))
-                        .on_click(cx.listener(move |this, _, _, cx| this.promote_model(slot, cx))),
-                )
-                .child(
-                    icon_button("✕", "Remove")
-                        .id(("openrouter-remove-model", slot))
-                        .when(self.busy(), |button| button.opacity(0.5))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.choose_model(slot, None, cx);
-                        })),
-                )
+                .child(self.render_order_controls(slot, chain_len, cx))
                 .child(button);
             panel = panel.child(
                 self.row_message(
@@ -1721,52 +1766,46 @@ impl OpenRouterSettings {
         extra_errors: Vec<String>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let header = div()
-            .id("openrouter-advanced")
-            .debug_selector(|| "openrouter-advanced".into())
-            .track_focus(&self.advanced_focus)
-            .focus(|header| header.bg(rgb(SURFACE_SELECTED)))
-            .pt_5()
-            .pb_2()
-            .px_1()
-            .flex()
-            .items_center()
-            .gap_2()
-            .cursor_pointer()
-            .text_size(px(11.0))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(rgb(FAINT))
-            .hover(|header| header.bg(rgb(SURFACE_HOVER)))
-            .child(if self.advanced_open { "▾" } else { "▸" })
-            .child("ADVANCED")
-            .on_click(cx.listener(|this, event, window, cx| {
-                if matches!(event, gpui::ClickEvent::Mouse(_)) {
-                    this.toggle_advanced(window, cx);
-                }
-            }))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                let modifiers = event.keystroke.modifiers;
-                if modifiers.platform || modifiers.control || modifiers.alt {
-                    return;
-                }
-                match event.keystroke.key.as_str() {
-                    "enter" | "space" => {
-                        if !event.is_held {
-                            this.toggle_advanced(window, cx);
-                        }
-                        cx.stop_propagation();
+        let header = crate::desktop_ui::disclosure_header(
+            "ADVANCED",
+            if extra.is_some() {
+                "Request limits, API URL and Microsoft resource"
+            } else {
+                "Request limits and API URL"
+            },
+            self.advanced_open,
+        )
+        .id("openrouter-advanced")
+        .debug_selector(|| "openrouter-advanced".into())
+        .track_focus(&self.advanced_focus)
+        .on_click(cx.listener(|this, event, window, cx| {
+            if matches!(event, gpui::ClickEvent::Mouse(_)) {
+                this.toggle_advanced(window, cx);
+            }
+        }))
+        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+            let modifiers = event.keystroke.modifiers;
+            if modifiers.platform || modifiers.control || modifiers.alt {
+                return;
+            }
+            match event.keystroke.key.as_str() {
+                "enter" | "space" => {
+                    if !event.is_held {
+                        this.toggle_advanced(window, cx);
                     }
-                    "tab" => {
-                        if modifiers.shift {
-                            window.focus_prev();
-                        } else {
-                            window.focus_next();
-                        }
-                        cx.stop_propagation();
-                    }
-                    _ => {}
+                    cx.stop_propagation();
                 }
-            }));
+                "tab" => {
+                    if modifiers.shift {
+                        window.focus_prev();
+                    } else {
+                        window.focus_next();
+                    }
+                    cx.stop_propagation();
+                }
+                _ => {}
+            }
+        }));
         let collapsed_feedback = div()
             .debug_selector(|| "advanced-collapsed-feedback".into())
             .when(!self.advanced_open, |feedback| {
@@ -1782,6 +1821,7 @@ impl OpenRouterSettings {
                             .child(error)
                     }))
             });
+        let header = div().flex().child(header);
         if !self.advanced_open {
             return div()
                 .child(header)
@@ -1818,6 +1858,9 @@ impl OpenRouterSettings {
         div()
             .child(header)
             .child(collapsed_feedback)
+            .when(extra.is_some(), |section| {
+                section.child(crate::desktop_ui::settings_subsection_label("Requests"))
+            })
             .child(
                 settings_panel()
                     .child(settings_row(
@@ -1850,6 +1893,29 @@ impl OpenRouterSettings {
             .children(self.render_message(Scope::Advanced))
             .children(extra)
             .into_any_element()
+    }
+}
+
+/// Which primary/fallback slots a provider's key serves, so the Providers
+/// list shows what each key is for without repeating the model names.
+fn key_usage(models: &[String], provider: crate::providers::Provider) -> String {
+    let slots: Vec<String> = models
+        .iter()
+        .take(MAX_FALLBACKS + 1)
+        .enumerate()
+        .filter(|(_, id)| crate::providers::ModelRef::parse(id).provider == provider)
+        .map(|(slot, _)| {
+            if slot == 0 {
+                "Primary".to_owned()
+            } else {
+                format!("Fallback {slot}")
+            }
+        })
+        .collect();
+    match slots.as_slice() {
+        [] => "Not used by your models".into(),
+        [only] => format!("Used by {only}"),
+        [rest @ .., last] => format!("Used by {} and {last}", rest.join(", ")),
     }
 }
 

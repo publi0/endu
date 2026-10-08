@@ -376,18 +376,20 @@ fn split_sided_keycap(part: &str) -> (Option<&'static str>, String) {
 
 pub(crate) fn toggle(position: f32) -> AnyElement {
     let color_position = position.clamp(0.0, 1.0);
+    // The off track stays visibly lighter than the panel so a switch never
+    // reads as a lone knob or a checkbox.
     div()
-        .w(px(24.0))
+        .w(px(28.0))
         .h(px(16.0))
         .p(px(2.0))
         .flex_none()
         .flex()
         .items_center()
         .rounded(px(4.0))
-        .bg(mix_color(rgb(0x3a3a3a), rgb(ACCENT), color_position))
+        .bg(mix_color(rgb(0x4a4a4a), rgb(ACCENT), color_position))
         .child(
             div()
-                .ml(px(8.0 * position.clamp(-0.04, 1.04)))
+                .ml(px(12.0 * position.clamp(-0.04, 1.04)))
                 .size(px(12.0))
                 .rounded(px(2.0))
                 .bg(mix_color(rgb(0xc8c8c8), rgb(0xfafafa), color_position)),
@@ -405,6 +407,60 @@ pub(crate) fn settings_section_label(label: &'static str) -> AnyElement {
         .text_color(rgb(FAINT))
         .child(label)
         .into_any_element()
+}
+
+/// A label for a group nested inside a collapsible section. It is quieter
+/// than a section label so the group reads as part of its parent.
+pub(crate) fn settings_subsection_label(label: &'static str) -> AnyElement {
+    div()
+        .pt_4()
+        .pb_2()
+        .px_1()
+        .text_size(px(CONTROL_TEXT_SIZE))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(MUTED))
+        .child(label)
+        .into_any_element()
+}
+
+/// The chevron and label of a collapsible section. The caller owns focus,
+/// clicks and keys; the header only highlights its own label, never the row.
+pub(crate) fn disclosure_header(label: &'static str, detail: &'static str, open: bool) -> Div {
+    div()
+        .mt_5()
+        .mb_2()
+        .px_1()
+        .py_1()
+        .flex()
+        .items_center()
+        .gap_2()
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(rgba(0x00000000))
+        .cursor_pointer()
+        .text_size(px(11.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(FAINT))
+        .hover(|header| header.text_color(rgb(TEXT_SOFT)))
+        .focus(|header| header.border_color(rgb(ACCENT)))
+        .child(
+            gpui_symbols::Icon::new(if open {
+                "chevron.down"
+            } else {
+                "chevron.right"
+            })
+            .size(px(9.0))
+            .color(rgb(MUTED))
+            .weight(gpui_symbols::SymbolWeight::Semibold)
+            .rendering_mode(gpui_symbols::RenderingMode::Monochrome),
+        )
+        .child(label)
+        .child(
+            div()
+                .font_weight(FontWeight::NORMAL)
+                .text_color(rgb(FAINT))
+                .child(detail),
+        )
 }
 
 pub(crate) fn settings_copy(
@@ -493,7 +549,23 @@ pub(crate) fn disclosure_button(label: impl IntoElement) -> Div {
         .text_size(px(CONTROL_TEXT_SIZE))
         .text_color(rgb(TEXT_SOFT))
         .hover(|button| button.bg(rgb(SURFACE_HOVER)).text_color(rgb(TEXT)))
-        .child(div().min_w(px(0.0)).flex_1().truncate().child(label))
+        // GPUI's truncation measures slightly narrower than the shaped text
+        // paints, so a clipped label could lose its last glyph without an
+        // ellipsis. Truncate a little early and let any overhang use the gap.
+        .child(
+            div()
+                .min_w(px(0.0))
+                .flex_1()
+                .pr(px(6.0))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .w(px(SETTINGS_CONTROL_WIDTH - 24.0 - 2.0 - 8.0 - 10.0 - 6.0))
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(label),
+                ),
+        )
         .child(
             div()
                 .size(px(10.0))
