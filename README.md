@@ -5,7 +5,7 @@
 <h1 align="center">Hex</h1>
 
 <p align="center">
-  Ditado por atalho para macOS, com OpenRouter, OpenAI, Deepgram, ElevenLabs, Microsoft, Grok e Google.
+  Ditado por atalho para macOS, com OpenRouter, OpenAI, Deepgram, ElevenLabs, Microsoft, Grok, Google e Meta.
 </p>
 
 ## Instalação rápida
@@ -308,6 +308,15 @@ resolver a condição, o aviso é atualizado.
 | **Microsoft** | MAI-Transcribe 2 por upload, com vocabulário e estilo limpo/verbatim; MAI-Transcribe 2 Streaming por WebSocket, usando um deployment do Azure. |
 | **Grok (xAI)** | Grok Voice Transcribe 2.0 por upload ou streaming, com keyterms e controles de formatação e hesitações. |
 | **Google** | Gemini 3.5 Transcribe e Transcribe Live com chave do AI Studio, vocabulário e Smart transcription. |
+| **Meta** | Muse Voice Transcribe 1.0 por upload ou streaming, com keywords e indicação de idioma. |
+
+Na **Meta** (Facebook), crie uma chave no [Model API](https://dev.meta.ai/) e cadastre-a
+em **Providers**. Em **Models**, selecione **Muse Voice Transcribe 1.0**
+(`meta::muse-voice-transcribe-1.0`). Streaming começa ativado; desligá-lo usa o upload
+do áudio gravado. As keywords vêm da lista compartilhada. Português é suportado;
+Auto permite a detecção de idioma. Um idioma explícito incompatível mostra um aviso
+abaixo do modelo, sem substituí-lo silenciosamente. A busca aceita `meta`, `facebook`
+e `muse`, combinados com recursos como `streaming` e `keywords`.
 
 No **Google**, use uma chave do [AI Studio](https://aistudio.google.com/apikey).
 **Smart transcription** controla o modo que limpa hesitações/repetições e formata o texto;
@@ -390,7 +399,7 @@ sendo do OpenRouter. Providers diretos usam `provider::modelo`:
 
 Prefira o Keychain. As variáveis `OPENROUTER_API_KEY`, `OPENAI_API_KEY`,
 `DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`, `AZURE_MAI_API_KEY`, `XAI_API_KEY` e
-`GEMINI_API_KEY` têm precedência sobre a chave salva do provider correspondente.
+`GEMINI_API_KEY` e `MODEL_API_KEY` (Meta) têm precedência sobre a chave salva do provider correspondente.
 Apenas o OpenRouter preserva a compatibilidade com o antigo
 campo `api_key` no arquivo. Chaves e endpoints não entram na exportação.
 
@@ -401,6 +410,7 @@ Contratos oficiais: [OpenAI file transcription](https://developers.openai.com/ap
 [Grok STT](https://docs.x.ai/developers/rest-api-reference/inference/speech-to-text),
 [Gemini Transcribe](https://ai.google.dev/gemini-api/docs/transcribe),
 [Gemini Live Transcribe](https://ai.google.dev/gemini-api/docs/live-api/live-transcribe),
+[Meta Muse Voice](https://dev.meta.ai/docs/speech-to-text),
 [ElevenLabs Scribe](https://elevenlabs.io/docs/overview/capabilities/speech-to-text).
 
 ## Post-processing

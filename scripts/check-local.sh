@@ -37,6 +37,7 @@ trap 'rm -rf -- "$test_support"' EXIT
 export HEX_APPLICATION_SUPPORT_DIR="$test_support"
 unset OPENROUTER_API_KEY OPENAI_API_KEY DEEPGRAM_API_KEY ELEVENLABS_API_KEY
 unset AZURE_MAI_API_KEY XAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY
+unset MODEL_API_KEY
 
 run_step "Formatting" cargo fmt --all --check
 run_step "Shell syntax" sh -n scripts/build-app.sh scripts/write-cask.sh

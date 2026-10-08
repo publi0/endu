@@ -631,6 +631,11 @@ fn endpoint(
     options: &ModelOptions,
     keywords: &[String],
 ) -> Result<url::Url> {
+    if model.provider == Provider::Meta {
+        // Validate the model/language before DNS or credential resolution.
+        super::meta::settings(model.model, options, "PCM_16KHZ", keywords)
+            .map_err(|_| failure("Invalid Muse Voice model or language hint."))?;
+    }
     if model.provider == Provider::Microsoft {
         // Validate the resource before resolving credentials. Only the documented
         // Azure root is configurable; protocol path/query are supplied here.
@@ -648,6 +653,7 @@ fn endpoint(
         Provider::ElevenLabs => "wss://api.elevenlabs.io/v1/speech-to-text/realtime",
         Provider::Deepgram => "wss://api.deepgram.com/v1/listen",
         Provider::Grok => "wss://api.x.ai/v1/stt",
+        Provider::Meta => "wss://api.meta.ai/v1/asr/realtime",
         Provider::Google => {
             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
         }
@@ -804,6 +810,9 @@ fn authentication(
     provider: Provider,
     key: &str,
 ) -> Result<(&'static str, tungstenite::http::HeaderValue)> {
+    if provider == Provider::Meta {
+        return Err(failure("Meta authenticates in its first session frame."));
+    }
     let (header, value) = match provider {
         Provider::Microsoft => ("api-key", key.to_owned()),
         Provider::Google => ("x-goog-api-key", key.to_owned()),
@@ -826,6 +835,7 @@ fn finish_message(provider: Provider) -> Result<Value> {
         Provider::Deepgram => Ok(json!({"type":"CloseStream"})),
         Provider::Grok => Ok(json!({"type":"audio.done"})),
         Provider::Google => Ok(json!({"realtimeInput":{"activityEnd":{}}})),
+        Provider::Meta => Ok(json!({"type":"endStream"})),
         Provider::OpenRouter => Err(failure("Unsupported streaming provider.")),
     }
 }
@@ -1031,6 +1041,7 @@ struct Protocol {
     google_text: String,
     google_finished: bool,
     google_turn_complete: bool,
+    meta_final: Option<String>,
     commit_item: Option<String>,
     completed_items: BTreeMap<String, String>,
     segments: BTreeMap<(u64, u64), String>,
@@ -1047,6 +1058,7 @@ impl Protocol {
             google_text: String::new(),
             google_finished: false,
             google_turn_complete: false,
+            meta_final: None,
             commit_item: None,
             completed_items: BTreeMap::new(),
             segments: BTreeMap::new(),
@@ -1074,18 +1086,67 @@ impl Protocol {
                 .or_else(|| event.pointer("/error/code"))
                 .and_then(Value::as_u64)
                 .and_then(|n| u16::try_from(n).ok())
-                .filter(|status| (100..=599).contains(status));
+                .filter(|status| (100..=599).contains(status))
+                .or_else(|| {
+                    if self.provider != Provider::Meta {
+                        return None;
+                    }
+                    // Voice errorType uses the documented Model API taxonomy.
+                    match event["errorType"].as_str() {
+                        Some("authentication_error") => Some(401),
+                        Some("rate_limit_error") => Some(429),
+                        Some("server_error") => Some(500),
+                        _ => None,
+                    }
+                });
             return Err(LiveError {
                 status,
                 keyword_count: 0,
-                keywords_rejected: rejected_keywords(&event.to_string()),
+                keywords_rejected: (self.provider != Provider::Meta
+                    || status.is_none_or(|status| matches!(status, 400 | 422)))
+                    && rejected_keywords(&event.to_string()),
                 attempted: true,
-                error_kind: status.map_or(ErrorKind::Rejected, ErrorKind::from_status),
+                error_kind: if self.provider == Provider::Meta
+                    && event["errorCode"].as_str() == Some("gateway_timeout")
+                {
+                    ErrorKind::Timeout
+                } else {
+                    status.map_or(ErrorKind::Rejected, ErrorKind::from_status)
+                },
                 message: "The streaming provider rejected the request.",
             }
             .into());
         }
         match self.provider {
+            Provider::Meta => {
+                if !self.ready {
+                    if event.get("type").is_none()
+                        && event
+                            .get("sessionId")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| !id.is_empty())
+                    {
+                        self.ready = true;
+                        return Ok(None);
+                    }
+                    return Err(failure(
+                        "Meta sent an event before acknowledging its session.",
+                    ));
+                }
+                if kind == "transcript" {
+                    if self.meta_final.is_some() {
+                        return Err(failure("Meta sent a transcript after its final result."));
+                    }
+                    if event["final"].as_bool() == Some(true) {
+                        if !self.finishing {
+                            return Err(failure("Meta finalized transcription before Finish."));
+                        }
+                        // Cumulative final replaces every partial. Wait for the
+                        // server's normal close before accepting it as complete.
+                        self.meta_final = Some(final_text(event.get("transcript"))?);
+                    }
+                }
+            }
             Provider::OpenAi => {
                 if kind == "session.updated" {
                     self.ready = true;
@@ -1290,6 +1351,26 @@ impl Protocol {
             "Streaming connection closed without its terminal confirmation.",
         ))
     }
+    fn meta_closed(&self, code: Option<u16>) -> Result<Option<String>> {
+        match code {
+            Some(1000) if self.ready && self.finishing && self.meta_final.is_some() => {
+                Ok(self.meta_final.clone())
+            }
+            Some(1013) => Err(failure_kind(
+                "Meta rate limited the live session.",
+                ErrorKind::RateLimited,
+            )),
+            Some(1011) => Err(failure_kind(
+                "Meta could not complete the live session.",
+                ErrorKind::Server,
+            )),
+            Some(1008) => Err(failure_kind(
+                "Meta rejected the live session or its audio pacing.",
+                ErrorKind::Rejected,
+            )),
+            _ => self.closed(),
+        }
+    }
 }
 
 fn final_text(value: Option<&Value>) -> Result<String> {
@@ -1410,8 +1491,10 @@ impl Connection {
             .as_str()
             .into_client_request()
             .map_err(|_| failure("Could not create streaming request."))?;
-        let (header, value) = authentication(model.provider, &key)?;
-        request.headers_mut().insert(header, value);
+        if model.provider != Provider::Meta {
+            let (header, value) = authentication(model.provider, &key)?;
+            request.headers_mut().insert(header, value);
+        }
         let host = url
             .host_str()
             .ok_or_else(|| failure("Invalid streaming endpoint."))?
@@ -1508,6 +1591,14 @@ impl Connection {
             control: control.clone(),
         };
         match model.provider {
+            Provider::Meta => {
+                let setup = super::meta::handshake(model.model, &options, &keywords, &key)
+                    .map_err(|_| failure("Invalid Muse Voice model or language hint."))?;
+                connection.json(setup)?;
+                control
+                    .sent_keyword_count
+                    .store(keywords.len(), Ordering::Release);
+            }
             Provider::OpenAi => {
                 connection.json(session_update(model.model, &options, &keywords))?;
                 control
@@ -1555,8 +1646,8 @@ impl Connection {
             self.protocol.provider,
             self.encoder.source.saturating_add(samples.len()),
         )?;
-        if self.protocol.provider == Provider::Grok {
-            // xAI documents real-time-paced 100 ms binary packets. Pace on this
+        if matches!(self.protocol.provider, Provider::Grok | Provider::Meta) {
+            // Both APIs require real-time-paced PCM packets. Pace on this
             // socket worker; capture keeps its bounded nonblocking producer.
             let target = *self.pacing_started.get_or_insert_with(Instant::now)
                 + Duration::from_secs_f64(self.wire_frames as f64 / 16_000.0);
@@ -1578,7 +1669,7 @@ impl Connection {
             Provider::OpenAi | Provider::Microsoft => self.json(json!({"type":"input_audio_buffer.append","audio":crate::openrouter::transcribe::encode_base64(&pcm)})),
             Provider::ElevenLabs => self.json(json!({"message_type":"input_audio_chunk","audio_base_64":crate::openrouter::transcribe::encode_base64(&pcm),"commit":false,"sample_rate":16000})),
             Provider::Google => self.json(json!({"realtimeInput":{"audio":{"data":crate::openrouter::transcribe::encode_base64(&pcm),"mimeType":"audio/pcm;rate=16000"}}})),
-            Provider::Deepgram | Provider::Grok => {
+            Provider::Deepgram | Provider::Grok | Provider::Meta => {
                 self.socket.send(Message::Binary(pcm.into())).map_err(|error| websocket_failure("Streaming write failed.", &error))?;
                 self.last_send = Instant::now();
                 Ok(())
@@ -1624,14 +1715,19 @@ impl Connection {
                 self.protocol.event(&value)
             }
             Ok(Message::Close(frame)) => {
-                if frame.is_some_and(|frame| {
-                    frame.code != tungstenite::protocol::frame::coding::CloseCode::Normal
-                }) {
-                    return Err(failure(
-                        "Streaming provider closed the connection with an error.",
-                    ));
+                if self.protocol.provider == Provider::Meta {
+                    self.protocol
+                        .meta_closed(frame.map(|frame| frame.code.into()))
+                } else {
+                    if frame.is_some_and(|frame| {
+                        frame.code != tungstenite::protocol::frame::coding::CloseCode::Normal
+                    }) {
+                        return Err(failure(
+                            "Streaming provider closed the connection with an error.",
+                        ));
+                    }
+                    self.protocol.closed()
                 }
-                self.protocol.closed()
             }
             Err(tungstenite::Error::ConnectionClosed) => self.protocol.closed(),
             Err(tungstenite::Error::Io(error))
@@ -1757,6 +1853,163 @@ impl PcmEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meta_authenticates_only_in_its_handshake_and_preserves_pcm16_contract() {
+        let options = ModelOptions {
+            language: "pt".into(),
+            ..Default::default()
+        };
+        let model = ModelRef::parse("meta::muse-voice-transcribe-1.0");
+        let words = ["Nimbus Files".into()];
+        let url = endpoint(&Config::default(), model, &options, &words).unwrap();
+        assert_eq!(url.as_str(), "wss://api.meta.ai/v1/asr/realtime");
+        assert!(authentication(Provider::Meta, "fixture-only-key").is_err());
+        assert!(!query_keywords(Provider::Meta));
+        let setup =
+            super::super::meta::handshake(model.model, &options, &words, "fixture-only-key")
+                .unwrap();
+        assert_eq!(
+            setup["authorization"]["accessToken"],
+            "Bearer fixture-only-key"
+        );
+        assert_eq!(setup["audioEncoding"], "PCM_16KHZ");
+        assert_eq!(setup["languageBias"], json!(["Portuguese"]));
+        assert_eq!(setup["keywords"], json!(["Nimbus Files"]));
+        assert_eq!(
+            finish_message(Provider::Meta).unwrap(),
+            json!({"type":"endStream"})
+        );
+        let mut encoder = PcmEncoder::new(false).unwrap();
+        let pcm = encoder.push(&[0.0; 1600], false).unwrap();
+        assert_eq!(pcm.len(), 3200);
+        assert!(encoder.push(&[], true).unwrap().is_empty());
+        assert!(
+            endpoint(
+                &Config::default(),
+                model,
+                &ModelOptions {
+                    language: "ru".into(),
+                    ..Default::default()
+                },
+                &words
+            )
+            .is_err()
+        );
+    }
+
+    fn ready_meta() -> Protocol {
+        let mut protocol = Protocol::new(Provider::Meta);
+        assert!(!protocol.ready);
+        protocol
+            .event(&json!({"sessionId":"synthetic-session"}))
+            .unwrap();
+        assert!(protocol.ready);
+        protocol
+    }
+
+    #[test]
+    fn meta_waits_for_final_and_explicit_normal_close_never_pasting_partials() {
+        let mut protocol = ready_meta();
+        for text in ["Nimb", "Nimbus wrong", "Nimbus Files"] {
+            assert!(
+                protocol
+                    .event(&json!({"type":"transcript", "transcript":text, "final":false}))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        protocol.finishing = true;
+        // End-of-speech/segment events are not full PUSH_TO_TALK completion.
+        for event in [
+            json!({"type":"speechEnd"}),
+            json!({"type":"speechComplete","transcript":"partial"}),
+            json!({"type":"futureEvent"}),
+        ] {
+            assert!(protocol.event(&event).unwrap().is_none());
+        }
+        assert!(protocol.meta_closed(Some(1000)).is_err());
+        assert!(
+            protocol
+                .event(
+                    &json!({"type":"transcript","transcript":"Nimbus Files is ready.","final":true})
+                )
+                .unwrap()
+                .is_none()
+        );
+        // A TCP close or any abnormal close discards the speculative result.
+        assert!(protocol.closed().is_err());
+        for code in [None, Some(1006), Some(1008), Some(1011), Some(1013)] {
+            assert!(protocol.meta_closed(code).is_err());
+        }
+        assert_eq!(
+            protocol.meta_closed(Some(1000)).unwrap(),
+            Some("Nimbus Files is ready.".into())
+        );
+    }
+
+    #[test]
+    fn meta_rejects_early_malformed_oversized_or_conflicting_finals() {
+        for ack in [
+            json!({}),
+            json!({"sessionId":""}),
+            json!({"type":"transcript","sessionId":"fixture"}),
+        ] {
+            assert!(Protocol::new(Provider::Meta).event(&ack).is_err());
+        }
+        assert!(
+            ready_meta()
+                .event(&json!({"type":"transcript","transcript":"early","final":true}))
+                .is_err()
+        );
+        for text in [Value::Null, json!(123), json!("x".repeat(MAX_TEXT + 1))] {
+            let mut protocol = ready_meta();
+            protocol.finishing = true;
+            assert!(
+                protocol
+                    .event(&json!({"type":"transcript","transcript":text,"final":true}))
+                    .is_err()
+            );
+        }
+        let mut protocol = ready_meta();
+        protocol.finishing = true;
+        protocol
+            .event(&json!({"type":"transcript","transcript":"full","final":true}))
+            .unwrap();
+        assert!(
+            protocol
+                .event(&json!({"type":"transcript","transcript":"late","final":false}))
+                .is_err()
+        );
+        for (code, kind) in [
+            (1008, ErrorKind::Rejected),
+            (1011, ErrorKind::Server),
+            (1013, ErrorKind::RateLimited),
+        ] {
+            let error = protocol.meta_closed(Some(code)).unwrap_err();
+            assert_eq!(error.downcast_ref::<LiveError>().unwrap().error_kind, kind);
+        }
+        let error = ready_meta().event(&json!({"type":"error","message":"keywords unsupported PRIVATE_MARKER","errorParam":"keywords"})).unwrap_err();
+        assert!(error.downcast_ref::<LiveError>().unwrap().keywords_rejected);
+        assert!(!error.to_string().contains("PRIVATE_MARKER"));
+        for (error_type, status, kind) in [
+            ("authentication_error", 401, ErrorKind::Auth),
+            ("rate_limit_error", 429, ErrorKind::RateLimited),
+            ("server_error", 500, ErrorKind::Server),
+        ] {
+            let error = ready_meta()
+                .event(&json!({
+                    "type":"error", "errorType":error_type,
+                    "message":"PRIVATE_MARKER keywords are unavailable"
+                }))
+                .unwrap_err();
+            let typed = error.downcast_ref::<LiveError>().unwrap();
+            assert_eq!(typed.status, Some(status));
+            assert_eq!(typed.error_kind, kind);
+            assert!(!typed.keywords_rejected);
+            assert!(!error.to_string().contains("PRIVATE_MARKER"));
+        }
+    }
 
     fn fixture() -> (
         LiveCapture,

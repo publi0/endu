@@ -1224,7 +1224,8 @@ fn preview_dashboard(period: Period) -> Dashboard {
         let mut totals = Totals::default();
         if day % 13 != 3 {
             for index in 0..(20 + day % 11) {
-                let provider = ((day + index) % 7) as usize;
+                let provider =
+                    ((day + index) % crate::providers::Provider::ALL.len() as u64) as usize;
                 let recorded_model = [
                     "microsoft/mai-transcribe-2",
                     "openai::gpt-transcribe",
@@ -1233,6 +1234,7 @@ fn preview_dashboard(period: Period) -> Dashboard {
                     "microsoft::MAI-Transcribe-2",
                     "grok::grok-voice-transcribe-2.0",
                     "google::gemini-3.5-transcribe",
+                    "meta::muse-voice-transcribe-1.0",
                 ][provider];
                 let live_model = [
                     None,
@@ -1242,6 +1244,7 @@ fn preview_dashboard(period: Period) -> Dashboard {
                     Some("microsoft::MAI-Transcribe-2-Streaming"),
                     Some("grok::grok-voice-transcribe-2.0"),
                     Some("google::gemini-3.5-transcribe-live"),
+                    Some("meta::muse-voice-transcribe-1.0"),
                 ][provider];
                 let live = index % 2 == 0 && live_model.is_some();
                 let first_model = if live {
@@ -1549,7 +1552,10 @@ mod tests {
             daily.merge(totals);
         }
         assert_eq!(daily, week.totals);
-        assert_eq!(stats_dashboard::observed_providers(&week.totals).len(), 7);
+        assert_eq!(
+            stats_dashboard::observed_providers(&week.totals).len(),
+            crate::providers::Provider::ALL.len()
+        );
         assert_eq!(
             week.totals.dictations + week.totals.failed_dictations,
             week.totals.details.dictations
@@ -1634,7 +1640,7 @@ mod tests {
         });
         cx.update(|window, cx| {
             let view = view.read(cx);
-            assert_eq!(view.provider, Some(Provider::Google));
+            assert_eq!(view.provider, Some(Provider::Meta));
             assert_eq!(view.menu, None);
             assert!(
                 view.controls

@@ -758,7 +758,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|_, cx| ProvidersView::new(true, cx));
         cx.simulate_resize(gpui::size(px(760.0), px(2400.0)));
         cx.run_until_parked();
-        cx.update(|_, cx| assert_eq!(view.read(cx).keys.len(), 7));
+        cx.update(|_, cx| assert_eq!(view.read(cx).keys.len(), Provider::ALL.len()));
         assert!(cx.debug_bounds("microsoft-connection-0").is_none());
         let collapsed = cx.debug_bounds("providers-advanced").unwrap();
         let header = cx.debug_bounds("openrouter-advanced").unwrap();
@@ -781,6 +781,7 @@ mod tests {
             "provider-key-4",
             "provider-key-5",
             "provider-key-6",
+            "provider-key-7",
         ] {
             assert!(cx.debug_bounds(selector).is_some());
         }

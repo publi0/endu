@@ -29,6 +29,9 @@ pub fn validate_key(provider: Provider, key: &str) -> Result<&str> {
             byte.is_ascii_alphanumeric()
                 || matches!(byte, b'-' | b'_' | b'.')
                 || (provider == Provider::Microsoft && matches!(byte, b'+' | b'/' | b'='))
+                // Meta Model API keys use LLM|account|secret; these pipes are
+                // data in HTTPS headers/JSON, never shell arguments.
+                || (provider == Provider::Meta && byte == b'|')
         })
     {
         bail!("The {} key has an invalid format.", provider.label());
@@ -200,7 +203,7 @@ pub(crate) fn authorization(provider: Provider, key: &str) -> (&'static str, Str
         Provider::ElevenLabs => ("xi-api-key", key.into()),
         Provider::Microsoft => ("Ocp-Apim-Subscription-Key", key.into()),
         Provider::Google => ("x-goog-api-key", key.into()),
-        Provider::OpenRouter | Provider::OpenAi | Provider::Grok => {
+        Provider::OpenRouter | Provider::OpenAi | Provider::Grok | Provider::Meta => {
             ("Authorization", format!("Bearer {key}"))
         }
     }
@@ -210,6 +213,7 @@ fn check_endpoint(provider: Provider) -> &'static str {
     match provider {
         Provider::OpenAi => "https://api.openai.com/v1/models",
         Provider::Grok => "https://api.x.ai/v1/models",
+        Provider::Meta => "https://api.meta.ai/v1/models",
         Provider::Google => "https://generativelanguage.googleapis.com/v1beta/models",
         Provider::Microsoft => {
             unreachable!("Azure token checks require a validated resource endpoint")
@@ -309,7 +313,35 @@ fn check_status(provider: Provider, status: u16) -> Result<String> {
 mod tests {
     use super::*;
     #[test]
+    fn meta_accepts_its_documented_pipe_separated_key_without_relaxing_other_providers() {
+        // https://dev.meta.ai/docs/authentication
+        let key = "LLM|123456789012345|fixture-key-0123456789";
+        assert_eq!(validate_key(Provider::Meta, key).unwrap(), key);
+        for provider in Provider::ALL {
+            if provider != Provider::Meta {
+                assert!(validate_key(provider, key).is_err());
+            }
+        }
+        for invalid in [
+            "LLM|123456789012345|PRIVATE_MARKER\nheader",
+            "LLM|123456789012345|PRIVATE_MARKER`id`",
+            "LLM|123456789012345|PRIVATE_MARKER;id",
+        ] {
+            let error = validate_key(Provider::Meta, invalid).unwrap_err();
+            assert!(!error.to_string().contains("PRIVATE_MARKER"));
+        }
+    }
+    #[test]
     fn new_credentials_use_only_their_provider_header_and_destination() {
+        assert_eq!(
+            authorization(Provider::Meta, "fixture"),
+            ("Authorization", "Bearer fixture".into())
+        );
+        assert_eq!(
+            check_endpoint(Provider::Meta),
+            "https://api.meta.ai/v1/models"
+        );
+        assert_eq!(Provider::Meta.env(), "MODEL_API_KEY");
         assert_eq!(
             authorization(Provider::Microsoft, "fixture"),
             ("Ocp-Apim-Subscription-Key", "fixture".into())

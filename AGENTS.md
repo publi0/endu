@@ -194,6 +194,14 @@ not reintroduce seams for them.
   the terminal acknowledgement. Never promote an interim segment or socket close
   to a completed transcript. Cover empty terminal text and absent confirmation
   through the provider dispatcher so valid streaming never triggers a second upload.
+  Meta uses Muse Voice Transcribe's native PUSH_TO_TALK API: named languageBias,
+  shared keywords and mono PCM16 at 16 kHz. Its WebSocket credential belongs only
+  in the first JSON handshake, never HTTP headers or query parameters. Wait for
+  its untyped sessionId acknowledgement before audio, pace PCM in real time,
+  send endStream after the exact clip, and accept text only after final:true and
+  server close 1000. Partials, speechEnd and abnormal/absent close are incomplete
+  and must recover from the recorded clip. No prompt/formatting capabilities are
+  documented. Unsupported explicit language hints are visible and rejected.
   Model search combines name, ID, provider and supported capabilities with AND
   between terms. Exact capability words must not match a model name that lacks
   that capability. Reuse cached keyword evidence; never probe on a search edit.

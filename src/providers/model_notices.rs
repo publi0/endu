@@ -93,6 +93,13 @@ pub fn model_notices(config: &Config, id: &str) -> Vec<ModelNotice> {
         });
     }
 
+    if model.provider == Provider::Meta && super::meta::language_bias(&options.language).is_err() {
+        notices.push(ModelNotice {
+            text: "Muse Voice does not support this language hint. Choose Auto or a supported language.",
+            is_error: true,
+        });
+    }
+
     notices
 }
 
@@ -106,6 +113,36 @@ mod tests {
             .transcription
             .model_options
             .insert(ModelRef::parse(id).key(), options);
+    }
+
+    #[test]
+    fn meta_language_warning_is_only_beneath_the_affected_selected_model() {
+        let mut config = Config::default();
+        let id = "meta::muse-voice-transcribe-1.0";
+        for language in ["auto", "pt", "en"] {
+            profile(
+                &mut config,
+                id,
+                ModelOptions {
+                    language: language.into(),
+                    ..Default::default()
+                },
+            );
+            assert!(model_notices(&config, id).is_empty());
+        }
+        profile(
+            &mut config,
+            id,
+            ModelOptions {
+                language: "ru".into(),
+                ..Default::default()
+            },
+        );
+        let notices = model_notices(&config, id);
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].is_error);
+        assert!(model_notices(&config, "openai::gpt-transcribe").is_empty());
+        assert!(model_notices(&config, "meta/muse-voice-transcribe-1.0").is_empty());
     }
 
     #[test]

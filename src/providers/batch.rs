@@ -45,6 +45,14 @@ pub fn keywords(model: ModelRef<'_>, vocabulary: &Snapshot) -> Vec<String> {
         Provider::Microsoft => (2_000, 256_000, usize::MAX, usize::MAX),
         Provider::Grok => (100, 128_000, 50, usize::MAX),
         Provider::Google => (1_000, 128_000, usize::MAX, usize::MAX),
+        // Meta publishes no term cap. Keep Hex's shared dictionary bounds;
+        // retry without hints on an explicit server-side keyword rejection.
+        Provider::Meta => (
+            crate::vocabulary::MAX_TERMS,
+            256_000,
+            usize::MAX,
+            usize::MAX,
+        ),
         Provider::OpenRouter => return Vec::new(), // Routing-specific hints use HintPlan.
     };
     let mut used = 0;
@@ -312,6 +320,22 @@ fn request(
                 keyword_count: terms.len(),
             })
         }
+        Provider::Meta => {
+            let settings = super::meta::settings(model.model, options, "WAV", &terms)?;
+            let (content_type, body) = multipart_audio_typed(
+                &[("request", settings.to_string())],
+                wav,
+                "audio",
+                Some("application/json"),
+            );
+            Ok(Request {
+                provider: model.provider,
+                url: "https://api.meta.ai/v1/asr/transcribe".into(),
+                content_type,
+                body,
+                keyword_count: terms.len(),
+            })
+        }
         Provider::Google => {
             // https://ai.google.dev/gemini-api/docs/transcribe and /api/interactions-api
             let mut transcription = json!({"mode": if options.smart_format {
@@ -354,6 +378,15 @@ fn multipart(fields: &[(&str, String)], wav: &[u8]) -> (String, Vec<u8>) {
 }
 
 fn multipart_audio(fields: &[(&str, String)], wav: &[u8], audio_field: &str) -> (String, Vec<u8>) {
+    multipart_audio_typed(fields, wav, audio_field, None)
+}
+
+fn multipart_audio_typed(
+    fields: &[(&str, String)],
+    wav: &[u8],
+    audio_field: &str,
+    field_type: Option<&str>,
+) -> (String, Vec<u8>) {
     let boundary = loop {
         let value = format!(
             "hex-audio-{}-{}",
@@ -370,9 +403,11 @@ fn multipart_audio(fields: &[(&str, String)], wav: &[u8], audio_field: &str) -> 
     };
     let mut body = Vec::new();
     for (name, value) in fields {
+        let content_type =
+            field_type.map_or(String::new(), |kind| format!("Content-Type: {kind}\r\n"));
         body.extend_from_slice(
             format!(
-                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n{content_type}\r\n{value}\r\n"
             )
             .as_bytes(),
         );
@@ -542,6 +577,7 @@ fn parse(provider: Provider, body: &[u8]) -> Result<(String, Usage)> {
         match provider {
             Provider::Deepgram => value.pointer("/results/channels/0/alternatives/0/transcript"),
             Provider::Microsoft => value.pointer("/combinedPhrases/0/text"),
+            Provider::Meta => value.get("transcript"),
             _ => value.get("text"),
         }
         .and_then(Value::as_str)
@@ -589,6 +625,7 @@ fn keywords_rejected(
                 || body.contains("customvocabulary")
                 || body.contains("custom vocabulary")
         }
+        Provider::Meta => body.contains("keywords"),
         Provider::OpenRouter => false,
     }
 }
@@ -1338,6 +1375,194 @@ fn transcribe_configured(
 mod tests {
     use super::*;
     use crate::vocabulary::Vocabulary;
+
+    #[test]
+    fn meta_upload_uses_typed_request_part_named_language_and_authoritative_wav() {
+        let id = "meta::muse-voice-transcribe-1.0";
+        let model = ModelRef::parse(id);
+        let config = config(&[id]);
+        let words = vocabulary(&["Nimbus Files", "Álvaro"]);
+        let wav = encode_wav(&[0.1; 1600]).unwrap();
+        for without_hints in [false, true] {
+            let request = request(
+                &config,
+                model,
+                &ModelOptions {
+                    language: "pt".into(),
+                    ..Default::default()
+                },
+                &wav,
+                &words,
+                &HintPlan::default(),
+                without_hints,
+            )
+            .unwrap();
+            assert_eq!(request.url, "https://api.meta.ai/v1/asr/transcribe");
+            let body = String::from_utf8_lossy(&request.body);
+            let settings: Value = serde_json::from_str(
+                body.split("name=\"request\"\r\nContent-Type: application/json\r\n\r\n")
+                    .nth(1)
+                    .unwrap()
+                    .split("\r\n")
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(settings["audioEncoding"], "WAV");
+            assert_eq!(settings["mode"], "PUSH_TO_TALK");
+            assert_eq!(settings["languageBias"], json!(["Portuguese"]));
+            assert_eq!(settings.get("keywords").is_none(), without_hints);
+            assert_eq!(request.keyword_count, if without_hints { 0 } else { 2 });
+            assert!(settings.get("authorization").is_none());
+            assert!(request.body.windows(wav.len()).any(|part| part == wav));
+            assert!(
+                body.contains("name=\"audio\"; filename=\"clip.wav\"\r\nContent-Type: audio/wav")
+            );
+        }
+        let (text, usage) = parse(
+            Provider::Meta,
+            br#"{"transcript":" full transcription ","turns":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(text, "full transcription");
+        assert!(!usage.cost_reported);
+        for body in [
+            r#"{"text":"wrong field"}"#,
+            r#"{"transcript":" "}"#,
+            r#"{"error":{"message":"PRIVATE_MARKER"}}"#,
+        ] {
+            assert!(
+                !parse(Provider::Meta, body.as_bytes())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("PRIVATE_MARKER")
+            );
+        }
+    }
+
+    #[test]
+    fn meta_hint_retry_and_cross_provider_fallback_record_actual_attempts() {
+        let ids = ["meta::muse-voice-transcribe-1.0", "openai::gpt-transcribe"];
+        let config = config(&ids);
+        let words = vocabulary(&["Nimbus Files"]);
+        let mut progress = Progress::default();
+        let mut calls = Vec::new();
+        let success = Chain {
+            config: &config,
+            vocabulary: &words,
+            hints: &HintPlan::default(),
+            cancelled: None,
+        }
+        .run(
+            &[0.1; 1600],
+            Duration::ZERO,
+            &mut progress,
+            &mut |request, _| {
+                calls.push((request.provider, request.keyword_count));
+                let response = match (request.provider, request.keyword_count) {
+                    (Provider::Meta, 1) => response(
+                        400,
+                        r#"{"error":{"param":"keywords","message":"unsupported PRIVATE_MARKER"}}"#,
+                        None,
+                    ),
+                    (Provider::Meta, 0) => response(503, "PRIVATE_MARKER", None),
+                    (Provider::OpenAi, 1) => response(200, r#"{"text":"done"}"#, None),
+                    _ => panic!("unexpected attempt"),
+                };
+                (Ok(response), Duration::from_millis(10))
+            },
+            &mut |_, _, _, _| panic!("no completed websocket"),
+            &mut |_| panic!("no sleep"),
+        )
+        .unwrap();
+        assert_eq!(success.model, ids[1]);
+        assert_eq!(
+            calls,
+            [
+                (Provider::Meta, 1),
+                (Provider::Meta, 0),
+                (Provider::OpenAi, 1)
+            ]
+        );
+        assert_eq!(progress.executions[0].provider, "meta");
+        assert_eq!(progress.executions[0].keyword_count, 1);
+        let telemetry = progress.telemetry(true);
+        assert!(telemetry.used_fallback && telemetry.retried);
+        assert_eq!(telemetry.attempts.len(), 3);
+        assert_eq!(telemetry.attempts[0].mode, RequestMode::Recorded);
+        assert!(
+            progress
+                .failures
+                .iter()
+                .all(|failure| !failure.detail.contains("PRIVATE_MARKER"))
+        );
+    }
+
+    #[test]
+    fn meta_live_success_and_file_recovery_keep_history_mode_and_cost_unknown() {
+        for live_succeeds in [true, false] {
+            take_samples();
+            let id = "meta::muse-voice-transcribe-1.0";
+            let mut config = config(&[id]);
+            config.transcription.trim_silence = false;
+            let words = vocabulary(&["Nimbus Files"]);
+            let live_result = if live_succeeds {
+                Ok(streaming::LiveResult {
+                    text: "live result".into(),
+                    model: id.into(),
+                    keyword_count: 1,
+                    latency_ms: 125,
+                })
+            } else {
+                let mut error = streaming::fixture_error(None, false);
+                error
+                    .downcast_mut::<streaming::LiveError>()
+                    .unwrap()
+                    .keyword_count = 1;
+                Err(error)
+            };
+            let live =
+                streaming::PendingLive::fixture(config.clone(), words.clone(), live_result, 1600);
+            let mut requests = 0;
+            let result = transcribe_configured(
+                &[0.1; 1600],
+                &words,
+                Some(live),
+                &config,
+                &mut |request, _| {
+                    requests += 1;
+                    assert_eq!(request.provider, Provider::Meta);
+                    (
+                        Ok(response(200, r#"{"transcript":"recovered result"}"#, None)),
+                        Duration::from_millis(25),
+                    )
+                },
+                &mut |_, _, _, _| panic!("Meta recovery uses upload"),
+                &mut |_| panic!("no wait"),
+            )
+            .unwrap();
+            assert_eq!(requests, usize::from(!live_succeeds));
+            let report = result.report.unwrap();
+            assert_eq!(report.executions[0].provider, "meta");
+            assert!(report.executions[0].streaming);
+            assert_eq!(report.executions[0].keyword_count, 1);
+            let samples = take_samples();
+            assert_eq!(samples.len(), 1);
+            let telemetry = samples[0].telemetry.as_ref().unwrap();
+            assert_eq!(telemetry.live_recovered, !live_succeeds);
+            assert!(!telemetry.used_fallback);
+            assert!(
+                telemetry
+                    .attempts
+                    .iter()
+                    .all(|attempt| attempt.cost_usd.is_none())
+            );
+            if !live_succeeds {
+                assert!(!report.executions[1].streaming);
+                assert_eq!(telemetry.attempts[1].mode, RequestMode::Recorded);
+            }
+        }
+    }
 
     fn vocabulary(terms: &[&str]) -> Snapshot {
         Snapshot::new(Vocabulary {

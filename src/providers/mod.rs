@@ -6,6 +6,7 @@ use std::sync::{LazyLock, RwLock};
 
 pub mod batch;
 pub mod keys;
+mod meta;
 mod model_notices;
 pub use model_notices::model_notices;
 mod microsoft;
@@ -22,9 +23,10 @@ pub enum Provider {
     Microsoft,
     Grok,
     Google,
+    Meta,
 }
 impl Provider {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::OpenRouter,
         Self::OpenAi,
         Self::Deepgram,
@@ -32,6 +34,7 @@ impl Provider {
         Self::Microsoft,
         Self::Grok,
         Self::Google,
+        Self::Meta,
     ];
     pub const fn id(self) -> &'static str {
         match self {
@@ -42,6 +45,7 @@ impl Provider {
             Self::Microsoft => "microsoft",
             Self::Grok => "grok",
             Self::Google => "google",
+            Self::Meta => "meta",
         }
     }
     pub const fn label(self) -> &'static str {
@@ -53,6 +57,7 @@ impl Provider {
             Self::Microsoft => "Microsoft",
             Self::Grok => "Grok (xAI)",
             Self::Google => "Google",
+            Self::Meta => "Meta",
         }
     }
     pub const fn keys_url(self) -> &'static str {
@@ -64,6 +69,7 @@ impl Provider {
             Self::Microsoft => "https://ai.azure.com/",
             Self::Grok => "https://console.x.ai/",
             Self::Google => "https://aistudio.google.com/apikey",
+            Self::Meta => "https://dev.meta.ai/",
         }
     }
     pub const fn env(self) -> &'static str {
@@ -75,6 +81,7 @@ impl Provider {
             Self::Microsoft => "AZURE_MAI_API_KEY",
             Self::Grok => "XAI_API_KEY",
             Self::Google => "GEMINI_API_KEY",
+            Self::Meta => "MODEL_API_KEY",
         }
     }
 }
@@ -333,6 +340,17 @@ pub fn native_models() -> Vec<NativeModel> {
                 ..Capabilities::default()
             },
         },
+        NativeModel {
+            provider: Provider::Meta,
+            id: meta::MODEL,
+            name: "Muse Voice Transcribe 1.0",
+            capabilities: Capabilities {
+                batch: true,
+                streaming: true,
+                keywords: true,
+                ..Capabilities::default()
+            },
+        },
     ]
 }
 
@@ -502,6 +520,13 @@ mod tests {
     #[test]
     fn new_native_models_keep_transport_capabilities_distinct_from_routes() {
         let cases = [
+            (
+                "meta::muse-voice-transcribe-1.0",
+                Provider::Meta,
+                true,
+                true,
+                true,
+            ),
             (
                 "microsoft::MAI-Transcribe-2",
                 Provider::Microsoft,

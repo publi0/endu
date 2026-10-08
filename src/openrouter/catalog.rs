@@ -31,10 +31,10 @@ impl CatalogModel {
             self.name,
             self.provider,
             model.provider.label(),
-            if model.provider == Provider::Microsoft {
-                "Azure"
-            } else {
-                ""
+            match model.provider {
+                Provider::Microsoft => "Azure",
+                Provider::Meta => "Facebook Muse",
+                _ => "",
             },
         ));
         let badges = capability_badges(&self.id, verified_keywords);
@@ -269,6 +269,17 @@ mod tests {
 
     #[test]
     fn search_combines_provider_and_supported_capabilities_with_and() {
+        let meta = native("meta::muse-voice-transcribe-1.0");
+        for query in [
+            "meta streaming keywords",
+            "facebook streaming",
+            "muse batch",
+            "muse voice",
+        ] {
+            assert!(meta.matches(query, false));
+        }
+        assert!(!meta.matches("meta context", false));
+        assert!(!meta.matches("meta formatting", false));
         let google_live = native("google::gemini-3.5-transcribe-live");
         let google_file = native("google::gemini-3.5-transcribe");
         assert!(google_live.matches(" \tGOOGLE \n STREAMING  ", false));
