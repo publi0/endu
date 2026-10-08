@@ -35,6 +35,7 @@ enum Edit {
 
 pub struct ModelOptionsView {
     config: Config,
+    available_providers: Vec<providers::Provider>,
     preview: bool,
     selected: Option<String>,
     saved: ModelOptions,
@@ -53,7 +54,11 @@ impl EventEmitter<ConfigChanged> for ModelOptionsView {}
 
 impl ModelOptionsView {
     pub fn new(config: Config, preview: bool, cx: &mut Context<Self>) -> Self {
-        let selected = config.transcription.models.first().cloned();
+        let selected = if preview {
+            config.transcription.models.first().cloned()
+        } else {
+            None
+        };
         let saved = selected
             .as_deref()
             .map(|id| providers::options(&config, id))
@@ -88,6 +93,11 @@ impl ModelOptionsView {
         }
         Self {
             config,
+            available_providers: if preview {
+                providers::Provider::ALL.to_vec()
+            } else {
+                Vec::new()
+            },
             preview,
             selected,
             saved,
@@ -104,16 +114,53 @@ impl ModelOptionsView {
         }
     }
 
+    fn available_models(&self) -> Vec<String> {
+        self.config
+            .transcription
+            .models
+            .iter()
+            .filter(|id| {
+                self.available_providers
+                    .contains(&ModelRef::parse(id).provider)
+            })
+            .cloned()
+            .collect()
+    }
+    pub fn set_available_providers(
+        &mut self,
+        mut available: Vec<providers::Provider>,
+        cx: &mut Context<Self>,
+    ) {
+        available.sort();
+        available.dedup();
+        if available == self.available_providers {
+            return;
+        }
+        self.available_providers = available;
+        self.close_pickers(cx);
+        self.refresh(self.config.clone(), cx);
+    }
+
     pub fn config_snapshot(&self) -> Config {
         self.config.clone()
     }
     pub fn refresh(&mut self, config: Config, cx: &mut Context<Self>) {
+        let eligible: Vec<_> = config
+            .transcription
+            .models
+            .iter()
+            .filter(|id| {
+                self.available_providers
+                    .contains(&ModelRef::parse(id).provider)
+            })
+            .cloned()
+            .collect();
         let selected = self
             .selected
             .as_ref()
-            .filter(|id| config.transcription.models.contains(id))
+            .filter(|id| eligible.contains(id))
             .cloned()
-            .or_else(|| config.transcription.models.first().cloned());
+            .or_else(|| eligible.first().cloned());
         let saved = selected
             .as_deref()
             .map(|id| providers::options(&config, id))
@@ -214,7 +261,7 @@ impl ModelOptionsView {
                 self.config = config;
                 self.clear_error(field);
                 self.load_fields(cx);
-                cx.emit(ConfigChanged(self.config.clone()));
+                cx.emit(ConfigChanged);
                 cx.notify();
                 true
             }
@@ -226,21 +273,18 @@ impl ModelOptionsView {
         }
     }
     fn toggle_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.finish_editing(cx) {
+        if self.available_models().is_empty() || !self.finish_editing(cx) {
             return;
         }
         self.open = None;
         self.model_open = !self.model_open;
         if self.model_open {
-            let index = self
-                .config
-                .transcription
-                .models
+            let available = self.available_models();
+            let index = available
                 .iter()
                 .position(|id| Some(id) == self.selected.as_ref())
                 .unwrap_or(0);
-            self.model_picker
-                .open(index, self.config.transcription.models.len(), window);
+            self.model_picker.open(index, available.len(), window);
         } else {
             self.model_picker.trigger.focus(window);
         }
@@ -250,7 +294,7 @@ impl ModelOptionsView {
         if !self.finish_editing(cx) {
             return;
         }
-        let Some(id) = self.config.transcription.models.get(index).cloned() else {
+        let Some(id) = self.available_models().get(index).cloned() else {
             return;
         };
         self.selected = Some(id.clone());
@@ -266,7 +310,7 @@ impl ModelOptionsView {
         let key = event.keystroke.key.as_str();
         if self
             .model_picker
-            .navigate(key, self.config.transcription.models.len())
+            .navigate(key, self.available_models().len())
         {
         } else if matches!(key, "enter" | "space") {
             self.choose_model(self.model_picker.highlight, window, cx);
@@ -360,6 +404,7 @@ impl ModelOptionsView {
     ) -> AnyElement {
         let control = div()
             .id(("model-option-toggle", index))
+            .debug_selector(move || format!("model-option-toggle-{index}"))
             .track_focus(&self.toggles[index])
             .w(px(SETTINGS_CONTROL_WIDTH))
             .h(px(crate::desktop_ui::CONTROL_HEIGHT))
@@ -380,37 +425,40 @@ impl ModelOptionsView {
             .selected
             .as_deref()
             .map(|id| ModelRef::parse(id).label())
-            .unwrap_or_else(|| "Choose models in Models".into());
-        let menu = self.model_open.then(|| {
-            menu_frame("provider-options-model-menu")
-                .track_focus(&self.model_picker.menu)
-                .on_key_down(cx.listener(Self::model_keys))
-                .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    this.model_open = false;
-                    cx.notify();
-                }))
-                .child(
-                    div()
-                        .id("provider-model-choices")
-                        .max_h(px(240.0))
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.model_picker.scroll)
-                        .children(self.config.transcription.models.iter().enumerate().map(
-                            |(index, id)| {
-                                choice(
-                                    ModelRef::parse(id).label(),
-                                    index == self.model_picker.highlight,
-                                )
-                                .id(("provider-model-choice", index))
-                                .on_click(cx.listener(
-                                    move |this, _, window, cx| this.choose_model(index, window, cx),
-                                ))
-                            },
-                        )),
-                )
-                .into_any_element()
-        });
+            .unwrap_or_else(|| "No model with a configured provider".into());
+        let menu =
+            self.model_open.then(|| {
+                menu_frame("provider-options-model-menu")
+                    .track_focus(&self.model_picker.menu)
+                    .on_key_down(cx.listener(Self::model_keys))
+                    .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.model_open = false;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .id("provider-model-choices")
+                            .max_h(px(240.0))
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.model_picker.scroll)
+                            .children(self.available_models().iter().enumerate().map(
+                                |(index, id)| {
+                                    choice(
+                                        ModelRef::parse(id).label(),
+                                        index == self.model_picker.highlight,
+                                    )
+                                    .id(("provider-model-choice", index))
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            this.choose_model(index, window, cx)
+                                        },
+                                    ))
+                                },
+                            )),
+                    )
+                    .into_any_element()
+            });
         div()
             .relative()
             .flex_none()
@@ -497,6 +545,25 @@ impl Render for ModelOptionsView {
         ));
         if let Some(id) = &self.selected {
             let caps = ModelRef::parse(id).capabilities();
+            if ModelRef::parse(id).provider == providers::Provider::Microsoft {
+                let streaming = caps.streaming && (!caps.batch || self.saved.streaming);
+                panel = panel.child(
+                    div()
+                        .debug_selector(|| "microsoft-connection-state".into())
+                        .when(providers::microsoft_endpoint(&self.config, streaming).is_err(), |state| {
+                            state.child(
+                                div()
+                                    .debug_selector(|| "microsoft-connection-required".into())
+                                    .px_4().py_3().text_size(px(11.0)).text_color(rgb(NEGATIVE))
+                                    .child(if streaming {
+                                        "Set a valid Microsoft streaming endpoint and deployment in Providers."
+                                    } else {
+                                        "Set a valid Microsoft batch endpoint in Providers."
+                                    }),
+                            )
+                        }),
+                );
+            }
             panel = panel.child(self.row(
                 Field::Language,
                 "Language",
@@ -504,7 +571,7 @@ impl Render for ModelOptionsView {
                 self.render_language(cx),
             ));
             if caps.streaming {
-                panel = panel.child(self.toggle_row(Field::Streaming, 0, "Streaming", if caps.batch { "Transcribe while recording. Silence trimming applies only to recorded-audio requests." } else { "This model is realtime-only. Turning streaming off skips it in the fallback chain." }, self.saved.streaming, cx));
+                panel = panel.child(self.toggle_row(Field::Streaming, 0, "Streaming", if !ModelRef::parse(id).can_stream_language(&self.saved.language) { "Auto-detect uses recorded audio for Nova-2. Choose a language to stream." } else if caps.batch { "Transcribe while recording. Silence trimming applies only to recorded-audio requests." } else { "This model is realtime-only. Turning streaming off skips it in the fallback chain." }, self.saved.streaming, cx));
             }
             if caps.prompt {
                 panel = panel.child(
@@ -513,6 +580,7 @@ impl Render for ModelOptionsView {
                         "Context",
                         "Optional instructions or context supported by this model",
                         div()
+                            .debug_selector(|| "model-options-context".into())
                             .w(px(SETTINGS_CONTROL_WIDTH))
                             .child(self.context.clone())
                             .into_any_element(),
@@ -533,31 +601,39 @@ impl Render for ModelOptionsView {
                 );
             }
             if caps.formatting {
-                panel = panel
-                    .child(self.toggle_row(
-                        Field::SmartFormat,
-                        1,
-                        "Smart formatting",
-                        "Let the provider format dates, amounts and similar expressions",
-                        self.saved.smart_format,
-                        cx,
-                    ))
-                    .child(self.toggle_row(
-                        Field::Punctuate,
-                        2,
-                        "Punctuation",
-                        "Ask the provider to add punctuation",
-                        self.saved.punctuate,
-                        cx,
-                    ))
-                    .child(self.toggle_row(
-                        Field::Numerals,
-                        3,
-                        "Numerals",
-                        "Ask the provider to render numbers as digits",
-                        self.saved.numerals,
-                        cx,
-                    ));
+                let google = ModelRef::parse(id).provider == providers::Provider::Google;
+                panel = panel.child(self.toggle_row(
+                    Field::SmartFormat,
+                    1,
+                    if google {
+                        "Smart transcription"
+                    } else {
+                        "Smart formatting"
+                    },
+                    formatting_description(ModelRef::parse(id).provider, &self.saved.language),
+                    self.saved.smart_format,
+                    cx,
+                ));
+            }
+            if caps.punctuate {
+                panel = panel.child(self.toggle_row(
+                    Field::Punctuate,
+                    2,
+                    "Punctuation",
+                    "Ask the provider to add punctuation",
+                    self.saved.punctuate,
+                    cx,
+                ));
+            }
+            if caps.numerals {
+                panel = panel.child(self.toggle_row(
+                    Field::Numerals,
+                    3,
+                    "Numerals",
+                    "Ask the provider to render numbers as digits",
+                    self.saved.numerals,
+                    cx,
+                ));
             }
             if caps.no_verbatim {
                 panel = panel.child(self.toggle_row(
@@ -583,6 +659,22 @@ impl Render for ModelOptionsView {
             })
             .child(settings_section_label("MODEL OPTIONS"))
             .child(panel)
+    }
+}
+
+fn formatting_description(provider: providers::Provider, language: &str) -> &'static str {
+    if provider == providers::Provider::Google {
+        "Remove fillers and repetitions and format the transcript together"
+    } else if provider == providers::Provider::Grok
+        && !providers::batch::grok_format_supported(language)
+    {
+        if language == crate::openrouter::AUTO_LANGUAGE {
+            "Auto leaves smart formatting off. Choose a supported language, such as Portuguese or English."
+        } else {
+            "Smart formatting is unavailable for this language. Choose a supported language, such as Portuguese or English."
+        }
+    } else {
+        "Let the provider format dates, amounts and similar expressions"
     }
 }
 
@@ -621,8 +713,8 @@ fn edit_model(base: &Config, id: &str, edit: &Edit) -> Result<Config, String> {
         Edit::Temperature(value) if caps.temperature => options.temperature = *value,
         Edit::Toggle(Field::Streaming, value) if caps.streaming => options.streaming = *value,
         Edit::Toggle(Field::SmartFormat, value) if caps.formatting => options.smart_format = *value,
-        Edit::Toggle(Field::Punctuate, value) if caps.formatting => options.punctuate = *value,
-        Edit::Toggle(Field::Numerals, value) if caps.formatting => options.numerals = *value,
+        Edit::Toggle(Field::Punctuate, value) if caps.punctuate => options.punctuate = *value,
+        Edit::Toggle(Field::Numerals, value) if caps.numerals => options.numerals = *value,
         Edit::Toggle(Field::NoVerbatim, value) if caps.no_verbatim => options.no_verbatim = *value,
         _ => return Err("This model does not support that option.".into()),
     }
@@ -667,6 +759,120 @@ mod tests {
     use super::*;
     use gpui::Focusable;
 
+    #[gpui::test]
+    fn microsoft_models_explain_missing_local_connection_fields(cx: &mut gpui::TestAppContext) {
+        let mut config = Config::default();
+        config.transcription.models = vec!["microsoft::MAI-Transcribe-2-Streaming".into()];
+        let (view, cx) = cx.add_window_view(|_, cx| ModelOptionsView::new(config, true, cx));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("microsoft-connection-state")
+                .unwrap()
+                .size
+                .height
+                > px(0.0)
+        );
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let mut config = view.config_snapshot();
+                config.microsoft.streaming_endpoint =
+                    "https://fixture.services.ai.azure.com".into();
+                view.refresh(config, cx);
+            })
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("microsoft-connection-state")
+                .unwrap()
+                .size
+                .height
+                > px(0.0),
+            "deployment is also required"
+        );
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let mut config = view.config_snapshot();
+                config.microsoft.deployment = "MAI-Transcribe-2-Streaming".into();
+                view.refresh(config, cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert!(providers::microsoft_endpoint(&view.read(cx).config_snapshot(), true).is_ok());
+        });
+        // GPUI retains removed debug selectors between frames. This persistent
+        // container is updated every frame, so zero height proves the warning
+        // no longer occupies layout rather than consulting a stale map entry.
+        assert_eq!(
+            cx.debug_bounds("microsoft-connection-state")
+                .unwrap()
+                .size
+                .height,
+            px(0.0),
+        );
+    }
+
+    #[gpui::test]
+    fn provider_formatting_controls_follow_each_capability(cx: &mut gpui::TestAppContext) {
+        let mut config = Config::default();
+        let google = providers::native_models()
+            .into_iter()
+            .find(|model| model.provider == providers::Provider::Google)
+            .unwrap();
+        config.transcription.models = vec![format!("google::{}", google.id)];
+        let (view, cx) = cx.add_window_view(|_, cx| ModelOptionsView::new(config, true, cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("model-option-toggle-1").is_some());
+        assert!(cx.debug_bounds("model-option-toggle-2").is_none());
+        assert!(cx.debug_bounds("model-option-toggle-3").is_none());
+        assert!(cx.debug_bounds("model-option-toggle-4").is_none());
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                assert!(
+                    edit_model(
+                        &view.config,
+                        view.selected.as_deref().unwrap(),
+                        &Edit::Toggle(Field::Punctuate, true)
+                    )
+                    .is_err()
+                );
+                let mut config = view.config_snapshot();
+                config.transcription.models = vec!["grok::grok-voice-transcribe-2.0".into()];
+                view.refresh(config, cx);
+            })
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("model-option-toggle-1").is_some());
+        assert!(cx.debug_bounds("model-option-toggle-2").is_none());
+        assert!(cx.debug_bounds("model-option-toggle-3").is_none());
+        assert!(cx.debug_bounds("model-option-toggle-4").is_some());
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let mut config = view.config_snapshot();
+                config.transcription.models = vec!["deepgram::nova-3".into()];
+                view.refresh(config, cx);
+            })
+        });
+        cx.run_until_parked();
+        for selector in [
+            "model-option-toggle-1",
+            "model-option-toggle-2",
+            "model-option-toggle-3",
+        ] {
+            assert!(cx.debug_bounds(selector).is_some());
+        }
+    }
+
+    #[test]
+    fn grok_formatting_explains_when_the_saved_toggle_cannot_apply() {
+        use providers::Provider;
+        assert!(formatting_description(Provider::Grok, "auto").contains("Auto leaves"));
+        assert!(formatting_description(Provider::Grok, "it").contains("unavailable"));
+        assert!(!formatting_description(Provider::Grok, "pt").contains("unavailable"));
+        assert!(!formatting_description(Provider::Grok, "en").contains("off"));
+        assert!(formatting_description(Provider::Google, "auto").contains("repetitions"));
+    }
+
     fn fixture() -> Config {
         let mut config = Config::default();
         config.transcription.models =
@@ -688,6 +894,49 @@ mod tests {
             },
         );
         config
+    }
+
+    #[gpui::test]
+    fn unknown_credentials_do_not_expose_a_model_before_first_refresh(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let original = fixture();
+        let (view, cx) =
+            cx.add_window_view(|_, cx| ModelOptionsView::new(original.clone(), false, cx));
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.set_available_providers(Vec::new(), cx);
+                assert!(view.selected.is_none());
+                assert!(view.available_models().is_empty());
+                assert_eq!(view.config_snapshot(), original);
+                view.set_available_providers(vec![providers::Provider::OpenAi], cx);
+                assert_eq!(view.selected.as_deref(), Some("openai::gpt-transcribe"));
+                assert_eq!(view.saved.prompt, "Original context");
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn options_picker_filters_credentials_without_deleting_profiles(cx: &mut gpui::TestAppContext) {
+        let original = fixture();
+        let (view, cx) =
+            cx.add_window_view(|_, cx| ModelOptionsView::new(original.clone(), true, cx));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_available_providers(vec![providers::Provider::Deepgram], cx);
+                assert_eq!(view.available_models(), vec!["deepgram::nova-3"]);
+                assert_eq!(view.selected.as_deref(), Some("deepgram::nova-3"));
+                view.choose_model(0, window, cx);
+                assert_eq!(view.selected.as_deref(), Some("deepgram::nova-3"));
+                view.set_available_providers(Vec::new(), cx);
+                assert!(view.selected.is_none());
+                assert!(view.available_models().is_empty());
+                assert_eq!(view.config_snapshot(), original);
+                view.set_available_providers(vec![providers::Provider::OpenAi], cx);
+                assert_eq!(view.selected.as_deref(), Some("openai::gpt-transcribe"));
+                assert_eq!(view.saved.prompt, "Original context");
+            })
+        });
     }
 
     #[test]

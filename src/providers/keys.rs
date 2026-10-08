@@ -25,9 +25,11 @@ pub fn validate_key(provider: Provider, key: &str) -> Result<&str> {
     }
     let key = key.trim();
     if !(16..=4096).contains(&key.len())
-        || !key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || !key.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'_' | b'.')
+                || (provider == Provider::Microsoft && matches!(byte, b'+' | b'/' | b'='))
+        })
     {
         bail!("The {} key has an invalid format.", provider.label());
     }
@@ -196,13 +198,22 @@ pub(crate) fn authorization(provider: Provider, key: &str) -> (&'static str, Str
     match provider {
         Provider::Deepgram => ("Authorization", format!("Token {key}")),
         Provider::ElevenLabs => ("xi-api-key", key.into()),
-        Provider::OpenRouter | Provider::OpenAi => ("Authorization", format!("Bearer {key}")),
+        Provider::Microsoft => ("Ocp-Apim-Subscription-Key", key.into()),
+        Provider::Google => ("x-goog-api-key", key.into()),
+        Provider::OpenRouter | Provider::OpenAi | Provider::Grok => {
+            ("Authorization", format!("Bearer {key}"))
+        }
     }
 }
 
 fn check_endpoint(provider: Provider) -> &'static str {
     match provider {
         Provider::OpenAi => "https://api.openai.com/v1/models",
+        Provider::Grok => "https://api.x.ai/v1/models",
+        Provider::Google => "https://generativelanguage.googleapis.com/v1beta/models",
+        Provider::Microsoft => {
+            unreachable!("Azure token checks require a validated resource endpoint")
+        }
         Provider::Deepgram => "https://api.deepgram.com/v1/auth/token",
         Provider::ElevenLabs => "https://api.elevenlabs.io/v1/user",
         Provider::OpenRouter => unreachable!("OpenRouter key checks retain their existing adapter"),
@@ -216,6 +227,20 @@ pub fn check_key(provider: Provider, config: &Config) -> Result<String> {
     if provider == Provider::OpenRouter {
         return openrouter::check_key(config);
     }
+    // Resolve and validate destination before looking up any credentials.
+    let endpoint = if provider == Provider::Microsoft {
+        if config.microsoft.endpoint.is_empty() {
+            bail!(
+                "A separate Microsoft key test needs the Batch endpoint. Streaming checks the key when connecting to its deployment."
+            );
+        }
+        let mut root = super::microsoft_endpoint(config, false).map_err(|e| eyre!("{e}"))?;
+        root.set_path("/sts/v1.0/issueToken");
+        root.to_string()
+    } else {
+        check_endpoint(provider).into()
+    };
+    openrouter::http::validate_url(&endpoint)?;
     let key = api_key(provider, config)?;
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
@@ -226,11 +251,18 @@ pub fn check_key(provider: Provider, config: &Config) -> Result<String> {
             .build(),
     );
     let (name, value) = authorization(provider, &key);
-    let mut response = agent
-        .get(check_endpoint(provider))
-        .header(name, value)
-        .call()
-        .map_err(|_| eyre!("Could not reach {} to check the key.", provider.label()))?;
+    let response = if provider == Provider::Microsoft {
+        // The documented Speech STS exchange checks the key without sending audio.
+        agent
+            .post(&endpoint)
+            .header(name, value)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .send_empty()
+    } else {
+        agent.get(&endpoint).header(name, value).call()
+    };
+    let mut response =
+        response.map_err(|_| eyre!("Could not reach {} to check the key.", provider.label()))?;
     let status = response.status().as_u16();
     if status == 401 {
         invalidate(provider);
@@ -242,6 +274,13 @@ pub fn check_key(provider: Provider, config: &Config) -> Result<String> {
         .limit(2 * 1024 * 1024)
         .read_to_vec()
         .map_err(|_| eyre!("The key-check response could not be read safely."))?;
+    if provider == Provider::Microsoft {
+        // Never return or cache the short-lived token from the check.
+        if body.is_empty() {
+            bail!("The provider returned an empty key-check response.");
+        }
+        return Ok(message);
+    }
     if !serde_json::from_slice::<serde_json::Value>(&body).is_ok_and(|body| body.is_object()) {
         bail!("The provider returned an invalid key-check response.");
     }
@@ -269,6 +308,30 @@ fn check_status(provider: Provider, status: u16) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn new_credentials_use_only_their_provider_header_and_destination() {
+        assert_eq!(
+            authorization(Provider::Microsoft, "fixture"),
+            ("Ocp-Apim-Subscription-Key", "fixture".into())
+        );
+        assert_eq!(
+            authorization(Provider::Google, "fixture"),
+            ("x-goog-api-key", "fixture".into())
+        );
+        assert_eq!(
+            authorization(Provider::Grok, "fixture"),
+            ("Authorization", "Bearer fixture".into())
+        );
+        assert_eq!(
+            check_endpoint(Provider::Google),
+            "https://generativelanguage.googleapis.com/v1beta/models"
+        );
+        assert_eq!(check_endpoint(Provider::Grok), "https://api.x.ai/v1/models");
+        assert_eq!(Provider::Microsoft.env(), "AZURE_MAI_API_KEY");
+        assert_eq!(Provider::Google.env(), "GEMINI_API_KEY");
+        assert_eq!(Provider::Grok.env(), "XAI_API_KEY");
+    }
+
     #[test]
     fn all_provider_entrypoints_stop_before_credentials_or_network_in_tests() {
         let config = Config::default();
@@ -305,7 +368,10 @@ mod tests {
     }
     #[test]
     fn invalid_keys_cannot_inject_commands_and_errors_do_not_echo_them() {
-        for provider in [Provider::OpenAi, Provider::Deepgram, Provider::ElevenLabs] {
+        for provider in Provider::ALL
+            .into_iter()
+            .filter(|p| *p != Provider::OpenRouter)
+        {
             let error = validate_key(provider, "PRIVATE_MARKER\nquit").unwrap_err();
             assert!(!error.to_string().contains("PRIVATE_MARKER"));
             assert!(validate_key(provider, "sk-fixture_only_0123456789").is_ok());

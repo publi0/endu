@@ -89,7 +89,7 @@ cask "hex-openrouter" do
 
   url "https://github.com/{repository}/releases/download/v#{{version}}/Hex-#{{version}}.zip"
   name "Hex"
-  desc "Hold-to-talk dictation transcribed through OpenRouter with model fallback"
+  desc "Dictation with live transcription and speech provider fallback"
   homepage "https://github.com/{repository}"
 
   depends_on arch: :arm64

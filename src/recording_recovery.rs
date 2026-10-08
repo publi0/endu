@@ -20,6 +20,23 @@ const VERSION: u32 = 1;
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const REQUEST_FAILED: &str = "Transcription could not finish; no detailed cause is available.";
 
+#[derive(Debug)]
+enum UnusableTranscript {
+    EmptyResponse,
+    EmptyAfterFormatting,
+}
+
+impl std::fmt::Display for UnusableTranscript {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::EmptyResponse => "The transcription returned no text. The saved audio has been kept.",
+            Self::EmptyAfterFormatting => "Post-processing removed all text. Change its settings before Retry; the saved audio was kept.",
+        })
+    }
+}
+
+impl std::error::Error for UnusableTranscript {}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryStatus {
@@ -345,10 +362,13 @@ impl RecordingRecovery {
 
     /// Run on the transcription worker, never on the capture callback. A failed
     /// remote attempt leaves both the original samples and its recovery entry.
+    /// Format with the accepted job's preferences before resolving recovery;
+    /// an unusable result keeps its audio and returns a visible failure.
     pub fn transcribe_original(
         &self,
         samples: &[f32],
         application: Option<&str>,
+        preferences: crate::post_processing::Preferences,
         transcribe: impl FnOnce(&[f32]) -> color_eyre::Result<Transcription>,
     ) -> color_eyre::Result<Transcription> {
         let mut entry = self.begin(samples, application);
@@ -357,7 +377,24 @@ impl RecordingRecovery {
             id: entry.id.clone(),
             retry: false,
         };
-        let result = transcribe(samples);
+        let result = transcribe(samples).and_then(|mut transcription| {
+            // An empty local silence result is intentional. A remote result or
+            // text removed by formatting must remain available for recovery.
+            if transcription.text.trim().is_empty() {
+                if transcription.report.is_some() {
+                    return Err(UnusableTranscript::EmptyResponse.into());
+                }
+            } else {
+                transcription.text = preferences
+                    .process(transcription.text.trim())
+                    .trim()
+                    .to_owned();
+                if transcription.text.is_empty() {
+                    return Err(UnusableTranscript::EmptyAfterFormatting.into());
+                }
+            }
+            Ok(transcription)
+        });
         match &result {
             Ok(_) => {
                 // A terminal marker prevents an orphan WAV from being presented
@@ -604,6 +641,9 @@ fn transcription_failure_reason(error: &color_eyre::Report) -> String {
             details
         };
     }
+    if let Some(reason) = error.downcast_ref::<UnusableTranscript>() {
+        return reason.to_string();
+    }
     let detail = format!("{error:#}").to_lowercase();
     if detail.contains("api key not found") {
         return "The OpenRouter API key is missing. Add it in Models before retrying.".into();
@@ -831,9 +871,14 @@ mod tests {
         let samples = vec![0.125, -0.25, 0.5, 0.0];
         assert!(
             store
-                .transcribe_original(&samples, Some("Notes"), |_| Err(color_eyre::eyre::eyre!(
-                    "simulated network failure with SECRET_DO_NOT_PERSIST"
-                )))
+                .transcribe_original(
+                    &samples,
+                    Some("Notes"),
+                    crate::post_processing::Preferences::default(),
+                    |_| Err(color_eyre::eyre::eyre!(
+                        "simulated network failure with SECRET_DO_NOT_PERSIST"
+                    ))
+                )
                 .is_err()
         );
         store.entries("")[0].id.clone()
@@ -1043,14 +1088,117 @@ mod tests {
         let fixture = Fixture::new();
         let store = fixture.store();
         let result = store
-            .transcribe_original(&[0.25; 32], Some("Notes"), |_| {
+            .transcribe_original(
+                &[0.25; 32],
+                Some("Notes"),
+                crate::post_processing::Preferences::default(),
+                |_| {
+                    Ok(Transcription {
+                        text: "done".into(),
+                        report: None,
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(result.text, "done");
+        assert!(store.entries("").is_empty());
+        assert!(fs::read_dir(&fixture.0).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn original_empty_remote_result_keeps_audio_and_can_be_retried_after_reload() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let samples = [0.25; 160];
+        let error = store
+            .transcribe_original(
+                &samples,
+                Some("Notes"),
+                crate::post_processing::Preferences::default(),
+                |_| {
+                    Ok(Transcription {
+                        text: " \n\t ".into(),
+                        report: Some(crate::openrouter::StepReport::default()),
+                    })
+                },
+            )
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("returned no text"));
+        let store = fixture.store();
+        let entry = store.entries("").remove(0);
+        assert_eq!(entry.status, RecoveryStatus::Failed);
+        assert_eq!(entry.application.as_deref(), Some("Notes"));
+        assert!(entry.message.unwrap().contains("returned no text"));
+        assert_eq!(&**store.read_audio(&entry.id).unwrap(), &samples);
+        store
+            .retry_with(&entry.id, |_| {
                 Ok(Transcription {
-                    text: "done".into(),
+                    text: "recovered speech".into(),
                     report: None,
                 })
             })
             .unwrap();
-        assert_eq!(result.text, "done");
+        wait(&store);
+        let recovered = fixture.store().entries("").remove(0);
+        assert_eq!(recovered.status, RecoveryStatus::Recovered);
+        assert_eq!(recovered.text.as_deref(), Some("recovered speech"));
+        assert!(!store.audio_path(&entry.id).unwrap().exists());
+    }
+
+    #[test]
+    fn original_formatting_that_removes_all_text_keeps_audio() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let samples = [0.25; 160];
+        let preferences = crate::post_processing::Preferences {
+            remove_ellipses: true,
+            ..Default::default()
+        };
+        let error = store
+            .transcribe_original(&samples, Some("Notes"), preferences, |_| {
+                Ok(Transcription {
+                    text: "...".into(),
+                    report: Some(crate::openrouter::StepReport::default()),
+                })
+            })
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("Post-processing removed all text")
+        );
+        let store = fixture.store();
+        let entry = store.entries("").remove(0);
+        assert_eq!(entry.status, RecoveryStatus::Failed);
+        assert!(
+            entry
+                .message
+                .unwrap()
+                .contains("Post-processing removed all text")
+        );
+        assert_eq!(&**store.read_audio(&entry.id).unwrap(), &samples);
+    }
+
+    #[test]
+    fn original_local_silence_does_not_create_a_recovery_failure() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let result = store
+            .transcribe_original(
+                &[0.0; 160],
+                Some("Notes"),
+                crate::post_processing::Preferences::default(),
+                |_| {
+                    Ok(Transcription {
+                        text: String::new(),
+                        report: None,
+                    })
+                },
+            )
+            .unwrap();
+        assert!(result.text.is_empty());
         assert!(store.entries("").is_empty());
         assert!(fs::read_dir(&fixture.0).unwrap().next().is_none());
     }
@@ -1203,12 +1351,17 @@ mod tests {
         let store = fixture.store();
         assert!(
             store
-                .transcribe_original(&[0.1; 160], Some("Codex"), |_| {
-                    Err(api_error(
-                        ErrorKind::Timeout,
-                        "Operation timed out after 30000 milliseconds",
-                    ))
-                })
+                .transcribe_original(
+                    &[0.1; 160],
+                    Some("Codex"),
+                    crate::post_processing::Preferences::default(),
+                    |_| {
+                        Err(api_error(
+                            ErrorKind::Timeout,
+                            "Operation timed out after 30000 milliseconds",
+                        ))
+                    }
+                )
                 .is_err()
         );
         let entry = store.entries("").remove(0);

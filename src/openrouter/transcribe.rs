@@ -77,6 +77,7 @@ impl std::error::Error for ChainFailure {}
 pub(crate) struct Usage {
     pub tokens: u64,
     pub cost_usd: f64,
+    pub cost_reported: bool,
 }
 
 /// Shared entrypoint for recovery and CLI callers without a live capture session.
@@ -306,15 +307,22 @@ fn parse_transcript(body: &[u8]) -> Result<(String, Usage)> {
         .and_then(Value::as_str)
         .map(|text| text.trim().to_owned())
         .ok_or_else(|| eyre!("response has no text: {}", excerpt(body)))?;
+    if text.is_empty() {
+        bail!("response contains an empty transcription");
+    }
     let usage = value.get("usage");
     let number = |key: &str| usage.and_then(|usage| usage.get(key));
+    let cost = number("cost")
+        .and_then(Value::as_f64)
+        .filter(|cost| cost.is_finite() && *cost >= 0.0);
     Ok((
         text,
         Usage {
             tokens: number("total_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or_default(),
-            cost_usd: number("cost").and_then(Value::as_f64).unwrap_or_default(),
+            cost_usd: cost.unwrap_or_default(),
+            cost_reported: cost.is_some(),
         },
     ))
 }
@@ -429,6 +437,18 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned()
+    }
+
+    #[test]
+    fn legacy_usage_preserves_reported_zero_without_inventing_absent_cost() {
+        for (body, known) in [
+            (br#"{"text":"ok","usage":{"cost":0}}"#.as_slice(), true),
+            (br#"{"text":"ok"}"#.as_slice(), false),
+        ] {
+            let (_, usage) = parse_transcript(body).unwrap();
+            assert_eq!(usage.cost_usd, 0.0);
+            assert_eq!(usage.cost_reported, known);
+        }
     }
 
     #[test]
@@ -619,6 +639,58 @@ mod tests {
             ]
         );
         assert_eq!(calls.borrow().len(), 6);
+    }
+
+    #[test]
+    fn rate_limit_then_empty_fallback_tries_the_next_model() {
+        let calls = RefCell::new(Vec::new());
+        let success = transcribe_with_fallback(
+            &config(&["primary", "empty", "good"]),
+            "AAAA",
+            None,
+            |body, _| {
+                let model = model_of(body);
+                calls.borrow_mut().push(model.clone());
+                match model.as_str() {
+                    "primary" => status(429, Some(1)),
+                    "empty" => ok(r#"{"text":" \n\t "}"#),
+                    _ => ok(r#"{"text":"recovered speech"}"#),
+                }
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), ["primary", "primary", "empty", "good"]);
+        assert_eq!(success.text, "recovered speech");
+        assert_eq!(success.model, "good");
+        assert_eq!(success.failures[0].kind, ErrorKind::RateLimited);
+        assert_eq!(success.failures[1].kind, ErrorKind::InvalidResponse);
+    }
+
+    #[test]
+    fn all_empty_responses_fail_the_chain() {
+        for text in [r#"{"text":""}"#, r#"{"text":" \n\t "}"#] {
+            let calls = RefCell::new(Vec::new());
+            let failure = transcribe_with_fallback(
+                &config(&["a", "b"]),
+                "AAAA",
+                None,
+                |body, _| {
+                    calls.borrow_mut().push(model_of(body));
+                    ok(text)
+                },
+                |_| panic!("no sleep expected"),
+            )
+            .unwrap_err();
+            assert_eq!(*calls.borrow(), ["a", "b"]);
+            assert_eq!(failure.failures.len(), 2);
+            assert!(
+                failure
+                    .failures
+                    .iter()
+                    .all(|failure| failure.kind == ErrorKind::InvalidResponse)
+            );
+        }
     }
 
     #[test]

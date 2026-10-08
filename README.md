@@ -5,7 +5,7 @@
 <h1 align="center">Hex</h1>
 
 <p align="center">
-  Ditado por atalho para macOS, com OpenRouter, OpenAI, Deepgram e ElevenLabs Scribe.
+  Ditado por atalho para macOS, com OpenRouter, OpenAI, Deepgram, ElevenLabs, Microsoft, Grok e Google.
 </p>
 
 ## Instalação rápida
@@ -103,11 +103,11 @@ ou concede permissões por conta própria.
 
 1. Abra o **Hex** e conceda Microfone, Input Monitoring e Acessibilidade na
    tela de setup. As permissões são concedidas por você nos ajustes do macOS.
-2. Em **Providers**, conecte OpenRouter, OpenAI, Deepgram ou ElevenLabs. Cada
+2. Em **Providers**, conecte o provider que deseja usar. Cada
    chave fica em uma entrada separada do Keychain. No setup, **Choose another
    provider** abre essa tela.
 3. Em **Models**, escolha o principal e os fallbacks. Os ajustes de cada modelo
-   ficam em **Providers** e são salvos automaticamente.
+   ficam em **Models → Model options** e são salvos automaticamente.
 4. Coloque o cursor onde quer escrever, toque **Option**, fale e pressione
    **Option** novamente para encerrar. Segurar e soltar também funciona.
 
@@ -265,7 +265,7 @@ em que o ditado começou e o motivo da falha (como timeout, conexão ou código
 HTTP). Os detalhes exibidos não incluem respostas brutas ou credenciais. O áudio
 salvo também pode ser recuperado depois de fechar e reabrir o aplicativo.
 
-**Retry** usa a cadeia atual de **Models** e as chaves/opções de **Providers**. Só uma
+**Retry** usa a cadeia e as opções atuais de **Models**, com as chaves de **Providers**. Só uma
 recuperação manual roda por vez. Quando funcionar, o texto será salvo na
 mesma entrada e poderá ser copiado com **Copy text**; não há colagem
 automática. O áudio temporário só é removido depois que esse texto é salvo.
@@ -282,9 +282,11 @@ com Esc ou áudio ainda em memória antes de começar a tentativa.
 
 ## Providers e Models
 
-**Providers** guarda as chaves, as opções específicas de cada modelo e os
-limites globais de tentativa. **Command + 8** abre a tela. **Models** define
-um principal e até dois fallbacks, que podem pertencer a providers diferentes.
+**Providers** guarda as chaves e os limites globais de tentativa.
+**Command + 8** abre a tela. **Models** reúne o principal, até dois fallbacks,
+as opções por modelo e as keywords compartilhadas. Os seletores mostram
+somente modelos de providers com chave cadastrada. Remover uma chave não
+apaga a seleção nem o perfil salvo; o modelo fica sinalizado como indisponível.
 O provider aparece no nome do modelo; os indicadores de recursos mostram
 streaming, keywords e contexto quando disponíveis.
 
@@ -294,6 +296,21 @@ streaming, keywords e contexto quando disponíveis.
 | **OpenAI** | GPT Transcribe e modelos GPT-4o/Whisper por upload; GPT Live Transcribe por WebSocket. Nomes são enviados como keywords ou prompt conforme o modelo. |
 | **Deepgram** | Nova-3 e Nova-2, por upload ou streaming. Nova-3 aceita keyterms; formatação, pontuação e números têm controles próprios. |
 | **ElevenLabs** | Scribe v2 por upload e Scribe v2 Realtime por WebSocket, com keyterms e opção de remover hesitações. |
+| **Microsoft** | MAI-Transcribe 2 por upload, com vocabulário e estilo limpo/verbatim; MAI-Transcribe 2 Streaming por WebSocket, usando um deployment do Azure. |
+| **Grok (xAI)** | Grok Voice Transcribe 2.0 por upload ou streaming, com keyterms e controles de formatação e hesitações. |
+| **Google** | Gemini 3.5 Transcribe e Transcribe Live com chave do AI Studio, vocabulário e Smart transcription. |
+
+No **Google**, use uma chave do [AI Studio](https://aistudio.google.com/apikey).
+**Smart transcription** controla o modo que limpa hesitações/repetições e formata o texto;
+essas funções são oferecidas juntas pela API. No **Grok**, a formatação de números
+exige um idioma explícito compatível; em Auto, essa preferência continua salva para uso posterior.
+
+Na **Microsoft**, cadastre a chave do recurso Azure. Para upload, informe **Batch endpoint**
+(`https://<recurso>.cognitiveservices.azure.com`). Para streaming, informe **Streaming endpoint**
+(`https://<recurso>.services.ai.azure.com`) e o nome de **Deployment**.
+Os endpoints são locais e não entram na exportação de preferências. O botão **Test** da
+Microsoft requer o endpoint de upload e valida a chave sem enviar áudio; o acesso ao deployment
+é verificado quando ele é usado. O modelo de streaming não anuncia keywords sem suporte documentado.
 
 Uma chave salva mostra somente os últimos quatro caracteres, com **Test** e
 **Remove**. Clique no indicador da chave para substituí-la. O teste verifica acesso à conta; não garante saldo,
@@ -306,8 +323,12 @@ removê-lo da cadeia não apaga o perfil. As keywords são a exceção: uma list
 compartilhada por toda a cadeia, sem cópias por modelo.
 
 **Streaming** envia áudio durante a gravação, mas o Hex só cola o texto final,
-depois do pós-processamento. O toggle é explícito e começa desligado. Modelos
-exclusivamente realtime precisam dele ligado; desligá-lo faz a cadeia pular
+depois do pós-processamento. Streaming, formatação inteligente, pontuação,
+números e transcrição sem hesitações começam ligados nos modelos compatíveis.
+Escolhas desligadas já salvas continuam valendo. Opções que o modelo não oferece
+não aparecem nem são enviadas. No Nova-2, Auto-detect usa áudio gravado; escolha
+um idioma para usar streaming. Modelos exclusivamente realtime precisam de
+streaming ligado; desligá-lo faz a cadeia pular
 esse modelo. Não há troca silenciosa por outro modelo com nome parecido.
 Os fallbacks começam após o modelo anterior falhar; o app não envia o áudio
 a todos os providers ao mesmo tempo.
@@ -354,14 +375,19 @@ sendo do OpenRouter. Providers diretos usam `provider::modelo`:
 }
 ```
 
-Prefira o Keychain. Variáveis `OPENROUTER_API_KEY`, `OPENAI_API_KEY`,
-`DEEPGRAM_API_KEY` e `ELEVENLABS_API_KEY` têm precedência sobre a chave salva
-correspondente. Apenas o OpenRouter preserva a compatibilidade com o antigo
+Prefira o Keychain. As variáveis `OPENROUTER_API_KEY`, `OPENAI_API_KEY`,
+`DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`, `AZURE_MAI_API_KEY`, `XAI_API_KEY` e
+`GEMINI_API_KEY` têm precedência sobre a chave salva do provider correspondente.
+Apenas o OpenRouter preserva a compatibilidade com o antigo
 campo `api_key` no arquivo. Chaves e endpoints não entram na exportação.
 
 Contratos oficiais: [OpenAI file transcription](https://developers.openai.com/api/docs/guides/speech-to-text),
 [OpenAI realtime](https://developers.openai.com/api/docs/guides/realtime-transcription),
 [Deepgram live audio](https://developers.deepgram.com/reference/speech-to-text/listen-streaming),
+[Microsoft MAI](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/mai-transcribe),
+[Grok STT](https://docs.x.ai/developers/rest-api-reference/inference/speech-to-text),
+[Gemini Transcribe](https://ai.google.dev/gemini-api/docs/transcribe),
+[Gemini Live Transcribe](https://ai.google.dev/gemini-api/docs/live-api/live-transcribe),
 [ElevenLabs Scribe](https://elevenlabs.io/docs/overview/capabilities/speech-to-text).
 
 ## Post-processing
@@ -466,24 +492,45 @@ Tem busca, cópia e controles de retenção e limpeza. A retenção padrão é d
 **7 dias**, com limites adicionais de quantidade e tamanho. A atualização da
 versão 2.x preserva o texto e os relatórios de transcrição existentes.
 
-**Statistics** reúne palavras, ditados, áudio gravado e enviado, clipes
-silenciosos, tokens, custo informado pelo OpenRouter, latência de transcrição,
-fallbacks e erros por tipo e modelo. Não armazena texto nem áudio. A latência
-mostrada corresponde ao processamento da transcrição, sem o tempo na fila
-ou na colagem. Em streaming, a latência mede a espera para concluir depois do fim da gravação. Um ditado com vários trechos pode contar para mais de um modelo.
+**Statistics** separa o uso do Hex das tentativas feitas nos providers.
+O resumo do período mostra palavras, transcrições concluídas, taxa de sucesso,
+espera após a gravação e áudio gravado. Hoje, 7 dias e 30 dias podem ser comparados
+com o período anterior de mesma duração. O gráfico alterna palavras, transcrições,
+espera e falhas por dia.
 
-Em **Models and latency**, cada modelo mostra sua latência média e a
-quantidade de respostas medidas no período. A média usa apenas requisições
-bem-sucedidas, incluindo o tempo de rede; não inclui a fila local, tentativas
-que falharam nem a espera entre retries. Cada trecho de áudio respondido
-fornece uma medição. Os registros anteriores à versão 3.0.1 continuam
-preservados, mas aparecem sem latência por modelo até haver novas medições.
+A comparação detalhada agrupa tentativas por **provider** ou **modelo**, com filtro
+por provider e por **Live / Recorded**. Mostra quantidade de tentativas, sucesso,
+latência média e **P95 aproximado**: o limite de latência dentro do qual ficaram
+cerca de 95% das respostas medidas. O P95 só aparece após 20 respostas bem-sucedidas.
+A ordenação permite examinar volume, latência ou confiabilidade; as medições vêm
+dos seus próprios ditados, com durações e conteúdos diferentes, e não são um benchmark.
 
-Os períodos são **Today**, **7 days**, **30 days** e **All time**, calculados
-por datas locais. São mantidos até 400 dias com registros; **All time** soma
+**Live** identifica uma sessão iniciada durante a gravação; em clipes curtos, a conexão
+pode ficar pronta só depois de encerrá-la. Sua latência começa ao terminar a gravação.
+**Recorded** identifica uma tentativa iniciada com o clipe já concluído, mesmo via
+WebSocket; sua latência começa no início dessa tentativa.
+A comparação usa respostas bem-sucedidas e não inclui fila local, colagem ou espera
+entre retries. O resumo geral de espera também inclui transcrições que falharam.
+Um áudio longo dividido em trechos gera várias tentativas, mas continua contando
+como uma transcrição no resumo.
+
+Retries no mesmo modelo, sucesso com um modelo de fallback e recuperação de
+streaming por envio posterior têm contagens separadas. A página também mostra
+uso confirmado de keywords e erros por tipo. Envios que falham sem confirmação não
+são somados como keywords enviadas. Custos são apenas os valores retornados pelos
+providers: **sem informação** é diferente de custo zero. Não são aplicadas tabelas
+de preços estimadas.
+
+Os totais antigos permanecem no resumo. Detalhes que não eram coletados, como modo
+de envio, cobertura de custo ou percentis, começam nos novos ditados; não são
+reconstruídos a partir do History. A estatística mede transcrição, antes do
+pós-processamento e da colagem, enquanto History registra o texto efetivamente colado.
+
+Os períodos são **Today**, **7 days**, **30 days** e **All saved**, calculados
+por datas locais. São mantidos até 400 dias com registros; **All saved** soma
 os dias retidos e seu gráfico mostra os últimos 30 dias. **Reset** limpa as
-estatísticas após confirmação. Tokens e custos dependem dos dados de uso
-retornados pelo provedor.
+estatísticas após confirmação. A coleta guarda somente agregados diários,
+sem texto, áudio, conteúdo de keywords ou corpos de respostas de erro.
 
 ## Dados e privacidade
 

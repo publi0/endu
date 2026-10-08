@@ -251,8 +251,8 @@ impl MetalIndicator {
             DictationIndicatorEvent::Preparing | DictationIndicatorEvent::Started
         ) {
             self.position_on_selected_screen();
-            self.visibility.update(&self.window, true);
-            tracing::info!("Metal dictation indicator shown");
+            self.visibility.update(&mut self.window, true);
+            tracing::info!("Metal dictation indicator presentation requested");
         }
         // Present first: an off-Space CAMetalLayer may be waiting for a drawable
         // while holding the renderer lock. WindowServer must see the panel again
@@ -268,12 +268,16 @@ impl MetalIndicator {
     fn maintain(&mut self) {
         if self.renderer.is_active() {
             self.position_on_selected_screen();
-            self.visibility.update(&self.window, true);
+            if self.renderer.has_live_work() {
+                self.visibility.update(&mut self.window, true);
+            } else {
+                self.visibility.maintain_fading(&mut self.window);
+            }
         } else {
             if self.display_link.is_running() {
                 let _ = self.display_link.stop();
             }
-            self.visibility.update(&self.window, false);
+            self.visibility.update(&mut self.window, false);
         }
     }
 
@@ -338,6 +342,7 @@ extern "C" fn display_link_callback(
 struct SharedRenderer {
     renderer: Mutex<MetalRenderer>,
     active: AtomicBool,
+    live_work: AtomicBool,
 }
 
 // Metal command queues and layers are designed for cross-thread submission. Access to mutable
@@ -350,6 +355,7 @@ impl SharedRenderer {
         Ok(Self {
             renderer: Mutex::new(MetalRenderer::new()?),
             active: AtomicBool::new(false),
+            live_work: AtomicBool::new(false),
         })
     }
 
@@ -360,6 +366,10 @@ impl SharedRenderer {
     fn handle(&self, event: DictationIndicatorEvent) {
         let mut renderer = self.renderer.lock().unwrap();
         renderer.handle(event);
+        self.live_work.store(
+            renderer.capture_phase.is_some() || !renderer.jobs.is_empty(),
+            Ordering::Release,
+        );
         self.active.store(true, Ordering::Release);
     }
 
@@ -384,6 +394,10 @@ impl SharedRenderer {
 
     fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
+    }
+
+    fn has_live_work(&self) -> bool {
+        self.live_work.load(Ordering::Acquire)
     }
 }
 
@@ -524,12 +538,23 @@ impl MetalRenderer {
             f64::from(WINDOW_HEIGHT * 2.0),
         ));
 
-        let library = device
-            .new_library_with_data(include_bytes!(concat!(
-                env!("OUT_DIR"),
-                "/dictation_indicator.metallib"
-            )))
-            .map_err(|error| format!("could not load indicator shader: {error}"))?;
+        let shader: &[u8] =
+            include_bytes!(concat!(env!("OUT_DIR"), "/dictation_indicator.metallib"));
+        #[cfg(test)]
+        let library = if shader == b"HEX_SHADER_STUB" {
+            // The opt-in test build can lack Xcode's offline Metal compiler.
+            // Compile the real shader on the GPU for tests, never in releases.
+            device.new_library_with_source(
+                include_str!("dictation_indicator.metal"),
+                &metal::CompileOptions::new(),
+            )
+        } else {
+            device.new_library_with_data(shader)
+        };
+        #[cfg(not(test))]
+        let library = device.new_library_with_data(shader);
+        let library =
+            library.map_err(|error| format!("could not load indicator shader: {error}"))?;
         let vertex = library
             .get_function("indicator_vertex", None)
             .map_err(|error| format!("could not load indicator vertex shader: {error}"))?;
@@ -1052,6 +1077,31 @@ mod tests {
         );
         assert_eq!(active_phase(None, 2), Some(Phase::Transcribing));
         assert_eq!(active_phase(None, 0), None);
+    }
+
+    #[test]
+    fn recovery_stops_for_terminal_fades_but_preserves_other_pending_work() {
+        let shared = SharedRenderer::new().expect("local macOS checks require Metal");
+        shared.handle(DictationIndicatorEvent::Started);
+        assert!(shared.has_live_work());
+        shared.handle(DictationIndicatorEvent::Submitted { job_id: 7 });
+        shared.handle(DictationIndicatorEvent::Started);
+        shared.handle(DictationIndicatorEvent::Cancelled);
+        assert!(
+            shared.has_live_work(),
+            "an accepted job still needs its HUD"
+        );
+        shared.handle(DictationIndicatorEvent::JobCancelled { job_id: 7 });
+        assert!(!shared.has_live_work());
+        assert!(
+            shared.is_active(),
+            "the terminal fade may still be rendering"
+        );
+        shared.handle(DictationIndicatorEvent::Preparing);
+        assert!(
+            shared.has_live_work(),
+            "a new capture can recover the panel"
+        );
     }
 
     #[test]

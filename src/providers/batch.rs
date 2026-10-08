@@ -12,7 +12,9 @@ use serde_json::{Value, json};
 use super::{ModelOptions, ModelRef, Provider, keys, streaming};
 use crate::openrouter::http::Response;
 use crate::openrouter::report::{AudioTrim, ExecutionReport, StepReport};
-use crate::openrouter::stats::{self, ErrorKind, Failure, ModelLatency, Sample};
+use crate::openrouter::stats::{
+    self, AttemptSample, DictationTelemetry, ErrorKind, Failure, ModelLatency, RequestMode, Sample,
+};
 use crate::openrouter::transcribe::{
     ChainFailure, SAMPLE_RATE, Transcription, Usage, chunk_ranges, encode_base64, encode_wav,
 };
@@ -40,6 +42,9 @@ pub fn keywords(model: ModelRef<'_>, vocabulary: &Snapshot) -> Vec<String> {
         Provider::Deepgram => (100, 400, usize::MAX, usize::MAX),
         Provider::ElevenLabs if model.model.ends_with("_realtime") => (50, 4_000, 20, 5),
         Provider::ElevenLabs => (1_000, 128_000, 49, 5),
+        Provider::Microsoft => (2_000, 256_000, usize::MAX, usize::MAX),
+        Provider::Grok => (100, 128_000, 50, usize::MAX),
+        Provider::Google => (1_000, 128_000, usize::MAX, usize::MAX),
         Provider::OpenRouter => return Vec::new(), // Routing-specific hints use HintPlan.
     };
     let mut used = 0;
@@ -95,6 +100,13 @@ struct Request {
 fn language(options: &ModelOptions) -> Option<&str> {
     let language = options.language.trim();
     (!language.is_empty() && language != AUTO_LANGUAGE).then_some(language)
+}
+
+pub(crate) fn grok_format_supported(language: &str) -> bool {
+    matches!(
+        language,
+        "ar" | "de" | "en" | "es" | "fr" | "ja" | "pt" | "ru" | "sv" | "vi" | "zh"
+    )
 }
 
 fn prompt_with_terms(context: &str, terms: &[String]) -> (String, usize) {
@@ -247,6 +259,89 @@ fn request(
                 keyword_count: terms.len(),
             })
         }
+        Provider::Microsoft => {
+            // https://learn.microsoft.com/azure/ai-services/speech-service/mai-transcribe
+            // Follow the current REST example, including the explicit enhanced-mode switch.
+            let mut definition = json!({"enhancedMode": {
+                "enabled": true,
+                "model": "MAI-Transcribe-2",
+                "modelOptions": {"transcribeStyle": if options.no_verbatim { "clean" } else { "verbatim" }}
+            }});
+            if let Some(locale) = super::bcp47_language(&options.language) {
+                definition["locales"] = json!([locale]);
+            }
+            if !terms.is_empty() {
+                definition["phraseList"] = json!({"phrases": terms});
+            }
+            let mut url = super::microsoft_endpoint(config, false)
+                .map_err(|_| eyre!("Configure a valid Microsoft Speech endpoint in Providers."))?;
+            url.set_path("/speechtotext/transcriptions:transcribe");
+            url.set_query(Some("api-version=2025-10-15"));
+            let (content_type, body) =
+                multipart_audio(&[("definition", definition.to_string())], wav, "audio");
+            Ok(Request {
+                provider: model.provider,
+                url: url.into(),
+                content_type,
+                body,
+                keyword_count: terms.len(),
+            })
+        }
+        Provider::Grok => {
+            // https://docs.x.ai/developers/model-capabilities/audio/speech-to-text
+            let mut fields = vec![
+                ("model", model.model.to_owned()),
+                (
+                    "format",
+                    bool_text(options.smart_format && grok_format_supported(&options.language))
+                        .into(),
+                ),
+                ("filler_words", bool_text(!options.no_verbatim).into()),
+            ];
+            if let Some(language) = language(options) {
+                fields.push(("language", language.into()));
+            }
+            fields.extend(terms.iter().cloned().map(|term| ("keyterm", term)));
+            // xAI ignores options placed after the audio: multipart keeps file last.
+            let (content_type, body) = multipart(&fields, wav);
+            Ok(Request {
+                provider: model.provider,
+                url: "https://api.x.ai/v1/stt".into(),
+                content_type,
+                body,
+                keyword_count: terms.len(),
+            })
+        }
+        Provider::Google => {
+            // https://ai.google.dev/gemini-api/docs/transcribe and /api/interactions-api
+            let mut transcription = json!({"mode": if options.smart_format {
+                json!("smart")
+            } else {
+                json!({"type":"verbatim"})
+            }});
+            if let Some(locale) = super::bcp47_language(&options.language) {
+                transcription["language_codes"] = json!([locale]);
+                if options.language == "zh" {
+                    transcription["language_codes"] = json!(["cmn-Hans-CN"]);
+                }
+            }
+            if !terms.is_empty() {
+                transcription["custom_vocabulary"] = json!(terms);
+            }
+            let body = json!({
+                "model": model.model,
+                "store": false,
+                "input": [{"type":"audio", "data":encode_base64(wav), "mime_type":"audio/wav"}],
+                "generation_config": {"transcription_config":transcription}
+            });
+            Ok(Request {
+                provider: model.provider,
+                url: "https://generativelanguage.googleapis.com/v1beta/interactions".into(),
+                content_type: "application/json".into(),
+                body: body.to_string().into_bytes(),
+                keyword_count: terms.len(),
+            })
+        }
     }
 }
 
@@ -255,6 +350,10 @@ fn bool_text(value: bool) -> &'static str {
 }
 
 fn multipart(fields: &[(&str, String)], wav: &[u8]) -> (String, Vec<u8>) {
+    multipart_audio(fields, wav, "file")
+}
+
+fn multipart_audio(fields: &[(&str, String)], wav: &[u8], audio_field: &str) -> (String, Vec<u8>) {
     let boundary = loop {
         let value = format!(
             "hex-audio-{}-{}",
@@ -278,7 +377,7 @@ fn multipart(fields: &[(&str, String)], wav: &[u8]) -> (String, Vec<u8>) {
             .as_bytes(),
         );
     }
-    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"clip.wav\"\r\nContent-Type: audio/wav\r\n\r\n").as_bytes());
+    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{audio_field}\"; filename=\"clip.wav\"\r\nContent-Type: audio/wav\r\n\r\n").as_bytes());
     body.extend_from_slice(wav);
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
     (format!("multipart/form-data; boundary={boundary}"), body)
@@ -315,7 +414,7 @@ fn hint_count(provider: &Value) -> usize {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct TransportFailure(ErrorKind);
+struct TransportFailure(ErrorKind, usize);
 
 impl std::fmt::Display for TransportFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -330,17 +429,39 @@ impl std::fmt::Display for TransportFailure {
 }
 impl std::error::Error for TransportFailure {}
 
+fn http_error_kind(error: &ureq::Error, reading_body: bool) -> ErrorKind {
+    match error {
+        ureq::Error::Timeout(_) => ErrorKind::Timeout,
+        ureq::Error::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            ErrorKind::Timeout
+        }
+        _ if reading_body => ErrorKind::InvalidResponse,
+        _ => ErrorKind::Network,
+    }
+}
+
+fn http_body_failure(error: &ureq::Error, keyword_count: usize) -> TransportFailure {
+    // Response headers have already arrived, so the request and its hints were
+    // sent even if the body stalls or exceeds the configured response bound.
+    TransportFailure(http_error_kind(error, true), keyword_count)
+}
+
 fn send(request: &Request, config: &Config, timeout: Duration) -> Result<Response> {
     crate::openrouter::http::validate_url(&request.url)
-        .map_err(|_| TransportFailure(ErrorKind::Rejected))?;
+        .map_err(|_| TransportFailure(ErrorKind::Rejected, 0))?;
     if cfg!(test) {
         bail!("HTTP transcription is disabled in unit tests; inject a transport.");
     }
     if request.body.len() > MAX_REQUEST_BYTES {
-        bail!("Transcription request is too large.");
+        return Err(TransportFailure(ErrorKind::Rejected, 0).into());
     }
-    let key =
-        keys::api_key(request.provider, config).map_err(|_| TransportFailure(ErrorKind::Auth))?;
+    let key = keys::api_key(request.provider, config)
+        .map_err(|_| TransportFailure(ErrorKind::Auth, 0))?;
     let (header, authorization) = keys::authorization(request.provider, &key);
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
@@ -358,15 +479,7 @@ fn send(request: &Request, config: &Config, timeout: Duration) -> Result<Respons
         .header("Content-Type", request.content_type.as_str())
         .header("X-Title", "Hex")
         .send(request.body.as_slice())
-        .map_err(|error| {
-            TransportFailure(match error {
-                ureq::Error::Timeout(_) => ErrorKind::Timeout,
-                ureq::Error::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => {
-                    ErrorKind::Timeout
-                }
-                _ => ErrorKind::Network,
-            })
-        })?;
+        .map_err(|error| TransportFailure(http_error_kind(&error, false), 0))?;
     let status = response.status().as_u16();
     let retry_after = response
         .headers()
@@ -380,7 +493,7 @@ fn send(request: &Request, config: &Config, timeout: Duration) -> Result<Respons
         .with_config()
         .limit(MAX_RESPONSE_BYTES)
         .read_to_vec()
-        .map_err(|_| TransportFailure(ErrorKind::InvalidResponse))?;
+        .map_err(|error| http_body_failure(&error, request.keyword_count))?;
     Ok(Response {
         status,
         retry_after,
@@ -388,22 +501,58 @@ fn send(request: &Request, config: &Config, timeout: Duration) -> Result<Respons
     })
 }
 
+fn reported_cost(value: &Value) -> Option<f64> {
+    value
+        .pointer("/usage/cost")
+        .and_then(Value::as_f64)
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)
+}
+fn response_cost(body: &[u8]) -> Option<f64> {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .as_ref()
+        .and_then(reported_cost)
+}
+
 fn parse(provider: Provider, body: &[u8]) -> Result<(String, Usage)> {
     let value: Value = serde_json::from_slice(body)
         .map_err(|_| eyre!("The provider returned invalid transcription JSON."))?;
-    if value.get("error").is_some() || value.get("err_code").is_some() {
+    if value.get("error").is_some_and(|error| !error.is_null()) || value.get("err_code").is_some() {
         bail!("The provider returned a transcription error.");
     }
-    let text = match provider {
-        Provider::Deepgram => value.pointer("/results/channels/0/alternatives/0/transcript"),
-        _ => value.get("text"),
-    }
-    .and_then(Value::as_str)
-    .ok_or_else(|| eyre!("The provider returned no transcription text."))?;
+    let text = if provider == Provider::Google {
+        if value.get("status").and_then(Value::as_str) != Some("completed") {
+            bail!("The provider did not complete the transcription.");
+        }
+        // output_text is an SDK convenience property. REST returns typed steps;
+        // never include thoughts, tools or echoed user input in a dictation.
+        value
+            .get("steps")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|step| step.get("type").and_then(Value::as_str) == Some("model_output"))
+            .filter_map(|step| step.get("content").and_then(Value::as_array))
+            .flatten()
+            .filter(|content| content.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|content| content.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        match provider {
+            Provider::Deepgram => value.pointer("/results/channels/0/alternatives/0/transcript"),
+            Provider::Microsoft => value.pointer("/combinedPhrases/0/text"),
+            _ => value.get("text"),
+        }
+        .and_then(Value::as_str)
+        .ok_or_else(|| eyre!("The provider returned no transcription text."))?
+        .to_owned()
+    };
     if text.trim().is_empty() {
         bail!("The provider returned empty transcription text.");
     }
     let usage = value.get("usage");
+    let cost = reported_cost(&value);
     Ok((
         text.trim().to_owned(),
         Usage {
@@ -411,11 +560,8 @@ fn parse(provider: Provider, body: &[u8]) -> Result<(String, Usage)> {
                 .and_then(|usage| usage.get("total_tokens"))
                 .and_then(Value::as_u64)
                 .unwrap_or_default(),
-            cost_usd: usage
-                .and_then(|usage| usage.get("cost"))
-                .and_then(Value::as_f64)
-                .filter(|cost| cost.is_finite() && *cost >= 0.0)
-                .unwrap_or_default(),
+            cost_usd: cost.unwrap_or_default(),
+            cost_reported: cost.is_some(),
         },
     ))
 }
@@ -436,7 +582,13 @@ fn keywords_rejected(
     match model.provider {
         Provider::OpenAi if model.model == "gpt-transcribe" => body.contains("keywords"),
         Provider::OpenAi => body.contains("prompt"),
-        Provider::Deepgram | Provider::ElevenLabs => body.contains("keyterm"),
+        Provider::Deepgram | Provider::ElevenLabs | Provider::Grok => body.contains("keyterm"),
+        Provider::Microsoft => body.contains("phraselist") || body.contains("phrases"),
+        Provider::Google => {
+            body.contains("custom_vocabulary")
+                || body.contains("customvocabulary")
+                || body.contains("custom vocabulary")
+        }
         Provider::OpenRouter => false,
     }
 }
@@ -452,6 +604,7 @@ struct Success {
 struct Progress {
     failures: Vec<Failure>,
     executions: Vec<ExecutionReport>,
+    telemetry: DictationTelemetry,
 }
 
 impl Progress {
@@ -469,6 +622,45 @@ impl Progress {
             keyword_count,
             outcome: if success { "success" } else { "failed" }.into(),
         });
+    }
+    fn attempt(
+        &mut self,
+        model: ModelRef<'_>,
+        mode: RequestMode,
+        keyword_count: usize,
+        outcome: std::result::Result<u64, ErrorKind>,
+        cost_usd: Option<f64>,
+        retried: bool,
+    ) {
+        self.telemetry.retried |= retried;
+        self.telemetry.attempts.push(AttemptSample {
+            model: model.key(),
+            mode,
+            success: outcome.is_ok(),
+            error: outcome.err(),
+            latency_ms: outcome.ok(),
+            keyword_count,
+            cost_usd,
+        });
+    }
+    fn telemetry(&self, dictation_succeeded: bool) -> DictationTelemetry {
+        let mut telemetry = self.telemetry.clone();
+        if dictation_succeeded {
+            telemetry.live_recovered = telemetry
+                .attempts
+                .iter()
+                .any(|attempt| attempt.mode == RequestMode::Live && !attempt.success)
+                && telemetry
+                    .attempts
+                    .iter()
+                    .any(|attempt| attempt.mode == RequestMode::Recorded && attempt.success);
+        } else {
+            // Successful requests remain visible even if a later chunk fails,
+            // but only a complete dictation can be counted as a rescued result.
+            telemetry.used_fallback = false;
+            telemetry.live_recovered = false;
+        }
+        telemetry
     }
     fn fail(&mut self, id: &str, kind: ErrorKind, detail: &str) {
         self.failures.push(Failure {
@@ -504,13 +696,14 @@ impl Chain<'_> {
         let mut spent = initial_spent;
         let wav =
             encode_wav(samples).map_err(|_| eyre!("Could not encode transcription audio."))?;
-        for id in self
+        for (model_index, id) in self
             .config
             .transcription
             .models
             .iter()
-            .map(|id| id.trim())
-            .filter(|id| !id.is_empty())
+            .enumerate()
+            .map(|(index, id)| (index, id.trim()))
+            .filter(|(_, id)| !id.is_empty())
         {
             let model = ModelRef::parse(id);
             let capability = model.capabilities();
@@ -553,6 +746,15 @@ impl Chain<'_> {
                     check_cancelled(self.cancelled)?;
                     match result {
                         Ok(result) if !result.text.trim().is_empty() => {
+                            progress.attempt(
+                                model,
+                                RequestMode::Recorded,
+                                result.keyword_count,
+                                Ok(result.latency_ms),
+                                None,
+                                rate_retried || without_hints,
+                            );
+                            progress.telemetry.used_fallback |= model_index > 0;
                             progress.execution(model, false, result.keyword_count, true);
                             return Ok(Success {
                                 text: result.text.trim().into(),
@@ -562,6 +764,14 @@ impl Chain<'_> {
                             });
                         }
                         Ok(result) => {
+                            progress.attempt(
+                                model,
+                                RequestMode::Recorded,
+                                result.keyword_count,
+                                Err(ErrorKind::InvalidResponse),
+                                None,
+                                rate_retried || without_hints,
+                            );
                             progress.execution(model, false, result.keyword_count, false);
                             progress.fail(
                                 id,
@@ -573,6 +783,18 @@ impl Chain<'_> {
                         Err(error) => {
                             let live_error = error.downcast_ref::<streaming::LiveError>();
                             let status = live_error.and_then(|error| error.status);
+                            if live_error.is_none_or(|error| error.attempted) {
+                                let kind =
+                                    live_error.map_or(ErrorKind::Network, |error| error.error_kind);
+                                progress.attempt(
+                                    model,
+                                    RequestMode::Recorded,
+                                    live_error.map_or(0, |error| error.keyword_count),
+                                    Err(kind),
+                                    None,
+                                    rate_retried || without_hints,
+                                );
+                            }
                             progress.execution(
                                 model,
                                 false,
@@ -606,7 +828,7 @@ impl Chain<'_> {
                             }
                             progress.fail(
                                 id,
-                                status.map_or(ErrorKind::Network, ErrorKind::from_status),
+                                live_error.map_or(ErrorKind::Network, |error| error.error_kind),
                                 &status.map_or_else(
                                     || "realtime transcription failed".into(),
                                     |status| {
@@ -618,7 +840,7 @@ impl Chain<'_> {
                         }
                     }
                 }
-                let request = request(
+                let request = match request(
                     self.config,
                     model,
                     &options,
@@ -626,7 +848,18 @@ impl Chain<'_> {
                     self.vocabulary,
                     self.hints,
                     without_hints,
-                )?;
+                ) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        progress.execution(model, false, 0, false);
+                        progress.fail(
+                            id,
+                            ErrorKind::Rejected,
+                            "provider endpoint or model options are invalid",
+                        );
+                        break;
+                    }
+                };
                 let (response, latency) = send(&request, timeout);
                 spent = spent.saturating_add(latency);
                 check_cancelled(self.cancelled)?;
@@ -634,6 +867,15 @@ impl Chain<'_> {
                     Ok(response) if response.is_success() => {
                         match parse(model.provider, &response.body) {
                             Ok((text, usage)) => {
+                                progress.attempt(
+                                    model,
+                                    RequestMode::Recorded,
+                                    request.keyword_count,
+                                    Ok(latency.as_millis() as u64),
+                                    usage.cost_reported.then_some(usage.cost_usd),
+                                    rate_retried || without_hints,
+                                );
+                                progress.telemetry.used_fallback |= model_index > 0;
                                 progress.execution(model, false, request.keyword_count, true);
                                 return Ok(Success {
                                     text,
@@ -643,6 +885,14 @@ impl Chain<'_> {
                                 });
                             }
                             Err(_) => {
+                                progress.attempt(
+                                    model,
+                                    RequestMode::Recorded,
+                                    request.keyword_count,
+                                    Err(ErrorKind::InvalidResponse),
+                                    response_cost(&response.body),
+                                    rate_retried || without_hints,
+                                );
                                 progress.execution(model, false, request.keyword_count, false);
                                 progress.fail(
                                     id,
@@ -653,6 +903,14 @@ impl Chain<'_> {
                         }
                     }
                     Ok(response) => {
+                        progress.attempt(
+                            model,
+                            RequestMode::Recorded,
+                            request.keyword_count,
+                            Err(ErrorKind::from_status(response.status)),
+                            response_cost(&response.body),
+                            rate_retried || without_hints,
+                        );
                         progress.execution(model, false, request.keyword_count, false);
                         if response.status == 401 {
                             keys::invalidate(model.provider);
@@ -700,7 +958,21 @@ impl Chain<'_> {
                         let kind = error
                             .downcast_ref::<TransportFailure>()
                             .map_or(ErrorKind::Network, |error| error.0);
-                        progress.execution(model, false, 0, false);
+                        let keyword_count = error
+                            .downcast_ref::<TransportFailure>()
+                            .map_or(0, |error| error.1);
+                        // Rejected here means local URL/body preflight, not HTTP 4xx.
+                        if kind != ErrorKind::Rejected {
+                            progress.attempt(
+                                model,
+                                RequestMode::Recorded,
+                                keyword_count,
+                                Err(kind),
+                                None,
+                                rate_retried || without_hints,
+                            );
+                        }
+                        progress.execution(model, false, keyword_count, false);
                         progress.fail(
                             id,
                             kind,
@@ -771,17 +1043,48 @@ pub fn transcribe(
     let vocabulary = live
         .as_ref()
         .map_or_else(|| vocabulary.clone(), |live| live.vocabulary.clone());
-    if config
-        .transcription
-        .models
-        .iter()
-        .all(|id| id.trim().is_empty())
-    {
-        return Err(ChainFailure {
-            failures: Vec::new(),
-        }
-        .into());
-    }
+    let cancelled = live.as_ref().map(streaming::PendingLive::cancellation_flag);
+    transcribe_configured(
+        samples,
+        &vocabulary,
+        live,
+        &config,
+        &mut |request, timeout| {
+            let at = Instant::now();
+            let result = send(request, &config, timeout);
+            (result, at.elapsed())
+        },
+        &mut |id, samples, vocabulary, timeout| {
+            streaming::transcribe_completed(
+                &config,
+                id,
+                samples,
+                vocabulary,
+                timeout,
+                cancelled.clone(),
+            )
+        },
+        &mut |wait| {
+            let at = Instant::now();
+            while at.elapsed() < wait && check_cancelled(cancelled.as_deref()).is_ok() {
+                std::thread::sleep(
+                    wait.saturating_sub(at.elapsed())
+                        .min(Duration::from_millis(50)),
+                );
+            }
+        },
+    )
+}
+
+fn transcribe_configured(
+    samples: &[f32],
+    vocabulary: &Snapshot,
+    live: Option<streaming::PendingLive>,
+    config: &Config,
+    send: &mut RequestSender<'_>,
+    completed: &mut CompletedSender<'_>,
+    sleep: &mut dyn FnMut(Duration),
+) -> Result<Transcription> {
     let cancelled = live.as_ref().map(streaming::PendingLive::cancellation_flag);
     check_cancelled(cancelled.as_deref())?;
     let recorded_ms = duration_ms(samples.len());
@@ -811,6 +1114,7 @@ pub fn transcribe(
             skipped_silent: true,
             recorded_ms,
             sent_ms,
+            telemetry: Some(DictationTelemetry::default()),
             ..Sample::default()
         });
         return Ok(Transcription {
@@ -825,6 +1129,14 @@ pub fn transcribe(
             Ok(result) if !result.text.trim().is_empty() => {
                 check_cancelled(cancelled.as_deref())?;
                 sent_ms = duration_ms(sent_samples.load(Ordering::Acquire));
+                progress.attempt(
+                    ModelRef::parse(&result.model),
+                    RequestMode::Live,
+                    result.keyword_count,
+                    Ok(result.latency_ms),
+                    None,
+                    false,
+                );
                 progress.execution(
                     ModelRef::parse(&result.model),
                     true,
@@ -842,6 +1154,14 @@ pub fn transcribe(
             }
             Ok(result) => {
                 check_cancelled(cancelled.as_deref())?;
+                progress.attempt(
+                    ModelRef::parse(&model_id),
+                    RequestMode::Live,
+                    result.keyword_count,
+                    Err(ErrorKind::InvalidResponse),
+                    None,
+                    false,
+                );
                 progress.execution(
                     ModelRef::parse(&model_id),
                     true,
@@ -858,6 +1178,16 @@ pub fn transcribe(
                 check_cancelled(cancelled.as_deref())?;
                 let live_error = error.downcast_ref::<streaming::LiveError>();
                 let status = live_error.and_then(|error| error.status);
+                if live_error.is_none_or(|error| error.attempted) {
+                    progress.attempt(
+                        ModelRef::parse(&model_id),
+                        RequestMode::Live,
+                        live_error.map_or(0, |error| error.keyword_count),
+                        Err(live_error.map_or(ErrorKind::Network, |error| error.error_kind)),
+                        None,
+                        false,
+                    );
+                }
                 progress.execution(
                     ModelRef::parse(&model_id),
                     true,
@@ -866,7 +1196,7 @@ pub fn transcribe(
                 );
                 progress.fail(
                     &model_id,
-                    status.map_or(ErrorKind::Network, ErrorKind::from_status),
+                    live_error.map_or(ErrorKind::Network, |error| error.error_kind),
                     &status.map_or_else(
                         || "live transcription failed; trying completed audio".into(),
                         |status| format!("HTTP {status}: live transcription failed"),
@@ -888,11 +1218,11 @@ pub fn transcribe(
         let hints = if cfg!(test) {
             HintPlan::default()
         } else {
-            HintPlan::cached(&config, &vocabulary)
+            HintPlan::cached(config, vocabulary)
         };
         let chain = Chain {
-            config: &config,
-            vocabulary: &vocabulary,
+            config,
+            vocabulary,
             hints: &hints,
             cancelled: cancelled.as_deref(),
         };
@@ -908,35 +1238,16 @@ pub fn transcribe(
                 &samples[range],
                 initial_spent,
                 &mut progress,
-                &mut |request, timeout| {
-                    let at = Instant::now();
-                    let result = send(request, &config, timeout);
-                    (result, at.elapsed())
-                },
-                &mut |id, samples, vocabulary, timeout| {
-                    streaming::transcribe_completed(
-                        &config,
-                        id,
-                        samples,
-                        vocabulary,
-                        timeout,
-                        cancelled.clone(),
-                    )
-                },
-                &mut |wait| {
-                    let at = Instant::now();
-                    while at.elapsed() < wait && check_cancelled(cancelled.as_deref()).is_ok() {
-                        std::thread::sleep(
-                            wait.saturating_sub(at.elapsed())
-                                .min(Duration::from_millis(50)),
-                        );
-                    }
-                },
+                send,
+                completed,
+                sleep,
             );
             match success {
                 Ok(success) => {
-                    usage.tokens += success.usage.tokens;
-                    usage.cost_usd += success.usage.cost_usd;
+                    usage.tokens = usage.tokens.saturating_add(success.usage.tokens);
+                    // Each reported cost is finite/nonnegative; the sum can still
+                    // overflow when a provider reports extreme values per chunk.
+                    usage.cost_usd = (usage.cost_usd + success.usage.cost_usd).min(f64::MAX);
                     model_latency
                         .entry(success.model.clone())
                         .or_default()
@@ -957,6 +1268,7 @@ pub fn transcribe(
                         tokens: usage.tokens,
                         cost_usd: usage.cost_usd,
                         model_latency,
+                        telemetry: Some(progress.telemetry(false)),
                         failures: progress.failures,
                         ..Sample::default()
                     });
@@ -982,6 +1294,7 @@ pub fn transcribe(
         tokens: usage.tokens,
         cost_usd: usage.cost_usd,
         failures: progress.failures.clone(),
+        telemetry: Some(progress.telemetry(true)),
         skipped_silent: false,
     });
     let mut failed = Vec::new();
@@ -1031,6 +1344,902 @@ mod tests {
     fn field(request: &Request, name: &str, value: &str) -> bool {
         String::from_utf8_lossy(&request.body)
             .contains(&format!("name=\"{name}\"\r\n\r\n{value}\r\n"))
+    }
+
+    fn microsoft_config(models: &[&str]) -> Config {
+        let mut config = config(models);
+        config.microsoft.endpoint = "https://fixture.cognitiveservices.azure.com".into();
+        config
+    }
+
+    fn definition(request: &Request) -> Value {
+        let body = String::from_utf8_lossy(&request.body);
+        let value = body
+            .split("name=\"definition\"\r\n\r\n")
+            .nth(1)
+            .unwrap()
+            .split("\r\n")
+            .next()
+            .unwrap();
+        serde_json::from_str(value).unwrap()
+    }
+
+    fn telemetry_config(models: &[&str]) -> Config {
+        let mut config = config(models);
+        config.transcription.trim_silence = false;
+        config.transcription.chunk_seconds = 10;
+        config
+    }
+
+    #[test]
+    fn timeouts_remain_timeouts_before_headers_and_while_reading_the_body() {
+        for error in [
+            ureq::Error::Timeout(ureq::Timeout::RecvBody),
+            ureq::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "PRIVATE_BODY",
+            )),
+            ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+        ] {
+            assert_eq!(http_error_kind(&error, false), ErrorKind::Timeout);
+            assert_eq!(http_error_kind(&error, true), ErrorKind::Timeout);
+        }
+        assert_eq!(
+            http_error_kind(&ureq::Error::BodyExceedsLimit(MAX_RESPONSE_BYTES), true),
+            ErrorKind::InvalidResponse
+        );
+        take_samples();
+        let config = telemetry_config(&["fixture/primary"]);
+        let error = transcribe_configured(
+            &[0.1; 1600],
+            &Snapshot::default(),
+            None,
+            &config,
+            &mut |_, _| {
+                (
+                    Err(
+                        http_body_failure(&ureq::Error::Timeout(ureq::Timeout::RecvBody), 0).into(),
+                    ),
+                    Duration::from_secs(1),
+                )
+            },
+            &mut |_, _, _, _| panic!("HTTP only"),
+            &mut |_| panic!("no retry"),
+        )
+        .err()
+        .expect("transcription must fail");
+        assert_eq!(
+            error.downcast_ref::<ChainFailure>().unwrap().failures[0].kind,
+            ErrorKind::Timeout
+        );
+        let samples = take_samples();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].failures[0].kind, ErrorKind::Timeout);
+        assert_eq!(
+            samples[0].telemetry.as_ref().unwrap().attempts[0].error,
+            Some(ErrorKind::Timeout)
+        );
+    }
+
+    #[test]
+    fn body_timeout_preserves_sent_keywords_in_statistics_and_history_report() {
+        take_samples();
+        let config = telemetry_config(&["openai::gpt-transcribe", "fixture/fallback"]);
+        let vocabulary = vocabulary(&["Synthetic One", "Synthetic Two"]);
+        let result = transcribe_configured(
+            &[0.1; 1600],
+            &vocabulary,
+            None,
+            &config,
+            &mut |request, _| {
+                (
+                    if request.provider == Provider::OpenAi {
+                        assert_eq!(request.keyword_count, 2);
+                        Err(http_body_failure(
+                            &ureq::Error::Timeout(ureq::Timeout::RecvBody),
+                            request.keyword_count,
+                        )
+                        .into())
+                    } else {
+                        Ok(response(200, r#"{"text":"recovered"}"#, None))
+                    },
+                    Duration::from_millis(50),
+                )
+            },
+            &mut |_, _, _, _| panic!("batch only"),
+            &mut |_| panic!("no retry"),
+        )
+        .unwrap();
+        let report = result.report.unwrap();
+        assert_eq!(report.executions[0].keyword_count, 2);
+        assert_eq!(report.executions[0].outcome, "failed");
+        let samples = take_samples();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].failures[0].kind, ErrorKind::Timeout);
+        let telemetry = samples[0].telemetry.as_ref().unwrap();
+        assert_eq!(telemetry.attempts[0].keyword_count, 2);
+        assert_eq!(telemetry.attempts[0].error, Some(ErrorKind::Timeout));
+        assert_eq!(telemetry.attempts[0].latency_ms, None);
+        assert!(telemetry.used_fallback);
+    }
+
+    #[test]
+    fn live_and_completed_error_categories_and_sent_keywords_reach_legacy_and_new_stats() {
+        for kind in [ErrorKind::Auth, ErrorKind::Timeout] {
+            take_samples();
+            let config = telemetry_config(&["openai::gpt-live-transcribe"]);
+            let fixture = || {
+                let mut error = streaming::fixture_error(None, false);
+                let typed = error.downcast_mut::<streaming::LiveError>().unwrap();
+                typed.error_kind = kind;
+                typed.keyword_count = 4;
+                error
+            };
+            let live = streaming::PendingLive::fixture(
+                config.clone(),
+                Snapshot::default(),
+                Err(fixture()),
+                800,
+            );
+            let error = transcribe_configured(
+                &[0.1; 1600],
+                &Snapshot::default(),
+                Some(live),
+                &config,
+                &mut |_, _| panic!("realtime-only model"),
+                &mut |_, _, _, _| Err(fixture()),
+                &mut |_| panic!("no retry"),
+            )
+            .err()
+            .expect("transcription must fail");
+            assert!(
+                error
+                    .downcast_ref::<ChainFailure>()
+                    .unwrap()
+                    .failures
+                    .iter()
+                    .all(|failure| failure.kind == kind)
+            );
+            let samples = take_samples();
+            assert_eq!(samples.len(), 1);
+            assert_eq!(samples[0].failures.len(), 2);
+            assert!(
+                samples[0]
+                    .failures
+                    .iter()
+                    .all(|failure| failure.kind == kind)
+            );
+            let telemetry = samples[0].telemetry.as_ref().unwrap();
+            assert_eq!(telemetry.attempts.len(), 2);
+            assert!(
+                telemetry
+                    .attempts
+                    .iter()
+                    .all(|attempt| attempt.error == Some(kind) && attempt.keyword_count == 4)
+            );
+        }
+    }
+
+    #[test]
+    fn complete_dictation_telemetry_counts_429_and_hint_retry_without_false_fallback() {
+        take_samples();
+        let config = telemetry_config(&["openai::gpt-transcribe"]);
+        let mut calls = 0;
+        let mut waits = 0;
+        let result = transcribe_configured(
+            &[0.1; 1600],
+            &vocabulary(&["Synthetic Name"]),
+            None,
+            &config,
+            &mut |request, _| {
+                calls += 1;
+                assert_eq!(request.keyword_count, if calls == 3 { 0 } else { 1 });
+                (
+                    Ok(match calls {
+                        1 => response(
+                            429,
+                            r#"{"error":"PRIVATE_RATE_LIMIT"}"#,
+                            Some(Duration::ZERO),
+                        ),
+                        2 => response(
+                            422,
+                            r#"{"error":"keywords unsupported PRIVATE_HINT"}"#,
+                            None,
+                        ),
+                        _ => response(
+                            200,
+                            r#"{"text":"complete","usage":{"cost":0,"total_tokens":7}}"#,
+                            None,
+                        ),
+                    }),
+                    Duration::from_millis(if calls == 3 { 42 } else { 99 }),
+                )
+            },
+            &mut |_, _, _, _| panic!("batch model"),
+            &mut |_| waits += 1,
+        )
+        .unwrap();
+        assert_eq!(result.text, "complete");
+        assert_eq!(calls, 3);
+        assert_eq!(waits, 1);
+        let samples = take_samples();
+        assert_eq!(samples.len(), 1);
+        let telemetry = samples[0].telemetry.as_ref().unwrap();
+        assert_eq!(telemetry.attempts.len(), 3);
+        assert!(telemetry.retried);
+        assert!(!telemetry.used_fallback);
+        assert!(!telemetry.live_recovered);
+        assert_eq!(
+            telemetry
+                .attempts
+                .iter()
+                .map(|attempt| attempt.error)
+                .collect::<Vec<_>>(),
+            [
+                Some(ErrorKind::RateLimited),
+                Some(ErrorKind::Rejected),
+                None
+            ]
+        );
+        assert_eq!(
+            telemetry
+                .attempts
+                .iter()
+                .map(|attempt| attempt.latency_ms)
+                .collect::<Vec<_>>(),
+            [None, None, Some(42)]
+        );
+        assert_eq!(
+            telemetry
+                .attempts
+                .iter()
+                .map(|attempt| attempt.keyword_count)
+                .collect::<Vec<_>>(),
+            [1, 1, 0]
+        );
+        assert_eq!(
+            telemetry
+                .attempts
+                .iter()
+                .map(|attempt| attempt.cost_usd)
+                .collect::<Vec<_>>(),
+            [None, None, Some(0.0)]
+        );
+        assert!(
+            telemetry
+                .attempts
+                .iter()
+                .all(|attempt| attempt.mode == RequestMode::Recorded)
+        );
+        assert!(!format!("{telemetry:?}").contains("PRIVATE"));
+    }
+
+    #[test]
+    fn local_preflight_is_excluded_but_auth_attempt_and_native_route_identity_are_preserved() {
+        take_samples();
+        let mut config = telemetry_config(&[
+            "microsoft::MAI-Transcribe-2",
+            "openai::gpt-live-transcribe",
+            "openai::gpt-transcribe",
+            "openai/gpt-transcribe",
+        ]);
+        config.transcription.model_options.insert(
+            "openai::gpt-live-transcribe".into(),
+            ModelOptions {
+                streaming: false,
+                ..Default::default()
+            },
+        );
+        let mut calls = 0;
+        transcribe_configured(
+            &[0.1; 1600],
+            &Snapshot::default(),
+            None,
+            &config,
+            &mut |request, _| {
+                calls += 1;
+                let response = if request.provider == Provider::OpenAi {
+                    Err(TransportFailure(ErrorKind::Auth, 0).into())
+                } else {
+                    assert_eq!(request.provider, Provider::OpenRouter);
+                    Ok(response(200, r#"{"text":"done"}"#, None))
+                };
+                (response, Duration::from_millis(31))
+            },
+            &mut |_, _, _, _| panic!("realtime profile was not enabled"),
+            &mut |_| panic!("no retry"),
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
+        let samples = take_samples();
+        assert_eq!(samples.len(), 1);
+        let telemetry = samples[0].telemetry.as_ref().unwrap();
+        assert_eq!(
+            telemetry
+                .attempts
+                .iter()
+                .map(|attempt| attempt.model.as_str())
+                .collect::<Vec<_>>(),
+            ["openai::gpt-transcribe", "openai/gpt-transcribe"]
+        );
+        assert_eq!(telemetry.attempts[0].error, Some(ErrorKind::Auth));
+        assert_eq!(telemetry.attempts[0].keyword_count, 0);
+        assert_eq!(telemetry.attempts[1].cost_usd, None);
+        assert!(telemetry.used_fallback);
+        assert!(!telemetry.retried);
+        assert!(!telemetry.live_recovered);
+        assert!(
+            samples[0]
+                .failures
+                .iter()
+                .any(|failure| failure.model == "microsoft::MAI-Transcribe-2")
+        );
+    }
+
+    #[test]
+    fn all_chunks_produce_one_sample_and_earlier_success_survives_a_later_failure() {
+        for fail_second_chunk in [false, true] {
+            take_samples();
+            let config = telemetry_config(&["fixture/primary", "fixture/fallback"]);
+            let audio = vec![0.1; 160_160];
+            assert_eq!(chunk_ranges(&audio, 160_000).len(), 2);
+            let mut calls = 0;
+            let result = transcribe_configured(
+                &audio,
+                &Snapshot::default(),
+                None,
+                &config,
+                &mut |_, _| {
+                    calls += 1;
+                    let failed = calls % 2 == 1 || (fail_second_chunk && calls == 4);
+                    (
+                        Ok(if failed {
+                            response(503, "unavailable", None)
+                        } else {
+                            response(200, r#"{"text":"chunk","usage":{"cost":0.002}}"#, None)
+                        }),
+                        Duration::from_millis(75),
+                    )
+                },
+                &mut |_, _, _, _| panic!("batch only"),
+                &mut |_| panic!("no retry"),
+            );
+            assert_eq!(result.is_err(), fail_second_chunk);
+            assert_eq!(calls, 4);
+            let samples = take_samples();
+            assert_eq!(samples.len(), 1);
+            let sample = &samples[0];
+            assert_eq!(sample.words.is_none(), fail_second_chunk);
+            let telemetry = sample.telemetry.as_ref().unwrap();
+            assert_eq!(telemetry.attempts.len(), 4);
+            assert_eq!(
+                telemetry
+                    .attempts
+                    .iter()
+                    .filter(|attempt| attempt.success)
+                    .count(),
+                if fail_second_chunk { 1 } else { 2 }
+            );
+            assert_eq!(telemetry.used_fallback, !fail_second_chunk);
+            assert!(!telemetry.live_recovered);
+            assert!(!telemetry.retried);
+            assert_eq!(telemetry.attempts[1].latency_ms, Some(75));
+            assert_eq!(telemetry.attempts[1].cost_usd, Some(0.002));
+            assert!(
+                telemetry
+                    .attempts
+                    .iter()
+                    .filter(|attempt| !attempt.success)
+                    .all(|attempt| attempt.latency_ms.is_none())
+            );
+        }
+    }
+
+    #[test]
+    fn extreme_reported_usage_saturates_across_chunks_before_statistics() {
+        take_samples();
+        let config = telemetry_config(&["fixture/primary"]);
+        let audio = vec![0.1; 160_160];
+        assert_eq!(chunk_ranges(&audio, 160_000).len(), 2);
+        let body =
+            json!({"text":"chunk", "usage":{"total_tokens":u64::MAX, "cost":f64::MAX}}).to_string();
+        let mut calls = 0;
+        transcribe_configured(
+            &audio,
+            &Snapshot::default(),
+            None,
+            &config,
+            &mut |_, _| {
+                calls += 1;
+                (Ok(response(200, &body, None)), Duration::from_millis(10))
+            },
+            &mut |_, _, _, _| panic!("batch only"),
+            &mut |_| panic!("no retry"),
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
+        let samples = take_samples();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].tokens, u64::MAX);
+        assert_eq!(samples[0].cost_usd, f64::MAX);
+        let telemetry = samples[0].telemetry.as_ref().unwrap();
+        assert_eq!(telemetry.attempts.len(), 2);
+        assert!(
+            telemetry
+                .attempts
+                .iter()
+                .all(|attempt| attempt.success && attempt.cost_usd.is_some_and(f64::is_finite))
+        );
+    }
+
+    #[test]
+    fn failed_live_can_be_recovered_on_same_model_without_counting_model_fallback() {
+        for recovered in [false, true] {
+            take_samples();
+            let config = telemetry_config(&["deepgram::nova-3"]);
+            let live = streaming::PendingLive::fixture(
+                config.clone(),
+                Snapshot::default(),
+                Err(streaming::fixture_error(Some(503), false)),
+                800,
+            );
+            let result = transcribe_configured(
+                &[0.1; 1600],
+                &Snapshot::default(),
+                Some(live),
+                &config,
+                &mut |_, _| {
+                    (
+                        Ok(if recovered {
+                            response(
+                                200,
+                                r#"{"results":{"channels":[{"alternatives":[{"transcript":"recovered"}]}]}}"#,
+                                None,
+                            )
+                        } else {
+                            response(503, "unavailable", None)
+                        }),
+                        Duration::from_millis(93),
+                    )
+                },
+                &mut |_, _, _, _| panic!("Deepgram completed uses batch"),
+                &mut |_| panic!("no retry"),
+            );
+            assert_eq!(result.is_ok(), recovered);
+            let samples = take_samples();
+            assert_eq!(samples.len(), 1);
+            let telemetry = samples[0].telemetry.as_ref().unwrap();
+            assert_eq!(telemetry.attempts.len(), 2);
+            assert_eq!(telemetry.attempts[0].mode, RequestMode::Live);
+            assert_eq!(telemetry.attempts[1].mode, RequestMode::Recorded);
+            assert_eq!(telemetry.attempts[1].latency_ms, recovered.then_some(93));
+            assert_eq!(telemetry.live_recovered, recovered);
+            assert!(!telemetry.used_fallback);
+            assert!(!telemetry.retried);
+        }
+    }
+
+    #[test]
+    fn completed_websocket_retries_are_recorded_mode_and_success_latency_only() {
+        take_samples();
+        let mut config = telemetry_config(&["openai::gpt-live-transcribe"]);
+        config.transcription.model_options.insert(
+            "openai::gpt-live-transcribe".into(),
+            ModelOptions {
+                streaming: true,
+                ..Default::default()
+            },
+        );
+        let mut calls = 0;
+        transcribe_configured(
+            &[0.1; 1600],
+            &Snapshot::default(),
+            None,
+            &config,
+            &mut |_, _| panic!("no batch transport"),
+            &mut |id, _, _, _| {
+                calls += 1;
+                if calls == 1 {
+                    Err(streaming::fixture_error(Some(429), false))
+                } else {
+                    Ok(streaming::LiveResult {
+                        text: "finished".into(),
+                        model: id.into(),
+                        keyword_count: 0,
+                        latency_ms: 61,
+                    })
+                }
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+        let samples = take_samples();
+        assert_eq!(samples.len(), 1);
+        let telemetry = samples[0].telemetry.as_ref().unwrap();
+        assert_eq!(telemetry.attempts.len(), 2);
+        assert_eq!(telemetry.attempts[0].error, Some(ErrorKind::RateLimited));
+        assert_eq!(telemetry.attempts[0].latency_ms, None);
+        assert_eq!(telemetry.attempts[1].latency_ms, Some(61));
+        assert!(
+            telemetry
+                .attempts
+                .iter()
+                .all(|attempt| attempt.mode == RequestMode::Recorded)
+        );
+        assert!(telemetry.retried);
+        assert!(!telemetry.live_recovered);
+        assert!(!telemetry.used_fallback);
+    }
+
+    #[test]
+    fn telemetry_distinguishes_explicit_zero_missing_and_invalid_costs() {
+        for (body, expected) in [
+            (r#"{"text":"ok","usage":{"cost":0}}"#, Some(0.0)),
+            (r#"{"text":"ok","usage":{"cost":0.004}}"#, Some(0.004)),
+            (r#"{"text":"ok","usage":{"cost":null}}"#, None),
+            (r#"{"text":"ok","usage":{"cost":-1}}"#, None),
+            (r#"{"text":"ok","usage":{"cost":"0.004"}}"#, None),
+            (r#"{"text":"ok"}"#, None),
+        ] {
+            let (_, usage) = parse(Provider::OpenRouter, body.as_bytes()).unwrap();
+            assert_eq!(usage.cost_reported, expected.is_some());
+            assert_eq!(usage.cost_usd, expected.unwrap_or_default());
+            assert_eq!(response_cost(body.as_bytes()), expected);
+        }
+    }
+
+    #[test]
+    fn microsoft_grok_and_google_follow_their_native_batch_contracts() {
+        let config = microsoft_config(&[]);
+        let vocabulary = vocabulary(&["Synthetic Nimbus"]);
+        let hints = HintPlan::default();
+        let options = ModelOptions {
+            language: "pt".into(),
+            prompt: "NOT_SUPPORTED_CONTEXT".into(),
+            temperature: Some(0.5),
+            ..Default::default()
+        };
+        let microsoft = request(
+            &config,
+            ModelRef::parse("microsoft::MAI-Transcribe-2"),
+            &options,
+            b"WAV_FIXTURE",
+            &vocabulary,
+            &hints,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            microsoft.url,
+            "https://fixture.cognitiveservices.azure.com/speechtotext/transcriptions:transcribe?api-version=2025-10-15"
+        );
+        let definition = definition(&microsoft);
+        assert_eq!(definition["enhancedMode"]["enabled"], true);
+        assert_eq!(definition["enhancedMode"]["model"], "MAI-Transcribe-2");
+        assert_eq!(
+            definition["enhancedMode"]["modelOptions"]["transcribeStyle"],
+            "clean"
+        );
+        assert_eq!(definition["locales"], json!(["pt-BR"]));
+        assert_eq!(
+            definition["phraseList"]["phrases"],
+            json!(["Synthetic Nimbus"])
+        );
+        assert!(
+            String::from_utf8_lossy(&microsoft.body)
+                .contains("name=\"audio\"; filename=\"clip.wav\"")
+        );
+        assert_eq!(microsoft.keyword_count, 1);
+
+        let grok = request(
+            &config,
+            ModelRef::parse("grok::grok-voice-transcribe-2.0"),
+            &options,
+            b"WAV_FIXTURE",
+            &vocabulary,
+            &hints,
+            false,
+        )
+        .unwrap();
+        assert_eq!(grok.url, "https://api.x.ai/v1/stt");
+        for (name, value) in [
+            ("model", "grok-voice-transcribe-2.0"),
+            ("format", "true"),
+            ("language", "pt"),
+            ("filler_words", "false"),
+            ("keyterm", "Synthetic Nimbus"),
+        ] {
+            assert!(field(&grok, name, value));
+        }
+        let multipart = String::from_utf8_lossy(&grok.body);
+        assert!(
+            multipart.find("name=\"keyterm\"").unwrap() < multipart.find("name=\"file\"").unwrap()
+        );
+
+        let google = request(
+            &config,
+            ModelRef::parse("google::gemini-3.5-transcribe"),
+            &options,
+            b"WAV_FIXTURE",
+            &vocabulary,
+            &hints,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            google.url,
+            "https://generativelanguage.googleapis.com/v1beta/interactions"
+        );
+        let body: Value = serde_json::from_slice(&google.body).unwrap();
+        assert_eq!(body["model"], "gemini-3.5-transcribe");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["input"][0]["type"], "audio");
+        assert_eq!(body["input"][0]["mime_type"], "audio/wav");
+        assert_eq!(body["input"][0]["data"], encode_base64(b"WAV_FIXTURE"));
+        assert_eq!(
+            body["generation_config"]["transcription_config"],
+            json!({"mode":"smart","language_codes":["pt-BR"],"custom_vocabulary":["Synthetic Nimbus"]})
+        );
+        for request in [&microsoft, &grok, &google] {
+            let body = String::from_utf8_lossy(&request.body);
+            for absent in [
+                "NOT_SUPPORTED_CONTEXT",
+                "temperature",
+                "diarization",
+                "timestamp",
+                "punctuate",
+                "numerals",
+            ] {
+                assert!(!body.contains(absent), "unsupported field {absent}");
+            }
+            assert_eq!(request.keyword_count, 1);
+        }
+    }
+
+    #[test]
+    fn new_provider_options_preserve_false_auto_and_whole_keyword_limits() {
+        let config = microsoft_config(&[]);
+        let vocabulary = vocabulary(&["Synthetic Nimbus"]);
+        let hints = HintPlan::default();
+        let options = ModelOptions {
+            smart_format: false,
+            no_verbatim: false,
+            ..Default::default()
+        };
+        for id in [
+            "microsoft::MAI-Transcribe-2",
+            "grok::grok-voice-transcribe-2.0",
+            "google::gemini-3.5-transcribe",
+        ] {
+            let request = request(
+                &config,
+                ModelRef::parse(id),
+                &options,
+                b"WAV",
+                &vocabulary,
+                &hints,
+                true,
+            )
+            .unwrap();
+            assert_eq!(request.keyword_count, 0);
+            assert!(!String::from_utf8_lossy(&request.body).contains("Synthetic Nimbus"));
+            match request.provider {
+                Provider::Microsoft => {
+                    let body = definition(&request);
+                    assert!(body.get("locales").is_none());
+                    assert_eq!(
+                        body["enhancedMode"]["modelOptions"]["transcribeStyle"],
+                        "verbatim"
+                    );
+                }
+                Provider::Grok => {
+                    assert!(field(&request, "format", "false"));
+                    assert!(field(&request, "filler_words", "true"));
+                    assert!(!String::from_utf8_lossy(&request.body).contains("name=\"language\""));
+                }
+                Provider::Google => {
+                    let body: Value = serde_json::from_slice(&request.body).unwrap();
+                    assert_eq!(
+                        body["generation_config"]["transcription_config"],
+                        json!({"mode":{"type":"verbatim"}})
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+        for code in ["auto", "ko", "nl"] {
+            assert!(!grok_format_supported(code));
+            let options = ModelOptions {
+                language: code.into(),
+                ..Default::default()
+            };
+            let request = request(
+                &config,
+                ModelRef::parse("grok::grok-voice-transcribe-2.0"),
+                &options,
+                b"WAV",
+                &vocabulary,
+                &hints,
+                false,
+            )
+            .unwrap();
+            assert!(field(&request, "format", "false"));
+        }
+        let names = Snapshot::new(Vocabulary {
+            terms: (0..1100).map(|index| format!("Name{index}")).collect(),
+            ..Default::default()
+        });
+        assert_eq!(
+            keywords(ModelRef::parse("google::gemini-3.5-transcribe"), &names).len(),
+            1000
+        );
+        assert_eq!(
+            keywords(ModelRef::parse("grok::grok-voice-transcribe-2.0"), &names).len(),
+            100
+        );
+        let long = "A".repeat(51);
+        let whole = "Á".repeat(50);
+        assert_eq!(
+            keywords(
+                ModelRef::parse("grok::grok-voice-transcribe-2.0"),
+                &self::vocabulary(&[&long, &whole])
+            ),
+            [whole]
+        );
+    }
+
+    #[test]
+    fn new_response_parsers_reject_empty_partial_and_nontranscript_google_content() {
+        assert_eq!(
+            parse(
+                Provider::Microsoft,
+                br#"{"combinedPhrases":[{"text":" hello "}]}"#
+            )
+            .unwrap()
+            .0,
+            "hello"
+        );
+        assert_eq!(
+            parse(Provider::Grok, br#"{"text":" hello "}"#).unwrap().0,
+            "hello"
+        );
+        let google = br#"{"status":"completed","error":null,"steps":[{"type":"user_input","content":[{"type":"text","text":"PRIVATE_INPUT"}]},{"type":"model_output","content":[{"type":"thought","text":"PRIVATE_THOUGHT"},{"type":"text","text":"hello"},{"type":"text","text":"world"}]}],"usage":{"total_tokens":42}}"#;
+        let (text, usage) = parse(Provider::Google, google).unwrap();
+        assert_eq!(text, "hello\nworld");
+        assert_eq!(usage.tokens, 42);
+        for (provider, body) in [
+            (Provider::Microsoft, r#"{"combinedPhrases":[{"text":" "}]}"#),
+            (Provider::Grok, r#"{"text":""}"#),
+            (
+                Provider::Google,
+                r#"{"status":"in_progress","steps":[{"type":"model_output","content":[{"type":"text","text":"partial"}]}]}"#,
+            ),
+            (
+                Provider::Google,
+                r#"{"status":"completed","steps":[{"type":"model_output","content":[{"type":"thought","text":"PRIVATE_THOUGHT"}]}]}"#,
+            ),
+        ] {
+            assert!(parse(provider, body.as_bytes()).is_err());
+        }
+        let error = parse(
+            Provider::Google,
+            br#"{"error":{"message":"PRIVATE_REMOTE_ERROR"}}"#,
+        )
+        .unwrap_err();
+        assert!(!error.to_string().contains("PRIVATE_REMOTE_ERROR"));
+    }
+
+    #[test]
+    fn new_provider_hint_rejection_empty_response_and_configuration_errors_keep_fallback() {
+        let ids = [
+            "microsoft::MAI-Transcribe-2",
+            "grok::grok-voice-transcribe-2.0",
+            "google::gemini-3.5-transcribe",
+        ];
+        let mut config = microsoft_config(&ids);
+        let vocabulary = vocabulary(&["Synthetic Nimbus"]);
+        let hints = HintPlan::default();
+        for valid_endpoint in [true, false] {
+            if !valid_endpoint {
+                config.microsoft.endpoint = "https://PRIVATE_MARKER.evil.test".into();
+            }
+            let mut progress = Progress::default();
+            let mut calls = Vec::new();
+            let success = Chain {config:&config, vocabulary:&vocabulary,hints:&hints,cancelled:None}.run(
+                &[0.1;160], Duration::ZERO, &mut progress,
+                &mut |request, _| {
+                    calls.push((request.provider, request.keyword_count));
+                    (Ok(match request.provider {
+                        Provider::Microsoft if request.keyword_count > 0 => response(422,"phraseList unsupported PRIVATE_MARKER",None),
+                        Provider::Microsoft => response(200,r#"{"combinedPhrases":[{"text":""}]}"#,None),
+                        Provider::Grok => response(503,"PRIVATE_MARKER",None),
+                        Provider::Google => response(200,r#"{"status":"completed","steps":[{"type":"model_output","content":[{"type":"text","text":"done"}]}]}"#,None),
+                        _ => panic!("unexpected provider"),
+                    }),Duration::ZERO)
+                }, &mut |_,_,_,_| panic!("no websocket"), &mut |_| panic!("no wait")
+            ).unwrap();
+            assert_eq!(success.model, ids[2]);
+            assert_eq!(success.text, "done");
+            assert!(
+                !progress
+                    .failures
+                    .iter()
+                    .any(|failure| failure.detail.contains("PRIVATE_MARKER"))
+            );
+            if valid_endpoint {
+                assert_eq!(
+                    calls,
+                    [
+                        (Provider::Microsoft, 1),
+                        (Provider::Microsoft, 0),
+                        (Provider::Grok, 1),
+                        (Provider::Google, 1)
+                    ]
+                );
+                assert!(
+                    progress
+                        .failures
+                        .iter()
+                        .any(|failure| failure.kind == ErrorKind::InvalidResponse)
+                );
+            } else {
+                assert_eq!(calls, [(Provider::Grok, 1), (Provider::Google, 1)]);
+                assert_eq!(progress.executions[0].keyword_count, 0);
+                assert_eq!(progress.failures[0].kind, ErrorKind::Rejected);
+            }
+        }
+    }
+
+    #[test]
+    fn new_provider_hint_rejection_only_retries_fields_that_were_sent() {
+        let config = microsoft_config(&[]);
+        let vocabulary = vocabulary(&["Synthetic Nimbus"]);
+        let hints = HintPlan::default();
+        for (id, field) in [
+            ("microsoft::MAI-Transcribe-2", "phraseList"),
+            ("grok::grok-voice-transcribe-2.0", "keyterm"),
+            ("google::gemini-3.5-transcribe", "custom_vocabulary"),
+        ] {
+            let model = ModelRef::parse(id);
+            let sent = request(
+                &config,
+                model,
+                &ModelOptions::default(),
+                b"WAV",
+                &vocabulary,
+                &hints,
+                false,
+            )
+            .unwrap();
+            let without = request(
+                &config,
+                model,
+                &ModelOptions::default(),
+                b"WAV",
+                &vocabulary,
+                &hints,
+                true,
+            )
+            .unwrap();
+            assert!(keywords_rejected(
+                model,
+                &sent,
+                &response(422, field, None),
+                &hints
+            ));
+            assert!(!keywords_rejected(
+                model,
+                &sent,
+                &response(503, field, None),
+                &hints
+            ));
+            assert!(!keywords_rejected(
+                model,
+                &without,
+                &response(422, field, None),
+                &hints
+            ));
+        }
     }
 
     #[test]
@@ -1291,6 +2500,96 @@ mod tests {
     }
 
     #[test]
+    fn empty_responses_fall_back_after_rate_limit_retry_and_fail_when_all_are_empty() {
+        let config = config(&[
+            "openai/vendor-model",
+            "openai::gpt-transcribe",
+            "deepgram::nova-3",
+        ]);
+        let vocabulary = Snapshot::default();
+        let hints = HintPlan::default();
+        for final_succeeds in [true, false] {
+            let mut progress = Progress::default();
+            let mut calls = Vec::new();
+            let mut waits = Vec::new();
+            let result = Chain {
+                config: &config,
+                vocabulary: &vocabulary,
+                hints: &hints,
+                cancelled: None,
+            }
+            .run(
+                &[0.1; 160],
+                Duration::ZERO,
+                &mut progress,
+                &mut |request, _| {
+                    calls.push(request.provider);
+                    let response = match request.provider {
+                        Provider::OpenRouter if final_succeeds && calls.len() == 1 => {
+                            response(429, "rate limit", Some(Duration::from_millis(100)))
+                        }
+                        Provider::OpenRouter if final_succeeds => response(503, "unavailable", None),
+                        Provider::Deepgram => response(
+                            200,
+                            if final_succeeds {
+                                r#"{"results":{"channels":[{"alternatives":[{"transcript":"done"}]}]}}"#
+                            } else {
+                                r#"{"results":{"channels":[{"alternatives":[{"transcript":" \n\t "}]}]}}"#
+                            },
+                            None,
+                        ),
+                        _ => response(200, r#"{"text":" \n\t "}"#, None),
+                    };
+                    (Ok(response), Duration::ZERO)
+                },
+                &mut |_, _, _, _| panic!("no websocket"),
+                &mut |wait| waits.push(wait),
+            );
+            if final_succeeds {
+                let success = result.unwrap();
+                assert_eq!(success.model, "deepgram::nova-3");
+                assert_eq!(success.text, "done");
+                assert_eq!(
+                    calls,
+                    [
+                        Provider::OpenRouter,
+                        Provider::OpenRouter,
+                        Provider::OpenAi,
+                        Provider::Deepgram
+                    ]
+                );
+                assert_eq!(waits, [Duration::from_millis(100)]);
+                assert_eq!(progress.failures.len(), 2);
+                assert_eq!(progress.failures[1].kind, ErrorKind::InvalidResponse);
+                assert_eq!(progress.executions.len(), 4);
+            } else {
+                let Err(error) = result else {
+                    panic!("empty responses must fail the chain")
+                };
+                let failure = error.downcast_ref::<ChainFailure>().unwrap();
+                assert_eq!(failure.failures.len(), 3);
+                assert!(
+                    failure
+                        .failures
+                        .iter()
+                        .all(|failure| failure.kind == ErrorKind::InvalidResponse)
+                );
+                assert_eq!(
+                    calls,
+                    [Provider::OpenRouter, Provider::OpenAi, Provider::Deepgram]
+                );
+                assert!(waits.is_empty());
+                assert!(
+                    progress
+                        .executions
+                        .iter()
+                        .all(|execution| execution.outcome == "failed")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn rate_limit_and_keyword_rejection_retry_within_one_original_budget() {
         let mut config = config(&["openai::gpt-transcribe"]);
         config.transcription.total_timeout_seconds = 3;
@@ -1377,7 +2676,7 @@ mod tests {
             &mut |request, _| {
                 (
                     if request.provider == Provider::OpenAi {
-                        Err(TransportFailure(ErrorKind::Auth).into())
+                        Err(TransportFailure(ErrorKind::Auth, 0).into())
                     } else {
                         Ok(response(401, "PRIVATE_PROVIDER_MESSAGE", None))
                     },
@@ -1518,6 +2817,12 @@ mod tests {
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].words, Some(2));
         assert_eq!(samples[0].latency_ms, 425);
+        let telemetry = samples[0].telemetry.as_ref().unwrap();
+        assert_eq!(telemetry.attempts.len(), 1);
+        assert_eq!(telemetry.attempts[0].mode, RequestMode::Live);
+        assert_eq!(telemetry.attempts[0].latency_ms, Some(425));
+        assert_eq!(telemetry.attempts[0].cost_usd, None);
+        assert!(!telemetry.used_fallback && !telemetry.retried && !telemetry.live_recovered);
         assert_eq!(
             samples[0].model_latency["openai::gpt-live-transcribe"].total_ms,
             425
@@ -1539,6 +2844,7 @@ mod tests {
         assert_eq!(samples.len(), 1);
         assert!(samples[0].skipped_silent);
         assert_eq!(samples[0].sent_ms, 50);
+        assert!(samples[0].telemetry.as_ref().unwrap().attempts.is_empty());
     }
 
     #[test]

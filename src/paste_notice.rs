@@ -109,7 +109,7 @@ impl PasteNotice {
         self.detail.setStringValue(&NSString::from_str(detail));
         self.position_on_selected_screen();
         self.until = Some(Instant::now() + Duration::from_secs(5));
-        self.visibility.update(&self.window, true);
+        self.visibility.update(&mut self.window, true);
     }
 
     fn position_on_selected_screen(&self) {
@@ -139,7 +139,7 @@ impl PasteNotice {
 
     pub fn hide(&mut self) {
         self.until = None;
-        self.visibility.update(&self.window, false);
+        self.visibility.update(&mut self.window, false);
     }
 
     pub fn maintain(&mut self) {
@@ -147,7 +147,7 @@ impl PasteNotice {
             self.hide();
         } else if self.until.is_some() {
             self.position_on_selected_screen();
-            self.visibility.update(&self.window, true);
+            self.visibility.update(&mut self.window, true);
         }
     }
 }

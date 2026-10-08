@@ -6,8 +6,8 @@ A slim macOS fork of HEX: tap a shortcut to lock recording or hold and release,
 trim the silence, send
 the clip to a speech provider with an ordered fallback chain, and paste the
 transcript. Settings, Microphone, Providers, Models, Post-processing, HUD, History, and Statistics are the panes.
-Keys, per-model language/streaming/options and advanced limits belong in Providers.
-Models contains the primary/fallback chain and shared keywords;
+Keys and advanced request limits belong in Providers. Models contains the
+primary/fallback chain, per-model language/streaming/options and shared keywords;
 device/channel choices, priority, input levels, capture mode, silence trimming
 and audio behavior while dictating belong in Microphone. Indicator position and
 recording/transcription palettes belong in HUD. Everything
@@ -31,7 +31,8 @@ not reintroduce seams for them.
   in-memory RMS/peak diagnostics, measured at 16 kHz before silence trimming.
 - `providers`: provider identities/capabilities, separate Keychain credentials, native
   batch adapters and bounded WebSocket workers. `providers_view` owns credentials
-  and model profiles; `model_options_view` exposes only compatible features.
+  and request limits; `model_options_view` lives in Models and exposes only
+  compatible features.
 - `pipeline`: one transcription worker and one ordered output worker with
   bounded queues, cancellation, paste-last, and History recording.
 - `openrouter`: configuration (`openrouter.json`), Keychain key handling,
@@ -134,7 +135,23 @@ not reintroduce seams for them.
   to the next model; a 429 asking to wait at most the configured time is
   retried once on the same model.
 - Statistics record daily totals only, never text or audio, and recording
-  them must never affect dictation.
+  them must never affect dictation. Per-attempt telemetry is ephemeral and folds
+  into daily provider/model/mode counters and bounded latency histograms. Do not
+  persist individual requests, prompts, keyword contents or raw errors.
+  Keep one overview sample per transcription, including all chunks. Count retries
+  on the same model separately from successful fallback to another chain slot and
+  live-to-recorded recovery. Transcription success is not proof of a successful paste.
+  Live means a session initiated during capture, not proof that its handshake or
+  audio transmission completed before Finish. Recorded means a completed-clip
+  attempt, including WebSockets started after recording. Compare their successful
+  request latencies as Finish-to-final and request-to-response respectively. Mark P95 as
+  approximate and require twenty measured successful responses. Never assign old
+  records a request mode, percentile or cost coverage they did not contain.
+  Missing reported cost is unknown; explicit zero is known. Do not invent price
+  estimates. Group native models by their true provider; a vendor/model route is
+  still OpenRouter. Filters for request comparisons must not silently change the
+  scope of overview cards. Load one consistent period snapshot off the UI thread,
+  preserve unreadable statistics and discard stale asynchronous reloads.
 - Each accepted dictation snapshots its post-processing preferences. Format
   once before ordered output; History and Paste Last retain that result and
   its casing policy. Continuation must not undo explicit lowercase choices.
@@ -154,6 +171,22 @@ not reintroduce seams for them.
   cancels the draft. Failed saves retain accepted chips and the pending draft.
   Other options live in persistent per-model profiles: initialize from compatible
   source options only once, never overwrite a profile on reselection/removal.
+  Compatible streaming/formatting/cleanup toggles default on; explicit persisted
+  false stays off. Newly supported target capabilities start with their defaults.
+  Native Microsoft/Google model IDs remain distinct from identically named OpenRouter
+  routes. Azure resource endpoints/deployment stay local across preference imports and
+  never enter exports. Validate Azure HTTPS roots before resolving the Microsoft key.
+  Google uses the AI Studio key and dedicated Transcribe API with store:false for unary
+  requests; do not persist Interactions or upload permanent files. Smart transcription
+  is one atomic Google option. Grok formatting requires a supported explicit language;
+  never invent one for Auto. Punctuation/numerals are separate capabilities.
+  Only explicit final acknowledgements may complete a live transcript. Google needs
+  transcription completion as well as turn completion; neither interim transcription
+  nor generated assistant content is dictation text. Missing completion falls back.
+  Selectors filter on cached provider-key availability, never resolving keys or
+  making requests during render. Missing keys hide choices but retain saved
+  selections/profiles with an unavailable notice. Nova-2 with Auto language uses
+  batch until an explicit language is chosen; never invent a language.
 - Live PCM comes from the authoritative, resampled Recording prefix, after the
   intentional threshold and before the conservative pending-input boundary.
   Never use the disposable HUD meter projection. Capture only uses bounded
@@ -164,7 +197,8 @@ not reintroduce seams for them.
   after Finish, cancellation belongs to that pipeline job. Never paste partial
   text or end capture on a provider's segment completion. Final text still goes
   through ordered output, formatting, vocabulary and destination verification.
-  Streaming is opt-in, does not compact silence, and may send/bill silence before
+  Streaming is enabled by default when compatible, does not compact silence,
+  and may send/bill silence before
   a final local silence check. Recovery WAV persistence happens after Finish.
   History stores actual provider/model/mode/keyword counts and attempt outcomes,
   never term/prompt contents; absent old metadata remains unknown.
@@ -288,7 +322,7 @@ not treat a successful release build as evidence that tests passed. Record
 the local command and result when handing off work.
 
 The script isolates application data in a temporary directory and removes
-all four provider API-key environment variables for the test process. Do not point tests at
+all provider API-key environment variables for the test process. Do not point tests at
 the user's real settings, History, Statistics, or credentials. Native tests
 that are explicitly ignored remain manual checks; report that limitation
 rather than claiming they ran.

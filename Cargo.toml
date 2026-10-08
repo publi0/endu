@@ -1,6 +1,6 @@
 [package]
 name = "voice-control"
-version = "3.2.0"
+version = "3.3.0"
 edition = "2024"
 default-run = "voice-control"
 license = "MIT"
@@ -8,6 +8,10 @@ repository = "https://github.com/publi0/hex"
 
 [[test]]
 name = "keyboard_layout"
+harness = false
+
+[[test]]
+name = "overlay_visibility"
 harness = false
 
 [build-dependencies]

@@ -13,6 +13,7 @@ pub mod report;
 #[cfg(target_os = "macos")]
 pub mod settings_view;
 pub mod stats;
+pub mod stats_dashboard;
 #[cfg(target_os = "macos")]
 pub mod stats_view;
 pub mod transcribe;
@@ -84,6 +85,7 @@ pub struct Config {
     /// OpenRouter-compatible API root.
     pub base_url: String,
     pub transcription: TranscriptionConfig,
+    pub microsoft: crate::providers::MicrosoftConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -118,6 +120,7 @@ impl Default for Config {
             api_key: None,
             base_url: "https://openrouter.ai/api/v1".into(),
             transcription: TranscriptionConfig::default(),
+            microsoft: Default::default(),
         }
     }
 }
@@ -165,6 +168,10 @@ pub fn config_path() -> Result<PathBuf> {
 pub fn load_config() -> Result<Config> {
     let path = config_path()?;
     let config = load_config_at(&path)?;
+    config
+        .microsoft
+        .validate()
+        .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
     crate::providers::validate_profiles(&config.transcription.model_options)
         .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
     crate::providers::apply_runtime(&config);
@@ -242,6 +249,10 @@ fn config_temporary_path(path: &Path) -> PathBuf {
 }
 
 pub(crate) fn save_config_at(path: &Path, config: &Config) -> Result<()> {
+    config
+        .microsoft
+        .validate()
+        .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
     crate::providers::validate_profiles(&config.transcription.model_options)
         .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
     let parent = path

@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -12,11 +12,29 @@ use color_eyre::Result;
 use serde::{Deserialize, Serialize};
 
 const FILE: &str = "stats.json";
-const VERSION: u32 = 2;
-/// Days kept on disk; older buckets are dropped.
+const VERSION: u32 = 3;
+const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// Daily buckets kept on disk; older saved buckets are dropped, including across gaps.
 const MAX_DAYS: usize = 400;
 
 static LOCK: Mutex<()> = Mutex::new(());
+
+fn add_counter(total: &mut u64, count: u64) {
+    *total = total.saturating_add(count);
+}
+
+/// Ignore invalid reported amounts and clamp an unrepresentable sum. Never
+/// serialize infinity as null, which would make the next load lose the totals.
+fn add_cost(total: &mut f64, cost: f64) -> bool {
+    if !total.is_finite() || *total < 0.0 {
+        *total = 0.0;
+    }
+    if !cost.is_finite() || cost < 0.0 {
+        return false;
+    }
+    *total = (*total + cost).min(f64::MAX);
+    true
+}
 
 /// Why one model attempt failed, grouped for display.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,23 +118,277 @@ pub struct ModelLatency {
 
 impl ModelLatency {
     pub fn record(&mut self, latency_ms: u64) {
-        self.responses += 1;
-        self.total_ms += latency_ms;
+        self.responses = self.responses.saturating_add(1);
+        self.total_ms = self.total_ms.saturating_add(latency_ms);
     }
 
+    #[cfg(test)]
     pub fn average_ms(&self) -> Option<u64> {
         self.total_ms.checked_div(self.responses)
     }
 
-    fn merge(&mut self, other: &Self) {
-        self.responses += other.responses;
-        self.total_ms += other.total_ms;
+    pub fn merge(&mut self, other: &Self) {
+        self.responses = self.responses.saturating_add(other.responses);
+        self.total_ms = self.total_ms.saturating_add(other.total_ms);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestMode {
+    Live,
+    #[default]
+    Recorded,
+}
+
+/// Ephemeral measurements for one actual provider attempt. Never serialized.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AttemptSample {
+    pub model: String,
+    pub mode: RequestMode,
+    pub success: bool,
+    pub error: Option<ErrorKind>,
+    pub latency_ms: Option<u64>,
+    pub keyword_count: usize,
+    pub cost_usd: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DictationTelemetry {
+    pub attempts: Vec<AttemptSample>,
+    pub used_fallback: bool,
+    pub retried: bool,
+    pub live_recovered: bool,
+}
+
+// Stable bucket upper bounds in milliseconds; the final bucket is overflow.
+const LATENCY_BOUNDS: [u64; 22] = [
+    100, 200, 300, 400, 500, 750, 1_000, 1_500, 2_000, 2_500, 3_000, 4_000, 5_000, 7_500, 10_000,
+    15_000, 20_000, 30_000, 45_000, 60_000, 90_000, 120_000,
+];
+
+/// Fixed-size distribution of successful measured requests, never raw samples.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct LatencyDistribution {
+    pub count: u64,
+    pub total_ms: u64,
+    pub min_ms: Option<u64>,
+    pub max_ms: Option<u64>,
+    buckets: [u64; 23],
+}
+
+impl LatencyDistribution {
+    pub fn record(&mut self, milliseconds: u64) {
+        let bucket = LATENCY_BOUNDS.partition_point(|bound| *bound < milliseconds);
+        self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
+        self.count = self.count.saturating_add(1);
+        self.total_ms = self.total_ms.saturating_add(milliseconds);
+        self.min_ms = Some(
+            self.min_ms
+                .map_or(milliseconds, |old| old.min(milliseconds)),
+        );
+        self.max_ms = Some(
+            self.max_ms
+                .map_or(milliseconds, |old| old.max(milliseconds)),
+        );
+    }
+
+    pub fn merge(&mut self, other: &Self) {
+        self.count = self.count.saturating_add(other.count);
+        self.total_ms = self.total_ms.saturating_add(other.total_ms);
+        self.min_ms = match (self.min_ms, other.min_ms) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
+        };
+        self.max_ms = match (self.max_ms, other.max_ms) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (left, right) => left.or(right),
+        };
+        for (target, source) in self.buckets.iter_mut().zip(other.buckets) {
+            *target = target.saturating_add(source);
+        }
+    }
+
+    pub fn average_ms(&self) -> Option<u64> {
+        self.total_ms.checked_div(self.count)
+    }
+
+    /// Approximate nearest-rank percentile using bucket upper bounds. P95 and
+    /// higher require at least twenty measured successes. Overflow uses max_ms.
+    pub fn percentile_ms(&self, percent: u8) -> Option<u64> {
+        if self.count == 0 || !(1..=100).contains(&percent) || (percent >= 95 && self.count < 20) {
+            return None;
+        }
+        let rank = (u128::from(self.count) * u128::from(percent)).div_ceil(100);
+        let mut cumulative = 0_u128;
+        for (index, count) in self.buckets.iter().enumerate() {
+            cumulative += u128::from(*count);
+            if cumulative >= rank {
+                let maximum = self.max_ms?;
+                return Some(
+                    LATENCY_BOUNDS
+                        .get(index)
+                        .copied()
+                        .unwrap_or(maximum)
+                        .min(maximum),
+                );
+            }
+        }
+        None
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct RequestTotals {
+    pub attempts: u64,
+    pub successes: u64,
+    pub errors: BTreeMap<String, u64>,
+    pub latency: LatencyDistribution,
+    pub keyword_requests: u64,
+    pub keywords_sent: u64,
+    pub reported_cost_usd: f64,
+    pub cost_reports: u64,
+}
+
+impl RequestTotals {
+    fn normalize_cost(&mut self) {
+        if !self.reported_cost_usd.is_finite() || self.reported_cost_usd < 0.0 {
+            self.reported_cost_usd = 0.0;
+            self.cost_reports = 0;
+        }
+    }
+
+    fn add_attempt(&mut self, attempt: &AttemptSample) {
+        self.normalize_cost();
+        self.attempts = self.attempts.saturating_add(1);
+        if attempt.success {
+            self.successes = self.successes.saturating_add(1);
+            if let Some(milliseconds) = attempt.latency_ms {
+                self.latency.record(milliseconds);
+            }
+        } else {
+            add_counter(
+                self.errors
+                    .entry(attempt.error.map_or("unknown", ErrorKind::key).into())
+                    .or_default(),
+                1,
+            );
+        }
+        if attempt.keyword_count > 0 {
+            self.keyword_requests = self.keyword_requests.saturating_add(1);
+            self.keywords_sent = self
+                .keywords_sent
+                .saturating_add(attempt.keyword_count as u64);
+        }
+        if let Some(cost) = attempt
+            .cost_usd
+            .filter(|cost| cost.is_finite() && *cost >= 0.0)
+        {
+            add_cost(&mut self.reported_cost_usd, cost);
+            self.cost_reports = self.cost_reports.saturating_add(1);
+        }
+    }
+
+    pub fn merge(&mut self, other: &Self) {
+        self.attempts = self.attempts.saturating_add(other.attempts);
+        self.successes = self.successes.saturating_add(other.successes);
+        self.latency.merge(&other.latency);
+        self.keyword_requests = self.keyword_requests.saturating_add(other.keyword_requests);
+        self.keywords_sent = self.keywords_sent.saturating_add(other.keywords_sent);
+        self.normalize_cost();
+        if other.cost_reports > 0 && add_cost(&mut self.reported_cost_usd, other.reported_cost_usd)
+        {
+            self.cost_reports = self.cost_reports.saturating_add(other.cost_reports);
+        }
+        for (kind, count) in &other.errors {
+            add_counter(self.errors.entry(kind.clone()).or_default(), *count);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct ModelRequests {
+    pub live: RequestTotals,
+    pub recorded: RequestTotals,
+}
+
+impl ModelRequests {
+    pub fn merge(&mut self, other: &Self) {
+        self.live.merge(&other.live);
+        self.recorded.merge(&other.recorded);
+    }
+
+    pub fn combined(&self) -> RequestTotals {
+        let mut combined = self.live.clone();
+        combined.merge(&self.recorded);
+        combined
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct DetailedTotals {
+    pub dictations: u64,
+    pub successful_dictations: u64,
+    pub fallback_dictations: u64,
+    pub retried_dictations: u64,
+    pub live_recoveries: u64,
+    pub requests: BTreeMap<String, ModelRequests>,
+}
+
+impl DetailedTotals {
+    fn add_dictation(&mut self, telemetry: &DictationTelemetry, success: bool) {
+        self.dictations = self.dictations.saturating_add(1);
+        self.successful_dictations = self
+            .successful_dictations
+            .saturating_add(u64::from(success));
+        self.fallback_dictations = self
+            .fallback_dictations
+            .saturating_add(u64::from(success && telemetry.used_fallback));
+        self.retried_dictations = self
+            .retried_dictations
+            .saturating_add(u64::from(telemetry.retried));
+        self.live_recoveries = self
+            .live_recoveries
+            .saturating_add(u64::from(success && telemetry.live_recovered));
+        for attempt in &telemetry.attempts {
+            let requests = self.requests.entry(attempt.model.clone()).or_default();
+            match attempt.mode {
+                RequestMode::Live => &mut requests.live,
+                RequestMode::Recorded => &mut requests.recorded,
+            }
+            .add_attempt(attempt);
+        }
+    }
+
+    pub fn merge(&mut self, other: &Self) {
+        self.dictations = self.dictations.saturating_add(other.dictations);
+        self.successful_dictations = self
+            .successful_dictations
+            .saturating_add(other.successful_dictations);
+        self.fallback_dictations = self
+            .fallback_dictations
+            .saturating_add(other.fallback_dictations);
+        self.retried_dictations = self
+            .retried_dictations
+            .saturating_add(other.retried_dictations);
+        self.live_recoveries = self.live_recoveries.saturating_add(other.live_recoveries);
+        for (model, requests) in &other.requests {
+            self.requests
+                .entry(model.clone())
+                .or_default()
+                .merge(requests);
+        }
     }
 }
 
 /// What one dictation contributed.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Sample {
+    pub telemetry: Option<DictationTelemetry>,
     /// `None` when nothing was transcribed (every model failed).
     pub words: Option<u64>,
     /// Models used by a successful dictation, counted once each.
@@ -134,6 +406,7 @@ pub struct Sample {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
 pub struct Totals {
+    pub details: DetailedTotals,
     pub dictations: u64,
     pub failed_dictations: u64,
     pub skipped_silent: u64,
@@ -154,29 +427,39 @@ pub struct Totals {
 }
 
 impl Totals {
-    fn add_sample(&mut self, sample: &Sample) {
-        self.recorded_ms += sample.recorded_ms;
-        self.sent_ms += sample.sent_ms;
+    pub(crate) fn add_sample(&mut self, sample: &Sample) {
+        self.recorded_ms = self.recorded_ms.saturating_add(sample.recorded_ms);
+        self.sent_ms = self.sent_ms.saturating_add(sample.sent_ms);
         if sample.skipped_silent {
-            self.skipped_silent += 1;
+            self.skipped_silent = self.skipped_silent.saturating_add(1);
             return;
+        }
+        if let Some(telemetry) = &sample.telemetry {
+            self.details
+                .add_dictation(telemetry, sample.words.is_some());
         }
         match sample.words {
             Some(words) => {
-                self.dictations += 1;
-                self.words += words;
+                self.dictations = self.dictations.saturating_add(1);
+                self.words = self.words.saturating_add(words);
                 for model in sample.models.iter().collect::<BTreeSet<_>>() {
-                    *self.models.entry(model.clone()).or_default() += 1;
+                    add_counter(self.models.entry(model.clone()).or_default(), 1);
                 }
-                if !sample.failures.is_empty() {
-                    self.fallbacks += 1;
+                if sample
+                    .telemetry
+                    .as_ref()
+                    .map_or(!sample.failures.is_empty(), |telemetry| {
+                        telemetry.used_fallback
+                    })
+                {
+                    self.fallbacks = self.fallbacks.saturating_add(1);
                 }
             }
-            None => self.failed_dictations += 1,
+            None => self.failed_dictations = self.failed_dictations.saturating_add(1),
         }
-        self.latency_ms += sample.latency_ms;
-        self.tokens += sample.tokens;
-        self.cost_usd += sample.cost_usd;
+        self.latency_ms = self.latency_ms.saturating_add(sample.latency_ms);
+        self.tokens = self.tokens.saturating_add(sample.tokens);
+        add_cost(&mut self.cost_usd, sample.cost_usd);
         for (model, latency) in &sample.model_latency {
             self.model_latency
                 .entry(model.clone())
@@ -184,28 +467,33 @@ impl Totals {
                 .merge(latency);
         }
         for failure in &sample.failures {
-            *self
-                .errors
-                .entry(failure.kind.key().into())
-                .or_default()
-                .entry(failure.model.clone())
-                .or_default() += 1;
+            add_counter(
+                self.errors
+                    .entry(failure.kind.key().into())
+                    .or_default()
+                    .entry(failure.model.clone())
+                    .or_default(),
+                1,
+            );
         }
     }
 
-    fn merge(&mut self, other: &Self) {
-        self.dictations += other.dictations;
-        self.failed_dictations += other.failed_dictations;
-        self.skipped_silent += other.skipped_silent;
-        self.words += other.words;
-        self.recorded_ms += other.recorded_ms;
-        self.sent_ms += other.sent_ms;
-        self.latency_ms += other.latency_ms;
-        self.tokens += other.tokens;
-        self.cost_usd += other.cost_usd;
-        self.fallbacks += other.fallbacks;
+    pub fn merge(&mut self, other: &Self) {
+        self.details.merge(&other.details);
+        self.dictations = self.dictations.saturating_add(other.dictations);
+        self.failed_dictations = self
+            .failed_dictations
+            .saturating_add(other.failed_dictations);
+        self.skipped_silent = self.skipped_silent.saturating_add(other.skipped_silent);
+        self.words = self.words.saturating_add(other.words);
+        self.recorded_ms = self.recorded_ms.saturating_add(other.recorded_ms);
+        self.sent_ms = self.sent_ms.saturating_add(other.sent_ms);
+        self.latency_ms = self.latency_ms.saturating_add(other.latency_ms);
+        self.tokens = self.tokens.saturating_add(other.tokens);
+        add_cost(&mut self.cost_usd, other.cost_usd);
+        self.fallbacks = self.fallbacks.saturating_add(other.fallbacks);
         for (model, count) in &other.models {
-            *self.models.entry(model.clone()).or_default() += count;
+            add_counter(self.models.entry(model.clone()).or_default(), *count);
         }
         for (model, latency) in &other.model_latency {
             self.model_latency
@@ -216,23 +504,27 @@ impl Totals {
         for (kind, models) in &other.errors {
             let target = self.errors.entry(kind.clone()).or_default();
             for (model, count) in models {
-                *target.entry(model.clone()).or_default() += count;
+                add_counter(target.entry(model.clone()).or_default(), *count);
             }
         }
     }
 
     pub fn average_latency_ms(&self) -> Option<u64> {
-        let attempts = self.dictations + self.failed_dictations;
+        let attempts = self.dictations.saturating_add(self.failed_dictations);
         (attempts > 0).then(|| self.latency_ms / attempts)
     }
 
+    #[cfg(test)]
     pub fn error_count(&self, kind: &str) -> u64 {
-        self.errors
-            .get(kind)
-            .map_or(0, |models| models.values().sum())
+        self.errors.get(kind).map_or(0, |models| {
+            models
+                .values()
+                .fold(0_u64, |total, count| total.saturating_add(*count))
+        })
     }
 
     /// Error kinds by descending count.
+    #[cfg(test)]
     pub fn errors_by_count(&self) -> Vec<(&str, u64)> {
         let mut errors: Vec<_> = self
             .errors
@@ -268,7 +560,7 @@ impl Period {
             Self::Today => "Today",
             Self::Week => "7 days",
             Self::Month => "30 days",
-            Self::AllTime => "All time",
+            Self::AllTime => "All saved",
         }
     }
 
@@ -280,6 +572,53 @@ impl Period {
             Self::AllTime => None,
         }
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Dashboard {
+    pub totals: Totals,
+    pub previous: Option<Totals>,
+    /// One entry per local day, including gaps. AllTime charts only the last 30 days.
+    pub daily: Vec<(String, Totals)>,
+}
+
+pub fn dashboard(period: Period) -> Result<Dashboard> {
+    let path = crate::app_paths::support_dir()?.join(FILE);
+    dashboard_at(&path, period, now_seconds())
+}
+
+/// Read one consistent snapshot without consulting the real application path.
+pub fn dashboard_at(path: &Path, period: Period, now: i64) -> Result<Dashboard> {
+    let _guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let file = load(path)?;
+    let today = local_day(now);
+    let first = period.days().map(|days| local_day_before(now, days - 1));
+    let sum = |first: Option<&str>, last: &str| {
+        let mut totals = Totals::default();
+        for (day, day_totals) in &file.days {
+            if day.as_str() <= last && first.is_none_or(|first| day.as_str() >= first) {
+                totals.merge(day_totals);
+            }
+        }
+        totals
+    };
+    Ok(Dashboard {
+        totals: sum(first.as_deref(), &today),
+        previous: period.days().map(|days| {
+            sum(
+                Some(&local_day_before(now, days * 2 - 1)),
+                &local_day_before(now, days),
+            )
+        }),
+        daily: (0..period.days().unwrap_or(30))
+            .rev()
+            .map(|offset| {
+                let day = local_day_before(now, offset);
+                let totals = file.days.get(&day).cloned().unwrap_or_default();
+                (day, totals)
+            })
+            .collect(),
+    })
 }
 
 /// Add one dictation to today's totals. Failures are logged, never raised:
@@ -295,19 +634,6 @@ pub fn record(sample: &Sample) {
     }
 }
 
-/// Totals over `period`, ending today.
-pub fn summary(period: Period) -> Result<Totals> {
-    let path = crate::app_paths::support_dir()?.join(FILE);
-    Ok(summary_at(&path, period, now_seconds()))
-}
-
-/// Words per local day over `period`, oldest first, including empty days.
-/// All time is charted as the last 30 days.
-pub fn daily_words(period: Period) -> Result<Vec<(String, u64)>> {
-    let path = crate::app_paths::support_dir()?.join(FILE);
-    Ok(daily_words_at(&path, period, now_seconds()))
-}
-
 pub fn clear() -> Result<()> {
     let _guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let path = crate::app_paths::support_dir()?.join(FILE);
@@ -319,7 +645,7 @@ pub fn clear() -> Result<()> {
 
 fn record_at(path: &Path, sample: &Sample, day: &str) -> Result<()> {
     let _guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let mut file = load(path);
+    let mut file = load(path)?;
     file.days
         .entry(day.to_owned())
         .or_default()
@@ -333,65 +659,67 @@ fn record_at(path: &Path, sample: &Sample, day: &str) -> Result<()> {
     save(path, &file)
 }
 
+#[cfg(test)]
 fn summary_at(path: &Path, period: Period, now: i64) -> Totals {
-    let _guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let file = load(path);
-    let first_day = period.days().map(|days| local_day_before(now, days - 1));
-    let mut totals = Totals::default();
-    for (day, day_totals) in &file.days {
-        if first_day
-            .as_deref()
-            .is_none_or(|first| day.as_str() >= first)
-        {
-            totals.merge(day_totals);
-        }
-    }
-    totals
+    dashboard_at(path, period, now).unwrap().totals
 }
 
+#[cfg(test)]
 fn daily_words_at(path: &Path, period: Period, now: i64) -> Vec<(String, u64)> {
-    let _guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let file = load(path);
-    let days = period.days().unwrap_or(30);
-    (0..days)
-        .rev()
-        .map(|offset| {
-            let day = local_day_before(now, offset);
-            let words = file.days.get(&day).map_or(0, |totals| totals.words);
-            (day, words)
-        })
+    dashboard_at(path, period, now)
+        .unwrap()
+        .daily
+        .into_iter()
+        .map(|(day, totals)| (day, totals.words))
         .collect()
 }
 
-fn load(path: &Path) -> StatsFile {
-    match fs::read(path) {
-        Ok(bytes) => match serde_json::from_slice::<StatsFile>(&bytes) {
-            Ok(mut file) if file.version == 1 || file.version == VERSION => {
-                if file.version == 1 {
-                    // Version 1 joined every model used by a dictation into one key.
-                    // Keep the original dictation unit while separating those labels.
-                    for totals in file.days.values_mut() {
-                        let models = std::mem::take(&mut totals.models);
-                        for (joined, count) in models {
-                            for model in joined.split(", ").collect::<BTreeSet<_>>() {
-                                *totals.models.entry(model.to_owned()).or_default() += count;
-                            }
+fn load(path: &Path) -> Result<StatsFile> {
+    let handle = match fs::File::open(path) {
+        Ok(handle) => handle,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(StatsFile::default());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let bytes = read_bounded(handle, MAX_FILE_BYTES)?;
+    match serde_json::from_slice::<StatsFile>(&bytes) {
+        Ok(mut file) if matches!(file.version, 1 | 2 | VERSION) => {
+            if file.version == 1 {
+                // Version 1 joined every model used by a dictation into one key.
+                // Keep the original dictation unit while separating those labels.
+                for totals in file.days.values_mut() {
+                    let models = std::mem::take(&mut totals.models);
+                    for (joined, count) in models {
+                        for model in joined.split(", ").collect::<BTreeSet<_>>() {
+                            add_counter(totals.models.entry(model.to_owned()).or_default(), count);
                         }
                     }
-                    file.version = VERSION;
                 }
-                // Legacy error_examples are deliberately not deserialized. The next
-                // save removes response bodies without discarding any daily totals.
-                file
             }
-            Ok(_) | Err(_) => {
-                tracing::warn!(path = %path.display(), "unreadable statistics; starting over");
-                let _ = fs::rename(path, path.with_extension("json.corrupt"));
-                StatsFile::default()
-            }
-        },
-        Err(_) => StatsFile::default(),
+            file.version = VERSION;
+            // Legacy error_examples are deliberately not deserialized. The next
+            // save removes response bodies without discarding any daily totals.
+            Ok(file)
+        }
+        Ok(_) => Err(color_eyre::eyre::eyre!(
+            "Statistics use an unsupported version. The existing file was preserved."
+        )),
+        Err(_) => Err(color_eyre::eyre::eyre!(
+            "Statistics contain invalid data. The existing file was preserved."
+        )),
     }
+}
+
+fn read_bounded(reader: impl Read, limit: u64) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        color_eyre::eyre::bail!("Statistics file exceeds the size limit.");
+    }
+    Ok(bytes)
 }
 
 fn save(path: &Path, file: &StatsFile) -> Result<()> {
@@ -402,6 +730,12 @@ fn save(path: &Path, file: &StatsFile) -> Result<()> {
         version: VERSION,
         days: file.days.clone(),
     };
+    let bytes = serde_json::to_vec(&file)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        color_eyre::eyre::bail!(
+            "Statistics file exceeds the size limit. The existing file was preserved."
+        );
+    }
     let temporary = path.with_extension("json.tmp");
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -411,7 +745,7 @@ fn save(path: &Path, file: &StatsFile) -> Result<()> {
         options.mode(0o600);
     }
     let mut handle = options.open(&temporary)?;
-    handle.write_all(&serde_json::to_vec(&file)?)?;
+    handle.write_all(&bytes)?;
     handle.sync_all()?;
     fs::rename(temporary, path)?;
     Ok(())
@@ -468,6 +802,366 @@ pub fn word_count(text: &str) -> u64 {
 mod tests {
     use super::*;
 
+    fn local_noon(year: i32, month: i32, day: i32) -> i64 {
+        // SAFETY: zero initializes every tm field before normalization by libc.
+        let mut parts: libc::tm = unsafe { std::mem::zeroed() };
+        parts.tm_year = year - 1900;
+        parts.tm_mon = month - 1;
+        parts.tm_mday = day;
+        parts.tm_hour = 12;
+        parts.tm_isdst = -1;
+        // SAFETY: parts is a valid writable local calendar structure.
+        unsafe { libc::mktime(&mut parts) as i64 }
+    }
+
+    fn attempt(
+        model: &str,
+        mode: RequestMode,
+        latency: Option<u64>,
+        cost: Option<f64>,
+    ) -> AttemptSample {
+        AttemptSample {
+            model: model.into(),
+            mode,
+            success: true,
+            latency_ms: latency,
+            cost_usd: cost,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn telemetry_separates_models_modes_retries_and_actual_fallbacks() {
+        let mut sample = success(
+            12,
+            "openai::shared",
+            vec![failure("openai::shared", ErrorKind::RateLimited)],
+        );
+        sample.telemetry = Some(DictationTelemetry {
+            retried: true,
+            attempts: vec![
+                AttemptSample {
+                    model: "openai::shared".into(),
+                    mode: RequestMode::Live,
+                    error: Some(ErrorKind::RateLimited),
+                    latency_ms: Some(900),
+                    keyword_count: 3,
+                    ..Default::default()
+                },
+                attempt(
+                    "openai::shared",
+                    RequestMode::Recorded,
+                    Some(200),
+                    Some(0.0),
+                ),
+                attempt("openai/shared", RequestMode::Recorded, None, None),
+            ],
+            ..Default::default()
+        });
+        let mut totals = Totals::default();
+        totals.add_sample(&sample);
+        assert_eq!(
+            totals.fallbacks, 0,
+            "retrying the same model is not fallback"
+        );
+        assert_eq!(totals.error_count("rate_limited"), 1);
+        assert_eq!(totals.details.dictations, 1);
+        assert_eq!(totals.details.successful_dictations, 1);
+        assert_eq!(totals.details.retried_dictations, 1);
+        let requests = &totals.details.requests["openai::shared"];
+        assert_eq!(requests.live.attempts, 1);
+        assert_eq!(requests.live.successes, 0);
+        assert_eq!(requests.live.errors["rate_limited"], 1);
+        assert_eq!(
+            requests.live.latency.count, 0,
+            "failed latency cannot dilute success percentiles"
+        );
+        assert_eq!(requests.live.keyword_requests, 1);
+        assert_eq!(requests.live.keywords_sent, 3);
+        assert_eq!(requests.recorded.successes, 1);
+        assert_eq!(requests.recorded.latency.average_ms(), Some(200));
+        assert_eq!(requests.recorded.cost_reports, 1);
+        assert_eq!(requests.recorded.reported_cost_usd, 0.0);
+        assert_eq!(requests.combined().attempts, 2);
+        assert_eq!(
+            totals.details.requests["openai/shared"]
+                .recorded
+                .latency
+                .count,
+            0
+        );
+        assert_eq!(
+            totals.details.requests["openai/shared"]
+                .recorded
+                .cost_reports,
+            0
+        );
+
+        let telemetry = sample.telemetry.as_mut().unwrap();
+        telemetry.used_fallback = true;
+        telemetry.live_recovered = true;
+        sample.words = None;
+        totals.add_sample(&sample);
+        assert_eq!(totals.details.dictations, 2);
+        assert_eq!(totals.details.successful_dictations, 1);
+        assert_eq!(totals.details.fallback_dictations, 0);
+        assert_eq!(totals.details.live_recoveries, 0);
+        sample.words = Some(3);
+        totals.add_sample(&sample);
+        assert_eq!(totals.fallbacks, 1);
+        assert_eq!(totals.details.fallback_dictations, 1);
+        assert_eq!(totals.details.live_recoveries, 1);
+        sample.skipped_silent = true;
+        totals.add_sample(&sample);
+        assert_eq!(totals.details.dictations, 3);
+    }
+
+    #[test]
+    fn histogram_is_fixed_weighted_and_withholds_small_sample_p95() {
+        let mut slow = LatencyDistribution::default();
+        for _ in 0..19 {
+            slow.record(900);
+        }
+        assert_eq!(slow.percentile_ms(50), Some(900));
+        assert_eq!(slow.percentile_ms(95), None);
+        let mut fast = LatencyDistribution::default();
+        fast.record(100);
+        slow.merge(&fast);
+        assert_eq!(slow.count, 20);
+        assert_eq!(slow.average_ms(), Some(860));
+        assert_eq!(slow.percentile_ms(95), Some(900));
+        assert_eq!(slow.min_ms, Some(100));
+        assert_eq!(slow.max_ms, Some(900));
+        assert_eq!(slow.percentile_ms(0), None);
+        assert_eq!(slow.percentile_ms(101), None);
+        slow.record(200_000);
+        assert_eq!(slow.percentile_ms(100), Some(200_000));
+        let encoded = serde_json::to_value(&slow).unwrap();
+        assert_eq!(encoded["buckets"].as_array().unwrap().len(), 23);
+        let decoded: LatencyDistribution = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, slow);
+        let mut empty = LatencyDistribution::default();
+        empty.merge(&slow);
+        assert_eq!(empty, slow);
+    }
+
+    #[test]
+    fn detailed_merge_weights_latency_and_keeps_cost_coverage_distinct() {
+        let mut totals = Totals::default();
+        let mut daily = Totals::default();
+        for (target, timings) in [(&mut totals, vec![100, 300]), (&mut daily, vec![1_400])] {
+            let attempts = timings
+                .into_iter()
+                .map(|time| {
+                    attempt(
+                        "google::transcribe",
+                        RequestMode::Recorded,
+                        Some(time),
+                        Some(0.25),
+                    )
+                })
+                .collect();
+            target.add_sample(&Sample {
+                words: Some(1),
+                telemetry: Some(DictationTelemetry {
+                    attempts,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        daily.add_sample(&Sample {
+            telemetry: Some(DictationTelemetry {
+                attempts: vec![
+                    attempt("google::transcribe", RequestMode::Live, Some(9), None),
+                    attempt(
+                        "google::transcribe",
+                        RequestMode::Live,
+                        None,
+                        Some(f64::NAN),
+                    ),
+                    attempt("google::transcribe", RequestMode::Live, None, Some(-1.0)),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        totals.merge(&daily);
+        assert_eq!(totals.details.dictations, 3);
+        assert_eq!(totals.details.successful_dictations, 2);
+        let requests = &totals.details.requests["google::transcribe"];
+        assert_eq!(requests.recorded.latency.average_ms(), Some(600));
+        assert_eq!(requests.recorded.cost_reports, 3);
+        assert_eq!(requests.recorded.reported_cost_usd, 0.75);
+        assert_eq!(requests.live.cost_reports, 0);
+        assert_eq!(requests.combined().attempts, 6);
+        assert_eq!(requests.combined().latency.count, 4);
+    }
+
+    #[test]
+    fn counters_saturate_and_invalid_costs_do_not_corrupt_coverage_or_json() {
+        let mut requests = RequestTotals {
+            attempts: u64::MAX,
+            successes: u64::MAX,
+            keyword_requests: u64::MAX,
+            keywords_sent: u64::MAX,
+            reported_cost_usd: f64::MAX,
+            cost_reports: u64::MAX,
+            errors: BTreeMap::from([("network".into(), u64::MAX)]),
+            ..Default::default()
+        };
+        requests.merge(&requests.clone());
+        assert_eq!(requests.attempts, u64::MAX);
+        assert_eq!(requests.errors["network"], u64::MAX);
+        assert_eq!(requests.cost_reports, u64::MAX);
+        assert_eq!(requests.reported_cost_usd, f64::MAX);
+        let mut totals = Totals {
+            dictations: u64::MAX,
+            failed_dictations: u64::MAX,
+            words: u64::MAX,
+            tokens: u64::MAX,
+            cost_usd: f64::MAX,
+            models: BTreeMap::from([("fixture".into(), u64::MAX)]),
+            details: DetailedTotals {
+                dictations: u64::MAX,
+                requests: BTreeMap::from([(
+                    "fixture".into(),
+                    ModelRequests {
+                        recorded: requests,
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        totals.merge(&totals.clone());
+        let mut sample = success(1, "fixture", vec![]);
+        sample.cost_usd = f64::INFINITY;
+        sample.telemetry = Some(DictationTelemetry {
+            attempts: vec![attempt(
+                "fixture",
+                RequestMode::Recorded,
+                Some(u64::MAX),
+                Some(f64::NAN),
+            )],
+            ..Default::default()
+        });
+        totals.add_sample(&sample);
+        assert_eq!(totals.dictations, u64::MAX);
+        assert_eq!(totals.models["fixture"], u64::MAX);
+        assert_eq!(totals.details.dictations, u64::MAX);
+        assert!(totals.cost_usd.is_finite());
+        assert_eq!(totals.average_latency_ms(), Some(0));
+        let json = serde_json::to_vec(&totals).unwrap();
+        assert!(serde_json::from_slice::<Totals>(&json).is_ok());
+        let mut clean = RequestTotals::default();
+        clean.merge(&RequestTotals {
+            reported_cost_usd: f64::INFINITY,
+            cost_reports: 10,
+            ..Default::default()
+        });
+        assert_eq!(clean.cost_reports, 0);
+        assert_eq!(clean.reported_cost_usd, 0.0);
+        clean.add_attempt(&attempt("fixture", RequestMode::Recorded, None, Some(0.0)));
+        assert_eq!(clean.cost_reports, 1);
+    }
+
+    #[test]
+    fn dashboard_compares_equivalent_calendar_periods_and_excludes_future_days() {
+        let path = temp_path("dashboard-periods");
+        let now = local_noon(2024, 3, 1);
+        for (offset, words) in [
+            (0, 1),
+            (1, 2),
+            (6, 4),
+            (7, 8),
+            (13, 16),
+            (29, 32),
+            (30, 64),
+            (59, 128),
+            (-1, 1000),
+        ] {
+            record_at(
+                &path,
+                &success(words, "fixture", vec![]),
+                &local_day_before(now, offset),
+            )
+            .unwrap();
+        }
+        for (period, current, previous) in [
+            (Period::Today, 1, 2),
+            (Period::Week, 7, 24),
+            (Period::Month, 63, 192),
+        ] {
+            let view = dashboard_at(&path, period, now).unwrap();
+            assert_eq!(view.totals.words, current);
+            assert_eq!(view.previous.unwrap().words, previous);
+            assert_eq!(view.daily.len(), period.days().unwrap() as usize);
+            assert_eq!(view.daily.last().unwrap().0, "2024-03-01");
+        }
+        let week = dashboard_at(&path, Period::Week, now).unwrap();
+        assert_eq!(week.daily[4], (local_day_before(now, 2), Totals::default()));
+        assert_eq!(week.daily[5].0, "2024-02-29");
+        let all = dashboard_at(&path, Period::AllTime, now).unwrap();
+        assert_eq!(all.totals.words, 255);
+        assert!(all.previous.is_none());
+        assert_eq!(all.daily.len(), 30);
+        assert_eq!(all.daily.iter().map(|(_, day)| day.words).sum::<u64>(), 63);
+    }
+
+    #[test]
+    fn detailed_persistence_retains_aggregates_but_never_attempt_payloads() {
+        let path = temp_path("detailed-privacy");
+        let marker = "PRIVATE_PROVIDER_PAYLOAD";
+        let mut sample = success(
+            3,
+            "grok::voice",
+            vec![Failure {
+                model: "grok::voice".into(),
+                kind: ErrorKind::Network,
+                detail: marker.into(),
+            }],
+        );
+        sample.telemetry = Some(DictationTelemetry {
+            attempts: vec![AttemptSample {
+                model: "grok::voice".into(),
+                error: Some(ErrorKind::Network),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        record_at(&path, &sample, "2026-10-08").unwrap();
+        let encoded = fs::read_to_string(&path).unwrap();
+        assert!(!encoded.contains(marker));
+        assert!(!encoded.contains("telemetry"));
+        let file = load(&path).unwrap();
+        assert_eq!(file.version, VERSION);
+        assert_eq!(
+            file.days["2026-10-08"].details.requests["grok::voice"]
+                .recorded
+                .attempts,
+            1
+        );
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert!(value["days"]["2026-10-08"]["details"]["requests"]["grok::voice"]["recorded"]["attempts"].is_number());
+        assert_eq!(
+            read_bounded(std::io::Cursor::new(b"1234"), 4).unwrap(),
+            b"1234"
+        );
+        assert!(read_bounded(std::io::Cursor::new(b"12345"), 4).is_err());
+    }
+
+    #[test]
+    fn dashboard_and_record_surface_io_errors_without_replacing_existing_data() {
+        let path = temp_path("read-error");
+        fs::create_dir(&path).unwrap();
+        assert!(dashboard_at(&path, Period::Today, local_noon(2026, 10, 8)).is_err());
+        assert!(record_at(&path, &Sample::default(), "2026-10-08").is_err());
+        assert!(path.is_dir());
+        assert!(!path.with_extension("json.corrupt").exists());
+    }
+
     fn temp_path(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "hex-stats-{name}-{}-{}",
@@ -480,6 +1174,7 @@ mod tests {
 
     fn success(words: u64, model: &str, failures: Vec<Failure>) -> Sample {
         Sample {
+            telemetry: None,
             words: Some(words),
             models: vec![model.into()],
             model_latency: BTreeMap::new(),
@@ -533,7 +1228,7 @@ mod tests {
         )
         .unwrap();
 
-        let all = summary_at(&path, Period::AllTime, 0);
+        let all = summary_at(&path, Period::AllTime, local_noon(2026, 10, 4));
         assert_eq!(all.dictations, 2);
         assert_eq!(all.failed_dictations, 1);
         assert_eq!(all.skipped_silent, 1);
@@ -639,7 +1334,7 @@ mod tests {
     #[test]
     fn old_statistics_do_not_invent_model_latency_measurements() {
         let path = temp_path("legacy-latency");
-        for version in [1, VERSION] {
+        for version in [1, 2, VERSION] {
             fs::write(
                 &path,
                 serde_json::to_vec(&serde_json::json!({
@@ -653,9 +1348,10 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-            let old = summary_at(&path, Period::AllTime, 0);
+            let old = summary_at(&path, Period::AllTime, local_noon(2026, 10, 4));
             assert_eq!(old.models["a"], 100);
             assert!(old.model_latency.is_empty());
+            assert_eq!(old.details, DetailedTotals::default());
             assert_eq!(ModelLatency::default().average_ms(), None);
 
             let mut sample = success(1, "a", Vec::new());
@@ -665,10 +1361,61 @@ mod tests {
                 .or_default()
                 .record(250);
             record_at(&path, &sample, "2026-10-04").unwrap();
-            let updated = summary_at(&path, Period::AllTime, 0);
+            let updated = summary_at(&path, Period::AllTime, local_noon(2026, 10, 4));
             assert_eq!(updated.models["a"], 101);
             assert_eq!(updated.model_latency["a"].responses, 1);
             assert_eq!(updated.model_latency["a"].average_ms(), Some(250));
+        }
+    }
+
+    #[test]
+    fn version_two_migration_keeps_legacy_coverage_separate_from_new_requests() {
+        let path = temp_path("version-two-details");
+        fs::write(&path, br#"{"version":2,"days":{"2026-10-08":{"dictations":100,"failed_dictations":10,"words":500,"models":{"openai/model":100}}}}"#).unwrap();
+        let mut sample = success(3, "openai::model", vec![]);
+        sample.telemetry = Some(DictationTelemetry {
+            attempts: vec![attempt(
+                "openai::model",
+                RequestMode::Recorded,
+                Some(500),
+                None,
+            )],
+            ..Default::default()
+        });
+        record_at(&path, &sample, "2026-10-08").unwrap();
+        let file = load(&path).unwrap();
+        assert_eq!(file.version, VERSION);
+        let totals = &file.days["2026-10-08"];
+        assert_eq!(totals.dictations, 101);
+        assert_eq!(totals.failed_dictations, 10);
+        assert_eq!(totals.words, 503);
+        assert_eq!(totals.models["openai/model"], 100);
+        assert_eq!(totals.details.dictations, 1);
+        assert_eq!(totals.details.requests.len(), 1);
+        assert!(!totals.details.requests.contains_key("openai/model"));
+        assert_eq!(
+            totals.details.requests["openai::model"]
+                .recorded
+                .latency
+                .count,
+            1
+        );
+    }
+
+    #[test]
+    fn unsupported_versions_and_invalid_json_are_read_only_errors() {
+        let path = temp_path("unsupported-version");
+        let marker = "PRIVATE_OLD_PAYLOAD";
+        for bytes in [
+            format!("{{invalid {marker}"),
+            serde_json::json!({"version":VERSION+1,"days":{},"future":marker}).to_string(),
+        ] {
+            fs::write(&path, &bytes).unwrap();
+            let error = dashboard_at(&path, Period::Today, local_noon(2026, 10, 8)).unwrap_err();
+            assert!(!error.to_string().contains(marker));
+            assert!(record_at(&path, &Sample::default(), "2026-10-08").is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), bytes);
+            assert!(!path.with_extension("json.corrupt").exists());
         }
     }
 
@@ -690,7 +1437,7 @@ mod tests {
         });
         fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
 
-        let loaded = load(&path);
+        let loaded = load(&path).unwrap();
         let totals = &loaded.days["2026-10-04"];
         assert_eq!(loaded.version, VERSION);
         assert_eq!(totals.dictations, 3);
@@ -715,7 +1462,7 @@ mod tests {
         let saved = fs::read_to_string(&path).unwrap();
         assert!(!saved.contains(marker));
         assert!(!saved.contains("error_examples"));
-        let loaded = load(&path);
+        let loaded = load(&path).unwrap();
         assert_eq!(loaded.days["2026-10-04"].dictations, 3);
         assert_eq!(loaded.days["2026-10-04"].failed_dictations, 1);
         assert_eq!(loaded.days["2026-10-04"].error_count("invalid_response"), 2);
@@ -807,11 +1554,15 @@ mod tests {
         for day in 0..(MAX_DAYS + 3) {
             record_at(&path, &success(1, "m", Vec::new()), &format!("d{day:05}")).unwrap();
         }
-        assert_eq!(load(&path).days.len(), MAX_DAYS);
+        assert_eq!(load(&path).unwrap().days.len(), MAX_DAYS);
 
         fs::write(&path, "{ nope").unwrap();
-        assert_eq!(summary_at(&path, Period::AllTime, 0), Totals::default());
-        assert!(path.with_extension("json.corrupt").exists());
+        let backup = path.with_extension("json.corrupt");
+        fs::write(&backup, "earlier backup").unwrap();
+        assert!(dashboard_at(&path, Period::AllTime, local_noon(2026, 10, 8)).is_err());
+        assert!(record_at(&path, &Sample::default(), "2026-10-08").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{ nope");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "earlier backup");
     }
 
     #[test]

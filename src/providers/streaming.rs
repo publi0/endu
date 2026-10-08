@@ -17,6 +17,7 @@ use tungstenite::{Message, WebSocket};
 
 use super::{ModelOptions, ModelRef, Provider};
 use crate::openrouter::Config;
+use crate::openrouter::stats::ErrorKind;
 use crate::vocabulary::Snapshot;
 
 const BLOCK: usize = 1_600; // 100 ms of mono 16 kHz audio.
@@ -24,6 +25,23 @@ const QUEUE_BLOCKS: usize = 32;
 const MAX_TAIL: usize = BLOCK * QUEUE_BLOCKS;
 const POLL: Duration = Duration::from_millis(20);
 const MAX_LIFETIME: Duration = Duration::from_secs(60 * 60);
+const GOOGLE_LIFETIME: Duration = Duration::from_secs(10 * 60);
+
+fn session_lifetime(provider: Provider) -> Duration {
+    if provider == Provider::Google {
+        GOOGLE_LIFETIME
+    } else {
+        MAX_LIFETIME
+    }
+}
+fn validate_audio_length(provider: Provider, samples: usize) -> Result<()> {
+    if provider == Provider::Google && samples > GOOGLE_LIFETIME.as_secs() as usize * 16_000 {
+        return Err(failure(
+            "Google live transcription is limited to ten minutes; using the complete recording.",
+        ));
+    }
+    Ok(())
+}
 const MAX_TEXT: usize = 2 * 1024 * 1024;
 const MAX_SESSIONS: usize = 4;
 static SESSION_COUNT: LazyLock<Arc<AtomicUsize>> = LazyLock::new(|| Arc::new(AtomicUsize::new(0)));
@@ -57,6 +75,8 @@ pub struct LiveError {
     pub status: Option<u16>,
     pub keyword_count: usize,
     pub keywords_rejected: bool,
+    pub attempted: bool,
+    pub error_kind: ErrorKind,
     message: &'static str,
 }
 impl std::fmt::Display for LiveError {
@@ -70,10 +90,15 @@ impl std::fmt::Display for LiveError {
 }
 impl std::error::Error for LiveError {}
 fn failure(message: &'static str) -> color_eyre::Report {
+    failure_kind(message, ErrorKind::Network)
+}
+fn failure_kind(message: &'static str, error_kind: ErrorKind) -> color_eyre::Report {
     LiveError {
         status: None,
         keyword_count: 0,
         keywords_rejected: false,
+        attempted: false,
+        error_kind,
         message,
     }
     .into()
@@ -85,7 +110,91 @@ pub(crate) fn fixture_error(status: Option<u16>, keywords_rejected: bool) -> col
         status,
         keyword_count: 0,
         keywords_rejected,
+        attempted: true,
+        error_kind: status.map_or(ErrorKind::Network, ErrorKind::from_status),
         message: "Synthetic streaming failure.",
+    }
+    .into()
+}
+
+fn mark_attempt(mut error: color_eyre::Report, control: &SessionControl) -> color_eyre::Report {
+    if let Some(error) = error.downcast_mut::<LiveError>() {
+        error.attempted |= control.attempt_started.load(Ordering::Acquire);
+        error.keyword_count = error
+            .keyword_count
+            .max(control.sent_keyword_count.load(Ordering::Acquire));
+    }
+    error
+}
+
+fn connect_error_kind(error: &io::Error) -> ErrorKind {
+    match error.kind() {
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => ErrorKind::Timeout,
+        _ => ErrorKind::Network,
+    }
+}
+
+fn websocket_error_kind(error: &tungstenite::Error) -> ErrorKind {
+    match error {
+        tungstenite::Error::Io(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) =>
+        {
+            ErrorKind::Timeout
+        }
+        tungstenite::Error::Http(response) => ErrorKind::from_status(response.status().as_u16()),
+        tungstenite::Error::Utf8(_)
+        | tungstenite::Error::Capacity(_)
+        | tungstenite::Error::Protocol(_) => ErrorKind::InvalidResponse,
+        _ => ErrorKind::Network,
+    }
+}
+fn websocket_failure(message: &'static str, error: &tungstenite::Error) -> color_eyre::Report {
+    failure_kind(message, websocket_error_kind(error))
+}
+fn query_keywords(provider: Provider) -> bool {
+    matches!(
+        provider,
+        Provider::Deepgram | Provider::Grok | Provider::ElevenLabs
+    )
+}
+fn handshake_failure<S: Read + Write>(
+    error: tungstenite::HandshakeError<tungstenite::handshake::client::ClientHandshake<S>>,
+    query_keyword_count: usize,
+) -> color_eyre::Report {
+    let (status, keywords_rejected, keyword_count, error_kind) = match &error {
+        tungstenite::HandshakeError::Failure(tungstenite::Error::Http(response)) => {
+            let status = response.status().as_u16();
+            let rejected = matches!(status, 400 | 422)
+                && response
+                    .body()
+                    .as_ref()
+                    .is_some_and(|body| rejected_keywords(&String::from_utf8_lossy(body)));
+            // Every HTTP response confirms receipt of the request query, even
+            // when upgrade is rejected for auth, rate limits or a redirect.
+            // DNS/TCP/TLS and local credential failures do not prove delivery.
+            (
+                Some(status),
+                rejected,
+                query_keyword_count,
+                ErrorKind::from_status(status),
+            )
+        }
+        tungstenite::HandshakeError::Failure(error) => {
+            (None, false, 0, websocket_error_kind(error))
+        }
+        // Our socket is blocking; Interrupted here is its bounded I/O wait.
+        tungstenite::HandshakeError::Interrupted(_) => (None, false, 0, ErrorKind::Timeout),
+    };
+    LiveError {
+        status,
+        keyword_count,
+        keywords_rejected,
+        attempted: true,
+        error_kind,
+        message: "Streaming handshake failed.",
     }
     .into()
 }
@@ -105,6 +214,8 @@ struct SessionControl {
     cancelled: Arc<AtomicBool>,
     _permit: Option<SessionPermit>,
     sent_samples: Arc<AtomicUsize>,
+    attempt_started: AtomicBool,
+    sent_keyword_count: AtomicUsize,
 }
 impl SessionControl {
     fn new(permit: Option<SessionPermit>, cancellation: Option<Arc<AtomicBool>>) -> Arc<Self> {
@@ -113,6 +224,8 @@ impl SessionControl {
             cancelled: cancellation.unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
             _permit: permit,
             sent_samples: Arc::new(AtomicUsize::new(0)),
+            attempt_started: AtomicBool::new(false),
+            sent_keyword_count: AtomicUsize::new(0),
         })
     }
     fn check(&self, deadline: Instant) -> Result<()> {
@@ -120,7 +233,10 @@ impl SessionControl {
             return Err(failure("Streaming transcription was cancelled."));
         }
         if Instant::now() >= deadline {
-            return Err(failure("Streaming transcription timed out."));
+            return Err(failure_kind(
+                "Streaming transcription timed out.",
+                ErrorKind::Timeout,
+            ));
         }
         Ok(())
     }
@@ -146,7 +262,8 @@ impl LiveCapture {
         }
         let config = super::runtime_config()?;
         let id = config.transcription.models.first()?;
-        if !ModelRef::parse(id).capabilities().streaming || !super::options(&config, id).streaming {
+        let options = super::options(&config, id);
+        if !options.streaming || !ModelRef::parse(id).can_stream_language(&options.language) {
             return None;
         }
         Some(Self::spawn(config, Snapshot::current()))
@@ -174,7 +291,8 @@ impl LiveCapture {
                         seal_rx,
                         &worker_control,
                     );
-                    let _ = send_result.try_send(outcome);
+                    let _ = send_result
+                        .try_send(outcome.map_err(|error| mark_attempt(error, &worker_control)));
                 });
         } else {
             let _ = send_result.try_send(Err(failure(
@@ -287,8 +405,17 @@ impl PendingLive {
         sent_samples: usize,
     ) -> Self {
         let (sender, receiver) = mpsc::sync_channel(1);
+        let attempted = result.as_ref().map_or_else(
+            |error| {
+                error
+                    .downcast_ref::<LiveError>()
+                    .is_none_or(|error| error.attempted)
+            },
+            |_| true,
+        );
         sender.send(result).expect("fixture receiver is alive");
         let control = SessionControl::new(None, None);
+        control.attempt_started.store(attempted, Ordering::Release);
         control.sent_samples.store(sent_samples, Ordering::Release);
         Self {
             config,
@@ -312,6 +439,10 @@ impl PendingLive {
         &self.config.transcription.models[0]
     }
     pub fn resolve(self, timeout: Duration) -> Result<LiveResult> {
+        self.resolve_inner(timeout)
+            .map_err(|error| mark_attempt(error, &self.control))
+    }
+    fn resolve_inner(&self, timeout: Duration) -> Result<LiveResult> {
         if let Some(reason) = self.invalid {
             return Err(failure(reason));
         }
@@ -352,19 +483,24 @@ pub fn transcribe_completed(
     let permit = SessionPermit::acquire(SESSION_COUNT.clone())
         .ok_or_else(|| failure("Streaming session limit reached."))?;
     let control = SessionControl::new(Some(permit), cancellation);
-    let started = Instant::now();
-    let deadline = started + timeout;
-    control.check(deadline)?;
-    let mut connection = Connection::open(config, model_id, vocabulary, deadline, &control)?;
-    connection.ready(deadline, &control)?;
-    for chunk in samples.chunks(BLOCK) {
+    let result = (|| {
+        let started = Instant::now();
+        let provider = ModelRef::parse(model_id).provider;
+        validate_audio_length(provider, samples.len())?;
+        let deadline = (started + timeout).min(started + session_lifetime(provider));
         control.check(deadline)?;
-        connection.audio(chunk, deadline)?;
-        connection.poll(deadline, &control)?;
-    }
-    connection.finish(deadline)?;
-    let text = connection.complete(deadline, &control)?;
-    Ok(connection.result(text, started))
+        let mut connection = Connection::open(config, model_id, vocabulary, deadline, &control)?;
+        connection.ready(deadline, &control)?;
+        for chunk in samples.chunks(BLOCK) {
+            control.check(deadline)?;
+            connection.audio(chunk, deadline)?;
+            connection.poll(deadline, &control)?;
+        }
+        connection.finish(deadline)?;
+        let text = connection.complete(deadline, &control)?;
+        Ok(connection.result(text, started))
+    })();
+    result.map_err(|error| mark_attempt(error, &control))
 }
 
 fn run_live(
@@ -375,13 +511,14 @@ fn run_live(
     control: &Arc<SessionControl>,
 ) -> Result<LiveResult> {
     let started = Instant::now();
-    let lifetime = started + MAX_LIFETIME;
+
     let attempt = Duration::from_secs(config.transcription.attempt_timeout_seconds.clamp(1, 600));
     let id = config
         .transcription
         .models
         .first()
         .ok_or_else(|| failure("No streaming model selected."))?;
+    let lifetime = started + session_lifetime(ModelRef::parse(id).provider);
     let mut connection = Connection::open(
         config,
         id,
@@ -453,11 +590,33 @@ fn run_live(
     }
 }
 
-fn endpoint(model: ModelRef<'_>, options: &ModelOptions, keywords: &[String]) -> Result<url::Url> {
+fn endpoint(
+    config: &Config,
+    model: ModelRef<'_>,
+    options: &ModelOptions,
+    keywords: &[String],
+) -> Result<url::Url> {
+    if model.provider == Provider::Microsoft {
+        // Validate the resource before resolving credentials. Only the documented
+        // Azure root is configurable; protocol path/query are supplied here.
+        let mut url = super::microsoft_endpoint(config, true).map_err(|_| {
+            failure("Configure the Microsoft streaming resource and deployment in Providers.")
+        })?;
+        url.set_scheme("wss")
+            .map_err(|_| failure("Invalid Microsoft streaming endpoint."))?;
+        url.set_path("/mai/v1/realtime");
+        url.set_query(Some("intent=transcription"));
+        return Ok(url);
+    }
     let base = match model.provider {
         Provider::OpenAi => "wss://api.openai.com/v1/realtime?intent=transcription",
         Provider::ElevenLabs => "wss://api.elevenlabs.io/v1/speech-to-text/realtime",
         Provider::Deepgram => "wss://api.deepgram.com/v1/listen",
+        Provider::Grok => "wss://api.x.ai/v1/stt",
+        Provider::Google => {
+            "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+        }
+        Provider::Microsoft => unreachable!("Microsoft endpoint handled above"),
         Provider::OpenRouter => {
             return Err(failure(
                 "OpenRouter does not support live transcription here.",
@@ -514,15 +673,42 @@ fn endpoint(model: ModelRef<'_>, options: &ModelOptions, keywords: &[String]) ->
                 query.append_pair("keyterm", term);
             }
         }
+        Provider::Grok => {
+            let format =
+                options.smart_format && super::batch::grok_format_supported(&options.language);
+            let mut query = url.query_pairs_mut();
+            query
+                .append_pair("model", model.model)
+                .append_pair("encoding", "pcm")
+                .append_pair("sample_rate", "16000")
+                .append_pair("interim_results", "false")
+                .append_pair("format", if format { "true" } else { "false" })
+                .append_pair(
+                    "filler_words",
+                    if options.no_verbatim { "false" } else { "true" },
+                );
+            if !auto {
+                query.append_pair("language", &options.language);
+            }
+            for term in keywords {
+                query.append_pair("keyterm", term);
+            }
+        }
         _ => {}
     }
     Ok(url)
 }
 fn rejected_keywords(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
-    ["keyword", "keyterm", "prompt"]
-        .iter()
-        .any(|field| message.contains(field))
+    [
+        "keyword",
+        "keyterm",
+        "prompt",
+        "customvocabulary",
+        "custom_vocabulary",
+    ]
+    .iter()
+    .any(|field| message.contains(field))
 }
 
 fn session_update(model: &str, options: &ModelOptions, keywords: &[String]) -> Value {
@@ -541,10 +727,83 @@ fn session_update(model: &str, options: &ModelOptions, keywords: &[String]) -> V
     }}}})
 }
 
+fn streaming_keywords(model: ModelRef<'_>, vocabulary: &Snapshot) -> Vec<String> {
+    // MAI streaming documents language/model only, independently of batch hints.
+    if model.provider == Provider::Microsoft {
+        Vec::new()
+    } else {
+        super::batch::keywords(model, vocabulary)
+    }
+}
+
+fn microsoft_session_update(config: &Config, options: &ModelOptions) -> Value {
+    let mut transcription = json!({"model": config.microsoft.deployment});
+    if options.language != "auto" {
+        transcription["language"] = json!(options.language);
+    }
+    json!({"type":"session.update","session":{"type":"transcription","audio":{"input":{
+        "format":{"type":"audio/pcm","rate":16000}, "transcription":transcription,
+        "turn_detection":null,"noise_reduction":null
+    }}}})
+}
+
+fn google_setup(model: &str, options: &ModelOptions, keywords: &[String]) -> Value {
+    let language = if options.language == "zh" {
+        Some("cmn-Hans-CN")
+    } else {
+        super::bcp47_language(&options.language)
+    };
+    let languages: Vec<_> = language.into_iter().collect();
+    let mut transcription = json!({"languageCodes":languages,"mode":if options.smart_format {"SMART"} else {"VERBATIM"}});
+    if !keywords.is_empty() {
+        transcription["customVocabulary"] = json!(keywords);
+    }
+    json!({"setup":{"model":format!("models/{model}"),
+        "generationConfig":{"responseModalities":["TEXT"]},
+        "inputAudioTranscription":transcription,
+        "realtimeInputConfig":{"automaticActivityDetection":{"disabled":true}}
+    }})
+}
+
+fn authentication(
+    provider: Provider,
+    key: &str,
+) -> Result<(&'static str, tungstenite::http::HeaderValue)> {
+    let (header, value) = match provider {
+        Provider::Microsoft => ("api-key", key.to_owned()),
+        Provider::Google => ("x-goog-api-key", key.to_owned()),
+        Provider::ElevenLabs => ("xi-api-key", key.to_owned()),
+        Provider::Deepgram => ("authorization", format!("Token {key}")),
+        _ => ("authorization", format!("Bearer {key}")),
+    };
+    let mut value = tungstenite::http::HeaderValue::from_str(&value)
+        .map_err(|_| failure("Invalid streaming credential."))?;
+    value.set_sensitive(true);
+    Ok((header, value))
+}
+
+fn finish_message(provider: Provider) -> Result<Value> {
+    match provider {
+        Provider::OpenAi | Provider::Microsoft => Ok(json!({"type":"input_audio_buffer.commit"})),
+        Provider::ElevenLabs => Ok(
+            json!({"message_type":"input_audio_chunk","audio_base_64":"","commit":true,"sample_rate":16000}),
+        ),
+        Provider::Deepgram => Ok(json!({"type":"CloseStream"})),
+        Provider::Grok => Ok(json!({"type":"audio.done"})),
+        Provider::Google => Ok(json!({"realtimeInput":{"activityEnd":{}}})),
+        Provider::OpenRouter => Err(failure("Unsupported streaming provider.")),
+    }
+}
+
 struct Protocol {
     provider: Provider,
     ready: bool,
     finishing: bool,
+    created: bool,
+    setup_sent: bool,
+    google_text: String,
+    google_finished: bool,
+    google_turn_complete: bool,
     commit_item: Option<String>,
     completed_items: BTreeMap<String, String>,
     segments: BTreeMap<(u64, u64), String>,
@@ -555,6 +814,11 @@ impl Protocol {
             provider,
             ready: provider == Provider::Deepgram,
             finishing: false,
+            created: false,
+            setup_sent: false,
+            google_text: String::new(),
+            google_finished: false,
+            google_turn_complete: false,
             commit_item: None,
             completed_items: BTreeMap::new(),
             segments: BTreeMap::new(),
@@ -578,12 +842,16 @@ impl Protocol {
         {
             let status = event
                 .get("status")
+                .or_else(|| event.pointer("/error/code"))
                 .and_then(Value::as_u64)
-                .and_then(|n| u16::try_from(n).ok());
+                .and_then(|n| u16::try_from(n).ok())
+                .filter(|status| (100..=599).contains(status));
             return Err(LiveError {
                 status,
                 keyword_count: 0,
                 keywords_rejected: rejected_keywords(&event.to_string()),
+                attempted: true,
+                error_kind: status.map_or(ErrorKind::Rejected, ErrorKind::from_status),
                 message: "The streaming provider rejected the request.",
             }
             .into());
@@ -674,6 +942,101 @@ impl Protocol {
                     return self.joined().map(Some);
                 }
             }
+            Provider::Microsoft => {
+                if kind == "session.created" {
+                    self.created = true;
+                }
+                if kind == "session.updated" {
+                    if !self.created || !self.setup_sent {
+                        return Err(failure(
+                            "Microsoft acknowledged an unexpected streaming setup.",
+                        ));
+                    }
+                    self.ready = true;
+                }
+                if self.finishing && kind == "input_audio_buffer.committed" {
+                    self.commit_item = event["item_id"].as_str().map(str::to_owned);
+                }
+                if kind == "conversation.item.input_audio_transcription.completed" {
+                    if !self.finishing {
+                        return Err(failure("The streaming provider committed before Finish."));
+                    }
+                    if let (Some(expected), Some(actual)) =
+                        (&self.commit_item, event["item_id"].as_str())
+                        && expected != actual
+                    {
+                        return Err(failure(
+                            "Microsoft returned a final for a different audio item.",
+                        ));
+                    }
+                    // MAI explicitly documents completed events without item_id.
+                    return final_text(event.get("transcript")).map(Some);
+                }
+            }
+            Provider::Grok => {
+                if kind == "transcript.created" {
+                    self.ready = true;
+                }
+                if kind == "transcript.done" {
+                    if !self.finishing {
+                        return Err(failure("The streaming provider committed before Finish."));
+                    }
+                    // transcript.partial can itself say is_final/speech_final;
+                    // only transcript.done acknowledges audio.done for the clip.
+                    return final_text(event.get("text")).map(Some);
+                }
+            }
+            Provider::Google => {
+                if event.get("setupComplete").is_some_and(Value::is_object) {
+                    self.ready = true;
+                }
+                if event.get("goAway").is_some() {
+                    return Err(failure(
+                        "Google live session is ending; using the complete recording.",
+                    ));
+                }
+                if let Some(content) = event.get("serverContent") {
+                    if content["interrupted"].as_bool() == Some(true) {
+                        return Err(failure("Google live transcription was interrupted."));
+                    }
+                    if let Some(transcript) = content.get("inputTranscription") {
+                        if self.google_finished {
+                            return Err(failure(
+                                "Google sent audio transcription after its final marker.",
+                            ));
+                        }
+                        if let Some(text) = transcript.get("text") {
+                            let text = text.as_str().ok_or_else(|| {
+                                failure("Google returned invalid transcription text.")
+                            })?;
+                            if self.google_text.len().saturating_add(text.len()) > MAX_TEXT {
+                                return Err(failure("Streaming response exceeded its limit."));
+                            }
+                            self.google_text.push_str(text);
+                        }
+                        if transcript["finished"].as_bool() == Some(true) {
+                            if !self.finishing {
+                                return Err(failure(
+                                    "Google finalized transcription before Finish.",
+                                ));
+                            }
+                            self.google_finished = true;
+                        }
+                    }
+                    if content["turnComplete"].as_bool() == Some(true) {
+                        if !self.finishing {
+                            return Err(failure("Google completed its turn before Finish."));
+                        }
+                        self.google_turn_complete = true;
+                    }
+                    // The input transcription is independent of turnComplete.
+                    // The SDK's explicit finished flag avoids accepting the first
+                    // late fragment as a full result when turnComplete arrives first.
+                    if self.finishing && self.google_finished && self.google_turn_complete {
+                        return Ok(Some(std::mem::take(&mut self.google_text)));
+                    }
+                }
+            }
             Provider::OpenRouter => {}
         }
         Ok(None)
@@ -695,6 +1058,16 @@ impl Protocol {
             "Streaming connection closed without its terminal confirmation.",
         ))
     }
+}
+
+fn final_text(value: Option<&Value>) -> Result<String> {
+    let text = value
+        .and_then(Value::as_str)
+        .ok_or_else(|| failure("Streaming response had no final text."))?;
+    if text.len() > MAX_TEXT {
+        return Err(failure("Streaming response exceeded its limit."));
+    }
+    Ok(text.to_owned())
 }
 
 // tungstenite/TLS may perform several reads inside one call. Check the
@@ -763,6 +1136,10 @@ struct Connection {
     completed: Option<String>,
     wire_frames: usize,
     sent_samples: Arc<AtomicUsize>,
+    pending_setup: Option<Value>,
+    activity_started: bool,
+    pacing_started: Option<Instant>,
+    control: Arc<SessionControl>,
 }
 impl Connection {
     fn open(
@@ -784,23 +1161,24 @@ impl Connection {
         options
             .validate()
             .map_err(|_| failure("Invalid streaming model options."))?;
-        let keywords = super::batch::keywords(model, vocabulary);
-        let url = endpoint(model, &options, &keywords)?;
-        let key = super::keys::api_key(model.provider, config)
-            .map_err(|_| failure("The streaming provider has no available API key."))?;
+        let keywords = streaming_keywords(model, vocabulary);
+        let url = endpoint(config, model, &options, &keywords)?;
+        // Validation above is preflight. From credential resolution onward this
+        // is an attempted provider request, even when authentication fails before
+        // bytes reach the wire (the UI deliberately calls these attempts).
+        control.attempt_started.store(true, Ordering::Release);
+        let key = super::keys::api_key(model.provider, config).map_err(|_| {
+            failure_kind(
+                "The streaming provider has no available API key.",
+                ErrorKind::Auth,
+            )
+        })?;
         control.check(deadline)?;
         let mut request = url
             .as_str()
             .into_client_request()
             .map_err(|_| failure("Could not create streaming request."))?;
-        let (header, value) = match model.provider {
-            Provider::ElevenLabs => ("xi-api-key", key),
-            Provider::Deepgram => ("authorization", format!("Token {key}")),
-            _ => ("authorization", format!("Bearer {key}")),
-        };
-        let mut value = tungstenite::http::HeaderValue::from_str(&value)
-            .map_err(|_| failure("Invalid streaming credential."))?;
-        value.set_sensitive(true);
+        let (header, value) = authentication(model.provider, &key)?;
         request.headers_mut().insert(header, value);
         let host = url
             .host_str()
@@ -820,21 +1198,30 @@ impl Connection {
         });
         let addresses = rx
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .map_err(|_| failure("Streaming DNS lookup timed out."))?
+            .map_err(|_| failure_kind("Streaming DNS lookup timed out.", ErrorKind::Timeout))?
             .map_err(|_| failure("Streaming DNS lookup failed."))?;
         let mut connected = None;
+        let mut last_connect_error = ErrorKind::Network;
         for address in addresses {
             control.check(deadline)?;
-            if let Ok(stream) = TcpStream::connect_timeout(
+            match TcpStream::connect_timeout(
                 &address,
                 Duration::from_secs(2).min(deadline.saturating_duration_since(Instant::now())),
             ) {
-                connected = Some(stream);
-                break;
+                Ok(stream) => {
+                    connected = Some(stream);
+                    break;
+                }
+                Err(error) => last_connect_error = connect_error_kind(&error),
             }
         }
-        let stream =
-            connected.ok_or_else(|| failure("Could not connect to streaming provider."))?;
+        control.check(deadline)?;
+        let stream = connected.ok_or_else(|| {
+            failure_kind(
+                "Could not connect to streaming provider.",
+                last_connect_error,
+            )
+        })?;
         let stream = SocketIo {
             tcp: stream,
             control: control.clone(),
@@ -852,25 +1239,20 @@ impl Connection {
             None,
         )
         .map_err(|error| {
-            let (status, keywords_rejected) = match &error {
-                tungstenite::HandshakeError::Failure(tungstenite::Error::Http(response)) => {
-                    let status = response.status().as_u16();
-                    let rejected = matches!(status, 400 | 422)
-                        && response
-                            .body()
-                            .as_ref()
-                            .is_some_and(|body| rejected_keywords(&String::from_utf8_lossy(body)));
-                    (Some(status), rejected)
-                }
-                _ => (None, false),
-            };
-            color_eyre::Report::from(LiveError {
-                status,
-                keyword_count: 0,
-                keywords_rejected,
-                message: "Streaming handshake failed.",
-            })
+            handshake_failure(
+                error,
+                if query_keywords(model.provider) {
+                    keywords.len()
+                } else {
+                    0
+                },
+            )
         })?;
+        if query_keywords(model.provider) {
+            control
+                .sent_keyword_count
+                .store(keywords.len(), Ordering::Release);
+        }
         let stream = match socket.get_mut() {
             MaybeTlsStream::Plain(stream) => stream,
             MaybeTlsStream::Rustls(stream) => &mut stream.sock,
@@ -887,22 +1269,44 @@ impl Connection {
             completed: None,
             wire_frames: 0,
             sent_samples: control.sent_samples.clone(),
+            pending_setup: (model.provider == Provider::Microsoft)
+                .then(|| microsoft_session_update(config, &options)),
+            activity_started: false,
+            pacing_started: None,
+            control: control.clone(),
         };
-        if model.provider == Provider::OpenAi {
-            connection.json(session_update(model.model, &options, &keywords))?;
+        match model.provider {
+            Provider::OpenAi => {
+                connection.json(session_update(model.model, &options, &keywords))?;
+                control
+                    .sent_keyword_count
+                    .store(keywords.len(), Ordering::Release);
+            }
+            Provider::Google => {
+                connection.json(google_setup(model.model, &options, &keywords))?;
+                control
+                    .sent_keyword_count
+                    .store(keywords.len(), Ordering::Release);
+            }
+            _ => {}
         }
         Ok(connection)
     }
     fn json(&mut self, value: Value) -> Result<()> {
         self.socket
             .send(Message::Text(value.to_string().into()))
-            .map_err(|_| failure("Streaming write failed."))?;
+            .map_err(|error| websocket_failure("Streaming write failed.", &error))?;
         self.last_send = Instant::now();
         Ok(())
     }
     fn ready(&mut self, deadline: Instant, control: &SessionControl) -> Result<()> {
         while !self.protocol.ready {
             self.poll(deadline, control)?;
+        }
+        if self.protocol.provider == Provider::Google && !self.activity_started {
+            self.set_deadline(deadline);
+            self.json(json!({"realtimeInput":{"activityStart":{}}}))?;
+            self.activity_started = true;
         }
         Ok(())
     }
@@ -915,6 +1319,21 @@ impl Connection {
     }
     fn audio(&mut self, samples: &[f32], deadline: Instant) -> Result<()> {
         self.set_deadline(deadline);
+        validate_audio_length(
+            self.protocol.provider,
+            self.encoder.source.saturating_add(samples.len()),
+        )?;
+        if self.protocol.provider == Provider::Grok {
+            // xAI documents real-time-paced 100 ms binary packets. Pace on this
+            // socket worker; capture keeps its bounded nonblocking producer.
+            let target = *self.pacing_started.get_or_insert_with(Instant::now)
+                + Duration::from_secs_f64(self.wire_frames as f64 / 16_000.0);
+            let control = self.control.clone();
+            while Instant::now() < target {
+                self.poll(deadline, &control)?;
+                std::thread::sleep(POLL.min(target.saturating_duration_since(Instant::now())));
+            }
+        }
         let pcm = self.encoder.push(samples, false)?;
         self.send_pcm(pcm)
     }
@@ -924,10 +1343,11 @@ impl Connection {
         }
         let frames = pcm.len() / 2;
         match self.protocol.provider {
-            Provider::OpenAi => self.json(json!({"type":"input_audio_buffer.append","audio":crate::openrouter::transcribe::encode_base64(&pcm)})),
+            Provider::OpenAi | Provider::Microsoft => self.json(json!({"type":"input_audio_buffer.append","audio":crate::openrouter::transcribe::encode_base64(&pcm)})),
             Provider::ElevenLabs => self.json(json!({"message_type":"input_audio_chunk","audio_base_64":crate::openrouter::transcribe::encode_base64(&pcm),"commit":false,"sample_rate":16000})),
-            Provider::Deepgram => {
-                self.socket.send(Message::Binary(pcm.into())).map_err(|_| failure("Streaming write failed."))?;
+            Provider::Google => self.json(json!({"realtimeInput":{"audio":{"data":crate::openrouter::transcribe::encode_base64(&pcm),"mimeType":"audio/pcm;rate=16000"}}})),
+            Provider::Deepgram | Provider::Grok => {
+                self.socket.send(Message::Binary(pcm.into())).map_err(|error| websocket_failure("Streaming write failed.", &error))?;
                 self.last_send = Instant::now();
                 Ok(())
             }
@@ -947,11 +1367,7 @@ impl Connection {
         let pcm = self.encoder.push(&[], true)?;
         self.send_pcm(pcm)?;
         self.protocol.finishing = true;
-        self.json(match self.protocol.provider {
-            Provider::OpenAi => json!({"type":"input_audio_buffer.commit"}),
-            Provider::ElevenLabs => json!({"message_type":"input_audio_chunk","audio_base_64":"","commit":true,"sample_rate":16000}),
-            _ => json!({"type":"CloseStream"}),
-        })
+        self.json(finish_message(self.protocol.provider)?)
     }
     fn keep_alive(&mut self) -> Result<()> {
         if self.protocol.provider == Provider::Deepgram
@@ -968,6 +1384,11 @@ impl Connection {
             Ok(Message::Text(text)) => {
                 let value: Value = serde_json::from_str(&text)
                     .map_err(|_| failure("Invalid streaming response."))?;
+                self.protocol.event(&value)
+            }
+            Ok(Message::Binary(bytes)) if self.protocol.provider == Provider::Google => {
+                let value: Value = serde_json::from_slice(&bytes)
+                    .map_err(|_| failure("Invalid Google streaming response."))?;
                 self.protocol.event(&value)
             }
             Ok(Message::Close(frame)) => {
@@ -989,11 +1410,18 @@ impl Connection {
             {
                 Ok(None)
             }
-            Err(_) => Err(failure("Streaming read failed.")),
+            Err(error) => Err(websocket_failure("Streaming read failed.", &error)),
             _ => Ok(None),
         }?;
         if result.is_some() {
             self.completed = result;
+        }
+        if self.protocol.provider == Provider::Microsoft
+            && self.protocol.created
+            && let Some(setup) = self.pending_setup.take()
+        {
+            self.json(setup)?;
+            self.protocol.setup_sent = true;
         }
         Ok(())
     }
@@ -1120,6 +1548,467 @@ mod tests {
             invalid: None,
         };
         (live, audio_rx, seal_rx, send_result)
+    }
+
+    fn microsoft_config() -> Config {
+        let mut config = Config::default();
+        config.microsoft.streaming_endpoint = "https://fixture.services.ai.azure.com".into();
+        config.microsoft.deployment = "fixture-mai-deployment".into();
+        config
+    }
+
+    #[test]
+    fn microsoft_streaming_uses_validated_resource_and_distinct_auth_without_keywords() {
+        let config = microsoft_config();
+        let model = ModelRef::parse("microsoft::MAI-Transcribe-2-Streaming");
+        let options = ModelOptions {
+            language: "pt".into(),
+            prompt: "ignored context".into(),
+            smart_format: true,
+            no_verbatim: true,
+            ..Default::default()
+        };
+        let url = endpoint(&config, model, &options, &["never-sent".into()]).unwrap();
+        assert_eq!(
+            url.as_str(),
+            "wss://fixture.services.ai.azure.com/mai/v1/realtime?intent=transcription"
+        );
+        assert!(endpoint(&Config::default(), model, &options, &[]).is_err());
+        let mut invalid = config.clone();
+        invalid.microsoft.streaming_endpoint =
+            "https://fixture.services.ai.azure.com.evil.test".into();
+        assert!(endpoint(&invalid, model, &options, &[]).is_err());
+        let setup = microsoft_session_update(&config, &options);
+        let input = &setup["session"]["audio"]["input"];
+        assert_eq!(input["format"], json!({"type":"audio/pcm","rate":16000}));
+        assert_eq!(
+            input["transcription"],
+            json!({"model":"fixture-mai-deployment","language":"pt"})
+        );
+        assert!(input["turn_detection"].is_null());
+        assert!(input["noise_reduction"].is_null());
+        let vocabulary = Snapshot::new(crate::vocabulary::Vocabulary {
+            terms: vec!["Never Sent".into()],
+            ..Default::default()
+        });
+        assert!(streaming_keywords(model, &vocabulary).is_empty());
+        let (header, value) = authentication(Provider::Microsoft, "fixture-api-key").unwrap();
+        assert_eq!(header, "api-key");
+        assert_eq!(value.to_str().unwrap(), "fixture-api-key");
+        assert!(value.is_sensitive());
+    }
+
+    #[test]
+    fn microsoft_waits_for_created_and_setup_ack_then_accepts_full_final_without_item_id() {
+        let mut protocol = Protocol::new(Provider::Microsoft);
+        assert!(protocol.event(&json!({"type":"session.updated"})).is_err());
+        assert!(
+            protocol
+                .event(&json!({"type":"session.created","session":{"id":"fixture"}}))
+                .unwrap()
+                .is_none()
+        );
+        assert!(protocol.created);
+        assert!(!protocol.ready);
+        protocol.setup_sent = true;
+        protocol.event(&json!({"type":"session.updated"})).unwrap();
+        assert!(protocol.ready);
+        for event in [
+            json!({"type":"conversation.item.input_audio_transcription.delta","delta":"never paste"}),
+            json!({"type":"conversation.item.input_audio_transcription.intermediate","intermediate":"preview"}),
+        ] {
+            assert!(protocol.event(&event).unwrap().is_none());
+        }
+        assert!(protocol.event(&json!({"type":"conversation.item.input_audio_transcription.completed","transcript":"early"})).is_err());
+        protocol.finishing = true;
+        assert!(
+            protocol
+                .event(&json!({"type":"input_audio_buffer.committed"}))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(protocol.event(&json!({"type":"conversation.item.input_audio_transcription.completed","transcript":"Whole dictation"})).unwrap(), Some("Whole dictation".into()));
+        assert_eq!(
+            finish_message(Provider::Microsoft).unwrap(),
+            json!({"type":"input_audio_buffer.commit"})
+        );
+        protocol.commit_item = Some("ours".into());
+        assert!(protocol.event(&json!({"type":"conversation.item.input_audio_transcription.completed","item_id":"other","transcript":"wrong"})).is_err());
+    }
+
+    #[test]
+    fn grok_format_and_keywords_are_encoded_only_for_supported_options() {
+        let model = ModelRef::parse("grok::grok-voice-transcribe-2.0");
+        for (language, expected) in [("pt", "true"), ("auto", "false"), ("ko", "false")] {
+            let options = ModelOptions {
+                language: language.into(),
+                smart_format: true,
+                no_verbatim: true,
+                ..Default::default()
+            };
+            let url = endpoint(
+                &Config::default(),
+                model,
+                &options,
+                &["Name & Sons".into(), "Other".into()],
+            )
+            .unwrap();
+            assert_eq!(url.host_str(), Some("api.x.ai"));
+            assert!(
+                url.query_pairs()
+                    .any(|(k, v)| k == "format" && v == expected)
+            );
+            assert!(
+                url.query_pairs()
+                    .any(|(k, v)| k == "encoding" && v == "pcm")
+            );
+            assert!(
+                url.query_pairs()
+                    .any(|(k, v)| k == "sample_rate" && v == "16000")
+            );
+            assert!(
+                url.query_pairs()
+                    .any(|(k, v)| k == "filler_words" && v == "false")
+            );
+            assert_eq!(url.query_pairs().filter(|(k, _)| k == "keyterm").count(), 2);
+            assert_eq!(
+                url.query_pairs().any(|(k, _)| k == "language"),
+                language != "auto"
+            );
+        }
+        let (name, value) = authentication(Provider::Grok, "fixture-xai-key").unwrap();
+        assert_eq!(name, "authorization");
+        assert_eq!(value.to_str().unwrap(), "Bearer fixture-xai-key");
+        assert!(value.is_sensitive());
+    }
+
+    #[test]
+    fn grok_only_audio_done_acknowledgement_can_finish_the_capture() {
+        let mut protocol = Protocol::new(Provider::Grok);
+        assert!(!protocol.ready);
+        protocol
+            .event(&json!({"type":"transcript.created"}))
+            .unwrap();
+        assert!(protocol.ready);
+        for finality in [false, true] {
+            assert!(protocol.event(&json!({"type":"transcript.partial","is_final":finality,"speech_final":true,"text":"segment"})).unwrap().is_none());
+        }
+        assert!(
+            protocol
+                .event(&json!({"type":"transcript.done","text":"early"}))
+                .is_err()
+        );
+        protocol.finishing = true;
+        assert!(
+            protocol
+                .event(
+                    &json!({"type":"transcript.partial","is_final":true,"text":"still a segment"})
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(protocol.event(&json!({"type":"transcript.done","text":"Complete final transcript","duration":1.0})).unwrap(), Some("Complete final transcript".into()));
+        assert_eq!(
+            finish_message(Provider::Grok).unwrap(),
+            json!({"type":"audio.done"})
+        );
+    }
+
+    #[test]
+    fn google_native_transcription_setup_has_no_assistant_prompt_or_key_in_url() {
+        let model = ModelRef::parse("google::gemini-3.5-transcribe-live");
+        let options = ModelOptions {
+            language: "pt".into(),
+            smart_format: true,
+            prompt: "must not become system instruction".into(),
+            ..Default::default()
+        };
+        let url = endpoint(&Config::default(), model, &options, &[]).unwrap();
+        assert_eq!(url.host_str(), Some("generativelanguage.googleapis.com"));
+        assert!(url.query().is_none());
+        let setup = google_setup(model.model, &options, &["Nimbus Files".into()]);
+        assert_eq!(setup["setup"]["model"], "models/gemini-3.5-transcribe-live");
+        assert_eq!(
+            setup["setup"]["generationConfig"]["responseModalities"],
+            json!(["TEXT"])
+        );
+        assert_eq!(
+            setup["setup"]["inputAudioTranscription"],
+            json!({"languageCodes":["pt-BR"],"customVocabulary":["Nimbus Files"],"mode":"SMART"})
+        );
+        assert_eq!(
+            setup["setup"]["realtimeInputConfig"]["automaticActivityDetection"]["disabled"],
+            true
+        );
+        assert!(setup["setup"].get("systemInstruction").is_none());
+        assert!(setup["setup"].get("outputAudioTranscription").is_none());
+        let auto = google_setup(
+            model.model,
+            &ModelOptions {
+                smart_format: false,
+                ..ModelOptions::default()
+            },
+            &[],
+        );
+        assert_eq!(
+            auto["setup"]["inputAudioTranscription"],
+            json!({"languageCodes":[],"mode":"VERBATIM"})
+        );
+        let zh = google_setup(
+            model.model,
+            &ModelOptions {
+                language: "zh".into(),
+                ..Default::default()
+            },
+            &[],
+        );
+        assert_eq!(
+            zh["setup"]["inputAudioTranscription"]["languageCodes"],
+            json!(["cmn-Hans-CN"])
+        );
+        let (header, value) = authentication(Provider::Google, "fixture-google-key").unwrap();
+        assert_eq!(header, "x-goog-api-key");
+        assert!(value.is_sensitive());
+        assert!(!format!("{value:?}").contains("fixture-google-key"));
+        assert_eq!(
+            finish_message(Provider::Google).unwrap(),
+            json!({"realtimeInput":{"activityEnd":{}}})
+        );
+    }
+
+    #[test]
+    fn google_waits_for_last_transcription_fragment_in_either_terminal_event_order() {
+        for turn_first in [false, true] {
+            let mut protocol = Protocol::new(Provider::Google);
+            protocol.event(&json!({"setupComplete":{}})).unwrap();
+            assert!(protocol.ready);
+            assert!(protocol.event(&json!({"serverContent":{"inputTranscription":{"text":"Hello", "finished":false},"interimInputTranscription":{"text":"preview"},"modelTurn":{"parts":[{"text":"assistant must not paste"}]}}})).unwrap().is_none());
+            protocol.finishing = true;
+            if turn_first {
+                assert!(
+                    protocol
+                        .event(&json!({"serverContent":{"turnComplete":true}}))
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            assert!(protocol.event(&json!({"serverContent":{"inputTranscription":{"text":" world", "finished":false}}})).unwrap().is_none());
+            let result = protocol
+                .event(
+                    &json!({"serverContent":{"inputTranscription":{"text":"!", "finished":true}}}),
+                )
+                .unwrap();
+            if turn_first {
+                assert_eq!(result, Some("Hello world!".into()));
+            } else {
+                assert!(result.is_none());
+                assert_eq!(
+                    protocol
+                        .event(&json!({"serverContent":{"turnComplete":true}}))
+                        .unwrap(),
+                    Some("Hello world!".into())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn google_rejects_early_finish_and_missing_terminal_marker_never_returns_partial_text() {
+        let mut protocol = Protocol::new(Provider::Google);
+        assert!(protocol.event(&json!({"serverContent":{"inputTranscription":{"text":"early","finished":true}}})).is_err());
+        let mut protocol = Protocol::new(Provider::Google);
+        assert!(
+            protocol
+                .event(&json!({"serverContent":{"turnComplete":true}}))
+                .is_err()
+        );
+        for marker in ["finished", "turnComplete"] {
+            let mut protocol = Protocol::new(Provider::Google);
+            protocol.finishing = true;
+            let text = json!({"serverContent":{"inputTranscription":{"text":"must not paste","finished": marker == "finished"},"turnComplete":marker == "turnComplete"}});
+            assert!(protocol.event(&text).unwrap().is_none());
+            assert!(
+                protocol.closed().is_err(),
+                "a missing marker must fail into whole-clip fallback"
+            );
+        }
+        let mut protocol = Protocol::new(Provider::Google);
+        assert!(
+            protocol
+                .event(&json!({"goAway":{"timeLeft":"2s"}}))
+                .is_err()
+        );
+        assert!(
+            protocol
+                .event(&json!({"serverContent":{"interrupted":true}}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn google_audio_and_wall_time_are_bounded_and_errors_stay_sanitized() {
+        assert_eq!(session_lifetime(Provider::Google), Duration::from_secs(600));
+        assert!(validate_audio_length(Provider::Google, 600 * 16_000).is_ok());
+        assert!(validate_audio_length(Provider::Google, 600 * 16_000 + 1).is_err());
+        assert!(validate_audio_length(Provider::Microsoft, 600 * 16_000 + 1).is_ok());
+        let mut protocol = Protocol::new(Provider::Google);
+        let error = protocol.event(&json!({"error":{"code":400,"message":"invalid customVocabulary: PRIVATE_PAYLOAD"}})).unwrap_err();
+        let typed = error.downcast_ref::<LiveError>().unwrap();
+        assert_eq!(typed.status, Some(400));
+        assert!(typed.keywords_rejected);
+        assert!(!format!("{error:#}").contains("PRIVATE_PAYLOAD"));
+        protocol.finishing = true;
+        assert!(
+            protocol
+                .event(
+                    &json!({"serverContent":{"inputTranscription":{"text":"x".repeat(MAX_TEXT)}}})
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            protocol
+                .event(&json!({"serverContent":{"inputTranscription":{"text":"overflow"}}}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn tcp_connection_timeout_is_preserved_without_assuming_query_delivery() {
+        for (kind, expected) in [
+            (io::ErrorKind::TimedOut, ErrorKind::Timeout),
+            (io::ErrorKind::WouldBlock, ErrorKind::Timeout),
+            (io::ErrorKind::ConnectionRefused, ErrorKind::Network),
+            (io::ErrorKind::NetworkUnreachable, ErrorKind::Network),
+        ] {
+            let classified = connect_error_kind(&io::Error::new(kind, "PRIVATE_CONNECT"));
+            assert_eq!(classified, expected);
+            let control = SessionControl::new(None, None);
+            control.attempt_started.store(true, Ordering::Release);
+            let report = mark_attempt(
+                failure_kind("Could not connect to streaming provider.", classified),
+                &control,
+            );
+            let typed = report.downcast_ref::<LiveError>().unwrap();
+            assert_eq!(typed.error_kind, expected);
+            assert_eq!(typed.keyword_count, 0);
+            assert!(!format!("{report:#}").contains("PRIVATE"));
+        }
+    }
+
+    #[test]
+    fn socket_send_read_and_handshake_timeouts_keep_their_category() {
+        for kind in [io::ErrorKind::TimedOut, io::ErrorKind::WouldBlock] {
+            let error = tungstenite::Error::Io(io::Error::new(kind, "PRIVATE_TRANSPORT"));
+            assert_eq!(websocket_error_kind(&error), ErrorKind::Timeout);
+            for operation in ["Streaming write failed.", "Streaming read failed."] {
+                let safe = websocket_failure(operation, &error);
+                assert_eq!(
+                    safe.downcast_ref::<LiveError>().unwrap().error_kind,
+                    ErrorKind::Timeout
+                );
+                assert!(!format!("{safe:#}").contains("PRIVATE"));
+            }
+            let safe = handshake_failure::<std::io::Cursor<Vec<u8>>>(
+                tungstenite::HandshakeError::Failure(error),
+                7,
+            );
+            assert_eq!(
+                safe.downcast_ref::<LiveError>().unwrap().error_kind,
+                ErrorKind::Timeout
+            );
+            assert_eq!(safe.downcast_ref::<LiveError>().unwrap().keyword_count, 0);
+        }
+        #[derive(Debug)]
+        struct WaitingSocket;
+        impl Read for WaitingSocket {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+        }
+        impl Write for WaitingSocket {
+            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        // A pure in-memory I/O fixture reaches tungstenite's Interrupted path;
+        // no connection, DNS, credentials, or server is involved.
+        let error = tungstenite::client("ws://fixture.invalid/", WaitingSocket).unwrap_err();
+        assert!(matches!(
+            &error,
+            tungstenite::HandshakeError::Interrupted(_)
+        ));
+        let safe = handshake_failure(error, 0);
+        assert_eq!(
+            safe.downcast_ref::<LiveError>().unwrap().error_kind,
+            ErrorKind::Timeout
+        );
+    }
+
+    #[test]
+    fn failed_attempt_reports_only_keywords_confirmed_sent_in_query_or_setup() {
+        let control = SessionControl::new(None, None);
+        control.attempt_started.store(true, Ordering::Release);
+        let before = mark_attempt(
+            failure_kind("credential missing", ErrorKind::Auth),
+            &control,
+        );
+        assert_eq!(before.downcast_ref::<LiveError>().unwrap().keyword_count, 0);
+        control.sent_keyword_count.store(7, Ordering::Release);
+        let mut protocol = Protocol::new(Provider::Google);
+        let after = mark_attempt(protocol.event(&json!({"error":{"code":400,"message":"customVocabulary rejected PRIVATE_TERMS"}})).unwrap_err(),&control);
+        let typed = after.downcast_ref::<LiveError>().unwrap();
+        assert_eq!(typed.keyword_count, 7);
+        assert!(typed.keywords_rejected);
+        assert!(!format!("{after:#}").contains("PRIVATE"));
+        for status in [400, 422, 401, 429, 503, 302] {
+            for (query_count, expected) in [(3, 3), (0, 0)] {
+                let response = tungstenite::http::Response::builder()
+                    .status(status)
+                    .body(Some(b"keyterms rejected PRIVATE_QUERY".to_vec()))
+                    .unwrap();
+                let safe = handshake_failure::<std::io::Cursor<Vec<u8>>>(
+                    tungstenite::HandshakeError::Failure(tungstenite::Error::Http(Box::new(
+                        response,
+                    ))),
+                    query_count,
+                );
+                let typed = safe.downcast_ref::<LiveError>().unwrap();
+                assert_eq!(typed.keyword_count, expected);
+                assert_eq!(typed.error_kind, ErrorKind::from_status(status));
+                assert_eq!(typed.keywords_rejected, matches!(status, 400 | 422));
+                assert!(!format!("{safe:#}").contains("PRIVATE"));
+            }
+        }
+        assert!(query_keywords(Provider::Deepgram));
+        assert!(query_keywords(Provider::ElevenLabs));
+        assert!(query_keywords(Provider::Grok));
+        assert!(!query_keywords(Provider::Google));
+        assert!(!query_keywords(Provider::OpenAi));
+        assert!(!query_keywords(Provider::Microsoft));
+    }
+
+    #[test]
+    fn telemetry_marks_credentials_as_attempts_but_not_local_preflight() {
+        let control = SessionControl::new(None, None);
+        let error = mark_attempt(failure("preflight rejected"), &control);
+        assert!(!error.downcast_ref::<LiveError>().unwrap().attempted);
+        control.attempt_started.store(true, Ordering::Release);
+        let error = mark_attempt(
+            failure_kind("credential unavailable", ErrorKind::Auth),
+            &control,
+        );
+        let typed = error.downcast_ref::<LiveError>().unwrap();
+        assert!(typed.attempted);
+        assert_eq!(typed.error_kind, ErrorKind::Auth);
+        let error = mark_attempt(control.check(Instant::now()).unwrap_err(), &control);
+        assert_eq!(
+            error.downcast_ref::<LiveError>().unwrap().error_kind,
+            ErrorKind::Timeout
+        );
     }
 
     #[test]
@@ -1344,14 +2233,29 @@ mod tests {
     fn endpoints_encode_keywords_and_reject_unsupported_automatic_language() {
         let options = ModelOptions::default();
         let terms = vec!["A&B / name".into(), "Other name".into()];
-        let url = endpoint(ModelRef::parse("deepgram::nova-3"), &options, &terms).unwrap();
+        let url = endpoint(
+            &Config::default(),
+            ModelRef::parse("deepgram::nova-3"),
+            &options,
+            &terms,
+        )
+        .unwrap();
         assert_eq!(url.query_pairs().filter(|(k, _)| k == "keyterm").count(), 2);
         assert!(
             url.query_pairs()
                 .any(|(k, v)| k == "language" && v == "multi")
         );
-        assert!(endpoint(ModelRef::parse("deepgram::nova-2"), &options, &[]).is_err());
+        assert!(
+            endpoint(
+                &Config::default(),
+                ModelRef::parse("deepgram::nova-2"),
+                &options,
+                &[]
+            )
+            .is_err()
+        );
         let url = endpoint(
+            &Config::default(),
             ModelRef::parse("elevenlabs::scribe_v2_realtime"),
             &options,
             &terms,

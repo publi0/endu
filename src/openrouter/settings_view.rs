@@ -37,7 +37,7 @@ pub fn new_key_setup<V: 'static>(preview: bool, cx: &mut Context<V>) -> Entity<O
 }
 
 pub struct KeyChanged(pub KeyStatus);
-pub struct ConfigChanged(pub Config);
+pub struct ConfigChanged;
 #[derive(Clone, Copy, PartialEq)]
 enum ViewMode {
     Models,
@@ -150,6 +150,7 @@ pub struct OpenRouterSettings {
     key_editing: bool,
     key_remove_armed: bool,
     key_input: Entity<TextInput>,
+    available_providers: Vec<Provider>,
     catalog: CatalogState,
     catalog_revision: u64,
     picker: Option<ModelPicker>,
@@ -255,6 +256,11 @@ impl OpenRouterSettings {
             key_editing: false,
             key_remove_armed: false,
             key_input,
+            available_providers: if preview {
+                Provider::ALL.to_vec()
+            } else {
+                Vec::new()
+            },
             catalog: CatalogState::Idle,
             catalog_revision: 0,
             picker: None,
@@ -319,7 +325,7 @@ impl OpenRouterSettings {
             Ok(config) => {
                 self.config = config;
                 self.report(scope, Ok(success.to_owned()));
-                cx.emit(ConfigChanged(self.config.clone()));
+                cx.emit(ConfigChanged);
                 true
             }
             Err(error) => {
@@ -369,6 +375,14 @@ impl OpenRouterSettings {
 
     pub(crate) fn has_key_operation(&self) -> bool {
         self.busy()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stage_attempt_timeout_draft(&mut self, value: &str, cx: &mut Context<Self>) {
+        self.advanced.attempt_timeout.update(cx, |input, cx| {
+            input.set_text(value, cx);
+            cx.emit(Changed);
+        });
     }
 
     pub(crate) fn finish_editing(&mut self, cx: &mut Context<Self>) {
@@ -430,7 +444,6 @@ impl OpenRouterSettings {
         cx.emit(KeyChanged(status));
     }
 
-    #[cfg(test)]
     pub fn key_status(&self) -> Option<&KeyStatus> {
         self.key_status.as_ref()
     }
@@ -615,7 +628,40 @@ impl OpenRouterSettings {
 
     // ---- Models ----------------------------------------------------------
 
+    pub fn set_available_providers(
+        &mut self,
+        mut available: Vec<Provider>,
+        cx: &mut Context<Self>,
+    ) {
+        available.sort();
+        available.dedup();
+        if self.available_providers == available {
+            return;
+        }
+        let routed_changed = self.available_providers.contains(&Provider::OpenRouter)
+            != available.contains(&Provider::OpenRouter);
+        self.available_providers = available;
+        if routed_changed {
+            self.catalog_revision = self.catalog_revision.wrapping_add(1);
+            self.catalog = CatalogState::Idle;
+            if self.picker.is_some() {
+                self.ensure_catalog(cx);
+            }
+        }
+        self.highlight_current_model(cx);
+        cx.notify();
+    }
+
+    fn model_available(&self, id: &str) -> bool {
+        self.available_providers
+            .contains(&crate::providers::ModelRef::parse(id).provider)
+    }
+
     fn ensure_catalog(&mut self, cx: &mut Context<Self>) {
+        if !self.available_providers.contains(&Provider::OpenRouter) {
+            self.catalog = CatalogState::Loaded(Vec::new());
+            return;
+        }
         if matches!(
             self.catalog,
             CatalogState::Loading | CatalogState::Loaded(_)
@@ -771,8 +817,10 @@ impl OpenRouterSettings {
         let query = picker.search.read(cx).text();
         let catalog = catalog::available_catalog(self.catalog.models());
         let mut choices = picker_choices(&catalog, query);
+        choices.retain(|choice| self.model_available(choice.id()));
         if query.is_empty()
             && let Some(current) = self.config.transcription.models.get(picker.slot)
+            && self.model_available(current)
             && !choices.iter().any(|choice| choice.id() == current)
         {
             choices.insert(0, PickerChoice::Custom(current.clone()));
@@ -781,6 +829,14 @@ impl OpenRouterSettings {
     }
 
     fn choose_model(&mut self, slot: usize, model: Option<String>, cx: &mut Context<Self>) -> bool {
+        if model.as_deref().is_some_and(|id| !self.model_available(id)) {
+            self.report(
+                Scope::Model(slot),
+                Err("Add this provider’s key in Providers before selecting its models.".into()),
+            );
+            cx.notify();
+            return false;
+        }
         let success = match (&model, slot) {
             (None, _) => "Fallback removed.".to_owned(),
             (Some(model), 0) => format!("{model} is now the primary model."),
@@ -1269,11 +1325,20 @@ impl OpenRouterSettings {
                     })),
             )
             .children(model.map(|id| {
-                self.render_capabilities(
-                    id,
-                    MODEL_BUTTON_WIDTH,
-                    format!("model-capabilities-{slot}"),
-                )
+                if self.model_available(id) {
+                    self.render_capabilities(
+                        id,
+                        MODEL_BUTTON_WIDTH,
+                        format!("model-capabilities-{slot}"),
+                    )
+                } else {
+                    div()
+                        .w(px(MODEL_BUTTON_WIDTH))
+                        .h(px(16.0))
+                        .text_size(px(11.0))
+                        .text_color(rgb(NEGATIVE))
+                        .child("Provider key unavailable · connect in Providers")
+                }
             }))
             .children(menu.map(picker_popup))
             .into_any_element()
@@ -1290,9 +1355,14 @@ impl OpenRouterSettings {
         };
         let choices = self.picker_choices(cx);
         let highlight = picker.highlight.min(choices.len().saturating_sub(1));
-        let status: Option<AnyElement> = match &self.catalog {
+        let status: Option<AnyElement> = if self.available_providers.is_empty() {
+            Some(
+                picker_note("Add a provider key in Providers to choose models.").into_any_element(),
+            )
+        } else {
+            match &self.catalog {
             CatalogState::Idle | CatalogState::Loading => {
-                Some(picker_note("Loading OpenRouter models; direct providers are available…").into_any_element())
+                Some(picker_note("Loading OpenRouter models…").into_any_element())
             }
             CatalogState::Failed(error) => Some(
                 div()
@@ -1307,7 +1377,7 @@ impl OpenRouterSettings {
                             .min_w_0()
                             .text_size(px(11.0))
                             .text_color(rgb(NEGATIVE))
-                            .child(format!("OpenRouter unavailable: {error}. Direct-provider models remain available.")),
+                            .child(format!("OpenRouter catalog unavailable: {error}. Showing known models for connected providers.")),
                     )
                     .child(
                         button("Retry", false)
@@ -1325,6 +1395,7 @@ impl OpenRouterSettings {
                     .into_any_element(),
             ),
             CatalogState::Loaded(_) => None,
+        }
         };
         let rows = choices.into_iter().enumerate().map(|(index, choice)| {
             let selected = current == Some(choice.id());
@@ -1750,7 +1821,7 @@ impl Render for OpenRouterSettings {
         .children(self.render_message(Scope::Configuration))
         .child(models)
         .child(div().px_1().pt_3().text_size(px(11.0)).text_color(rgb(FAINT))
-            .child("Models are tried in this order. Provider keys and each model's language, streaming and other options are in Providers."))
+            .child("Models are tried in this order. Provider keys and request limits are in Providers."))
         .into_any_element()
     }
 }
@@ -1758,6 +1829,48 @@ impl Render for OpenRouterSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn model_choices_only_include_providers_with_registered_keys(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| OpenRouterSettings::new(false, true, cx));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_available_providers(vec![Provider::OpenAi], cx);
+                view.open_picker(0, window, cx);
+                assert!(
+                    view.catalog.models().is_empty(),
+                    "no OpenRouter catalog should be loaded without its key"
+                );
+                let choices = view.picker_choices(cx);
+                assert!(!choices.is_empty());
+                assert!(choices.iter().all(|choice| {
+                    crate::providers::ModelRef::parse(choice.id()).provider == Provider::OpenAi
+                }));
+                assert!(view.choose_model(0, Some("openai::gpt-transcribe".into()), cx));
+                let saved = view.config_snapshot();
+                view.set_available_providers(vec![Provider::Deepgram], cx);
+                view.open_picker(0, window, cx);
+                assert!(view.picker_choices(cx).iter().all(|choice| {
+                    crate::providers::ModelRef::parse(choice.id()).provider == Provider::Deepgram
+                }));
+                assert!(!view.choose_model(0, Some("openai::gpt-transcribe".into()), cx));
+                assert_eq!(
+                    view.config_snapshot(),
+                    saved,
+                    "losing a key must not delete saved selections or profiles"
+                );
+                let search = view.picker.as_ref().unwrap().search.clone();
+                search.update(cx, |input, cx| input.set_text("openai::custom-model", cx));
+                assert!(
+                    view.picker_choices(cx).is_empty(),
+                    "custom IDs cannot bypass the provider filter"
+                );
+                view.set_available_providers(Vec::new(), cx);
+                assert!(view.picker_choices(cx).is_empty());
+                assert_eq!(view.config_snapshot(), saved);
+            })
+        });
+    }
 
     #[gpui::test]
     fn selected_model_controls_and_capabilities_keep_compact_bounds(cx: &mut gpui::TestAppContext) {

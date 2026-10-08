@@ -1,72 +1,228 @@
-//! The Statistics pane: what dictation has cost and how often OpenRouter
-//! needed a fallback, over a chosen period.
-
-use gpui::{
-    AnyElement, Context, Div, FontWeight, IntoElement, Render, Window, div, prelude::*, px, rgb,
+//! Aggregate Statistics: global dictation totals and scoped, measured attempts.
+use super::stats::{
+    self, AttemptSample, Dashboard, DictationTelemetry, ErrorKind, Failure, Period, RequestMode,
+    RequestTotals, Sample, Totals,
 };
-
-use super::stats::{self, ErrorKind, ModelLatency, Period, Totals};
+use super::stats_dashboard::{self, Group, Mode, Sort};
 use crate::desktop_ui::{
-    ACCENT, FAINT, LINE, MUTED, NEGATIVE, PANEL_RADIUS, SURFACE, TEXT, TEXT_SOFT, compact_panel,
-    compact_panel_header, empty_message, error_message, header_button, pane_body, pane_content,
-    pane_header_with_action, sliding_segmented_control, sliding_segmented_item,
+    ACCENT, FAINT, LINE, MUTED, NEGATIVE, PANEL_RADIUS, PickerState, SETTINGS_CONTROL_WIDTH,
+    SURFACE, SURFACE_HOVER, SURFACE_SELECTED, TEXT, TEXT_SOFT, compact_panel, compact_panel_header,
+    disclosure_button, empty_message, error_message, header_button, pane_body, pane_content,
+    pane_header_with_action, picker_open_key, picker_popup, segmented_control, segmented_item,
+};
+use crate::providers::{ModelRef, Provider};
+use gpui::{
+    AnyElement, Context, Div, FocusHandle, FontWeight, IntoElement, KeyDownEvent, MouseDownEvent,
+    Render, Window, div, prelude::*, px, rgb,
 };
 
-const PERIOD_WIDTH: f32 = 64.0;
 const CHART_HEIGHT: f32 = 120.0;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Chart {
+    Words,
+    Dictations,
+    Wait,
+    Failures,
+}
+impl Chart {
+    const ALL: [Self; 4] = [Self::Words, Self::Dictations, Self::Wait, Self::Failures];
+    fn title(self) -> &'static str {
+        match self {
+            Self::Words => "Words per day",
+            Self::Dictations => "Successful dictations per day",
+            Self::Wait => "Average wait per day",
+            Self::Failures => "Failed dictations per day",
+        }
+    }
+    fn value(self, totals: &Totals) -> Option<u64> {
+        match self {
+            Self::Words => Some(totals.words),
+            Self::Dictations => Some(totals.dictations),
+            Self::Wait => totals.average_latency_ms(),
+            Self::Failures => Some(totals.failed_dictations),
+        }
+    }
+    fn format(self, value: u64) -> String {
+        if self == Self::Wait {
+            format_latency(value)
+        } else {
+            format_count(value)
+        }
+    }
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Segment {
+    Period,
+    Chart,
+    Group,
+    Mode,
+}
+impl Segment {
+    fn index(self) -> usize {
+        match self {
+            Self::Period => 0,
+            Self::Chart => 1,
+            Self::Group => 2,
+            Self::Mode => 3,
+        }
+    }
+    fn labels(self) -> Vec<&'static str> {
+        match self {
+            Self::Period => Period::ALL.iter().map(|period| period.label()).collect(),
+            Self::Chart => vec!["Words", "Dictations", "Wait", "Failures"],
+            Self::Group => vec!["Providers", "Models"],
+            Self::Mode => vec!["All", "Live", "Recorded"],
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Menu {
+    Provider,
+    Sort,
+}
+struct Controls {
+    segments: [Vec<FocusHandle>; 4],
+    provider: PickerState,
+    sort: PickerState,
+    reset: FocusHandle,
+}
+impl Controls {
+    fn new(cx: &gpui::App) -> Self {
+        Self {
+            segments: [4, 4, 2, 3].map(|count| (0..count).map(|_| cx.focus_handle()).collect()),
+            provider: PickerState::new(cx),
+            sort: PickerState::new(cx),
+            reset: cx.focus_handle().tab_stop(true),
+        }
+    }
+    fn picker(&self, menu: Menu) -> &PickerState {
+        match menu {
+            Menu::Provider => &self.provider,
+            Menu::Sort => &self.sort,
+        }
+    }
+    fn picker_mut(&mut self, menu: Menu) -> &mut PickerState {
+        match menu {
+            Menu::Provider => &mut self.provider,
+            Menu::Sort => &mut self.sort,
+        }
+    }
+}
 pub struct StatisticsView {
     preview: bool,
+    preview_cleared: bool,
     period: Period,
-    totals: Totals,
-    daily: Vec<(String, u64)>,
+    data: Dashboard,
+    chart: Chart,
+    group: Group,
+    mode: Mode,
+    provider: Option<Provider>,
+    sort: Sort,
+    controls: Option<Controls>,
+    menu: Option<Menu>,
+    needs_reload: bool,
+    loading: bool,
+    resetting: bool,
+    generation: u64,
     error: Option<String>,
     reset_armed: bool,
 }
-
 impl StatisticsView {
     pub fn new(preview: bool) -> Self {
         let mut view = Self {
             preview,
+            preview_cleared: false,
             period: Period::Week,
-            totals: Totals::default(),
-            daily: Vec::new(),
+            data: Dashboard::default(),
+            chart: Chart::Words,
+            group: Group::Provider,
+            mode: Mode::All,
+            provider: None,
+            sort: Sort::Requests,
+            controls: None,
+            menu: None,
+            needs_reload: false,
+            loading: false,
+            resetting: false,
+            generation: 0,
             error: None,
             reset_armed: false,
         };
-        if preview {
-            view.load_preview();
-        } else {
-            view.refresh();
-        }
+        view.refresh();
         view
     }
-
-    /// Re-reads `stats.json`; it is small, so this stays on the UI thread.
+    /// Callers mark a refresh and notify; rendering starts an off-thread read.
     pub fn refresh(&mut self) {
         if self.preview {
-            return;
-        }
-        match stats::summary(self.period)
-            .and_then(|totals| stats::daily_words(self.period).map(|daily| (totals, daily)))
-        {
-            Ok((totals, daily)) => {
-                self.totals = totals;
-                self.daily = daily;
-                self.error = None;
+            self.data = preview_dashboard(self.period);
+            if self.preview_cleared {
+                self.data.totals = Totals::default();
+                self.data.previous = self.data.previous.as_ref().map(|_| Totals::default());
+                for (_, totals) in &mut self.data.daily {
+                    *totals = Totals::default();
+                }
             }
-            Err(error) => self.error = Some(format!("{error:#}")),
+            self.error = None;
+        } else if !self.resetting {
+            self.generation = self.generation.wrapping_add(1);
+            self.needs_reload = true;
         }
     }
-
+    fn accept_result(
+        &mut self,
+        generation: u64,
+        result: Result<Dashboard, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.generation {
+            return;
+        }
+        self.loading = false;
+        self.resetting = false;
+        match result {
+            Ok(data) => {
+                self.data = data;
+                self.error = None;
+            }
+            Err(error) => self.error = Some(error),
+        }
+        cx.notify();
+    }
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        if self.preview || self.resetting {
+            return;
+        }
+        self.needs_reload = false;
+        self.loading = true;
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        let period = self.period;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(
+                    async move { stats::dashboard(period).map_err(|error| format!("{error:#}")) },
+                )
+                .await;
+            let _ = this.update(cx, |this, cx| this.accept_result(generation, result, cx));
+        })
+        .detach();
+    }
     fn select_period(&mut self, period: Period, cx: &mut Context<Self>) {
+        if self.resetting {
+            return;
+        }
         self.period = period;
+        self.menu = None;
         self.reset_armed = false;
         self.refresh();
         cx.notify();
     }
-
     fn reset(&mut self, cx: &mut Context<Self>) {
+        if self.loading || self.resetting {
+            return;
+        }
         if !self.reset_armed {
             self.reset_armed = true;
             cx.notify();
@@ -74,531 +230,914 @@ impl StatisticsView {
         }
         self.reset_armed = false;
         if self.preview {
+            self.preview_cleared = true;
+            self.refresh();
             cx.notify();
             return;
         }
-        if let Err(error) = stats::clear() {
-            self.error = Some(format!("{error:#}"));
-            cx.notify();
-            return;
-        }
-        self.refresh();
+        self.resetting = true;
+        self.loading = true;
+        self.needs_reload = false;
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        let period = self.period;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    stats::clear()
+                        .and_then(|_| stats::dashboard(period))
+                        .map_err(|error| format!("{error:#}"))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| this.accept_result(generation, result, cx));
+        })
+        .detach();
         cx.notify();
     }
-
-    fn load_preview(&mut self) {
-        let mut totals = Totals {
-            dictations: 184,
-            failed_dictations: 2,
-            skipped_silent: 6,
-            words: 9_412,
-            recorded_ms: 3_960_000,
-            sent_ms: 2_870_000,
-            latency_ms: 186 * 940,
-            tokens: 412_300,
-            cost_usd: 0.4123,
-            fallbacks: 9,
-            ..Totals::default()
-        };
-        totals
-            .models
-            .insert("openai/whisper-large-v3-turbo".into(), 175);
-        totals
-            .models
-            .insert("openai/gpt-4o-mini-transcribe".into(), 9);
-        totals.model_latency.insert(
-            "openai/whisper-large-v3-turbo".into(),
-            ModelLatency {
-                responses: 190,
-                total_ms: 190 * 820,
+    fn segment_index(&self, segment: Segment) -> usize {
+        match segment {
+            Segment::Period => Period::ALL
+                .iter()
+                .position(|period| *period == self.period)
+                .unwrap_or(0),
+            Segment::Chart => Chart::ALL
+                .iter()
+                .position(|chart| *chart == self.chart)
+                .unwrap_or(0),
+            Segment::Group => usize::from(self.group == Group::Model),
+            Segment::Mode => match self.mode {
+                Mode::All => 0,
+                Mode::Live => 1,
+                Mode::Recorded => 2,
             },
-        );
-        totals.model_latency.insert(
-            "openai/gpt-4o-mini-transcribe".into(),
-            ModelLatency {
-                responses: 11,
-                total_ms: 11 * 1_240,
-            },
-        );
-        totals.errors.insert(
-            "rate_limited".into(),
-            [("openai/whisper-large-v3-turbo".into(), 7)].into(),
-        );
-        totals.errors.insert(
-            "timeout".into(),
-            [
-                ("openai/whisper-large-v3-turbo".into(), 2),
-                ("openai/gpt-4o-mini-transcribe".into(), 2),
-            ]
-            .into(),
-        );
-        self.totals = totals;
-        self.daily = [
-            ("2026-09-28", 820),
-            ("2026-09-29", 1_430),
-            ("2026-09-30", 990),
-            ("2026-10-01", 0),
-            ("2026-10-02", 1_870),
-            ("2026-10-03", 2_210),
-            ("2026-10-04", 2_092),
-        ]
-        .into_iter()
-        .map(|(day, words)| (day.to_owned(), words))
-        .collect();
+        }
     }
-
+    fn choose_segment(&mut self, segment: Segment, index: usize, cx: &mut Context<Self>) {
+        if self.resetting {
+            return;
+        }
+        match segment {
+            Segment::Period => {
+                self.select_period(Period::ALL[index], cx);
+                return;
+            }
+            Segment::Chart => self.chart = Chart::ALL[index],
+            Segment::Group => self.group = [Group::Provider, Group::Model][index],
+            Segment::Mode => self.mode = [Mode::All, Mode::Live, Mode::Recorded][index],
+        }
+        cx.notify();
+    }
+    fn segments(&self, segment: Segment, width: f32, cx: &mut Context<Self>) -> AnyElement {
+        let labels = segment.labels();
+        let count = labels.len();
+        let selected = self.segment_index(segment);
+        let item_width = (width - 6.0) / count as f32;
+        segmented_control()
+            .debug_selector(move || format!("statistics-control-{}", segment.index()))
+            .w(px(width))
+            .flex_none()
+            .children(labels.into_iter().enumerate().map(|(index, label)| {
+                let focus =
+                    self.controls.as_ref().unwrap().segments[segment.index()][index].clone();
+                segmented_item(index == selected)
+                    .w(px(item_width))
+                    .px_0()
+                    .justify_center()
+                    .when(index == selected, |item| {
+                        item.debug_selector(move || {
+                            format!("statistics-active-{}", segment.index())
+                        })
+                    })
+                    .id(("statistics-segment", segment.index() * 4 + index))
+                    .track_focus(&focus.clone().tab_stop(index == selected && !self.resetting))
+                    .focus(|style| style.border_1().border_color(rgb(ACCENT)))
+                    .when(self.resetting, |item| item.opacity(0.45))
+                    .child(
+                        div()
+                            .debug_selector(move || {
+                                format!("statistics-label-{}-{index}", segment.index())
+                            })
+                            .child(label),
+                    )
+                    .on_click(cx.listener(move |this, event, window, cx| {
+                        if matches!(event, gpui::ClickEvent::Mouse(_)) {
+                            focus.focus(window);
+                            this.choose_segment(segment, index, cx);
+                        }
+                    }))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                        if event.keystroke.modifiers.platform
+                            || event.keystroke.modifiers.control
+                            || event.keystroke.modifiers.alt
+                        {
+                            return;
+                        }
+                        if event.keystroke.key == "tab" {
+                            if event.keystroke.modifiers.shift {
+                                window.focus_prev();
+                            } else {
+                                window.focus_next();
+                            }
+                            cx.stop_propagation();
+                            return;
+                        }
+                        if let Some(next) =
+                            segment_key(&event.keystroke.key, this.segment_index(segment), count)
+                        {
+                            this.choose_segment(segment, next, cx);
+                            this.controls.as_ref().unwrap().segments[segment.index()][next]
+                                .focus(window);
+                            cx.stop_propagation();
+                        }
+                    }))
+            }))
+            .into_any_element()
+    }
+    fn provider_choices(&self) -> Vec<Option<Provider>> {
+        let mut providers = stats_dashboard::observed_providers(&self.data.totals);
+        if let Some(selected) = self.provider
+            && !providers.contains(&selected)
+        {
+            providers.push(selected);
+            providers.sort();
+        }
+        std::iter::once(None)
+            .chain(providers.into_iter().map(Some))
+            .collect()
+    }
+    fn menu_choices(&self, menu: Menu) -> Vec<String> {
+        match menu {
+            Menu::Provider => self
+                .provider_choices()
+                .into_iter()
+                .map(|provider| provider.map_or("All providers", Provider::label).to_owned())
+                .collect(),
+            Menu::Sort => ["Attempts", "Average latency", "Success rate"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        }
+    }
+    fn toggle_menu(&mut self, menu: Menu, window: &mut Window, cx: &mut Context<Self>) {
+        if self.menu == Some(menu) {
+            self.menu = None;
+            self.controls
+                .as_ref()
+                .unwrap()
+                .picker(menu)
+                .trigger
+                .focus(window);
+        } else {
+            let count = self.menu_choices(menu).len();
+            let selected = match menu {
+                Menu::Provider => self
+                    .provider_choices()
+                    .iter()
+                    .position(|provider| *provider == self.provider)
+                    .unwrap_or(0),
+                Menu::Sort => match self.sort {
+                    Sort::Requests => 0,
+                    Sort::Latency => 1,
+                    Sort::Reliability => 2,
+                },
+            };
+            self.menu = Some(menu);
+            self.controls
+                .as_mut()
+                .unwrap()
+                .picker_mut(menu)
+                .open(selected, count, window);
+        }
+        cx.notify();
+    }
+    fn choose_menu(
+        &mut self,
+        menu: Menu,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match menu {
+            Menu::Provider => self.provider = self.provider_choices()[index],
+            Menu::Sort => self.sort = [Sort::Requests, Sort::Latency, Sort::Reliability][index],
+        }
+        self.menu = None;
+        self.controls
+            .as_ref()
+            .unwrap()
+            .picker(menu)
+            .trigger
+            .focus(window);
+        cx.notify();
+    }
+    fn menu_keys(
+        &mut self,
+        menu: Menu,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.modifiers.platform
+            || event.keystroke.modifiers.control
+            || event.keystroke.modifiers.alt
+        {
+            return;
+        }
+        let count = self.menu_choices(menu).len();
+        if self
+            .controls
+            .as_mut()
+            .unwrap()
+            .picker_mut(menu)
+            .navigate(&event.keystroke.key, count)
+        {
+            cx.stop_propagation();
+            cx.notify();
+        } else if event.keystroke.key == "enter" {
+            if !event.is_held {
+                let index = self.controls.as_ref().unwrap().picker(menu).highlight;
+                self.choose_menu(menu, index, window, cx);
+            }
+            cx.stop_propagation();
+        } else if matches!(event.keystroke.key.as_str(), "escape" | "tab") {
+            self.menu = None;
+            self.controls
+                .as_ref()
+                .unwrap()
+                .picker(menu)
+                .close(event, window);
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+    fn dropdown(&self, menu: Menu, cx: &mut Context<Self>) -> AnyElement {
+        let choices = self.menu_choices(menu);
+        let selected = match menu {
+            Menu::Provider => self
+                .provider_choices()
+                .iter()
+                .position(|provider| *provider == self.provider)
+                .unwrap_or(0),
+            Menu::Sort => match self.sort {
+                Sort::Requests => 0,
+                Sort::Latency => 1,
+                Sort::Reliability => 2,
+            },
+        };
+        let picker = self.controls.as_ref().unwrap().picker(menu);
+        let popup = (self.menu == Some(menu)).then(|| {
+            div()
+                .id(if menu == Menu::Provider {
+                    "statistics-provider-menu"
+                } else {
+                    "statistics-sort-menu"
+                })
+                .w(px(SETTINGS_CONTROL_WIDTH))
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(LINE))
+                .bg(rgb(SURFACE))
+                .shadow_lg()
+                .occlude()
+                .track_focus(&picker.menu)
+                .on_key_down(cx.listener(move |this, event, window, cx| {
+                    this.menu_keys(menu, event, window, cx)
+                }))
+                .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.menu = None;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id(if menu == Menu::Provider {
+                            "statistics-provider-options"
+                        } else {
+                            "statistics-sort-options"
+                        })
+                        .max_h(px(240.0))
+                        .overflow_y_scroll()
+                        .track_scroll(&picker.scroll)
+                        .children(choices.iter().cloned().enumerate().map(|(index, label)| {
+                            div()
+                                .id(("statistics-choice", index))
+                                .h(px(32.0))
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .rounded_sm()
+                                .text_size(px(12.0))
+                                .when(index == picker.highlight, |row| {
+                                    row.bg(rgb(SURFACE_SELECTED))
+                                })
+                                .hover(|row| row.bg(rgb(SURFACE_HOVER)))
+                                .child(label)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.choose_menu(menu, index, window, cx)
+                                }))
+                        })),
+                )
+                .into_any_element()
+        });
+        div()
+            .relative()
+            .flex_none()
+            .w(px(SETTINGS_CONTROL_WIDTH))
+            .child(
+                disclosure_button(choices[selected].clone())
+                    .id(if menu == Menu::Provider {
+                        "statistics-provider"
+                    } else {
+                        "statistics-sort"
+                    })
+                    .track_focus(&picker.trigger)
+                    .focus(|style| style.border_color(rgb(ACCENT)))
+                    .on_click(cx.listener(move |this, event, window, cx| {
+                        if matches!(event, gpui::ClickEvent::Mouse(_)) {
+                            this.toggle_menu(menu, window, cx);
+                        }
+                    }))
+                    .on_key_down(cx.listener(move |this, event, window, cx| {
+                        if picker_open_key(event) {
+                            this.toggle_menu(menu, window, cx);
+                            cx.stop_propagation();
+                        }
+                    })),
+            )
+            .children(popup.map(picker_popup))
+            .into_any_element()
+    }
     fn render_header_action(&self, cx: &mut Context<Self>) -> AnyElement {
-        let index = Period::ALL
-            .iter()
-            .position(|period| *period == self.period)
-            .unwrap_or(0);
-        let periods = sliding_segmented_control(index as f32, &[PERIOD_WIDTH; 4]).children(
-            Period::ALL.into_iter().enumerate().map(|(index, period)| {
-                sliding_segmented_item(PERIOD_WIDTH, period == self.period)
-                    .id(("statistics-period", index))
-                    .child(period.label())
-                    .on_click(cx.listener(move |this, _, _, cx| this.select_period(period, cx)))
-            }),
-        );
-        let reset = header_button(if self.reset_armed {
+        let reset = header_button(if self.resetting {
+            "Resetting…"
+        } else if self.reset_armed {
             "Really reset?"
         } else {
             "Reset"
         })
         .id("statistics-reset")
+        .track_focus(&self.controls.as_ref().unwrap().reset)
         .when(self.reset_armed, |button| button.text_color(rgb(NEGATIVE)))
-        .on_click(cx.listener(|this, _, _, cx| this.reset(cx)));
+        .when(self.loading, |button| button.opacity(0.45))
+        .on_click(cx.listener(|this, event, _, cx| {
+            if matches!(event, gpui::ClickEvent::Mouse(_)) {
+                this.reset(cx);
+            }
+        }))
+        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            if matches!(event.keystroke.key.as_str(), "enter" | "space") && !event.is_held {
+                this.reset(cx);
+                cx.stop_propagation();
+            }
+        }));
         div()
             .flex()
             .items_center()
             .gap_3()
-            .child(periods)
+            .child(self.segments(Segment::Period, 262.0, cx))
             .child(reset)
             .into_any_element()
     }
 
-    fn render_cards(&self) -> AnyElement {
-        let totals = &self.totals;
-        let attempts = totals.dictations + totals.failed_dictations;
-        let saved_ms = totals.recorded_ms.saturating_sub(totals.sent_ms);
-        let first = div()
+    fn render_overview(&self) -> AnyElement {
+        let totals = &self.data.totals;
+        let completed = totals.dictations.saturating_add(totals.failed_dictations);
+        let previous = self.data.previous.as_ref();
+        let measured = stats_dashboard::combined_requests(totals, Mode::All, None);
+        let cost = if measured.cost_reports > 0 || totals.cost_usd > 0.0 {
+            Some(totals.cost_usd)
+        } else {
+            None
+        };
+        let cards = div()
             .flex()
             .gap_3()
             .child(card(
                 "WORDS",
                 format_count(totals.words),
-                totals.words.checked_div(totals.dictations).map_or_else(
-                    || "Nothing dictated yet".into(),
-                    |words| format!("{words} per dictation"),
+                trend(Some(totals.words), previous.map(|old| old.words)),
+            ))
+            .child(card(
+                "SUCCESSFUL",
+                format_count(totals.dictations),
+                trend(Some(totals.dictations), previous.map(|old| old.dictations)),
+            ))
+            .child(card(
+                "SUCCESS RATE",
+                rate(totals.dictations, completed),
+                format!(
+                    "{} failed · {} silent",
+                    format_count(totals.failed_dictations),
+                    format_count(totals.skipped_silent)
                 ),
             ))
             .child(card(
-                "DICTATIONS",
-                format_count(totals.dictations),
-                format!("{} audio recorded", format_duration(totals.recorded_ms)),
-            ))
-            .child(card(
-                "AUDIO SENT",
-                format_duration(totals.sent_ms),
-                if saved_ms > 0 && totals.recorded_ms > 0 {
-                    format!(
-                        "{} saved by trimming ({}%)",
-                        format_duration(saved_ms),
-                        saved_ms * 100 / totals.recorded_ms
-                    )
-                } else {
-                    "No silence trimmed".into()
-                },
-            ))
-            .child(card(
-                "COST",
-                format_cost(totals.cost_usd),
-                format!("{} tokens", format_count(totals.tokens)),
+                "AVG WAIT",
+                measured_latency(totals.average_latency_ms()),
+                trend(
+                    totals.average_latency_ms(),
+                    previous.and_then(Totals::average_latency_ms),
+                ),
             ));
-        let second = div()
+        let trimmed = totals.recorded_ms.saturating_sub(totals.sent_ms);
+        let secondary = div()
             .flex()
             .gap_3()
-            .child(card(
-                "AVERAGE LATENCY",
-                totals
-                    .average_latency_ms()
-                    .map_or_else(|| "—".into(), format_latency),
-                "Transcription processing, excluding queue".into(),
+            .child(small_card(
+                "Audio recorded",
+                format_duration(totals.recorded_ms),
+                format!("{} after trimming", format_duration(totals.sent_ms)),
             ))
-            .child(card(
-                "FALLBACKS",
-                format_count(totals.fallbacks),
-                if totals.dictations > 0 {
-                    format!(
-                        "{}% of dictations",
-                        percent(totals.fallbacks, totals.dictations)
-                    )
+            .child(small_card(
+                "Audio trimmed",
+                format_duration(trimmed),
+                if totals.recorded_ms > 0 {
+                    format!("{} removed from clips", rate(trimmed, totals.recorded_ms))
                 } else {
-                    "Dictations that needed another model".into()
+                    "No recorded audio".into()
                 },
             ))
-            .child(card(
-                "FAILED",
-                format_count(totals.failed_dictations),
-                if attempts > 0 {
+            .child(small_card(
+                "Reported cost",
+                cost.map_or_else(|| "—".into(), format_cost),
+                if measured.cost_reports > 0 {
                     format!(
-                        "{}% — every model failed",
-                        percent(totals.failed_dictations, attempts)
+                        "{} detailed cost reports",
+                        format_count(measured.cost_reports)
                     )
+                } else if cost.is_some() {
+                    "Historical reported amounts".into()
                 } else {
-                    "Every model failed".into()
+                    "No cost reports available".into()
                 },
-            ))
-            .child(card(
-                "SILENT",
-                format_count(totals.skipped_silent),
-                "Recordings with no speech, not sent".into(),
             ));
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(first)
-            .child(second)
+        div().flex_none().flex().flex_col().gap_3()
+            .child(div().text_size(px(11.0)).text_color(rgb(MUTED))
+                .child(if self.period == Period::AllTime { "OVERVIEW · all retained days (up to 400)" } else { "OVERVIEW · selected period" }))
+            .child(cards).child(secondary)
+            .child(note("Words are raw transcription output. Avg wait covers transcription, including failed dictations; queue and paste time are excluded. Audio is clip duration, not total upload traffic."))
+            .child(compact_panel().flex_none().px_4().py_3()
+                .child(div().flex().flex_wrap().gap_4().text_size(px(12.0)).text_color(rgb(TEXT_SOFT))
+                    .child(format!("{} fallback recoveries", format_count(totals.details.fallback_dictations)))
+                    .child(format!("{} retried dictations", format_count(totals.details.retried_dictations)))
+                    .child(format!("{} live recoveries", format_count(totals.details.live_recoveries))))
+                .child(div().mt_2().child(note(coverage(totals)))))
             .into_any_element()
     }
-
-    fn render_chart(&self) -> Option<AnyElement> {
-        if self.daily.len() < 2 {
-            return None;
-        }
-        let max = self
+    fn render_chart(&self, cx: &mut Context<Self>) -> AnyElement {
+        let values: Vec<_> = self
+            .data
             .daily
             .iter()
-            .map(|(_, words)| *words)
-            .max()
-            .unwrap_or(0);
-        let first = self.daily.first().map(|(day, _)| short_day(day));
-        let last = self.daily.last().map(|(day, _)| short_day(day));
-        let bars = self.daily.iter().enumerate().map(|(index, (_, words))| {
-            let height = if max == 0 {
-                0.0
-            } else {
-                (*words as f32 / max as f32 * CHART_HEIGHT).max(if *words > 0 { 3.0 } else { 0.0 })
-            };
+            .map(|(_, totals)| self.chart.value(totals))
+            .collect();
+        let peak = values.iter().flatten().copied().max();
+        let maximum = peak.unwrap_or(0);
+        let bars = values.iter().enumerate().map(|(index, value)| {
+            let height = value.map(|value| {
+                if maximum == 0 {
+                    1.0
+                } else {
+                    (value as f32 / maximum as f32 * CHART_HEIGHT).max(if value > 0 {
+                        3.0
+                    } else {
+                        1.0
+                    })
+                }
+            });
             div()
                 .flex_1()
                 .min_w(px(2.0))
                 .h_full()
                 .flex()
                 .items_end()
+                .justify_center()
                 .child(
                     div()
                         .debug_selector(move || format!("statistics-bar-{index}"))
                         .w_full()
-                        .h(px(height.max(1.0)))
+                        .max_w(px(if height.is_some() { 44.0 } else { 4.0 }))
+                        .h(px(height.unwrap_or(4.0)))
                         .rounded_t(px(3.0))
-                        .bg(if *words > 0 { rgb(ACCENT) } else { rgb(LINE) }),
+                        .bg(if value.is_none() {
+                            rgb(FAINT)
+                        } else if value.unwrap_or(0) > 0 {
+                            rgb(ACCENT)
+                        } else {
+                            rgb(LINE)
+                        }),
                 )
         });
-        Some(
-            compact_panel()
-                .debug_selector(|| "statistics-chart".into())
-                .flex_none()
-                .child(compact_panel_header(
-                    "Words per day",
-                    Some(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(rgb(MUTED))
-                            .child(format!("Peak {}", format_count(max)))
-                            .into_any_element(),
-                    ),
-                ))
-                .child(
-                    div()
-                        .px_4()
-                        .pt_4()
-                        .pb_3()
-                        .child(
-                            div()
-                                .debug_selector(|| "statistics-chart-plot".into())
-                                .h(px(CHART_HEIGHT))
-                                .flex()
-                                .items_end()
-                                .gap(px(if self.daily.len() > 14 { 3.0 } else { 8.0 }))
-                                .children(bars),
-                        )
-                        .child(
-                            div()
-                                .pt_2()
-                                .flex()
-                                .justify_between()
-                                .text_size(px(10.0))
-                                .text_color(rgb(FAINT))
-                                .children(first)
-                                .children(last),
-                        ),
-                )
-                .into_any_element(),
-        )
+        compact_panel().debug_selector(|| "statistics-chart".into()).flex_none()
+            .child(div().px_4().py_3().flex().flex_wrap().items_center().justify_between().gap_3()
+                .child(div().flex().flex_col().gap_1()
+                    .child(div().text_size(px(12.0)).font_weight(FontWeight::SEMIBOLD).child(self.chart.title()))
+                    .child(note(peak.map_or_else(|| "No measurements".into(), |value| format!("Peak {}", self.chart.format(value))))))
+                .child(self.segments(Segment::Chart, SETTINGS_CONTROL_WIDTH, cx)))
+            .child(div().px_4().pt_2().pb_3()
+                .child(div().debug_selector(|| "statistics-chart-plot".into()).h(px(CHART_HEIGHT)).flex_none().flex().items_end()
+                    .gap(px(if values.len() > 14 { 3.0 } else { 8.0 })).children(bars))
+                .child(div().pt_2().flex().justify_between().text_size(px(10.0)).text_color(rgb(FAINT))
+                    .child(self.data.daily.first().map_or_else(String::new, |(day, _)| short_day(day)))
+                    .child(self.data.daily.last().map_or_else(String::new, |(day, _)| short_day(day))))
+                .when(self.chart == Chart::Wait, |chart| chart.child(div().mt_2().child(note("Grey dots mean no wait measurement, rather than zero-latency dictations."))))
+                .when(self.period == Period::AllTime, |chart| chart.child(div().mt_2().child(note("Chart: last 30 days. Overview: all retained daily totals.")))))
+            .into_any_element()
     }
-
-    fn render_models(&self) -> AnyElement {
-        let total = self.totals.dictations;
-        let mut counts = self.totals.models.clone();
-        for model in self.totals.model_latency.keys() {
-            counts.entry(model.clone()).or_default();
-        }
-        let mut models: Vec<_> = counts.iter().collect();
-        models.sort_by(|left, right| right.1.cmp(left.1).then(left.0.cmp(right.0)));
-        let body: Vec<AnyElement> = if models.is_empty() {
-            vec![empty_message("No transcripts in this period.")]
-        } else {
-            models
-                .into_iter()
-                .map(|(model, count)| {
-                    let share = percent(*count, total);
-                    div()
-                        .px_4()
-                        .py_3()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .border_b_1()
-                        .border_color(rgb(LINE))
-                        .child(
-                            div()
-                                .flex()
-                                .justify_between()
-                                .gap_3()
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_size(px(12.0))
-                                        .text_color(rgb(TEXT_SOFT))
-                                        .child(model.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .text_size(px(11.0))
-                                        .text_color(rgb(MUTED))
-                                        .child(format!(
-                                            "{} dictations · {share}%",
-                                            format_count(*count)
-                                        )),
-                                ),
-                        )
-                        .child(meter(share))
-                        .child(
-                            div()
-                                .text_size(px(11.0))
-                                .text_color(rgb(TEXT_SOFT))
-                                .child(model_latency_label(self.totals.model_latency.get(model))),
-                        )
-                        .into_any_element()
-                })
-                .collect()
-        };
-        compact_panel()
-            .flex_1()
-            .min_w_0()
-            .child(compact_panel_header("Models and latency", None))
+    fn render_comparison(&self, cx: &mut Context<Self>) -> AnyElement {
+        let rows = stats_dashboard::comparison_rows(
+            &self.data.totals,
+            self.group,
+            self.mode,
+            self.provider,
+            self.sort,
+        );
+        let headers = table_row()
+            .text_color(rgb(MUTED))
+            .text_size(px(10.0))
             .child(
                 div()
-                    .px_4()
-                    .py_2()
-                    .text_size(px(10.0))
-                    .text_color(rgb(FAINT))
-                    .child("Successful requests, including network time. Excludes queue and retry waits."),
+                    .flex_1()
+                    .min_w_0()
+                    .child(if self.group == Group::Provider {
+                        "PROVIDER"
+                    } else {
+                        "MODEL"
+                    }),
             )
-            .children(body)
+            .child(cell("Attempts", 66.0))
+            .child(cell("Success", 66.0))
+            .child(cell("Avg", 64.0))
+            .child(cell("~P95", 64.0));
+        let body = rows.iter().enumerate().map(|(index, row)| {
+            table_row()
+                .debug_selector(move || format!("statistics-comparison-row-{index}"))
+                .text_size(px(12.0))
+                .text_color(rgb(TEXT_SOFT))
+                .child(div().flex_1().min_w_0().truncate().child(row.label.clone()))
+                .child(cell(format_count(row.metrics.attempts), 66.0))
+                .child(cell(
+                    rate(row.metrics.successes, row.metrics.attempts),
+                    66.0,
+                ))
+                .child(cell(
+                    measured_latency(row.metrics.latency.average_ms()),
+                    64.0,
+                ))
+                .child(cell(
+                    measured_latency(row.metrics.latency.percentile_ms(95)),
+                    64.0,
+                ))
+        });
+        compact_panel().debug_selector(|| "statistics-comparison".into()).flex_none()
+            .child(compact_panel_header("Request comparison", None))
+            .child(div().px_4().py_3().flex().flex_col().gap_3()
+                .child(note("Filters apply to the comparisons and details below. Overview and the daily chart include all providers."))
+                .child(div().flex().flex_wrap().gap_3()
+                    .child(labelled("Group", self.segments(Segment::Group, SETTINGS_CONTROL_WIDTH, cx)))
+                    .child(labelled("Mode", self.segments(Segment::Mode, SETTINGS_CONTROL_WIDTH, cx))))
+                .child(div().flex().flex_wrap().gap_3()
+                    .child(labelled("Provider", self.dropdown(Menu::Provider, cx)))
+                    .child(labelled("Sort by", self.dropdown(Menu::Sort, cx)))))
+            .child(headers).children(body)
+            .when(rows.is_empty(), |panel| panel.child(empty_message(if self.data.totals.details.dictations == 0 {
+                "No detailed attempts yet. Earlier dictations remain in Overview."
+            } else { "No attempts match these filters." })))
+            .child(div().px_4().py_3().child(note("Live sessions start during recording; recorded attempts start after it. Avg and ~P95 cover successful measured attempts: live is release to final, recorded is request to response. ~P95 is approximate and needs 20 measurements.")))
             .into_any_element()
     }
-
-    fn render_errors(&self) -> AnyElement {
-        let errors = self.totals.errors_by_count();
-        let body: Vec<AnyElement> = if errors.is_empty() {
-            vec![empty_message("No model errors in this period.")]
-        } else {
-            errors
-                .into_iter()
-                .map(|(kind, count)| {
-                    let mut models: Vec<_> = self
-                        .totals
-                        .errors
-                        .get(kind)
-                        .map(|models| models.iter().collect())
-                        .unwrap_or_default();
-                    models.sort_by(|left: &(&String, &u64), right| {
-                        right.1.cmp(left.1).then(left.0.cmp(right.0))
-                    });
-                    div()
-                        .px_4()
-                        .py_3()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .border_b_1()
-                        .border_color(rgb(LINE))
-                        .child(
-                            div()
-                                .flex()
-                                .justify_between()
-                                .gap_3()
-                                .child(
-                                    div()
-                                        .text_size(px(12.0))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(TEXT))
-                                        .child(ErrorKind::label_for_key(kind)),
-                                )
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .text_size(px(12.0))
-                                        .text_color(rgb(NEGATIVE))
-                                        .child(format_count(count)),
-                                ),
-                        )
-                        .children(models.into_iter().map(|(model, count)| {
-                            div()
-                                .flex()
-                                .justify_between()
-                                .gap_3()
-                                .text_size(px(11.0))
-                                .text_color(rgb(MUTED))
-                                .child(div().min_w_0().truncate().child(model.clone()))
-                                .child(div().flex_none().child(format_count(*count)))
-                        }))
-                        .into_any_element()
-                })
-                .collect()
-        };
-        compact_panel()
+    fn render_details(&self) -> AnyElement {
+        let combined =
+            stats_dashboard::combined_requests(&self.data.totals, self.mode, self.provider);
+        let mut kinds: Vec<_> = combined.errors.iter().collect();
+        kinds.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let mut transport = compact_panel()
             .flex_1()
-            .min_w_0()
-            .child(compact_panel_header("Why models failed", None))
-            .children(body)
+            .min_w(px(240.0))
+            .child(compact_panel_header("Attempt details", None));
+        for (mode, label) in [(Mode::Live, "Live"), (Mode::Recorded, "Recorded")] {
+            if self.mode == Mode::All || self.mode == mode {
+                let metrics =
+                    stats_dashboard::combined_requests(&self.data.totals, mode, self.provider);
+                transport = transport.child(detail_row(
+                    label,
+                    format!(
+                        "{} attempts · {} success",
+                        format_count(metrics.attempts),
+                        rate(metrics.successes, metrics.attempts)
+                    ),
+                    format!(
+                        "{} average · {} measurements",
+                        measured_latency(metrics.latency.average_ms()),
+                        format_count(metrics.latency.count)
+                    ),
+                ));
+            }
+        }
+        transport = transport
+            .child(detail_row(
+                "Keywords",
+                format!(
+                    "{} attempts with hints",
+                    format_count(combined.keyword_requests)
+                ),
+                format!(
+                    "{} terms sent · confirmed sends only",
+                    format_count(combined.keywords_sent)
+                ),
+            ))
+            .child(detail_row(
+                "Reported cost",
+                reported_cost(&combined),
+                format!(
+                    "{} of {} attempts reported cost",
+                    format_count(combined.cost_reports),
+                    format_count(combined.attempts)
+                ),
+            ));
+        let errors = compact_panel()
+            .flex_1()
+            .min_w(px(240.0))
+            .child(compact_panel_header("Errors", None))
+            .children(kinds.iter().map(|(kind, count)| {
+                div()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .justify_between()
+                    .gap_3()
+                    .border_b_1()
+                    .border_color(rgb(LINE))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(12.0))
+                            .text_color(rgb(TEXT_SOFT))
+                            .child(ErrorKind::label_for_key(kind)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(12.0))
+                            .text_color(rgb(NEGATIVE))
+                            .child(format_count(**count)),
+                    )
+            }))
+            .when(kinds.is_empty(), |panel| {
+                panel.child(empty_message(if combined.attempts == 0 {
+                    "No attempts match these filters."
+                } else {
+                    "No recorded attempt errors."
+                }))
+            });
+        div()
+            .flex_none()
+            .flex()
+            .flex_wrap()
+            .items_start()
+            .gap_3()
+            .child(transport)
+            .child(errors)
             .into_any_element()
     }
 }
-
 impl Render for StatisticsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.controls.is_none() {
+            self.controls = Some(Controls::new(cx));
+        }
+        if self.needs_reload {
+            self.reload(cx);
+        }
         let header = pane_header_with_action("Statistics", Some(self.render_header_action(cx)));
-        let content = match &self.error {
-            Some(error) => pane_content().child(error_message(
+        let content = if self.loading {
+            pane_content().child(empty_message(if self.resetting {
+                "Resetting statistics…"
+            } else {
+                "Loading statistics…"
+            }))
+        } else if let Some(error) = &self.error {
+            pane_content().child(error_message(
                 "Statistics could not be loaded.",
                 error.clone(),
-            )),
-            None => pane_content()
-                .gap_4()
-                .child(self.render_cards())
-                .children(self.render_chart())
-                .child(
+            ))
+        } else {
+            pane_content().gap_4().child(self.render_overview()).child(self.render_chart(cx))
+                .child(self.render_comparison(cx)).child(self.render_details())
+                .child(note("Daily aggregates only: no text or audio. Request details cover newly measured attempts; historical counts cannot reconstruct transport, retries or percentiles. Costs are provider-reported amounts, not a complete bill."))
+        };
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .on_key_down(|event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "tab" {
+                    if event.keystroke.modifiers.shift {
+                        window.focus_prev();
+                    } else {
+                        window.focus_next();
+                    }
+                    cx.stop_propagation();
+                }
+            })
+            .child(header)
+            .child(
+                pane_body().child(
                     div()
+                        .id("statistics-scroll")
+                        .size_full()
+                        .overflow_y_scroll()
+                        .px_8()
+                        .pt_5()
+                        .pb_7()
                         .flex()
                         .items_start()
-                        .gap_4()
-                        .child(self.render_models())
-                        .child(self.render_errors()),
-                )
-                .child(
-                    div()
-                        .px_1()
-                        .text_size(px(10.0))
-                        .line_height(px(15.0))
-                        .text_color(rgb(FAINT))
-                        .child("Daily totals only — no text or audio. Cost and tokens are what OpenRouter reports for each request."),
+                        .justify_center()
+                        .child(content),
                 ),
-        };
-        div().size_full().flex().flex_col().child(header).child(
-            pane_body().child(
-                div()
-                    .id("statistics-scroll")
-                    .size_full()
-                    .overflow_y_scroll()
-                    .px_8()
-                    .pt_5()
-                    .pb_7()
-                    .flex()
-                    // Let the content keep its natural height and scroll. A
-                    // stretched flex column shrinks overflow-hidden panels.
-                    .items_start()
-                    .justify_center()
-                    .child(content),
-            ),
-        )
+            )
     }
 }
-
-fn card(label: &'static str, value: String, detail: String) -> Div {
+fn segment_key(key: &str, current: usize, count: usize) -> Option<usize> {
+    match key {
+        "left" => Some(current.saturating_sub(1)),
+        "right" => Some((current + 1).min(count - 1)),
+        "home" => Some(0),
+        "end" => Some(count - 1),
+        "enter" | "space" => Some(current),
+        _ => None,
+    }
+}
+fn note(text: impl Into<gpui::SharedString>) -> Div {
     div()
-        .flex_1()
-        .min_w_0()
-        .px_4()
-        .py_3()
+        .text_size(px(10.0))
+        .line_height(px(15.0))
+        .text_color(rgb(MUTED))
+        .child(text.into())
+}
+fn labelled(title: &'static str, control: AnyElement) -> Div {
+    div()
+        .flex_none()
         .flex()
         .flex_col()
         .gap_1()
-        .rounded(px(PANEL_RADIUS))
-        .border_1()
-        .border_color(rgb(LINE))
-        .bg(rgb(SURFACE))
         .child(
             div()
                 .text_size(px(10.0))
-                .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(FAINT))
-                .child(label),
+                .child(title),
+        )
+        .child(control)
+}
+fn card(title: &'static str, value: String, detail: String) -> Div {
+    div()
+        .debug_selector(move || format!("statistics-card-{title}"))
+        .flex_1()
+        .min_w_0()
+        .h(px(116.0))
+        .p_3()
+        .rounded(px(PANEL_RADIUS))
+        .bg(rgb(SURFACE))
+        .border_1()
+        .border_color(rgb(LINE))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .text_size(px(10.0))
+                .text_color(rgb(MUTED))
+                .child(title),
         )
         .child(
             div()
-                .text_size(px(22.0))
+                .debug_selector(move || format!("statistics-card-value-{title}"))
+                .w_full()
+                .h(px(32.0))
+                .flex_none()
+                .line_height(px(30.0))
+                .text_size(px(24.0))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(TEXT))
                 .child(value),
         )
-        .child(
-            div()
-                .text_size(px(11.0))
-                .line_height(px(15.0))
-                .text_color(rgb(MUTED))
-                .child(detail),
-        )
+        .child(note(detail))
 }
-
-fn meter(percent: u64) -> Div {
+fn small_card(title: &'static str, value: String, detail: String) -> Div {
     div()
-        .w_full()
-        .h(px(4.0))
-        .rounded_full()
-        .bg(rgb(LINE))
+        .flex_1()
+        .min_w_0()
+        .p_3()
+        .rounded(px(PANEL_RADIUS))
+        .border_1()
+        .border_color(rgb(LINE))
+        .child(note(title))
         .child(
             div()
-                .h_full()
-                .w(gpui::relative(percent.min(100) as f32 / 100.0))
-                .rounded_full()
-                .bg(rgb(ACCENT)),
+                .my_1()
+                .text_size(px(17.0))
+                .text_color(rgb(TEXT))
+                .child(value),
         )
+        .child(note(detail))
 }
-
+fn table_row() -> Div {
+    div()
+        .px_4()
+        .py_3()
+        .flex()
+        .items_center()
+        .gap_2()
+        .border_b_1()
+        .border_color(rgb(LINE))
+}
+fn cell(text: impl Into<gpui::SharedString>, width: f32) -> Div {
+    div()
+        .w(px(width))
+        .flex_none()
+        .flex()
+        .justify_end()
+        .child(div().min_w_0().truncate().child(text.into()))
+}
+fn detail_row(title: &'static str, value: String, detail: String) -> Div {
+    div()
+        .px_4()
+        .py_3()
+        .border_b_1()
+        .border_color(rgb(LINE))
+        .child(note(title))
+        .child(
+            div()
+                .my_1()
+                .text_size(px(12.0))
+                .text_color(rgb(TEXT_SOFT))
+                .child(value),
+        )
+        .child(note(detail))
+}
+fn coverage(totals: &Totals) -> String {
+    format!(
+        "Detailed coverage: {} of {} non-silent dictations. Recovery and retry counts use these new records only.",
+        format_count(totals.details.dictations),
+        format_count(totals.dictations.saturating_add(totals.failed_dictations))
+    )
+}
+fn trend(current: Option<u64>, previous: Option<u64>) -> String {
+    match (current, previous) {
+        (_, None) => "No previous-period comparison".into(),
+        (None, _) => "No measurement this period".into(),
+        (Some(0), Some(0)) => "No change vs previous period".into(),
+        (Some(_), Some(0)) => "No prior baseline".into(),
+        (Some(current), Some(previous)) => {
+            let delta = (current as f64 / previous as f64 - 1.0) * 100.0;
+            if delta.abs() < 0.5 {
+                "No change vs previous period".into()
+            } else if delta > 9_999.0 {
+                ">9,999% vs previous period".into()
+            } else {
+                format!("{delta:+.0}% vs previous period")
+            }
+        }
+    }
+}
+fn rate(part: u64, whole: u64) -> String {
+    if whole == 0 {
+        "—".into()
+    } else {
+        format!("{}%", percent(part, whole))
+    }
+}
 fn percent(part: u64, whole: u64) -> u64 {
-    (part * 100 + whole / 2).checked_div(whole).unwrap_or(0)
+    if whole == 0 {
+        return 0;
+    }
+    let rounded = (u128::from(part) * 100 + u128::from(whole) / 2) / u128::from(whole);
+    rounded.min(100) as u64
 }
 
+fn measured_latency(value: Option<u64>) -> String {
+    value.map_or_else(|| "—".into(), format_latency)
+}
+fn reported_cost(metrics: &RequestTotals) -> String {
+    if metrics.cost_reports == 0 {
+        "—".into()
+    } else {
+        format_cost(metrics.reported_cost_usd)
+    }
+}
 fn format_count(value: u64) -> String {
     let digits = value.to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
-        let remaining = digits.len() - index;
-        if index > 0 && remaining.is_multiple_of(3) {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(digit);
     }
     grouped
 }
-
 fn format_duration(ms: u64) -> String {
     let seconds = ms / 1_000;
     match seconds {
@@ -607,7 +1146,6 @@ fn format_duration(ms: u64) -> String {
         _ => format!("{} h {:02} min", seconds / 3_600, seconds % 3_600 / 60),
     }
 }
-
 fn format_latency(ms: u64) -> String {
     if ms < 1_000 {
         format!("{ms} ms")
@@ -615,41 +1153,197 @@ fn format_latency(ms: u64) -> String {
         format!("{:.1} s", ms as f64 / 1_000.0)
     }
 }
-
-fn model_latency_label(latency: Option<&ModelLatency>) -> String {
-    match latency.and_then(|latency| latency.average_ms().map(|average| (latency, average))) {
-        Some((latency, average)) => format!(
-            "Avg response: {} · {} response{}",
-            format_latency(average),
-            format_count(latency.responses),
-            if latency.responses == 1 { "" } else { "s" },
-        ),
-        None => "Avg response: — · no measurements yet".into(),
-    }
-}
-
 fn format_cost(usd: f64) -> String {
-    if usd <= 0.0 {
-        "$0".into()
-    } else if usd < 0.01 {
-        format!("${usd:.4}")
+    if !usd.is_finite() || usd < 0.0 {
+        return "—".into();
+    }
+    if usd > 0.0 && usd < 0.01 {
+        format!("{}{usd:.4}", "$")
     } else {
-        format!("${usd:.2}")
+        format!("{}{usd:.2}", "$")
     }
 }
-
-/// `2026-10-04` → `Oct 4`.
 fn short_day(day: &str) -> String {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
     let mut parts = day.split('-').skip(1);
     match (
-        parts.next().and_then(|month| month.parse::<usize>().ok()),
-        parts.next().and_then(|day| day.parse::<u32>().ok()),
+        parts.next().and_then(|v| v.parse::<usize>().ok()),
+        parts.next().and_then(|v| v.parse::<u32>().ok()),
     ) {
         (Some(month @ 1..=12), Some(day)) => format!("{} {day}", MONTHS[month - 1]),
         _ => day.to_owned(),
+    }
+}
+
+/// Consecutive synthetic days ending October 8. All aggregates share the same
+/// samples, so switching periods does not invent a second set of totals.
+fn preview_dashboard(period: Period) -> Dashboard {
+    let mut days = Vec::new();
+    for day in 0_u64..60 {
+        let date = if day < 22 {
+            format!("2026-08-{:02}", day + 10)
+        } else if day < 52 {
+            format!("2026-09-{:02}", day - 21)
+        } else {
+            format!("2026-10-{:02}", day - 51)
+        };
+        let mut totals = Totals::default();
+        if day % 13 != 3 {
+            for index in 0..(20 + day % 11) {
+                let provider = ((day + index) % 7) as usize;
+                let recorded_model = [
+                    "microsoft/mai-transcribe-2",
+                    "openai::gpt-transcribe",
+                    "deepgram::nova-3",
+                    "elevenlabs::scribe_v2",
+                    "microsoft::MAI-Transcribe-2",
+                    "grok::grok-voice-transcribe-2.0",
+                    "google::gemini-3.5-transcribe",
+                ][provider];
+                let live_model = [
+                    None,
+                    Some("openai::gpt-live-transcribe"),
+                    Some("deepgram::nova-3"),
+                    Some("elevenlabs::scribe_v2_realtime"),
+                    Some("microsoft::MAI-Transcribe-2-Streaming"),
+                    Some("grok::grok-voice-transcribe-2.0"),
+                    Some("google::gemini-3.5-transcribe-live"),
+                ][provider];
+                let live = index % 2 == 0 && live_model.is_some();
+                let first_model = if live {
+                    live_model.unwrap()
+                } else {
+                    recorded_model
+                };
+                let first_mode = if live {
+                    RequestMode::Live
+                } else {
+                    RequestMode::Recorded
+                };
+                let failed_attempt = (day + index) % 11 == 0;
+                let failed_dictation = (day * 7 + index) % 37 == 0;
+                let retry = failed_attempt && !live && index % 2 == 0;
+                let fallback = failed_attempt && !retry;
+                let winner = if fallback && first_model == "openai::gpt-transcribe" {
+                    "deepgram::nova-3"
+                } else if fallback {
+                    "openai::gpt-transcribe"
+                } else {
+                    first_model
+                };
+                let winner_mode = if failed_attempt {
+                    RequestMode::Recorded
+                } else {
+                    first_mode
+                };
+                let latency = if winner_mode == RequestMode::Live {
+                    220 + index * 15
+                } else {
+                    620 + provider as u64 * 110 + index * 17
+                };
+                let keywords = usize::from(ModelRef::parse(winner).capabilities().keywords) * 4;
+                let cost = (ModelRef::parse(winner).provider == Provider::OpenRouter)
+                    .then_some(0.003 + index as f64 * 0.0001);
+                let mut attempts = Vec::new();
+                let mut failures = Vec::new();
+                if failed_attempt || failed_dictation {
+                    let kind = if index % 2 == 0 {
+                        ErrorKind::RateLimited
+                    } else {
+                        ErrorKind::Timeout
+                    };
+                    attempts.push(AttemptSample {
+                        model: first_model.into(),
+                        mode: first_mode,
+                        error: Some(kind),
+                        ..Default::default()
+                    });
+                    failures.push(Failure {
+                        model: first_model.into(),
+                        kind,
+                        detail: String::new(),
+                    });
+                }
+                if !failed_dictation {
+                    attempts.push(AttemptSample {
+                        model: winner.into(),
+                        mode: winner_mode,
+                        success: true,
+                        latency_ms: Some(latency),
+                        keyword_count: keywords,
+                        cost_usd: cost,
+                        ..Default::default()
+                    });
+                }
+                let recorded = 9_000 + index * 420;
+                let mut sample = Sample {
+                    telemetry: Some(DictationTelemetry {
+                        attempts,
+                        used_fallback: fallback && !failed_dictation,
+                        retried: retry && !failed_dictation,
+                        live_recovered: live && failed_attempt && !failed_dictation,
+                    }),
+                    words: (!failed_dictation).then_some(24 + (day + index * 3) % 70),
+                    models: if failed_dictation {
+                        Vec::new()
+                    } else {
+                        vec![winner.into()]
+                    },
+                    recorded_ms: recorded,
+                    sent_ms: if live { recorded } else { recorded * 72 / 100 },
+                    latency_ms: latency + if failed_attempt { 1_300 } else { 0 },
+                    cost_usd: if failed_dictation {
+                        0.0
+                    } else {
+                        cost.unwrap_or(0.0)
+                    },
+                    failures,
+                    ..Default::default()
+                };
+                if !failed_dictation {
+                    sample.model_latency.insert(
+                        winner.into(),
+                        stats::ModelLatency {
+                            responses: 1,
+                            total_ms: latency,
+                        },
+                    );
+                }
+                totals.add_sample(&sample);
+            }
+            if day % 5 == 0 {
+                totals.add_sample(&Sample {
+                    recorded_ms: 3_000,
+                    skipped_silent: true,
+                    ..Default::default()
+                });
+            }
+        }
+        days.push((date, totals));
+    }
+    let count = match period {
+        Period::Today => 1,
+        Period::Week => 7,
+        Period::Month => 30,
+        Period::AllTime => 60,
+    };
+    let mut totals = Totals::default();
+    for (_, day) in &days[60 - count..] {
+        totals.merge(day);
+    }
+    let previous = (period != Period::AllTime).then(|| {
+        let mut totals = Totals::default();
+        for (_, day) in &days[60 - count * 2..60 - count] {
+            totals.merge(day);
+        }
+        totals
+    });
+    Dashboard {
+        totals,
+        previous,
+        daily: days[60 - count.min(30)..].to_vec(),
     }
 }
 
@@ -657,24 +1351,206 @@ fn short_day(day: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn preview_periods_and_request_totals_are_coherent() {
+        let week = preview_dashboard(Period::Week);
+        let today = preview_dashboard(Period::Today);
+        let month = preview_dashboard(Period::Month);
+        let all = preview_dashboard(Period::AllTime);
+        assert_eq!(week.daily.len(), 7);
+        assert_eq!(today.daily.len(), 1);
+        assert_eq!(month.daily.len(), 30);
+        assert_eq!(all.daily.len(), 30);
+        assert!(today.totals.words < week.totals.words && week.totals.words < month.totals.words);
+        assert!(month.totals.words < all.totals.words);
+        assert!(all.previous.is_none());
+        let mut daily = Totals::default();
+        for (_, totals) in &week.daily {
+            daily.merge(totals);
+        }
+        assert_eq!(daily, week.totals);
+        assert_eq!(stats_dashboard::observed_providers(&week.totals).len(), 7);
+        assert_eq!(
+            week.totals.dictations + week.totals.failed_dictations,
+            week.totals.details.dictations
+        );
+        assert!(
+            stats_dashboard::combined_requests(&week.totals, Mode::All, None).attempts
+                >= week.totals.details.dictations
+        );
+    }
+
+    #[test]
+    fn missing_metrics_are_not_zero_or_legacy_request_estimates() {
+        let legacy = Totals {
+            words: 100,
+            dictations: 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            stats_dashboard::combined_requests(&legacy, Mode::All, None).attempts,
+            0
+        );
+        assert_eq!(reported_cost(&RequestTotals::default()), "—");
+        assert_eq!(
+            reported_cost(&RequestTotals {
+                cost_reports: 1,
+                ..Default::default()
+            }),
+            "$0.00"
+        );
+        assert_eq!(Chart::Wait.value(&Totals::default()), None);
+        assert_eq!(measured_latency(None), "—");
+        assert_eq!(rate(0, 0), "—");
+        assert_eq!(trend(Some(10), Some(0)), "No prior baseline");
+        assert_eq!(format_count(1_234_567), "1,234,567");
+        assert_eq!(format_duration(3_960_000), "1 h 06 min");
+        assert_eq!(format_latency(1_340), "1.3 s");
+        assert_eq!(short_day("2026-10-08"), "Oct 8");
+        assert_eq!(rate(u64::MAX, u64::MAX), "100%");
+        assert_eq!(percent(u64::MAX, 1), 100);
+        assert_eq!(percent(u64::MAX, 0), 0);
+        assert_eq!(format_cost(f64::INFINITY), "—");
+        assert_eq!(trend(Some(u64::MAX), Some(1)), ">9,999% vs previous period");
+        assert!(
+            coverage(&Totals {
+                dictations: u64::MAX,
+                failed_dictations: u64::MAX,
+                ..Default::default()
+            })
+            .contains(&format_count(u64::MAX))
+        );
+    }
+
+    #[gpui::test]
+    fn keyboard_filters_keep_global_totals_and_picker_key_up_does_not_reopen(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, _| StatisticsView::new(true));
+        cx.run_until_parked();
+        let original = cx.update(|window, cx| {
+            let view = view.read(cx);
+            view.controls.as_ref().unwrap().segments[0][1].focus(window);
+            view.data.totals.clone()
+        });
+        cx.simulate_keystrokes("right");
+        cx.update(|_, cx| {
+            assert_eq!(view.read(cx).period, Period::Month);
+            assert!(view.read(cx).data.totals.words > original.words);
+        });
+        let period_totals = cx.update(|window, cx| {
+            view.read(cx)
+                .controls
+                .as_ref()
+                .unwrap()
+                .provider
+                .trigger
+                .focus(window);
+            view.read(cx).data.totals.clone()
+        });
+        cx.simulate_keystrokes("enter end enter");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+        });
+        cx.update(|window, cx| {
+            let view = view.read(cx);
+            assert_eq!(view.provider, Some(Provider::Google));
+            assert_eq!(view.menu, None);
+            assert!(
+                view.controls
+                    .as_ref()
+                    .unwrap()
+                    .provider
+                    .trigger
+                    .is_focused(window)
+            );
+            assert_eq!(view.data.totals, period_totals);
+            view.controls.as_ref().unwrap().sort.trigger.focus(window);
+        });
+        cx.simulate_keystrokes("enter down escape");
+        cx.update(|_, cx| assert_eq!(view.read(cx).sort, Sort::Requests));
+        cx.update(|window, cx| {
+            view.read(cx).controls.as_ref().unwrap().segments[3][0].focus(window)
+        });
+        cx.simulate_keystrokes("right");
+        cx.update(|_, cx| {
+            assert_eq!(view.read(cx).mode, Mode::Live);
+            assert_eq!(view.read(cx).data.totals, period_totals);
+        });
+    }
+
+    #[gpui::test]
+    fn selected_period_background_tracks_mouse_and_keyboard_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, _| StatisticsView::new(true));
+        cx.run_until_parked();
+        let initial = cx.debug_bounds("statistics-active-0").unwrap();
+        let month = cx.debug_bounds("statistics-label-0-2").unwrap();
+        let week = cx.debug_bounds("statistics-label-0-1").unwrap();
+        assert!(initial.left() <= week.left() && initial.right() >= week.right());
+        cx.simulate_click(month.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_eq!(view.read(cx).period, Period::Month));
+        let active = cx.debug_bounds("statistics-active-0").unwrap();
+        // This selector belongs to the segment with the actual selected
+        // background, and is written again every frame (never inferred absent).
+        assert!(active.left() > initial.left());
+        assert!(active.left() <= month.left() && active.right() >= month.right());
+        assert!(active.left() > week.center().x);
+        assert_eq!(active.size.height, px(26.0));
+        assert_eq!(
+            cx.debug_bounds("statistics-control-0").unwrap().size.height,
+            px(32.0)
+        );
+        cx.simulate_keystrokes("home");
+        cx.update(|_, cx| assert_eq!(view.read(cx).period, Period::Today));
+        let active = cx.debug_bounds("statistics-active-0").unwrap();
+        let today = cx.debug_bounds("statistics-label-0-0").unwrap();
+        assert!(active.left() <= today.left() && active.right() >= today.right());
+        assert!(active.right() < week.center().x);
+    }
+
+    #[gpui::test]
+    fn overview_values_use_the_card_width_instead_of_collapsing_to_ellipsis(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_, cx) = cx.add_window_view(|_, _| StatisticsView::new(true));
+        for width in [1040.0, 860.0] {
+            cx.simulate_resize(gpui::size(
+                px(width - crate::desktop_ui::SIDEBAR_WIDTH),
+                px(720.0),
+            ));
+            cx.run_until_parked();
+            for (card_selector, value_selector) in [
+                ("statistics-card-WORDS", "statistics-card-value-WORDS"),
+                (
+                    "statistics-card-SUCCESSFUL",
+                    "statistics-card-value-SUCCESSFUL",
+                ),
+                (
+                    "statistics-card-SUCCESS RATE",
+                    "statistics-card-value-SUCCESS RATE",
+                ),
+                ("statistics-card-AVG WAIT", "statistics-card-value-AVG WAIT"),
+            ] {
+                let card = cx.debug_bounds(card_selector).unwrap();
+                let value = cx.debug_bounds(value_selector).unwrap();
+                // 12pt horizontal padding plus 1pt border on each side.
+                assert!((value.size.width - (card.size.width - px(26.0))).abs() <= px(1.0));
+                assert!(value.size.width >= px(80.0));
+                assert_eq!(value.size.height, px(32.0));
+                assert!(value.left() > card.left() && value.right() < card.right());
+                assert!(value.top() > card.top() && value.bottom() < card.bottom());
+            }
+        }
+    }
+
     #[gpui::test]
     fn chart_keeps_its_plot_and_bars_when_statistics_overflow_the_viewport(
         cx: &mut gpui::TestAppContext,
     ) {
         let (view, cx) = cx.add_window_view(|_, _| StatisticsView::new(true));
-        cx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                // A long model breakdown must scroll below the chart rather
-                // than consume the chart's allotted height.
-                for index in 0..30 {
-                    view.totals
-                        .models
-                        .insert(format!("fixture/model-{index}"), 1);
-                }
-                assert_eq!(view.daily.last().unwrap().0, "2026-10-04");
-                cx.notify();
-            });
-        });
         for (width, height) in [(1040.0, 720.0), (860.0, 560.0)] {
             cx.simulate_resize(gpui::size(
                 px(width - crate::desktop_ui::SIDEBAR_WIDTH),
@@ -683,87 +1559,110 @@ mod tests {
             cx.run_until_parked();
             let chart = cx.debug_bounds("statistics-chart").unwrap();
             let plot = cx.debug_bounds("statistics-chart-plot").unwrap();
-            assert_eq!(
-                plot.size.height,
-                px(CHART_HEIGHT),
-                "{width}x{height}: {plot:?}"
-            );
+            assert_eq!(plot.size.height, px(CHART_HEIGHT));
             assert!(chart.size.height > px(CHART_HEIGHT));
             assert!(plot.top() >= chart.top() && plot.bottom() <= chart.bottom());
-            // Paint bounds snap to the pixel grid while the centered plot can
-            // retain half-pixel coordinates. Allow at most one pixel of drift.
-            let tolerance = px(1.0);
-            for (selector, words) in [
-                ("statistics-bar-0", 820),
-                ("statistics-bar-1", 1_430),
-                ("statistics-bar-2", 990),
-                ("statistics-bar-3", 0),
-                ("statistics-bar-4", 1_870),
-                ("statistics-bar-5", 2_210),
-                ("statistics-bar-6", 2_092),
-            ] {
+            let values = cx.update(|_, cx| {
+                view.read(cx)
+                    .data
+                    .daily
+                    .iter()
+                    .map(|(_, total)| total.words)
+                    .collect::<Vec<_>>()
+            });
+            let peak = *values.iter().max().unwrap();
+            for (index, selector) in [
+                "statistics-bar-0",
+                "statistics-bar-1",
+                "statistics-bar-2",
+                "statistics-bar-3",
+                "statistics-bar-4",
+                "statistics-bar-5",
+                "statistics-bar-6",
+            ]
+            .into_iter()
+            .enumerate()
+            {
                 let bar = cx.debug_bounds(selector).unwrap();
+                let tolerance = px(1.0);
                 assert!(bar.size.width >= px(2.0));
                 assert!(
                     bar.top() >= plot.top() - tolerance
                         && bar.bottom() <= plot.bottom() + tolerance
-                        && bar.left() >= plot.left() - tolerance
-                        && bar.right() <= plot.right() + tolerance,
-                    "{bar:?} outside {plot:?}"
+                );
+                assert!(
+                    bar.left() >= plot.left() - tolerance
+                        && bar.right() <= plot.right() + tolerance
                 );
                 assert!((bar.bottom() - plot.bottom()).abs() <= tolerance);
-                if words > 0 {
-                    assert!(bar.size.height >= px(3.0));
+                if values[index] == peak {
+                    assert!((bar.size.height - px(CHART_HEIGHT)).abs() <= tolerance);
                 }
             }
-            let tallest = cx.debug_bounds("statistics-bar-5").unwrap();
-            assert!((tallest.size.height - px(CHART_HEIGHT)).abs() <= tolerance);
+            let comparison = cx.debug_bounds("statistics-comparison").unwrap();
+            assert!(comparison.size.width <= px(width - crate::desktop_ui::SIDEBAR_WIDTH));
         }
     }
 
-    #[test]
-    fn model_latency_labels_distinguish_missing_data_from_zero() {
+    #[gpui::test]
+    fn preview_reset_and_legacy_empty_states_remain_local(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| StatisticsView::new(true));
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.reset(cx);
+                view.reset(cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(view.read(cx).data.totals, Totals::default());
+            assert!(!view.read(cx).needs_reload);
+        });
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.select_period(Period::Month, cx);
+                assert_eq!(view.data.totals.words, 0);
+                view.data.totals = Totals {
+                    dictations: 14,
+                    words: 220,
+                    ..Default::default()
+                };
+                view.chart = Chart::Wait;
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(view.read(cx).data.totals.details.requests.len(), 0);
+            assert!(view.read(cx).provider_choices().contains(&None));
+        });
         assert_eq!(
-            model_latency_label(None),
-            "Avg response: — · no measurements yet"
-        );
-        assert_eq!(
-            model_latency_label(Some(&ModelLatency::default())),
-            model_latency_label(None)
-        );
-        assert_eq!(
-            model_latency_label(Some(&ModelLatency {
-                responses: 2,
-                total_ms: 1_600
-            })),
-            "Avg response: 800 ms · 2 responses",
-        );
-        assert_eq!(
-            model_latency_label(Some(&ModelLatency {
-                responses: 1,
-                total_ms: 0
-            })),
-            "Avg response: 0 ms · 1 response",
+            cx.debug_bounds("statistics-chart-plot")
+                .unwrap()
+                .size
+                .height,
+            px(CHART_HEIGHT)
         );
     }
 
-    #[test]
-    fn numbers_are_formatted_for_reading() {
-        assert_eq!(format_count(0), "0");
-        assert_eq!(format_count(999), "999");
-        assert_eq!(format_count(1_234_567), "1,234,567");
-        assert_eq!(format_duration(42_000), "42 s");
-        assert_eq!(format_duration(125_000), "2 min");
-        assert_eq!(format_duration(3_960_000), "1 h 06 min");
-        assert_eq!(format_latency(940), "940 ms");
-        assert_eq!(format_latency(1_340), "1.3 s");
-        assert_eq!(format_cost(0.0), "$0");
-        assert_eq!(format_cost(0.00412), "$0.0041");
-        assert_eq!(format_cost(1.5), "$1.50");
-        assert_eq!(percent(1, 3), 33);
-        assert_eq!(percent(2, 3), 67);
-        assert_eq!(percent(5, 0), 0);
-        assert_eq!(short_day("2026-10-04"), "Oct 4");
-        assert_eq!(short_day("d00012"), "d00012");
+    #[gpui::test]
+    fn stale_dashboard_results_cannot_replace_the_current_period(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| StatisticsView::new(true));
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let old = view.data.totals.clone();
+                view.generation = 8;
+                view.period = Period::Month;
+                view.loading = true;
+                view.accept_result(7, Ok(preview_dashboard(Period::Today)), cx);
+                assert_eq!(view.data.totals, old);
+                assert!(view.loading);
+                view.accept_result(8, Ok(preview_dashboard(Period::Month)), cx);
+                assert_eq!(view.data.totals, preview_dashboard(Period::Month).totals);
+                assert!(!view.loading);
+                view.accept_result(7, Err("obsolete error".into()), cx);
+                assert!(view.error.is_none());
+            })
+        });
     }
 }

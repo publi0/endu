@@ -764,6 +764,11 @@ mod tests {
         let config = Config {
             api_key: Some("PRIVATE_KEY_MARKER".into()),
             base_url: "https://private-endpoint.example.test".into(),
+            microsoft: crate::providers::MicrosoftConfig {
+                endpoint: "https://private-resource.cognitiveservices.azure.com".into(),
+                streaming_endpoint: "https://private-resource.services.ai.azure.com".into(),
+                deployment: "private-deployment".into(),
+            },
             ..Config::default()
         };
         let bytes = export_bytes(&source, &config).unwrap();
@@ -771,6 +776,8 @@ mod tests {
         for forbidden in [
             "PRIVATE_KEY_MARKER",
             "private-endpoint",
+            "private-resource",
+            "private-deployment",
             "\"api_key\"",
             "\"base_url\"",
             "\"history_retention\"",
@@ -987,6 +994,11 @@ mod tests {
         let original = Config {
             api_key: Some("LOCAL_TEST_KEY".into()),
             base_url: "https://local.example.test/v1".into(),
+            microsoft: crate::providers::MicrosoftConfig {
+                endpoint: "https://local-resource.cognitiveservices.azure.com".into(),
+                streaming_endpoint: "https://local-resource.services.ai.azure.com".into(),
+                deployment: "local-deployment".into(),
+            },
             ..Config::default()
         };
         openrouter::save_config_at(&files.models, &original).unwrap();
@@ -1004,6 +1016,7 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.config.api_key, original.api_key);
         assert_eq!(outcome.config.base_url, original.base_url);
+        assert_eq!(outcome.config.microsoft, original.microsoft);
         assert_eq!(outcome.config.transcription.models, ["fixture/new-model"]);
         assert_eq!(outcome.settings.history_retention, local.history_retention);
         assert_eq!(fs::read_to_string(marker).unwrap(), "existing marker");
@@ -1033,6 +1046,7 @@ mod tests {
         );
         assert_eq!(outcome.config.api_key, original.api_key);
         assert_eq!(outcome.config.base_url, original.base_url);
+        assert_eq!(outcome.config.microsoft, original.microsoft);
         assert_eq!(outcome.config.transcription.models, ["fixture/preview"]);
         assert_ne!(
             outcome.config.transcription.models,

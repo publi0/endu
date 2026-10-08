@@ -518,6 +518,7 @@ pub struct AppWindow {
     openrouter_settings: Entity<OpenRouterSettings>,
     openrouter_setup: Entity<OpenRouterSettings>,
     providers: Entity<crate::providers_view::ProvidersView>,
+    model_options: Entity<crate::model_options_view::ModelOptionsView>,
     shared_keywords: Entity<crate::vocabulary_view::VocabularyView>,
     statistics: Entity<StatisticsView>,
     hotkey_capture: HotkeyCaptureState,
@@ -729,6 +730,21 @@ impl AppWindow {
         let openrouter_settings = crate::openrouter::settings_view::new(preview_mode, cx);
         let openrouter_setup = crate::openrouter::settings_view::new_key_setup(preview_mode, cx);
         let providers = cx.new(|cx| crate::providers_view::ProvidersView::new(preview_mode, cx));
+        let mut config = openrouter_settings.read(cx).config_snapshot();
+        if preview_mode {
+            // Keep the chain fixture while sharing local connection fixtures
+            // with Providers; no real endpoint or credential is read.
+            config.microsoft = providers.read(cx).config_snapshot().microsoft;
+            openrouter_settings.update(cx, |view, cx| view.refresh_config(config.clone(), cx));
+            providers.update(cx, |view, cx| view.refresh(config.clone(), cx));
+        }
+        let model_options =
+            cx.new(|cx| crate::model_options_view::ModelOptionsView::new(config, preview_mode, cx));
+        let available = providers.read(cx).available_providers(cx);
+        openrouter_settings.update(cx, |view, cx| {
+            view.set_available_providers(available.clone(), cx)
+        });
+        model_options.update(cx, |view, cx| view.set_available_providers(available, cx));
         let shared_keywords = cx.new(|cx| {
             crate::vocabulary_view::VocabularyView::for_models(
                 settings.vocabulary.clone(),
@@ -748,24 +764,30 @@ impl AppWindow {
         subscriptions.push(cx.observe(&shared_keywords, |_, _, cx| cx.notify()));
         subscriptions.push(cx.subscribe(
             &openrouter_settings,
-            |this, _, change: &crate::openrouter::settings_view::ConfigChanged, cx| {
-                this.shared_keywords
-                    .update(cx, |view, cx| view.set_models(&change.0, cx));
-                this.providers
-                    .update(cx, |view, cx| view.refresh(change.0.clone(), cx));
-                cx.notify();
+            |this, editor, _: &crate::openrouter::settings_view::ConfigChanged, cx| {
+                let config = editor.read(cx).config_snapshot();
+                this.synchronize_model_config(config, cx);
             },
         ));
         subscriptions.push(cx.subscribe(
+            &model_options,
+            |this, editor, _: &crate::openrouter::settings_view::ConfigChanged, cx| {
+                let config = editor.read(cx).config_snapshot();
+                this.synchronize_model_config(config, cx);
+            },
+        ));
+        subscriptions.push(cx.observe(&model_options, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.subscribe(
             &providers,
             |this, _, _: &crate::providers_view::ProvidersChanged, cx| {
+                let available = this.providers.read(cx).available_providers(cx);
+                this.openrouter_settings.update(cx, |view, cx| {
+                    view.set_available_providers(available.clone(), cx)
+                });
+                this.model_options
+                    .update(cx, |view, cx| view.set_available_providers(available, cx));
                 let config = this.providers.read(cx).config_snapshot();
-                this.shared_keywords
-                    .update(cx, |view, cx| view.set_models(&config, cx));
-                if config != this.openrouter_settings.read(cx).config_snapshot() {
-                    this.openrouter_settings
-                        .update(cx, |view, cx| view.apply_imported_config(config, cx));
-                }
+                this.synchronize_model_config(config, cx);
                 this.poll_setup(true);
                 cx.notify();
             },
@@ -947,6 +969,7 @@ impl AppWindow {
             openrouter_settings,
             openrouter_setup,
             providers,
+            model_options,
             shared_keywords,
             statistics: cx.new(|_| StatisticsView::new(preview_mode)),
             hotkey_capture: HotkeyCaptureState::Idle,
@@ -1044,6 +1067,11 @@ impl AppWindow {
     }
 
     fn select_pane(&mut self, pane: Pane, cx: &mut Context<Self>) {
+        if self.pane == Pane::Models && pane != Pane::Models {
+            self.finish_model_options(cx);
+        }
+        self.model_options
+            .update(cx, |view, cx| view.close_pickers(cx));
         self.providers.update(cx, |view, cx| view.close_pickers(cx));
         self.cancel_hotkey_capture(cx);
         self.openrouter_settings
@@ -1317,6 +1345,7 @@ impl AppWindow {
     }
 
     pub(crate) fn finish_editing(&mut self, cx: &mut Context<Self>) {
+        self.finish_model_options(cx);
         if let Some(candidate) = self.shared_keywords.update(cx, |view, cx| view.pending(cx)) {
             match candidate {
                 Ok(candidate) => self.update_vocabulary(candidate, cx),
@@ -1330,6 +1359,8 @@ impl AppWindow {
         }
         self.providers
             .update(cx, |view, cx| view.finish_editing(cx));
+        let config = self.providers.read(cx).config_snapshot();
+        self.synchronize_model_config(config, cx);
         let pending = self
             .post_processing_view
             .update(cx, |view, cx| view.pending_vocabulary(cx));
@@ -3269,17 +3300,76 @@ impl AppWindow {
         cx.notify();
     }
 
+    /// Normal cross-pane edits rebase editor state while keeping unrelated
+    /// drafts. Only an explicit import resets drafts and picker state.
+    fn synchronize_model_config(
+        &mut self,
+        config: crate::openrouter::Config,
+        cx: &mut Context<Self>,
+    ) {
+        if self.openrouter_settings.read(cx).config_snapshot() != config {
+            self.openrouter_settings
+                .update(cx, |view, cx| view.refresh_config(config.clone(), cx));
+        }
+        if self.model_options.read(cx).config_snapshot() != config {
+            self.model_options
+                .update(cx, |view, cx| view.refresh(config.clone(), cx));
+        }
+        if self.providers.read(cx).config_snapshot() != config {
+            self.providers
+                .update(cx, |view, cx| view.refresh(config.clone(), cx));
+        }
+        self.shared_keywords
+            .update(cx, |view, cx| view.set_models(&config, cx));
+        cx.notify();
+    }
+
+    fn finish_model_options(&mut self, cx: &mut Context<Self>) {
+        let config = self.openrouter_settings.read(cx).config_snapshot();
+        if self.model_options.read(cx).config_snapshot() != config {
+            self.model_options
+                .update(cx, |view, cx| view.refresh(config, cx));
+        }
+        self.model_options.update(cx, |view, cx| {
+            view.finish_editing(cx);
+        });
+        // Effects from ConfigChanged are delivered after this callback. Rebase
+        // synchronously before another editor saves its own draft.
+        let config = self.model_options.read(cx).config_snapshot();
+        self.synchronize_model_config(config, cx);
+    }
+
     fn render_models(&self, cx: &Context<Self>) -> AnyElement {
+        let available = self.providers.read(cx).available_providers(cx);
+        let mut eligible = self.openrouter_settings.read(cx).config_snapshot();
+        eligible
+            .transcription
+            .models
+            .retain(|id| available.contains(&crate::providers::ModelRef::parse(id).provider));
         configuration_pane(
             "Models",
             "models-scroll",
-            div().child(self.openrouter_settings.clone()).when(
-                crate::providers::has_keyword_support(
-                    &self.openrouter_settings.read(cx).config_snapshot(),
-                    !self.preview,
+            div()
+                .child(
+                    div()
+                        .debug_selector(|| "models-chain".into())
+                        .child(self.openrouter_settings.clone()),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "models-options".into())
+                        .child(self.model_options.clone()),
+                )
+                .when(
+                    crate::providers::has_keyword_support(&eligible, !self.preview),
+                    |pane| {
+                        pane.child(
+                            div()
+                                .debug_selector(|| "models-keywords".into())
+                                .child(self.shared_keywords.clone()),
+                        )
+                    },
                 ),
-                |pane| pane.child(self.shared_keywords.clone()),
-            ),
         )
     }
 
@@ -3287,6 +3377,7 @@ impl AppWindow {
         if self.preference_transfer_busy {
             return;
         }
+        self.finish_editing(cx);
         self.cancel_hotkey_capture(cx);
         self.preference_transfer_busy = true;
         self.preference_transfer_error = None;
@@ -3447,6 +3538,9 @@ impl AppWindow {
         self.shared_keywords
             .update(cx, |view, cx| view.set_models(&imported.config, cx));
         self.providers.update(cx, |view, cx| {
+            view.apply_imported_config(imported.config.clone(), cx)
+        });
+        self.model_options.update(cx, |view, cx| {
             view.apply_imported_config(imported.config.clone(), cx)
         });
         self.openrouter_setup.update(cx, |view, cx| {
@@ -4195,7 +4289,7 @@ fn preview_recording_recovery() -> Option<RecordingRecovery> {
     let samples: Vec<f32> = (0..294_400)
         .map(|index| (index as f32 * std::f32::consts::TAU * 220.0 / 16_000.0).sin() * 0.08)
         .collect();
-    let _ = store.transcribe_original(&samples, Some("Codex"), |_| {
+    let _ = store.transcribe_original(&samples, Some("Codex"), crate::post_processing::Preferences::default(), |_| {
         Err(crate::openrouter::transcribe::ChainFailure { failures: vec![crate::openrouter::stats::Failure {
             model: "openai/whisper-large-v3-turbo".into(),
             kind: crate::openrouter::stats::ErrorKind::Timeout,
@@ -4806,6 +4900,10 @@ mod tests {
                     );
                 }
                 assert_eq!(
+                    view.model_options.read(cx).config_snapshot().transcription,
+                    models.transcription
+                );
+                assert_eq!(
                     view.settings.microphone_priority,
                     desired.microphone_priority
                 );
@@ -5292,9 +5390,12 @@ mod tests {
         let store = RecordingRecovery::open(folder.clone()).unwrap();
         assert!(
             store
-                .transcribe_original(&[0.1; 1600], Some("Notes"), |_| Err(
-                    color_eyre::eyre::eyre!("offline fixture")
-                ))
+                .transcribe_original(
+                    &[0.1; 1600],
+                    Some("Notes"),
+                    crate::post_processing::Preferences::default(),
+                    |_| Err(color_eyre::eyre::eyre!("offline fixture"))
+                )
                 .is_err()
         );
         let id = store.entries("")[0].id.clone();
@@ -5382,6 +5483,265 @@ mod tests {
             cx.update(|_, cx| view.update(cx, |view, cx| view.select_pane(pane, cx)));
             cx.run_until_parked();
         }
+    }
+
+    #[gpui::test]
+    fn model_options_live_between_the_chain_and_keywords_only_in_models(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(preview_fixture);
+        cx.simulate_resize(size(px(WINDOW_WIDTH), px(2400.0)));
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let mut config = view.openrouter_settings.read(cx).config_snapshot();
+                config.transcription.models = vec!["openai::gpt-4o-transcribe".into()];
+                view.synchronize_model_config(config, cx);
+                view.show_models(cx);
+            })
+        });
+        cx.run_until_parked();
+        let chain = cx.debug_bounds("models-chain").unwrap();
+        let options = cx.debug_bounds("models-options").unwrap();
+        let keywords = cx.debug_bounds("models-keywords").unwrap();
+        assert!(chain.bottom() <= options.top());
+        assert!(options.bottom() <= keywords.top());
+        assert!(cx.debug_bounds("model-options-context").is_some());
+        assert!(
+            cx.debug_bounds("providers-credentials-and-limits")
+                .is_none()
+        );
+        cx.update(|_, cx| view.update(cx, |view, cx| view.show_providers(cx)));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("providers-credentials-and-limits")
+                .is_some()
+        );
+        assert!(cx.debug_bounds("models-options").is_none());
+        assert!(cx.debug_bounds("model-options-context").is_none());
+    }
+
+    #[gpui::test]
+    fn removing_and_restoring_provider_key_refreshes_model_editors(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(preview_fixture);
+        let id = "openai::gpt-transcribe";
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let mut config = view.openrouter_settings.read(cx).config_snapshot();
+                config.transcription.models = vec![id.into()];
+                crate::providers::initialize_model(&mut config, id, None);
+                view.synchronize_model_config(config, cx);
+                view.providers.update(cx, |providers, cx| {
+                    providers.sync_key_status(
+                        crate::providers::Provider::OpenAi,
+                        crate::openrouter::KeyStatus::Missing,
+                        cx,
+                    )
+                });
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let saved = view.openrouter_settings.read(cx).config_snapshot();
+                assert_eq!(saved.transcription.models, vec![id]);
+                assert!(saved.transcription.model_options.contains_key(id));
+                assert!(
+                    !view
+                        .providers
+                        .read(cx)
+                        .available_providers(cx)
+                        .contains(&crate::providers::Provider::OpenAi)
+                );
+                view.providers.update(cx, |providers, cx| {
+                    providers.sync_key_status(
+                        crate::providers::Provider::OpenAi,
+                        crate::openrouter::KeyStatus::Keychain("demo".into()),
+                        cx,
+                    )
+                });
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                assert!(
+                    view.providers
+                        .read(cx)
+                        .available_providers(cx)
+                        .contains(&crate::providers::Provider::OpenAi)
+                );
+                assert_eq!(
+                    view.openrouter_settings.read(cx).config_snapshot(),
+                    view.model_options.read(cx).config_snapshot()
+                );
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn closing_flushes_microsoft_and_advanced_drafts_before_export_and_model_sync(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(preview_fixture);
+        let endpoint = "https://edited-close.cognitiveservices.azure.com";
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.show_providers(cx);
+                // Create both drafts without focus changes flushing either first.
+                // Helpers emit the same Changed events as the TextInput controls.
+                view.providers.update(cx, |providers, cx| {
+                    providers.stage_connection_and_timeout_drafts(endpoint, "67", cx);
+                });
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let before = view.providers.read(cx).config_snapshot();
+                assert_ne!(before.microsoft.endpoint, endpoint);
+                assert_ne!(before.transcription.attempt_timeout_seconds, 67);
+                // The same synchronous path is used by close, quit and export.
+                view.finish_editing(cx);
+                let saved = view.openrouter_settings.read(cx).config_snapshot();
+                assert_eq!(saved.microsoft.endpoint, endpoint);
+                assert_eq!(saved.transcription.attempt_timeout_seconds, 67);
+                assert_eq!(view.providers.read(cx).config_snapshot(), saved);
+                assert_eq!(view.model_options.read(cx).config_snapshot(), saved);
+
+                let bytes =
+                    crate::preferences_transfer::export_bytes(&view.settings, &saved).unwrap();
+                let encoded = std::str::from_utf8(&bytes).unwrap();
+                assert!(
+                    !encoded.contains("edited-close"),
+                    "local endpoints must not travel"
+                );
+                let transferred = crate::preferences_transfer::preview_bundle(
+                    crate::preferences_transfer::decode(&bytes).unwrap(),
+                    &view.settings,
+                    &saved,
+                )
+                .unwrap();
+                assert_eq!(transferred.config.transcription.attempt_timeout_seconds, 67);
+                assert_eq!(transferred.config.microsoft, saved.microsoft);
+                view.show_models(cx);
+                assert_eq!(view.pane, Pane::Models);
+            })
+        });
+        // Queued callbacks from the first save must not overwrite the second.
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            let saved = view.openrouter_settings.read(cx).config_snapshot();
+            assert_eq!(saved.microsoft.endpoint, endpoint);
+            assert_eq!(saved.transcription.attempt_timeout_seconds, 67);
+            assert_eq!(view.providers.read(cx).config_snapshot(), saved);
+            assert_eq!(view.model_options.read(cx).config_snapshot(), saved);
+        });
+    }
+
+    #[gpui::test]
+    fn model_drafts_survive_global_sync_flush_on_close_and_reset_on_import(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| cx.bind_keys(crate::text_input::key_bindings()));
+        let (view, cx) = cx.add_window_view(preview_fixture);
+        cx.simulate_resize(size(px(WINDOW_WIDTH), px(2400.0)));
+        cx.update(|window, cx| {
+            window.activate_window();
+            view.update(cx, |view, cx| {
+                let mut config = view.openrouter_settings.read(cx).config_snapshot();
+                config.transcription.models = vec!["openai::gpt-4o-transcribe".into()];
+                view.synchronize_model_config(config, cx);
+                view.show_models(cx);
+            });
+        });
+        cx.run_until_parked();
+        let context = cx.debug_bounds("model-options-context").unwrap();
+        cx.simulate_click(context.center(), GpuiModifiers::default());
+        cx.simulate_input("Keep this draft");
+        // A global setting changes while Context is still being edited.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let mut config = view.providers.read(cx).config_snapshot();
+                config.transcription.attempt_timeout_seconds = 45;
+                view.providers.update(cx, |editor, cx| {
+                    editor.refresh(config, cx);
+                    cx.emit(crate::providers_view::ProvidersChanged);
+                });
+            })
+        });
+        cx.run_until_parked();
+        // The close/quit path flushes before removing the focus tree.
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.finish_editing(cx);
+                let config = view.openrouter_settings.read(cx).config_snapshot();
+                assert_eq!(
+                    crate::providers::options(&config, "openai::gpt-4o-transcribe").prompt,
+                    "Keep this draft"
+                );
+                assert_eq!(config.transcription.attempt_timeout_seconds, 45);
+                assert_eq!(view.providers.read(cx).config_snapshot(), config);
+                assert_eq!(view.model_options.read(cx).config_snapshot(), config);
+                let bytes =
+                    crate::preferences_transfer::export_bytes(&view.settings, &config).unwrap();
+                let exported = crate::preferences_transfer::preview_bundle(
+                    crate::preferences_transfer::decode(&bytes).unwrap(),
+                    &view.settings,
+                    &config,
+                )
+                .unwrap();
+                assert_eq!(
+                    exported.config.transcription.model_options,
+                    config.transcription.model_options
+                );
+            })
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_input("Discard this old draft");
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let mut config = view.openrouter_settings.read(cx).config_snapshot();
+                let options = config
+                    .transcription
+                    .model_options
+                    .get_mut("openai::gpt-4o-transcribe")
+                    .unwrap();
+                options.prompt = "Imported context".into();
+                view.accept_imported_preferences(
+                    crate::preferences_transfer::ImportOutcome {
+                        settings: view.settings.clone(),
+                        config: config.clone(),
+                    },
+                    cx,
+                );
+                view.finish_editing(cx);
+                assert_eq!(view.model_options.read(cx).config_snapshot(), config);
+            })
+        });
+        cx.update(|window, _| window.blur());
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let config = view.read(cx).openrouter_settings.read(cx).config_snapshot();
+            assert_eq!(
+                crate::providers::options(&config, "openai::gpt-4o-transcribe").prompt,
+                "Imported context"
+            );
+        });
+        let context = cx.debug_bounds("model-options-context").unwrap();
+        cx.simulate_click(context.center(), GpuiModifiers::default());
+        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_input("Save when leaving Models");
+        cx.update(|_, cx| view.update(cx, |view, cx| view.show_providers(cx)));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let config = view.read(cx).providers.read(cx).config_snapshot();
+            assert_eq!(
+                crate::providers::options(&config, "openai::gpt-4o-transcribe").prompt,
+                "Save when leaving Models"
+            );
+        });
     }
 
     #[gpui::test]
@@ -5486,7 +5846,7 @@ mod tests {
                 assert!(crate::providers::has_keyword_support(&config, false));
                 view.openrouter_settings.update(cx, |editor, cx| {
                     editor.apply_imported_config(config.clone(), cx);
-                    cx.emit(crate::openrouter::settings_view::ConfigChanged(config));
+                    cx.emit(crate::openrouter::settings_view::ConfigChanged);
                 });
                 let vocabulary = crate::vocabulary::Vocabulary {
                     terms: vec!["Nimbus-Files".into()],
@@ -5503,6 +5863,10 @@ mod tests {
                 assert_eq!(view.settings.vocabulary.terms, vec!["Nimbus-Files"]);
                 assert_eq!(
                     view.providers.read(cx).config_snapshot(),
+                    view.openrouter_settings.read(cx).config_snapshot()
+                );
+                assert_eq!(
+                    view.model_options.read(cx).config_snapshot(),
                     view.openrouter_settings.read(cx).config_snapshot()
                 );
                 let mut config = view.providers.read(cx).config_snapshot();
@@ -5529,6 +5893,7 @@ mod tests {
                 let config = view.openrouter_settings.read(cx).config_snapshot();
                 assert!(!crate::providers::has_keyword_support(&config, false));
                 assert!(crate::providers::options(&config, "deepgram::nova-2").streaming);
+                assert_eq!(view.model_options.read(cx).config_snapshot(), config);
                 view.show_providers(cx);
                 assert_eq!(view.pane, Pane::Providers);
                 view.show_models(cx);

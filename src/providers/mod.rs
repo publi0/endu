@@ -6,6 +6,8 @@ use std::sync::{LazyLock, RwLock};
 
 pub mod batch;
 pub mod keys;
+mod microsoft;
+pub use microsoft::{MicrosoftConfig, microsoft_endpoint};
 pub mod streaming;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -15,13 +17,19 @@ pub enum Provider {
     OpenAi,
     Deepgram,
     ElevenLabs,
+    Microsoft,
+    Grok,
+    Google,
 }
 impl Provider {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 7] = [
         Self::OpenRouter,
         Self::OpenAi,
         Self::Deepgram,
         Self::ElevenLabs,
+        Self::Microsoft,
+        Self::Grok,
+        Self::Google,
     ];
     pub const fn id(self) -> &'static str {
         match self {
@@ -29,6 +37,9 @@ impl Provider {
             Self::OpenAi => "openai",
             Self::Deepgram => "deepgram",
             Self::ElevenLabs => "elevenlabs",
+            Self::Microsoft => "microsoft",
+            Self::Grok => "grok",
+            Self::Google => "google",
         }
     }
     pub const fn label(self) -> &'static str {
@@ -37,6 +48,9 @@ impl Provider {
             Self::OpenAi => "OpenAI",
             Self::Deepgram => "Deepgram",
             Self::ElevenLabs => "ElevenLabs",
+            Self::Microsoft => "Microsoft",
+            Self::Grok => "Grok (xAI)",
+            Self::Google => "Google",
         }
     }
     pub const fn keys_url(self) -> &'static str {
@@ -45,6 +59,9 @@ impl Provider {
             Self::OpenAi => "https://platform.openai.com/api-keys",
             Self::Deepgram => "https://console.deepgram.com/",
             Self::ElevenLabs => "https://elevenlabs.io/app/settings/api-keys",
+            Self::Microsoft => "https://ai.azure.com/",
+            Self::Grok => "https://console.x.ai/",
+            Self::Google => "https://aistudio.google.com/apikey",
         }
     }
     pub const fn env(self) -> &'static str {
@@ -53,8 +70,44 @@ impl Provider {
             Self::OpenAi => "OPENAI_API_KEY",
             Self::Deepgram => "DEEPGRAM_API_KEY",
             Self::ElevenLabs => "ELEVENLABS_API_KEY",
+            Self::Microsoft => "AZURE_MAI_API_KEY",
+            Self::Grok => "XAI_API_KEY",
+            Self::Google => "GEMINI_API_KEY",
         }
     }
+}
+
+/// APIs requiring full BCP-47 locales use the same choices as Models.
+/// Portuguese defaults to Brazil, matching Hex's dictation locale.
+pub fn bcp47_language(language: &str) -> Option<&'static str> {
+    Some(match language.trim() {
+        "pt" => "pt-BR",
+        "en" => "en-US",
+        "es" => "es-ES",
+        "fr" => "fr-FR",
+        "de" => "de-DE",
+        "it" => "it-IT",
+        "nl" => "nl-NL",
+        "pl" => "pl-PL",
+        "ru" => "ru-RU",
+        "uk" => "uk-UA",
+        "tr" => "tr-TR",
+        "ar" => "ar-EG",
+        "hi" => "hi-IN",
+        "zh" => "zh-CN",
+        "ja" => "ja-JP",
+        "ko" => "ko-KR",
+        "vi" => "vi-VN",
+        "id" => "id-ID",
+        "sv" => "sv-SE",
+        "da" => "da-DK",
+        "fi" => "fi-FI",
+        "cs" => "cs-CZ",
+        "el" => "el-GR",
+        "ro" => "ro-RO",
+        "hu" => "hu-HU",
+        _ => return None,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,6 +154,15 @@ impl<'a> ModelRef<'a> {
             .find(|m| m.provider == self.provider && m.id == self.model)
             .map_or(Capabilities::default(), |m| m.capabilities)
     }
+
+    /// Whether live transport can use this language without choosing one for the user.
+    pub fn can_stream_language(self, language: &str) -> bool {
+        self.capabilities().streaming
+            && !(self.provider == Provider::Deepgram
+                && self.model == "nova-2"
+                && (language.trim().is_empty()
+                    || language.trim() == crate::openrouter::AUTO_LANGUAGE))
+    }
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Capabilities {
@@ -110,6 +172,8 @@ pub struct Capabilities {
     pub prompt: bool,
     pub temperature: bool,
     pub formatting: bool,
+    pub punctuate: bool,
+    pub numerals: bool,
     pub no_verbatim: bool,
 }
 #[derive(Clone)]
@@ -178,6 +242,8 @@ pub fn native_models() -> Vec<NativeModel> {
                 streaming: true,
                 keywords: true,
                 formatting: true,
+                punctuate: true,
+                numerals: true,
                 ..Capabilities::default()
             },
         },
@@ -189,6 +255,8 @@ pub fn native_models() -> Vec<NativeModel> {
                 batch: true,
                 streaming: true,
                 formatting: true,
+                punctuate: true,
+                numerals: true,
                 ..Capabilities::default()
             },
         },
@@ -208,6 +276,61 @@ pub fn native_models() -> Vec<NativeModel> {
                 ..scribe
             },
         },
+        NativeModel {
+            provider: Provider::Microsoft,
+            id: "MAI-Transcribe-2",
+            name: "MAI-Transcribe 2",
+            capabilities: Capabilities {
+                batch: true,
+                keywords: true,
+                no_verbatim: true,
+                ..Capabilities::default()
+            },
+        },
+        NativeModel {
+            provider: Provider::Microsoft,
+            id: "MAI-Transcribe-2-Streaming",
+            name: "MAI-Transcribe 2 Streaming",
+            capabilities: Capabilities {
+                streaming: true,
+                ..Capabilities::default()
+            },
+        },
+        NativeModel {
+            provider: Provider::Grok,
+            id: "grok-voice-transcribe-2.0",
+            name: "Grok Voice Transcribe 2.0",
+            capabilities: Capabilities {
+                batch: true,
+                streaming: true,
+                keywords: true,
+                formatting: true,
+                no_verbatim: true,
+                ..Capabilities::default()
+            },
+        },
+        NativeModel {
+            provider: Provider::Google,
+            id: "gemini-3.5-transcribe",
+            name: "Gemini 3.5 Transcribe",
+            capabilities: Capabilities {
+                batch: true,
+                keywords: true,
+                formatting: true,
+                ..Capabilities::default()
+            },
+        },
+        NativeModel {
+            provider: Provider::Google,
+            id: "gemini-3.5-transcribe-live",
+            name: "Gemini 3.5 Transcribe Live",
+            capabilities: Capabilities {
+                streaming: true,
+                keywords: true,
+                formatting: true,
+                ..Capabilities::default()
+            },
+        },
     ]
 }
 
@@ -215,7 +338,7 @@ pub fn native_models() -> Vec<NativeModel> {
 #[serde(default, deny_unknown_fields)]
 pub struct ModelOptions {
     pub language: String,
-    /// Opt-in for models with both modes. Realtime-only models can be disabled;
+    /// Enabled by default where supported. Realtime-only models can be disabled;
     /// the chain then skips them, without silently selecting a different model.
     pub streaming: bool,
     pub prompt: String,
@@ -229,13 +352,13 @@ impl Default for ModelOptions {
     fn default() -> Self {
         Self {
             language: "auto".into(),
-            streaming: false,
+            streaming: true,
             prompt: String::new(),
             temperature: None,
-            smart_format: false,
+            smart_format: true,
             punctuate: true,
-            numerals: false,
-            no_verbatim: false,
+            numerals: true,
+            no_verbatim: true,
         }
     }
 }
@@ -264,21 +387,37 @@ impl ModelOptions {
         Ok(())
     }
     pub fn inherited(mut self, source: Capabilities, target: Capabilities) -> Self {
-        self.streaming = source.streaming && target.streaming && self.streaming;
+        let defaults = Self::default();
+        if !source.streaming {
+            self.streaming = defaults.streaming;
+        }
         if !(source.prompt && target.prompt) {
             self.prompt.clear();
         }
         if !(source.temperature && target.temperature) {
             self.temperature = None;
         }
-        if !(source.formatting && target.formatting) {
-            self.smart_format = false;
-            self.punctuate = true;
-            self.numerals = false;
+        if !source.formatting {
+            self.smart_format = defaults.smart_format;
         }
-        if !(source.no_verbatim && target.no_verbatim) {
-            self.no_verbatim = false;
+        if !source.punctuate {
+            self.punctuate = defaults.punctuate;
         }
+        if !source.numerals {
+            self.numerals = defaults.numerals;
+        }
+        if !source.no_verbatim {
+            self.no_verbatim = defaults.no_verbatim;
+        }
+        self.for_capabilities(target)
+    }
+
+    fn for_capabilities(mut self, capabilities: Capabilities) -> Self {
+        self.streaming &= capabilities.streaming;
+        self.smart_format &= capabilities.formatting;
+        self.punctuate &= capabilities.punctuate;
+        self.numerals &= capabilities.numerals;
+        self.no_verbatim &= capabilities.no_verbatim;
         self
     }
 }
@@ -293,6 +432,7 @@ pub fn options(config: &Config, id: &str) -> ModelOptions {
             temperature: config.transcription.temperature,
             ..ModelOptions::default()
         })
+        .for_capabilities(ModelRef::parse(id).capabilities())
 }
 pub fn initialize_model(config: &mut Config, id: &str, previous: Option<&str>) {
     let key = ModelRef::parse(id).key();
@@ -338,6 +478,8 @@ pub fn is_configured() -> bool {
             let model = ModelRef::parse(id);
             let caps = model.capabilities();
             (caps.batch || (caps.streaming && options(&c, id).streaming))
+                && (model.provider != Provider::Microsoft
+                    || microsoft_endpoint(&c, !caps.batch).is_ok())
                 && keys::api_key(model.provider, &c).is_ok()
         })
     })
@@ -346,6 +488,243 @@ pub fn is_configured() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_supported_defaults(options: &ModelOptions, capabilities: Capabilities) {
+        assert_eq!(options.streaming, capabilities.streaming);
+        assert_eq!(options.smart_format, capabilities.formatting);
+        assert_eq!(options.punctuate, capabilities.punctuate);
+        assert_eq!(options.numerals, capabilities.numerals);
+        assert_eq!(options.no_verbatim, capabilities.no_verbatim);
+    }
+
+    #[test]
+    fn new_native_models_keep_transport_capabilities_distinct_from_routes() {
+        let cases = [
+            (
+                "microsoft::MAI-Transcribe-2",
+                Provider::Microsoft,
+                true,
+                false,
+                true,
+            ),
+            (
+                "microsoft::MAI-Transcribe-2-Streaming",
+                Provider::Microsoft,
+                false,
+                true,
+                false,
+            ),
+            (
+                "grok::grok-voice-transcribe-2.0",
+                Provider::Grok,
+                true,
+                true,
+                true,
+            ),
+            (
+                "google::gemini-3.5-transcribe",
+                Provider::Google,
+                true,
+                false,
+                true,
+            ),
+            (
+                "google::gemini-3.5-transcribe-live",
+                Provider::Google,
+                false,
+                true,
+                true,
+            ),
+        ];
+        for (id, provider, batch, streaming, keywords) in cases {
+            let model = ModelRef::parse(id);
+            assert_eq!(model.provider, provider);
+            assert_eq!(model.key(), id);
+            let caps = model.capabilities();
+            assert_eq!(
+                (caps.batch, caps.streaming, caps.keywords),
+                (batch, streaming, keywords)
+            );
+            assert!(!caps.punctuate && !caps.numerals);
+            assert_supported_defaults(&options(&Config::default(), id), caps);
+        }
+        for route in [
+            "microsoft/mai-transcribe-2",
+            "google/gemini-3.5-transcribe",
+            "x-ai/grok-voice-transcribe-2.0",
+        ] {
+            assert_eq!(ModelRef::parse(route).provider, Provider::OpenRouter);
+        }
+        for provider in Provider::ALL {
+            assert_eq!(
+                Provider::ALL
+                    .iter()
+                    .filter(|p| p.id() == provider.id())
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn every_explicit_ui_language_has_a_full_locale() {
+        assert_eq!(bcp47_language("auto"), None);
+        assert_eq!(bcp47_language("pt"), Some("pt-BR"));
+        for (code, _) in crate::openrouter::LANGUAGES {
+            if *code != "auto" {
+                assert!(bcp47_language(code).is_some(), "{code}");
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_language_support_never_invents_a_nova_2_language() {
+        let nova_2 = ModelRef::parse("deepgram::nova-2");
+        assert!(!nova_2.can_stream_language("auto"));
+        assert!(!nova_2.can_stream_language(""));
+        assert!(!nova_2.can_stream_language(" auto "));
+        assert!(nova_2.can_stream_language("pt"));
+        assert!(nova_2.can_stream_language("en"));
+        for id in [
+            "deepgram::nova-3",
+            "openai::gpt-live-transcribe",
+            "elevenlabs::scribe_v2_realtime",
+        ] {
+            assert!(ModelRef::parse(id).can_stream_language("auto"));
+            assert!(ModelRef::parse(id).can_stream_language("pt"));
+        }
+        for id in [
+            "deepgram/nova-2",
+            "openai::gpt-transcribe",
+            "elevenlabs::scribe_v2",
+            "deepgram::unknown",
+        ] {
+            assert!(!ModelRef::parse(id).can_stream_language("pt"));
+        }
+        let options = options(&Config::default(), "deepgram::nova-2");
+        assert!(options.streaming);
+        assert_eq!(options.language, "auto");
+    }
+
+    #[test]
+    fn missing_profiles_enable_only_supported_toggles_and_keep_language_and_temperature() {
+        let mut config = Config::default();
+        config.transcription.language = "pt".into();
+        config.transcription.temperature = Some(0.3);
+        let mut ids: Vec<_> = native_models()
+            .into_iter()
+            .map(|model| {
+                ModelRef {
+                    provider: model.provider,
+                    model: model.id,
+                }
+                .key()
+            })
+            .collect();
+        ids.extend(["openai/gpt-transcribe".into(), "openai::unknown".into()]);
+        for id in ids {
+            let options = options(&config, &id);
+            assert_supported_defaults(&options, ModelRef::parse(&id).capabilities());
+            assert_eq!(options.language, "pt");
+            assert_eq!(options.temperature, Some(0.3));
+            assert!(options.prompt.is_empty());
+        }
+    }
+
+    #[test]
+    fn sparse_profiles_default_on_but_explicit_false_survives_round_trip() {
+        let raw: ModelOptions = serde_json::from_str("{}").unwrap();
+        assert!(
+            raw.streaming && raw.smart_format && raw.punctuate && raw.numerals && raw.no_verbatim
+        );
+        let config: Config = serde_json::from_str(r#"{"transcription":{"model_options":{
+            "deepgram::nova-3":{"language":"pt"},
+            "elevenlabs::scribe_v2":{},
+            "deepgram::nova-2":{"streaming":false,"smart_format":false,"punctuate":false,"numerals":false,"no_verbatim":false},
+            "elevenlabs::scribe_v2_realtime":{"streaming":false,"no_verbatim":false}
+        }}}"#).unwrap();
+        let config: Config = serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        for id in ["deepgram::nova-3", "elevenlabs::scribe_v2"] {
+            assert_supported_defaults(&options(&config, id), ModelRef::parse(id).capabilities());
+        }
+        assert_eq!(options(&config, "deepgram::nova-3").language, "pt");
+        for id in ["deepgram::nova-2", "elevenlabs::scribe_v2_realtime"] {
+            let options = options(&config, id);
+            assert!(
+                !options.streaming
+                    && !options.smart_format
+                    && !options.punctuate
+                    && !options.numerals
+                    && !options.no_verbatim
+            );
+        }
+    }
+
+    #[test]
+    fn inheritance_defaults_target_only_features_on_and_preserves_shared_false() {
+        let mut config = Config::default();
+        config.transcription.model_options.insert(
+            "openai::gpt-transcribe".into(),
+            ModelOptions {
+                language: "pt".into(),
+                prompt: "Existing context".into(),
+                temperature: Some(0.4),
+                streaming: false,
+                smart_format: false,
+                punctuate: false,
+                numerals: false,
+                no_verbatim: false,
+            },
+        );
+        for id in [
+            "deepgram::nova-3",
+            "openai::gpt-live-transcribe",
+            "elevenlabs::scribe_v2",
+        ] {
+            initialize_model(&mut config, id, Some("openai::gpt-transcribe"));
+            let options = options(&config, id);
+            assert_supported_defaults(&options, ModelRef::parse(id).capabilities());
+            assert_eq!(options.language, "pt");
+        }
+        assert_eq!(
+            options(&config, "openai::gpt-live-transcribe").prompt,
+            "Existing context"
+        );
+        assert_eq!(
+            options(&config, "openai::gpt-transcribe").temperature,
+            Some(0.4)
+        );
+        let source = config
+            .transcription
+            .model_options
+            .get_mut("deepgram::nova-3")
+            .unwrap();
+        source.streaming = false;
+        source.smart_format = false;
+        source.punctuate = false;
+        source.numerals = false;
+        initialize_model(&mut config, "deepgram::nova-2", Some("deepgram::nova-3"));
+        let target = options(&config, "deepgram::nova-2");
+        assert!(!target.streaming && !target.smart_format && !target.punctuate && !target.numerals);
+        initialize_model(
+            &mut config,
+            "elevenlabs::scribe_v2_realtime",
+            Some("deepgram::nova-3"),
+        );
+        let target = options(&config, "elevenlabs::scribe_v2_realtime");
+        assert!(!target.streaming);
+        assert!(target.no_verbatim);
+        initialize_model(
+            &mut config,
+            "deepgram::nova-2",
+            Some("openai::gpt-transcribe"),
+        );
+        assert!(
+            !options(&config, "deepgram::nova-2").streaming,
+            "reselection must not overwrite the saved profile"
+        );
+    }
+
     #[test]
     fn keywords_are_enabled_by_any_fallback_not_just_the_primary() {
         let mut c = Config::default();

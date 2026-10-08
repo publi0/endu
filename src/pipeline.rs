@@ -220,10 +220,13 @@ impl DictationWorker {
     ) -> Self {
         Self::start_with(
             history,
-            move |samples, context, vocabulary, live| {
-                recovery.transcribe_original(samples, context.application.as_deref(), |samples| {
-                    crate::providers::batch::transcribe(samples, vocabulary, live)
-                })
+            move |samples, context, vocabulary, live, preferences| {
+                recovery.transcribe_original(
+                    samples,
+                    context.application.as_deref(),
+                    preferences,
+                    |samples| crate::providers::batch::transcribe(samples, vocabulary, live),
+                )
             },
             move || {
                 let mut paster = Paster::new(activity);
@@ -246,6 +249,7 @@ impl DictationWorker {
             &ContextSnapshot,
             &crate::vocabulary::Snapshot,
             Option<crate::providers::streaming::PendingLive>,
+            crate::post_processing::Preferences,
         ) -> Result<crate::openrouter::transcribe::Transcription>
         + Send
         + 'static,
@@ -427,6 +431,7 @@ fn run_transcription_worker(
         &ContextSnapshot,
         &crate::vocabulary::Snapshot,
         Option<crate::providers::streaming::PendingLive>,
+        crate::post_processing::Preferences,
     ) -> Result<crate::openrouter::transcribe::Transcription>,
 ) {
     prioritize_transcription_thread();
@@ -446,7 +451,13 @@ fn run_transcription_worker(
         let samples = job.clip.into_transcription_samples();
         crate::microphone::record(&samples, input_description);
         let started = Instant::now();
-        let result = transcribe(&samples, &job.context, &job.vocabulary, live);
+        let result = transcribe(
+            &samples,
+            &job.context,
+            &job.vocabulary,
+            live,
+            job.options.post_processing,
+        );
         if is_shutting_down(state) {
             break;
         }
@@ -458,11 +469,8 @@ fn run_transcription_worker(
         };
         let result = result
             .map(|transcription| {
-                let formatted = job
-                    .options
-                    .post_processing
-                    .process(transcription.text.trim());
-                let restored = job.vocabulary.restore(formatted.trim());
+                // Recovery already formatted once before resolving the saved audio.
+                let restored = job.vocabulary.restore(transcription.text.trim());
                 CompletedTranscript {
                     options: PasteOptions {
                         preserve_name_case: restored.preserve_initial_case,
@@ -1015,7 +1023,7 @@ mod tests {
         let mut count = 0;
         let worker = DictationWorker::start_with(
             None,
-            move |_, _, _, _| {
+            move |_, _, _, _, _| {
                 count += 1;
                 Ok(test_transcription(if count == 1 { "held" } else { "next" }))
             },
@@ -1292,28 +1300,6 @@ mod tests {
             .unwrap();
         }
         drop(jobs);
-        let state = Mutex::new(WorkerState::default());
-        run_transcription_worker(
-            receiver,
-            &output,
-            &events,
-            &state,
-            |samples, context, vocabulary, live| {
-                if live.is_some() {
-                    return crate::providers::batch::transcribe(samples, vocabulary, live);
-                }
-                Ok(test_transcription(
-                    if context.application.as_deref() == Some("2") {
-                        "..."
-                    } else if context.application.as_deref() == Some("3") {
-                        assert_eq!(vocabulary.settings().terms, ["Nimbus-Files"]);
-                        "NIMBUSFILES"
-                    } else {
-                        "Olá...  JOÃO."
-                    },
-                ))
-            },
-        );
         let directory = std::env::temp_dir().join(format!(
             "hex-post-history-{}-{}",
             std::process::id(),
@@ -1323,6 +1309,35 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&directory).unwrap();
+        let recovery =
+            crate::recording_recovery::RecordingRecovery::open(directory.join("recovery")).unwrap();
+        let state = Mutex::new(WorkerState::default());
+        run_transcription_worker(
+            receiver,
+            &output,
+            &events,
+            &state,
+            |samples, context, vocabulary, live, preferences| {
+                recovery.transcribe_original(
+                    samples,
+                    context.application.as_deref(),
+                    preferences,
+                    |samples| {
+                        if live.is_some() {
+                            assert_eq!(vocabulary.settings().terms, ["Nimbus-Files"]);
+                            return crate::providers::batch::transcribe(samples, vocabulary, live);
+                        }
+                        Ok(test_transcription(
+                            if context.application.as_deref() == Some("2") {
+                                "..."
+                            } else {
+                                "Olá...  JOÃO."
+                            },
+                        ))
+                    },
+                )
+            },
+        );
         let history = History::new(crate::history::HistoryStore::open(
             directory.join("history.json"),
             crate::history::HistoryRetention::Week,
@@ -1372,7 +1387,25 @@ mod tests {
             &state,
         );
         assert!(
-            matches!(event, WorkerEvent::Completed { result: Ok(text), .. } if text.is_empty())
+            matches!(event, WorkerEvent::Completed { result: Err(error), .. } if error.contains("Post-processing removed all text"))
+        );
+        let entries = recovery.entries("");
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the unusable formatted result remains recoverable"
+        );
+        let entry = &entries[0];
+        assert_eq!(entry.application.as_deref(), Some("2"));
+        assert_eq!(
+            entry.status,
+            crate::recording_recovery::RecoveryStatus::Failed
+        );
+        assert!(
+            directory
+                .join("recovery")
+                .join(format!("{}.wav", entry.id))
+                .exists()
         );
         assert_eq!(history.search("").len(), 1);
         finish_output(
@@ -1403,7 +1436,19 @@ mod tests {
             Some(&history),
             &state,
         );
-        assert_eq!(history.search("Nimbus").len(), 1);
+        let entries = history.search("Nimbus");
+        assert_eq!(entries.len(), 1);
+        let report = entries[0].transcription.as_ref().unwrap();
+        assert_eq!(report.model.as_deref(), Some("deepgram::nova-3"));
+        assert_eq!(report.latency_ms, 425);
+        assert_eq!(report.executions.len(), 1);
+        assert_eq!(report.executions[0].provider, "deepgram");
+        assert!(report.executions[0].streaming);
+        assert_eq!(report.executions[0].keyword_count, 1);
+        let reloaded =
+            crate::recording_recovery::RecordingRecovery::open(directory.join("recovery")).unwrap();
+        assert_eq!(reloaded.entries("").len(), 1);
+        assert_eq!(reloaded.entries("")[0].id, entry.id);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1432,7 +1477,7 @@ mod tests {
             &output,
             &events,
             &Mutex::new(WorkerState::default()),
-            |_, context, _, _| {
+            |_, context, _, _, _| {
                 assert_eq!(context.application.as_deref(), Some("Notes"));
                 Err(color_eyre::eyre::eyre!("offline"))
             },
@@ -1486,7 +1531,7 @@ mod tests {
             None,
             {
                 let calls = calls.clone();
-                move |_, _, _, _| {
+                move |_, _, _, _, _| {
                     let _alive = &network_alive;
                     if calls.fetch_add(1, Ordering::SeqCst) == 0 {
                         return Ok(test_transcription("previous"));
@@ -1546,7 +1591,7 @@ mod tests {
             let (pasted, pastes) = mpsc::channel();
             let worker = DictationWorker::start_with(
                 None,
-                |_, _, _, _| Ok(test_transcription("previous")),
+                |_, _, _, _, _| Ok(test_transcription("previous")),
                 move || {
                     let mut first = true;
                     Box::new(move |prepare_only, text, _, _submit, commit| {
