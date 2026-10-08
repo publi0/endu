@@ -101,24 +101,21 @@ impl StepReport {
     /// Every request in order, labelled by why it was sent, for the History detail view.
     pub fn attempts(&self) -> Vec<AttemptView> {
         let show_cost = self.executions.len() > 1 || self.omitted_executions > 0;
-        let mut attempts: Vec<AttemptView> = if self.executions.is_empty() {
+        let views: Vec<AttemptView> = if self.executions.is_empty() {
             // Older History kept only the answering model and the failures before it.
-            let legacy = |id: &str, succeeded| {
-                let model = crate::providers::ModelRef::parse(id);
-                AttemptView {
-                    provider: model.provider.label().into(),
-                    model: model.model.into(),
-                    streaming: None,
-                    keyword_count: None,
-                    succeeded,
-                    step: AttemptStep::First,
-                    cost: None,
-                }
-            };
-            self.failed
-                .iter()
-                .map(|id| legacy(id, false))
-                .chain(self.model.as_deref().map(|id| legacy(id, true)))
+            self.legacy_requests()
+                .map(|request| {
+                    let model = crate::providers::ModelRef::parse(request.model);
+                    AttemptView {
+                        provider: model.provider.label().into(),
+                        model: model.model.into(),
+                        streaming: None,
+                        keyword_count: None,
+                        succeeded: request.succeeded,
+                        step: AttemptStep::First,
+                        cost: None,
+                    }
+                })
                 .collect()
         } else {
             self.executions
@@ -138,41 +135,73 @@ impl StepReport {
                 })
                 .collect()
         };
-        for index in 1..attempts.len() {
-            let (before, after) = attempts.split_at_mut(index);
-            let previous = &before[index - 1];
-            let current = &mut after[0];
-            let same_model =
-                previous.provider == current.provider && previous.model == current.model;
-            current.step = if previous.succeeded {
-                AttemptStep::Continued
-            } else if !same_model {
-                AttemptStep::Fallback
-            } else if previous.streaming == Some(true) && current.streaming == Some(false) {
-                AttemptStep::Recovery
-            } else {
-                AttemptStep::Retry
-            };
-        }
-        attempts
+        views
+            .into_iter()
+            .zip(self.steps())
+            .map(|(view, step)| AttemptView { step, ..view })
+            .collect()
     }
 
     /// One word for the History list when the answer needed more than one request.
+    /// Runs for every visible row on every frame, so it borrows instead of building views.
     pub fn recovery_badge(&self) -> Option<&'static str> {
-        let attempts = self.attempts();
-        if attempts
-            .iter()
-            .any(|attempt| attempt.step == AttemptStep::Fallback)
-        {
-            Some("Fallback")
-        } else if attempts
-            .iter()
-            .any(|attempt| matches!(attempt.step, AttemptStep::Retry | AttemptStep::Recovery))
-        {
-            Some("Retried")
-        } else {
-            None
+        let mut retried = false;
+        for step in self.steps() {
+            match step {
+                AttemptStep::Fallback => return Some("Fallback"),
+                AttemptStep::Retry | AttemptStep::Recovery => retried = true,
+                AttemptStep::First | AttemptStep::Continued => {}
+            }
         }
+        retried.then_some("Retried")
+    }
+
+    /// Why each request was sent, judged against the one before it.
+    fn steps(&self) -> impl Iterator<Item = AttemptStep> + '_ {
+        let requests: Box<dyn Iterator<Item = Request<'_>>> = if self.executions.is_empty() {
+            Box::new(self.legacy_requests())
+        } else {
+            Box::new(self.executions.iter().map(|execution| Request {
+                provider: &execution.provider,
+                model: &execution.model,
+                streaming: Some(execution.streaming),
+                succeeded: execution.outcome == "success",
+            }))
+        };
+        let mut previous: Option<Request<'_>> = None;
+        requests.map(move |current| {
+            let step = match previous {
+                None => AttemptStep::First,
+                Some(previous) if previous.succeeded => AttemptStep::Continued,
+                Some(previous)
+                    if (previous.provider, previous.model) != (current.provider, current.model) =>
+                {
+                    AttemptStep::Fallback
+                }
+                Some(previous)
+                    if previous.streaming == Some(true) && current.streaming == Some(false) =>
+                {
+                    AttemptStep::Recovery
+                }
+                Some(_) => AttemptStep::Retry,
+            };
+            previous = Some(current);
+            step
+        })
+    }
+
+    /// Legacy model ids already carry their provider prefix.
+    fn legacy_requests(&self) -> impl Iterator<Item = Request<'_>> {
+        let request = |model, succeeded| Request {
+            provider: "",
+            model,
+            streaming: None,
+            succeeded,
+        };
+        self.failed
+            .iter()
+            .map(move |model| request(model.as_str(), false))
+            .chain(self.model.as_deref().map(move |model| request(model, true)))
     }
 
     /// `(value, detail)` for the audio summary, mentioning trimming only when it happened.
@@ -183,6 +212,14 @@ impl StepReport {
             (seconds(audio.sent_ms), trimmed)
         })
     }
+}
+
+#[derive(Clone, Copy)]
+struct Request<'a> {
+    provider: &'a str,
+    model: &'a str,
+    streaming: Option<bool>,
+    succeeded: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -290,21 +327,26 @@ fn deserialize_cost<'de, D: serde::Deserializer<'de>>(
 }
 
 fn format_cost(cost: f64) -> String {
+    format!("{} USD", format_usd(cost))
+}
+
+/// A dollar amount that never rounds a positive cost to zero. Shared with Statistics.
+pub fn format_usd(cost: f64) -> String {
     if cost == 0.0 {
-        return "$0.00 USD".into();
+        return "$0.00".into();
     }
     if !(0.000_000_000_001..1_000_000_000.0).contains(&cost) {
-        return format!("${cost:.6e} USD");
+        return format!("${cost:.6e}");
     }
     let precision = if cost < 0.000_001 { 12 } else { 6 };
     let mut amount = format!("{cost:.precision$}");
     while amount.ends_with('0') && amount.len() - amount.find('.').unwrap_or(0) > 3 {
         amount.pop();
     }
-    format!("${amount} USD")
+    format!("${amount}")
 }
 
-fn seconds(ms: u64) -> String {
+pub fn seconds(ms: u64) -> String {
     format!("{:.1} s", ms as f64 / 1_000.0)
 }
 

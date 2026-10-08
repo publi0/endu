@@ -22,6 +22,10 @@ pub struct CatalogModel {
 impl CatalogModel {
     pub fn matches(&self, query: &str, verified_keywords: bool) -> bool {
         use crate::providers::{ModelRef, Provider};
+        // Opening a picker renders every model with an empty query.
+        if query.trim().is_empty() {
+            return true;
+        }
         let model = ModelRef::parse(&self.id);
         let capabilities = model.capabilities();
         let query = search_text(query);
@@ -106,7 +110,7 @@ fn search_text(text: &str) -> String {
 /// Native choices remain available even when the OpenRouter catalog is offline.
 pub fn native_catalog() -> Vec<CatalogModel> {
     crate::providers::native_models()
-        .into_iter()
+        .iter()
         .map(|model| CatalogModel {
             id: crate::providers::ModelRef {
                 provider: model.provider,

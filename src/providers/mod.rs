@@ -159,7 +159,7 @@ impl<'a> ModelRef<'a> {
             };
         }
         native_models()
-            .into_iter()
+            .iter()
             .find(|m| m.provider == self.provider && m.id == self.model)
             .map_or(Capabilities::default(), |m| m.capabilities)
     }
@@ -185,14 +185,22 @@ pub struct Capabilities {
     pub numerals: bool,
     pub no_verbatim: bool,
 }
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct NativeModel {
     pub provider: Provider,
     pub id: &'static str,
     pub name: &'static str,
     pub capabilities: Capabilities,
 }
-pub fn native_models() -> Vec<NativeModel> {
+/// The fixed native catalog. Built once: capability checks run per model on
+/// every search keystroke and render.
+pub fn native_models() -> &'static [NativeModel] {
+    static MODELS: std::sync::LazyLock<Vec<NativeModel>> =
+        std::sync::LazyLock::new(build_native_models);
+    &MODELS
+}
+
+fn build_native_models() -> Vec<NativeModel> {
     let openai = Capabilities {
         batch: true,
         keywords: true,
@@ -639,7 +647,7 @@ mod tests {
         config.transcription.language = "pt".into();
         config.transcription.temperature = Some(0.3);
         let mut ids: Vec<_> = native_models()
-            .into_iter()
+            .iter()
             .map(|model| {
                 ModelRef {
                     provider: model.provider,
