@@ -702,6 +702,10 @@ impl Progress {
         telemetry
     }
     fn fail(&mut self, id: &str, kind: ErrorKind, detail: &str) {
+        // Details are Hex's own sanitized wording (status codes, timeouts), the same
+        // text a failed dictation already logs. Keep every attempt, including ones a
+        // later fallback recovered, so intermittent provider failures stay diagnosable.
+        tracing::warn!(model = id, kind = ?kind, "{detail}");
         self.failures.push(Failure {
             model: id.to_owned(),
             kind,
@@ -1219,6 +1223,10 @@ fn transcribe_configured(
                     false,
                     None,
                 );
+                tracing::warn!(
+                    model = %model_id,
+                    "live transcription returned no text; recovering from the recorded clip"
+                );
                 progress.fail(
                     &model_id,
                     ErrorKind::InvalidResponse,
@@ -1229,6 +1237,13 @@ fn transcribe_configured(
                 check_cancelled(cancelled.as_deref())?;
                 let live_error = error.downcast_ref::<streaming::LiveError>();
                 let status = live_error.and_then(|error| error.status);
+                // LiveError text is Hex's own fixed wording plus a status code, never
+                // provider payloads, so it is safe to keep for diagnosing fallbacks.
+                tracing::warn!(
+                    model = %model_id,
+                    reason = %live_error.map_or_else(|| "unclassified".to_owned(), ToString::to_string),
+                    "live transcription failed; recovering from the recorded clip"
+                );
                 if live_error.is_none_or(|error| error.attempted) {
                     progress.attempt(
                         ModelRef::parse(&model_id),
