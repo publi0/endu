@@ -12,6 +12,9 @@ use crate::desktop_ui::{
 use crate::text_input::{self, Changed, Dismissed, EditFinished, Submitted, TextInput};
 use crate::vocabulary::{Snapshot, Vocabulary};
 
+const EXAMPLE_NAMES: [&str; 3] = ["OpenRouter", "Claude Code", "Nimbus-Files"];
+const EXAMPLE: &str = "Abri o open router e o CLAUDE CODE no mimbus files.";
+
 /// An in-flight change is displayed only after the parent confirms persistence.
 struct PendingChange {
     candidate: Vocabulary,
@@ -467,6 +470,63 @@ impl VocabularyView {
             .into_any_element()
     }
 
+    /// Fixed names show both rules even before the user adds their own.
+    fn example_result(&self) -> String {
+        Snapshot::new(Vocabulary {
+            terms: EXAMPLE_NAMES.map(String::from).to_vec(),
+            restore_names: self.preferences.restore_names,
+            approximate: self.preferences.approximate,
+            ..Default::default()
+        })
+        .restore(EXAMPLE)
+        .text
+    }
+
+    fn render_example(&self) -> AnyElement {
+        let column = |title: &'static str, text: String, color: u32| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .mb_1()
+                        .text_size(px(11.0))
+                        .text_color(rgb(MUTED))
+                        .child(title),
+                )
+                .child(div().text_size(px(12.0)).text_color(rgb(color)).child(text))
+        };
+        div()
+            .p_4()
+            .border_b_1()
+            .border_color(rgb(LINE))
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child("Example"),
+            )
+            .child(
+                div()
+                    .mt_1()
+                    .mb_3()
+                    .text_size(px(11.0))
+                    .text_color(rgb(MUTED))
+                    .child(format!(
+                        "With {}, {} and {} in the list",
+                        EXAMPLE_NAMES[0], EXAMPLE_NAMES[1], EXAMPLE_NAMES[2]
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_4()
+                    .child(column("Original", EXAMPLE.into(), MUTED))
+                    .child(column("Result", self.example_result(), TEXT)),
+            )
+            .into_any_element()
+    }
+
     pub fn restore_text(&self, text: &str) -> String {
         self.snapshot.restore(text).text
     }
@@ -513,6 +573,7 @@ impl Render for VocabularyView {
             panel = panel
                 .child(self.rule(1, "Restore names locally", "Restores case, spacing and punctuation after other formatting", self.preferences.restore_names, cx))
                 .child(self.rule(2, "Correct small spelling errors", "Only long names with one changed letter and a single clear match; URLs and code stay unchanged", self.preferences.approximate, cx))
+                .child(self.render_example())
                 .child(div().p_4().child(div().mb_2().text_size(px(11.0)).text_color(rgb(MUTED)).child("Try the local correction"))
                     .child(self.sample.clone())
                     .when(!result.is_empty(), |row| row.child(div().mt_2().text_size(px(12.0)).text_color(rgb(TEXT)).child(result))));
@@ -621,6 +682,29 @@ mod tests {
         assert!(appended_terms(&accepted, "Good Name, https://invalid").is_err());
         assert!(appended_terms(&accepted, "New Name, open router").is_err());
         assert_eq!(accepted.terms, ["OpenRouter"]);
+    }
+
+    #[gpui::test]
+    fn example_follows_the_local_rules(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| VocabularyView::new(vocabulary(&[]), true, cx));
+        let result = |cx: &mut gpui::VisualTestContext, restore_names, approximate| {
+            cx.update(|_, cx| {
+                view.update(cx, |view, _| {
+                    view.preferences.restore_names = restore_names;
+                    view.preferences.approximate = approximate;
+                    view.example_result()
+                })
+            })
+        };
+        assert_eq!(
+            result(cx, true, false),
+            "Abri o OpenRouter e o Claude Code no mimbus files."
+        );
+        assert_eq!(
+            result(cx, true, true),
+            "Abri o OpenRouter e o Claude Code no Nimbus-Files."
+        );
+        assert_eq!(result(cx, false, true), EXAMPLE);
     }
 
     #[gpui::test]

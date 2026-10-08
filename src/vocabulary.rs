@@ -178,7 +178,14 @@ impl Snapshot {
                 }
                 if let Some(&term) = self.0.exact.get(&normalized) {
                     exact = Some((end_index, end, term));
-                } else if self.settings().approximate && chars.len() >= 7 {
+                } else if self.settings().approximate
+                    && chars.len() >= 7
+                    // A one-letter edge word such as "o" or "e" is a whole
+                    // neighbouring word, not a spelling error inside the name.
+                    && [index, end_index]
+                        .iter()
+                        .all(|&edge| normalize(&text[words[edge].clone()]).chars().count() > 1)
+                {
                     for (term, candidate) in self.0.normalized.iter().enumerate() {
                         if candidate.len() >= 7
                             && chars
@@ -354,6 +361,12 @@ mod tests {
                 .restore("mimbusfiles")
                 .text,
             "mimbusfiles"
+        );
+        assert_eq!(
+            snapshot(&["OpenRouter", "Claude Code"], true)
+                .restore("abri o open router e o claude kode a")
+                .text,
+            "abri o OpenRouter e o Claude Code a"
         );
         assert_eq!(
             snapshot(&["NIMB", "Claude Code"], true)
