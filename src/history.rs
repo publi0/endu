@@ -189,6 +189,8 @@ pub struct HistoryStore {
     retention: HistoryRetention,
     prune_pending: bool,
     prune_error_reported: bool,
+    /// Bumped on every change to `entries`, so readers can skip unchanged polls.
+    revision: u64,
 }
 
 impl HistoryStore {
@@ -203,6 +205,7 @@ impl HistoryStore {
             retention,
             prune_pending: false,
             prune_error_reported: false,
+            revision: 0,
         };
         match fs::read(&store.path) {
             Ok(bytes) => match serde_json::from_slice::<LoadedHistory>(&bytes) {
@@ -254,6 +257,7 @@ impl HistoryStore {
                 .transcription
                 .map(crate::openrouter::StepReport::bounded),
         });
+        self.revision += 1;
         self.prune(now_ms);
         self.persist()?;
         Ok(Some(id))
@@ -266,6 +270,7 @@ impl HistoryStore {
         if self.entries.len() == before {
             return Ok(false);
         }
+        self.revision += 1;
         self.persist()?;
         Ok(true)
     }
@@ -279,6 +284,7 @@ impl HistoryStore {
             return Ok(());
         }
         self.entries.clear();
+        self.revision += 1;
         self.persist()
     }
 
@@ -290,6 +296,8 @@ impl HistoryStore {
             return Ok(());
         }
         self.retention = retention;
+        // The visible window changes even when nothing is removed.
+        self.revision += 1;
         if self.prune(now_ms) {
             self.persist()?;
         }
@@ -309,6 +317,22 @@ impl HistoryStore {
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Changes whenever a search could return different entries: a stored
+    /// change, or an entry leaving the retention window before the next prune.
+    pub fn view_key(&self, now_ms: u64) -> (u64, usize) {
+        let visible = match self.retention.max_age_ms() {
+            Some(max_age) => {
+                let cutoff = now_ms.saturating_sub(max_age);
+                self.entries
+                    .iter()
+                    .filter(|entry| entry.timestamp_ms >= cutoff)
+                    .count()
+            }
+            None => self.entries.len(),
+        };
+        (self.revision, visible)
     }
 
     /// Case-insensitive substring search over text, application, and model.
@@ -346,14 +370,22 @@ impl HistoryStore {
             self.entries.retain(|entry| entry.timestamp_ms >= cutoff);
             changed |= self.entries.len() != before;
         }
-        while self.entries.len() > MAX_ENTRIES {
-            self.entries.remove(0);
+        // Drop the oldest entries in one pass rather than shifting the vector per removal.
+        let mut excess = self.entries.len().saturating_sub(MAX_ENTRIES);
+        let mut total: usize = self.entries[excess..]
+            .iter()
+            .map(HistoryEntry::text_bytes)
+            .sum();
+        while total > MAX_TOTAL_TEXT_BYTES && self.entries.len() - excess > 1 {
+            total -= self.entries[excess].text_bytes();
+            excess += 1;
+        }
+        if excess > 0 {
+            self.entries.drain(..excess);
             changed = true;
         }
-        let mut total: usize = self.entries.iter().map(HistoryEntry::text_bytes).sum();
-        while total > MAX_TOTAL_TEXT_BYTES && self.entries.len() > 1 {
-            total -= self.entries.remove(0).text_bytes();
-            changed = true;
+        if changed {
+            self.revision += 1;
         }
         self.prune_pending |= changed;
         changed
@@ -455,6 +487,10 @@ impl History {
     }
 
     /// Bounded snapshot of matching entries, newest first.
+    pub fn view_key(&self) -> (u64, usize) {
+        self.locked().view_key(now_ms())
+    }
+
     pub fn search(&self, query: &str) -> Vec<HistoryEntry> {
         self.locked()
             .search(query, now_ms())
@@ -595,6 +631,24 @@ mod tests {
             .map(|entry| entry.text.as_str())
             .collect();
         assert_eq!(texts, ["newest"]);
+    }
+
+    #[test]
+    fn view_key_moves_only_when_a_search_could_change() {
+        let path = temp_path("view-key");
+        let day_ms = HistoryRetention::Day.max_age_ms().unwrap();
+        let mut store = HistoryStore::open(path, HistoryRetention::Day, 0);
+        let empty = store.view_key(0);
+        assert_eq!(store.view_key(0), empty);
+        let id = store.record(draft("old"), 1_000).unwrap().unwrap();
+        store.record(draft("fresh"), 2_000).unwrap();
+        let recorded = store.view_key(2_000);
+        assert_ne!(recorded, empty);
+        assert_eq!(store.view_key(2_500), recorded);
+        // Expiry is visible to search before the idle prune removes anything.
+        assert_ne!(store.view_key(day_ms + 1_001), recorded);
+        store.delete(id).unwrap();
+        assert_ne!(store.view_key(2_000), recorded);
     }
 
     #[test]

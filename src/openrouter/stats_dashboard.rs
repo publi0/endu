@@ -131,7 +131,7 @@ pub fn comparison_rows(
 
 fn model_label(model: ModelRef<'_>) -> String {
     let native = crate::providers::native_models()
-        .into_iter()
+        .iter()
         .find(|native| native.provider == model.provider && native.id == model.model);
     format!(
         "{} · {}",

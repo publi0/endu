@@ -94,6 +94,8 @@ struct State {
     // and explicitly warn the user. No implementation can survive a crash
     // without writable storage, so never label this fallback as durable.
     volatile: BTreeMap<String, Arc<Vec<f32>>>,
+    /// Bumped whenever `entries` or `active` change, so the History poll can skip clones.
+    revision: u64,
 }
 
 #[derive(Clone)]
@@ -207,6 +209,13 @@ impl RecordingRecovery {
         self.load_warning.as_deref()
     }
 
+    pub fn revision(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .revision
+    }
+
     pub fn entries(&self, query: &str) -> Vec<RecoveryEntry> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let needle = query.trim().to_lowercase();
@@ -214,7 +223,8 @@ impl RecordingRecovery {
             .entries
             .values()
             .filter(|entry| {
-                entry.title().to_lowercase().contains(&needle)
+                needle.is_empty()
+                    || entry.title().to_lowercase().contains(&needle)
                     || entry.application_label().to_lowercase().contains(&needle)
                     || entry
                         .text
@@ -337,6 +347,7 @@ impl RecordingRecovery {
         }
         state.active.insert(entry.id.clone());
         state.entries.insert(entry.id.clone(), entry.clone());
+        state.revision += 1;
         entry
     }
 
@@ -358,6 +369,7 @@ impl RecordingRecovery {
         // ActiveAttempt alone releases ownership. Releasing here would allow
         // Retry to start before the original guard drops and clears the new owner.
         state.entries.insert(entry.id.clone(), entry);
+        state.revision += 1;
     }
 
     /// Run on the transcription worker, never on the capture callback. A failed
@@ -405,6 +417,7 @@ impl RecordingRecovery {
                     let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     state.entries.remove(&entry.id);
                     state.volatile.remove(&entry.id);
+                    state.revision += 1;
                 } else {
                     self.finish_failure(
                         entry,
@@ -481,6 +494,7 @@ impl RecordingRecovery {
                 .ok_or_else(|| io::Error::other("This recording is not available to retry"))?;
             state.active.insert(id.to_owned());
             state.retrying = true;
+            state.revision += 1;
             entry
         };
         let store = self.clone();
@@ -499,6 +513,7 @@ impl RecordingRecovery {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.active.remove(&id);
             state.retrying = false;
+            state.revision += 1;
             return Err(error);
         }
         Ok(())
@@ -584,6 +599,7 @@ impl RecordingRecovery {
                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 state.volatile.remove(&entry.id);
                 state.entries.insert(entry.id.clone(), entry);
+                state.revision += 1;
             }
             Ok(_) => self.finish_failure(
                 entry,
@@ -607,6 +623,7 @@ impl RecordingRecovery {
         remove_recording_files(&self.directory, id)?;
         state.entries.remove(id);
         state.volatile.remove(id);
+        state.revision += 1;
         Ok(())
     }
 }
@@ -792,6 +809,7 @@ impl Drop for ActiveAttempt {
     fn drop(&mut self) {
         let mut state = self.store.state.lock().unwrap_or_else(|e| e.into_inner());
         state.active.remove(&self.id);
+        state.revision += 1;
         if self.retry {
             state.retrying = false;
         }

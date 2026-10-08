@@ -736,7 +736,7 @@ mod tests {
     fn provider_formatting_controls_follow_each_capability(cx: &mut gpui::TestAppContext) {
         let mut config = Config::default();
         let google = providers::native_models()
-            .into_iter()
+            .iter()
             .find(|model| model.provider == providers::Provider::Google)
             .unwrap();
         config.transcription.models = vec![format!("google::{}", google.id)];

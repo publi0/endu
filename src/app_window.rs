@@ -535,6 +535,8 @@ pub struct AppWindow {
     history: Option<History>,
     history_search: Entity<TextInput>,
     history_entries: Vec<HistoryEntry>,
+    /// Store revisions behind the loaded lists; polling reloads only when they move.
+    history_loaded: Option<((u64, usize), u64)>,
     recovery: Option<RecordingRecovery>,
     recovery_entries: Vec<RecoveryEntry>,
     selected_recovery: Option<String>,
@@ -1007,6 +1009,7 @@ impl AppWindow {
             history,
             history_search,
             history_entries: Vec::new(),
+            history_loaded: None,
             recovery: if preview_mode {
                 preview
                     .as_ref()
@@ -1476,7 +1479,18 @@ impl AppWindow {
 
     // ---- History -----------------------------------------------------------
 
+    fn history_revisions(&self) -> ((u64, usize), u64) {
+        (
+            self.history.as_ref().map_or((0, 0), History::view_key),
+            self.recovery
+                .as_ref()
+                .map_or(0, RecordingRecovery::revision),
+        )
+    }
+
     fn reload_history(&mut self, cx: &App) {
+        // Read revisions first: a change landing during the reload is picked up next poll.
+        self.history_loaded = Some(self.history_revisions());
         let query = self.history_search.read(cx).text().to_string();
         self.recovery_entries = self
             .recovery
@@ -1498,7 +1512,6 @@ impl AppWindow {
             self.selected_history = None;
             return;
         };
-        let query = self.history_search.read(cx).text().to_string();
         self.history_entries = history.search(&query);
         if self
             .selected_history
@@ -1516,8 +1529,11 @@ impl AppWindow {
         {
             return false;
         }
+        if self.history_loaded == Some(self.history_revisions()) {
+            return false;
+        }
         let previous = std::mem::take(&mut self.history_entries);
-        let previous_recovery = self.recovery_entries.clone();
+        let previous_recovery = std::mem::take(&mut self.recovery_entries);
         self.reload_history(cx);
         self.history_entries != previous || self.recovery_entries != previous_recovery
     }
@@ -1704,7 +1720,7 @@ impl AppWindow {
                             .child(format!(
                                 "{} · {} audio · {}",
                                 entry.application_label(),
-                                seconds_label(entry.audio_ms),
+                                crate::openrouter::report::seconds(entry.audio_ms),
                                 event_age(entry.timestamp_ms)
                             )),
                     )
@@ -1795,7 +1811,7 @@ impl AppWindow {
         div().id("recovery-detail").flex_1().min_w_0().h_full().overflow_y_scroll().px_6().py_6()
             .child(div().text_size(px(18.0)).font_weight(FontWeight::SEMIBOLD).child(entry.title()))
             .child(div().mt_2().text_size(px(11.0)).text_color(rgb(MUTED))
-                .child(format!("{} audio · {}", seconds_label(entry.audio_ms), event_age(entry.timestamp_ms))))
+                .child(format!("{} audio · {}", crate::openrouter::report::seconds(entry.audio_ms), event_age(entry.timestamp_ms))))
             .child(div().mt_3().child(detail_row("Application", entry.application_label())))
             .child(div().mt_4().child(actions))
             .children(self.recovery_error.clone().map(|error| div().mt_3()
@@ -2137,7 +2153,9 @@ impl AppWindow {
                                 "Audio sent",
                                 report
                                     .and_then(|report| report.audio_summary())
-                                    .unwrap_or_else(|| (seconds_label(entry.audio_ms), None)),
+                                    .unwrap_or_else(|| {
+                                        (crate::openrouter::report::seconds(entry.audio_ms), None)
+                                    }),
                             ))
                             .child(history_tile("Cost (USD)", {
                                 let summary = report.map_or_else(
@@ -4992,10 +5010,6 @@ fn history_attempt_row(
                 ),
         )
         .into_any_element()
-}
-
-fn seconds_label(ms: u64) -> String {
-    format!("{:.1} s", ms as f64 / 1_000.0)
 }
 
 fn event_age(timestamp_ms: u64) -> String {

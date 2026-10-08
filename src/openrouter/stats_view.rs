@@ -1305,18 +1305,7 @@ fn format_cost(usd: f64) -> String {
     if !usd.is_finite() || usd < 0.0 {
         return "—".into();
     }
-    if usd == 0.0 {
-        return "$0.00".into();
-    }
-    if !(0.000_000_000_001..1_000_000_000.0).contains(&usd) {
-        return format!("${usd:.6e}");
-    }
-    let precision = if usd < 0.000_001 { 12 } else { 6 };
-    let mut amount = format!("{usd:.precision$}");
-    while amount.ends_with('0') && amount.len() - amount.find('.').unwrap_or(0) > 3 {
-        amount.pop();
-    }
-    format!("${amount}")
+    super::report::format_usd(usd)
 }
 fn short_day(day: &str) -> String {
     const MONTHS: [&str; 12] = [
