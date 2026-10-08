@@ -7159,7 +7159,7 @@ dependencies = [
 
 [[package]]
 name = "voice-control"
-version = "3.4.3"
+version = "3.4.4"
 dependencies = [
  "arboard",
  "block2",
