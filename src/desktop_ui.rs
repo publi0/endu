@@ -4,6 +4,70 @@ use gpui::{
     px, rgb, rgba,
 };
 
+/// Marks a control so the layout test can check that it stays horizontally
+/// inside every [`layout_container`] it overlaps. A no-op outside tests.
+pub(crate) fn layout_item<E: InteractiveElement>(element: E) -> E {
+    layout_probe(element, LayoutProbe::Item)
+}
+
+/// Marks a clipping surface (a panel or content column). Containers are
+/// themselves checked against the containers that enclose them.
+pub(crate) fn layout_container<E: InteractiveElement>(element: E) -> E {
+    layout_probe(element, LayoutProbe::Container)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LayoutProbe {
+    Item,
+    Container,
+}
+
+#[cfg(test)]
+fn layout_probe<E: InteractiveElement>(element: E, kind: LayoutProbe) -> E {
+    match layout_probes::register(kind) {
+        Some(name) => element.debug_selector(|| name),
+        None => element,
+    }
+}
+
+#[cfg(not(test))]
+fn layout_probe<E: InteractiveElement>(element: E, _: LayoutProbe) -> E {
+    element
+}
+
+/// Names the probes built on this thread while recording, so a test can look
+/// their bounds up after a frame. Probes from earlier frames have no bounds.
+/// Other tests never record, so their frames do not grow the list.
+#[cfg(test)]
+pub(crate) mod layout_probes {
+    use super::LayoutProbe;
+    use std::cell::{Cell, RefCell};
+
+    thread_local! {
+        static RECORDING: Cell<bool> = const { Cell::new(false) };
+        static PROBES: RefCell<Vec<(String, LayoutProbe)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn register(kind: LayoutProbe) -> Option<String> {
+        RECORDING.get().then(|| {
+            PROBES.with_borrow_mut(|probes| {
+                let name = format!("layout-probe-{}", probes.len());
+                probes.push((name.clone(), kind));
+                name
+            })
+        })
+    }
+
+    pub(crate) fn record() {
+        RECORDING.set(true);
+        PROBES.take();
+    }
+
+    pub(crate) fn take() -> Vec<(String, LayoutProbe)> {
+        PROBES.take()
+    }
+}
+
 /// Keyboard state shared by the small choice menus. Domain edits remain with
 /// their owner, so a failed save can leave the menu and its focus intact.
 pub(crate) struct PickerState {
@@ -223,8 +287,7 @@ pub(crate) fn pane_list(
     error_title: &'static str,
     error: Option<String>,
 ) -> Stateful<Div> {
-    div()
-        .id(id)
+    layout_container(div().id(id))
         .w(px(PANE_LIST_WIDTH))
         .h_full()
         .flex_none()
@@ -286,7 +349,7 @@ pub(crate) fn pane_body() -> Div {
 /// The one pane-header action button, using the shared control height. Every
 /// clickable header action renders this.
 pub(crate) fn header_button(label: impl IntoElement) -> Div {
-    div()
+    layout_item(div())
         .h(px(CONTROL_HEIGHT))
         .px_3()
         .flex()
@@ -303,7 +366,7 @@ pub(crate) fn header_button(label: impl IntoElement) -> Div {
 
 /// The one pane content column, bounded to [`PANE_CONTENT_WIDTH`].
 pub(crate) fn pane_content() -> Div {
-    div()
+    layout_container(div())
         .w_full()
         .max_w(px(PANE_CONTENT_WIDTH))
         .min_h(px(0.0))
@@ -321,7 +384,7 @@ pub(crate) fn section_label(label: &'static str) -> AnyElement {
 }
 
 pub(crate) fn hotkey_keycaps(parts: Vec<String>, opacity: f32) -> AnyElement {
-    div()
+    layout_item(div())
         .flex()
         .items_center()
         .gap(px(3.0))
@@ -378,7 +441,7 @@ pub(crate) fn toggle(position: f32) -> AnyElement {
     let color_position = position.clamp(0.0, 1.0);
     // The off track stays visibly lighter than the panel so a switch never
     // reads as a lone knob or a checkbox.
-    div()
+    layout_item(div())
         .w(px(28.0))
         .h(px(16.0))
         .p(px(2.0))
@@ -477,7 +540,7 @@ pub(crate) fn settings_copy(
 }
 
 pub(crate) fn compact_button(label: impl IntoElement) -> Div {
-    div()
+    layout_item(div())
         .h(px(CONTROL_HEIGHT))
         .px_3()
         .flex()
@@ -490,7 +553,7 @@ pub(crate) fn compact_button(label: impl IntoElement) -> Div {
 }
 
 pub(crate) fn compact_panel() -> Div {
-    div()
+    layout_container(div())
         .w_full()
         .rounded(px(PANEL_RADIUS))
         .border_1()
@@ -520,7 +583,7 @@ pub(crate) fn compact_panel_header(title: impl IntoElement, action: Option<AnyEl
 }
 
 pub(crate) fn disclosure_button(label: impl IntoElement) -> Div {
-    div()
+    layout_item(div())
         .w(px(SETTINGS_CONTROL_WIDTH))
         .h(px(CONTROL_HEIGHT))
         .px_3()
@@ -593,7 +656,7 @@ pub(crate) fn settings_panel() -> Div {
 }
 
 pub(crate) fn segmented_control() -> Div {
-    div()
+    layout_item(div())
         .h(px(CONTROL_HEIGHT))
         .p(px(2.0))
         .flex_none()
@@ -606,7 +669,7 @@ pub(crate) fn segmented_control() -> Div {
 }
 
 pub(crate) fn segmented_item(selected: bool) -> Div {
-    div()
+    layout_item(div())
         .h(px(26.0))
         .px_3()
         .flex()

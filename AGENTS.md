@@ -312,6 +312,10 @@ not reintroduce seams for them.
   to finish so their callbacks cannot overwrite the imported editor state.
 - Every pane renders the `desktop_ui` scaffold: `pane_header` or
   `pane_header_with_action`, then one column bounded by `PANE_CONTENT_WIDTH`.
+  Build controls from the shared `desktop_ui` primitives; a new control or
+  panel outside them is wrapped in `layout_item`/`layout_container` so the
+  every-pane layout test checks that it never crosses a panel edge. Text
+  beside a fixed control shrinks and wraps (`flex_1`, `min_w_0`).
 
 - Choice menus support Tab, arrows, Enter, and Escape, restore focus to their
   trigger, and keep errors visible outside scrollable choices. Setup must not

@@ -1697,6 +1697,8 @@ impl OpenRouterSettings {
                     .gap_4()
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .text_size(px(11.0))
                             .text_color(rgb(MUTED))
                             .child(format!(
@@ -1942,7 +1944,7 @@ fn button(label: impl Into<SharedString>, primary: bool) -> gpui::Div {
 }
 
 fn icon_button(glyph: &'static str, _label: &'static str) -> gpui::Div {
-    div()
+    crate::desktop_ui::layout_item(div())
         .size(px(crate::desktop_ui::CONTROL_HEIGHT))
         .flex_none()
         .flex()

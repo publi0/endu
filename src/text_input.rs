@@ -1374,7 +1374,7 @@ impl Render for TextInput {
         } else {
             LINE
         };
-        div()
+        crate::desktop_ui::layout_item(div())
             .key_context("TextInput")
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)

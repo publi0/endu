@@ -716,7 +716,7 @@ fn menu_frame(id: &'static str) -> gpui::Stateful<gpui::Div> {
         .occlude()
 }
 fn choice(label: String, active: bool) -> gpui::Div {
-    div()
+    crate::desktop_ui::layout_item(div())
         .min_h(px(crate::desktop_ui::CONTROL_HEIGHT))
         .px_3()
         .py_2()

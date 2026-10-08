@@ -2898,6 +2898,78 @@ mod tests {
         assert!(cx.debug_bounds("model-options-context").is_none());
     }
 
+    /// Every probed control and panel must stay horizontally inside each
+    /// panel or content column it overlaps. A control pushed past a clipping
+    /// edge is cut off instead of wrapping or shrinking its neighbours.
+    fn assert_layout_probes_fit(cx: &mut gpui::VisualTestContext, scene: &str) {
+        use crate::desktop_ui::{LayoutProbe, layout_probes};
+        let probes: Vec<_> = layout_probes::take()
+            .into_iter()
+            .filter_map(|(name, kind)| {
+                let name: &'static str = Box::leak(name.into_boxed_str());
+                cx.debug_bounds(name)
+                    .filter(|bounds| bounds.size.width > px(0.0) && bounds.size.height > px(0.0))
+                    .map(|bounds| (name, kind, bounds))
+            })
+            .collect();
+        for kind in [LayoutProbe::Item, LayoutProbe::Container] {
+            assert!(
+                probes.iter().any(|(_, probe, _)| *probe == kind),
+                "{scene}: no {kind:?} probes rendered"
+            );
+        }
+        let tolerance = px(0.5);
+        let within = |inner: &Bounds<gpui::Pixels>, outer: &Bounds<gpui::Pixels>| {
+            inner.left() >= outer.left() - tolerance && inner.right() <= outer.right() + tolerance
+        };
+        for (name, probe, bounds) in &probes {
+            assert!(
+                bounds.left() >= px(SIDEBAR_WIDTH) - tolerance
+                    && bounds.right() <= px(WINDOW_WIDTH) + tolerance,
+                "{scene}: {name} {bounds:?} leaves the pane"
+            );
+            for (container_name, kind, container) in &probes {
+                let overlaps = bounds.left() < container.right()
+                    && container.left() < bounds.right()
+                    && bounds.top() < container.bottom()
+                    && container.top() < bounds.bottom();
+                if container_name == name || *kind != LayoutProbe::Container || !overlaps {
+                    continue;
+                }
+                // Overlapping containers must nest, in either direction.
+                let nested = *probe == LayoutProbe::Container && within(container, bounds);
+                assert!(
+                    within(bounds, container) || nested,
+                    "{scene}: {name} {bounds:?} crosses the edge of {container_name} {container:?}"
+                );
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn controls_stay_inside_their_panels_in_every_pane(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(preview_fixture);
+        cx.simulate_resize(size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)));
+        for pane in Pane::ALL {
+            crate::desktop_ui::layout_probes::record();
+            cx.update(|_, cx| view.update(cx, |view, cx| view.select_pane(pane, cx)));
+            cx.run_until_parked();
+            assert_layout_probes_fit(cx, &format!("{pane:?}"));
+        }
+        // A one-model chain places the fallback hint beside its Add button.
+        crate::desktop_ui::layout_probes::record();
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let mut config = view.openrouter_settings.read(cx).config_snapshot();
+                config.transcription.models = vec!["openai::gpt-4o-transcribe".into()];
+                view.synchronize_model_config(config, cx);
+                view.show_models(cx);
+            })
+        });
+        cx.run_until_parked();
+        assert_layout_probes_fit(cx, "Models with one model");
+    }
+
     #[gpui::test]
     fn removing_and_restoring_provider_key_refreshes_model_editors(cx: &mut gpui::TestAppContext) {
         let (view, cx) = cx.add_window_view(preview_fixture);
