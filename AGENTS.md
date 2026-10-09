@@ -1,8 +1,8 @@
-# Hex Agent Guide
+# Endu Agent Guide
 
 ## Purpose
 
-A slim macOS fork of HEX: tap a shortcut to lock recording or hold and release,
+Endu (Tupi for "to hear"), which began as a slim macOS fork of HEX: tap a shortcut to lock recording or hold and release,
 trim the silence, send
 the clip to a speech provider with an ordered fallback chain, and paste the
 transcript. Settings, Microphone, Providers, Models, Post-processing, HUD, History, and Statistics are the panes.
@@ -40,6 +40,8 @@ not reintroduce seams for them.
   compatible features.
 - `pipeline`: one transcription worker and one ordered output worker with
   bounded queues, cancellation, paste-last, and History recording.
+- `doorbell`: a level-triggered wake-up that idle loops block on; producers
+  ring it after queueing work.
 - `openrouter`: configuration (`openrouter.json`), Keychain key handling,
   energy VAD (`vad`), chunking and fallback (`transcribe`), curl transport
   (`http`), the STT catalog (`catalog`), History reports (`report`), daily
@@ -61,6 +63,21 @@ not reintroduce seams for them.
   a restart, using the app bundle enclosing the current executable.
 - `app_settings`: persisted app settings and their live runtime projection.
 - `app_window`, `desktop_ui`, `text_input`: the GPUI window and controls.
+  Animations go through `desktop_ui::animate_once`/`animate_loop` or a
+  settling spring; all honor macOS Reduce Motion (end state at once, and
+  always in tests). Nothing may request frames while the window is at rest.
+- `nav_icons`: the sidebar icons, drawn as vectors so each plays its own
+  motion when its pane opens (clock hands turn, bars regrow, sliders slide).
+- `i18n`: interface language (System, Português, English, Español). English
+  text is the key; `t("…")` and `tf!("… {name}", name = value)` translate it
+  through `i18n/pt.rs` and `i18n/es.rs`. A test scans the sources and fails if
+  any key lacks a translation or a placeholder. Never translate identifiers,
+  key contexts, serialized values, logs or text the code compares; translate at
+  the point of display instead.
+- `appearance`: System/Light/Dark preferences. The window applies its choice
+  as the application's appearance override and repaints from the effective
+  window appearance; the HUD has its own choice and samples the system
+  appearance when it opens.
 - `desktop`: the GPUI application, menus, menu bar item, HUD, and listener
   thread lifetime.
 - `dictation_indicator`: the click-through Metal HUD.
@@ -68,6 +85,10 @@ not reintroduce seams for them.
   palettes, size, brightness, monitor selection and coherent runtime snapshots.
 - `interaction_settings`, `sound_settings_view`: independent sound volumes and
   double-tap sensitivity, preserving legacy audible levels and timing defaults.
+- `start_cue`: selectable recording start cues, rendered once and
+  deterministically before playback. Breath is the default; Classic keeps the
+  original bundled recording. The microphone is already open, so keep cues short.
+  Choosing a cue or pressing Play previews it, even while sounds are off.
 - `microphone_priority_view`: ordered Automatic input preferences; the audio
   owner applies device changes only between clips.
 - `preferences_transfer`: a versioned, validated allowlist; never export keys,
@@ -83,6 +104,13 @@ not reintroduce seams for them.
 - Capture never waits on transcription, paste, History, or statistics. Queues
   stay bounded. Starting a new capture never cancels accepted work, and output
   keeps submission order.
+- Idle loops block instead of polling. The listener turns every 20 ms only
+  while recording, opening, recovering, holding a key, or with unprocessed
+  input or pipeline work; the UI loop turns at 16 ms only while the HUD, paste
+  notice or menu bar glyph animates; the tone worker polls only while it holds
+  an output device. Whatever queues work for a sleeping loop rings its
+  doorbell. One-second fallbacks cover only bookkeeping that needs no prompt
+  reaction; boundaries still come from event timestamps.
 - Default TapOrHold locks on a clean release before 300 ms; the next press
   finishes. Holding at least 300 ms finishes on release. Hold and DoubleTap
   remain selectable legacy modes. DoubleTap uses the selected timing window
@@ -205,6 +233,11 @@ not reintroduce seams for them.
   the terminal acknowledgement. Never promote an interim segment or socket close
   to a completed transcript. Cover empty terminal text and absent confirmation
   through the provider dispatcher so valid streaming never triggers a second upload.
+  ElevenLabs Scribe Realtime auto-commits near 36 s and a commit inside a phrase
+  can drop the words after it. Commit before that, only in a sustained pause
+  (live: 400 ms quiet after 15 s; forced at 30 s), and join every committed
+  segment. Completed clips go out as one-second messages (100 ms bursts end in
+  queue_overflow), commit in the quietest 500 ms, and wait for each segment.
   Meta uses Muse Voice Transcribe's native PUSH_TO_TALK API: named languageBias,
   shared keywords and mono PCM16 at 16 kHz. Its WebSocket credential belongs only
   in the first JSON handshake, never HTTP headers or query parameters. Wait for
@@ -257,6 +290,14 @@ not reintroduce seams for them.
 - Normal History records only successful pasted output with seven-day default
   retention and hard caps. The History pane also exposes separate recovery
   entries, whose audio/text must not be pruned by those normal-history rules.
+  The list fills the pane and is one timeline, newest first: failed
+  recordings stay in recording order among dictations, never pinned on top.
+  Rows offer Copy, and failed recordings one "Retry & copy" that copies the
+  recovered text when the retry succeeds (never pastes; dropped if the user
+  leaves History first), without opening the entry. An
+  entry opens across the whole pane, never in a column beside the list. Back
+  or Escape returns to the list with its search and scroll intact; Up/Down
+  open the neighbouring entry.
 - Capture the destination at recording start. Immediately before writing the
   clipboard, verify it is still the foreground application. Send the shortcut
   to that verified process, never globally. A different or missing target
@@ -293,7 +334,20 @@ not reintroduce seams for them.
   It never changes captured audio; an explicit opt-out stays off across reloads
   and preference transfers. Stale or invalid meter values must settle to rest.
   HUD choices apply only after successful saves, with old settings defaulting
-  to Top/Red/Blue. Position uses visibleFrame to avoid the Dock; Paste Last's
+  to Top/Red/Blue/System. The HUD is a dark (light: Tabatinga) capsule with
+  two fine lines in the phase color: they follow the voice while recording,
+  run quickly while transcribing, rest gray while preparing and give way to a
+  check when done. A clip with no speech ends with a written "No audio" notice
+  in the capsule instead of the check; when it was streamed, the live session
+  stops at once, the dictation fails with the error tone and nothing is kept
+  for recovery. A successful but very quiet clip ends with "Low audio". The
+  same notices appear live while recording, judged only from the HUD meter:
+  "No audio" after a second without signal or samples (muted or wrong
+  microphone), "Low audio" when peaks stay under -35 dBFS after 2.5 s; they
+  clear as soon as sound returns. "Audio warnings" in HUD (default on) turns
+  them off; silence then just leaves, never with a check. The notice is a
+  native label over the Metal view and follows the capsule's opacity. The capsule keeps its width while transcribing; there is no
+  orb. Position uses visibleFrame to avoid the Dock; Paste Last's
   notice follows the same screen and edge. Palette changes affect the entire
   phase, including its glow and highlights, and never tint Preparing. Missing
   fixed displays or active-window metadata fall back without permission prompts.
@@ -316,6 +370,23 @@ not reintroduce seams for them.
   panel outside them is wrapped in `layout_item`/`layout_container` so the
   every-pane layout test checks that it never crosses a panel edge. Text
   beside a fixed control shrinks and wraps (`flex_1`, `min_w_0`).
+- Colors are `desktop_ui::ThemeColor` tokens resolved per appearance: Graphite
+  in dark, Tabatinga in light, one urucum accent. Use `desktop_ui::rgb` and a
+  token; never hard-code a color that only works in one appearance. Selected
+  segments use the soft accent with accent text; navigation icons sit without
+  tiles and turn urucum when selected. Section titles are sentence case.
+  Panel edges use Line, separators inside a panel use Divider, and
+  segmented and shortcut controls sit on the recessed Track; toggles are pills. Every
+  appearance choice defaults to System and remains a manual setting.
+- Brand: the app and menu bar glyph are a single-stroke "e" whose zigzag
+  crossbar turns into its arc (urucum wave, jenipapo arc, tabatinga field).
+  The menu bar glyph is a drawn template image; recording animates the wave,
+  transcription rewrites the e over a faint ghost, and the update badge keeps
+  a clear ring. The window sidebar shows only the monoline "endu" wordmark,
+  aligned with the navigation icons; the icon lives in the Dock and menu bar.
+  It is drawn as vectors from `resources/brand/wordmark-*.svg`; a click plays a
+  short thank-you: the e's crossbar becomes the urucum wave and the letters hop.
+  No tagline.
 
 - Choice menus support Tab, arrows, Enter, and Escape, restore focus to their
   trigger, and keep errors visible outside scrollable choices. Setup must not
@@ -382,7 +453,7 @@ the changes uncommitted. Do not move the checks into GitHub Actions.
 ## Build and preview
 
 ```sh
-scripts/build-app.sh  # target/app/Hex-<version>.zip
+scripts/build-app.sh  # target/app/Endu-<version>.zip
 cargo run -- preview settings
 cargo run -- preview microphone
 cargo run -- preview models
@@ -397,6 +468,9 @@ cargo run -- preview dictation-hud --hud-position bottom --recording-color green
 cargo run -- preview paste-notice
 ```
 
+The `dictation-hud` preview also installs the menu bar glyph, so both follow
+the same simulated capture cycle.
+
 Only macOS builds the app. Other platforms can run the portable modules'
 tests, but there is no Linux app. Previews must not access real configuration,
 credentials, or network services. The History preview includes a synthetic WAV
@@ -406,7 +480,7 @@ normal History polling.
 ## GitHub: releases only
 
 `.github/workflows/release.yml` may build, package, sign, publish a release,
-and update `Casks/hex-openrouter.rb`. **Do not add formatting, linting, unit
+and update `Casks/endu.rb`. **Do not add formatting, linting, unit
 tests, integration tests, or other validation jobs to GitHub Actions.** Do
 not call `scripts/check-local.sh` or any test suite from a workflow. All of
 those steps belong to the local pre-commit process above.
@@ -418,8 +492,8 @@ manual dispatch. Use dispatch to finish an interrupted release.
 
 The package version in `Cargo.toml` is the release version. Keep its package
 entry in `Cargo.lock` in sync. Publish only when that version is not already
-published: `3.0.0` becomes tag `v3.0.0`, title `Hex 3.0.0`, and asset
-`Hex-3.0.0.zip`. Never append a run number, a `fork-` prefix, or automatically
+published: `4.0.0` becomes tag `v4.0.0`, title `Endu 4.0.0`, and asset
+`Endu-4.0.0.zip`. Never append a run number, a `fork-` prefix, or automatically
 increment the version. Future releases require an explicit version change.
 
 The release bot may create a generated cask-only commit as part of
@@ -431,8 +505,13 @@ or repair the cask, but must not overwrite a published asset, duplicate the
 release, or downgrade the cask/latest release. Update the cask only after its
 release asset is available and verified. Keep `main` installable.
 
-The app is named **Hex**. Keep the existing bundle id, Keychain identifiers,
-data directory, and `hex-openrouter` Homebrew token for upgrade continuity.
+The app is named **Endu**: `Endu.app`, executable `endu`, cask `endu`, repository
+`publi0/endu`. Keep the internal bundle id `dev.publio.hex-openrouter`, the
+Keychain identifiers and the `hex-openrouter` data directory: they carry macOS
+permissions, saved keys and History across the rename. The first Endu release
+removes `Casks/hex-openrouter.rb` and writes `cask_renames.json` so an installed
+`hex-openrouter` migrates on `brew update`; until then the legacy cask keeps
+`main` installable. Published Hex-named releases stay as they are.
 
 Release signing must use the same persistent certificate, pinned publicly in
 `app/release-signing.pem`. Compile and prepare the bundle in a separate step

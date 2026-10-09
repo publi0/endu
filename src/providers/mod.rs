@@ -1,4 +1,5 @@
 //! Provider identities, model capabilities and persistent per-model options.
+use crate::i18n::t;
 use crate::openrouter::{Config, KeyStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -144,9 +145,6 @@ impl<'a> ModelRef<'a> {
         } else {
             format!("{}::{}", self.provider.id(), self.model)
         }
-    }
-    pub fn label(self) -> String {
-        format!("{} · {}", self.provider.label(), self.model)
     }
     pub fn capabilities(self) -> Capabilities {
         if self.provider == Provider::OpenRouter {
@@ -375,7 +373,7 @@ impl ModelOptions {
             .iter()
             .any(|(code, _)| *code == self.language)
         {
-            return Err("Choose a supported language.".into());
+            return Err(t("Choose a supported language.").into());
         }
         if self.prompt.len() > 2000
             || self
@@ -383,13 +381,13 @@ impl ModelOptions {
                 .chars()
                 .any(|c| c.is_control() && c != '\n' && c != '\t')
         {
-            return Err("Context must contain at most 2,000 bytes of text.".into());
+            return Err(t("Context must contain at most 2,000 bytes of text.").into());
         }
         if self
             .temperature
             .is_some_and(|v| !v.is_finite() || !(0.0..=1.0).contains(&v))
         {
-            return Err("Temperature must be between 0 and 1.".into());
+            return Err(t("Temperature must be between 0 and 1.").into());
         }
         Ok(())
     }
@@ -454,11 +452,11 @@ pub fn initialize_model(config: &mut Config, id: &str, previous: Option<&str>) {
 }
 pub fn validate_profiles(profiles: &BTreeMap<String, ModelOptions>) -> Result<(), String> {
     if profiles.len() > 128 {
-        return Err("At most 128 saved model profiles.".into());
+        return Err(t("At most 128 saved model profiles.").into());
     }
     for (id, options) in profiles {
         if id.is_empty() || id.len() > 200 || id.chars().any(char::is_whitespace) {
-            return Err("Invalid model profile id.".into());
+            return Err(t("Invalid model profile id.").into());
         }
         options.validate()?;
     }

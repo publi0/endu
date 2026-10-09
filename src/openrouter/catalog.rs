@@ -247,6 +247,12 @@ fn split_name(id: &str, name: &str) -> (String, String) {
 
 /// A readable label for a configured model id, using the catalog when it
 /// knows the id.
+/// The one selector label for a configured model: its provider, then its
+/// display name. Every model selector renders this.
+pub fn selector_label(id: &str, catalog: &[CatalogModel]) -> String {
+    format!("{} · {}", provider_label(id), label(id, catalog))
+}
+
 pub fn label(id: &str, catalog: &[CatalogModel]) -> String {
     catalog
         .iter()
@@ -270,6 +276,27 @@ mod tests {
             .into_iter()
             .find(|model| model.id == id)
             .unwrap()
+    }
+
+    #[test]
+    fn selectors_label_models_by_display_name() {
+        assert_eq!(
+            selector_label("elevenlabs::scribe_v2_realtime", &[]),
+            "ElevenLabs · Scribe v2 Realtime"
+        );
+        let route = CatalogModel {
+            id: "openai/whisper-1".into(),
+            name: "Whisper".into(),
+            provider: "OpenRouter · OpenAI".into(),
+        };
+        assert_eq!(
+            selector_label("openai/whisper-1", &[route]),
+            "OpenRouter · Whisper"
+        );
+        assert_eq!(
+            selector_label("openai/whisper-1", &[]),
+            "OpenRouter · openai/whisper-1"
+        );
     }
 
     #[test]

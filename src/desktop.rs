@@ -1,6 +1,7 @@
 //! The GPUI application: the menu bar item, the app window, the dictation
 //! HUD, and the listener thread they share a lifetime with.
 
+use crate::i18n::t;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -15,7 +16,8 @@ use gpui::{App, Application, KeyBinding, Menu, MenuItem, SystemMenuType, Timer, 
 use crate::app_settings::AppSettings;
 use crate::app_window::{AppWindow, AppWindowPreview};
 use crate::dictation_indicator::{self, DictationIndicatorEvent, DictationIndicatorUi};
-use crate::listener::ListenerControl;
+use crate::doorbell::Doorbell;
+use crate::listener::{ListenerControl, ListenerControls};
 use crate::status_item::StatusItemAction;
 
 pub struct ListenerConfig {
@@ -25,10 +27,28 @@ pub struct ListenerConfig {
 
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Wakes the UI loop when it sleeps with nothing to animate.
+static UI_WAKE: Doorbell = Doorbell::new();
+
+/// While the HUD, notice or menu bar glyph animates, the UI loop turns at
+/// display rate.
+const ACTIVE_UI_TURN: Duration = Duration::from_millis(16);
+
+/// At rest, the UI loop sleeps until an indicator event, a menu action, a
+/// quit request or this fallback, which bounds a Control-C shutdown and the
+/// once-a-minute update check.
+const IDLE_UI_TURN: Duration = Duration::from_secs(1);
+
 /// Asks the desktop loop to quit on its next tick. Safe from any thread;
 /// used by the update relaunch so `open` can hand off to the new bundle.
 pub fn request_quit() {
     QUIT_REQUESTED.store(true, Ordering::Relaxed);
+    wake_ui();
+}
+
+/// Wakes the UI loop after queueing work for it. Safe from any thread.
+pub fn wake_ui() {
+    UI_WAKE.ring();
 }
 
 /// What the desktop process hosts for its lifetime.
@@ -48,7 +68,7 @@ struct Ui {
     app_window: AppWindowSlot,
     listener_start: Option<SyncSender<()>>,
     history: Option<crate::history::History>,
-    listener_controls: SyncSender<ListenerControl>,
+    listener_controls: ListenerControls,
     status_actions: Option<Receiver<StatusItemAction>>,
     preview: Option<AppWindowPreview>,
 }
@@ -78,7 +98,7 @@ impl Ui {
                     view.focus_pane(window);
                 });
             }
-            Err(error) => tracing::error!(%error, "could not open HEX"),
+            Err(error) => tracing::error!(%error, "could not open Endu"),
         }
     }
 }
@@ -120,6 +140,8 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
         crate::openrouter::vocabulary_support::schedule(false);
     }
     let show_dock_icon = settings.show_dock_icon;
+    // Previews keep their own override, applied when their window opens.
+    let appearance = listener.is_some().then_some(settings.appearance);
     let setup_ready = listener.is_none() || crate::onboarding::status().ready();
     let onboarding_completed = listener.is_none() || crate::onboarding::completion_recorded();
     let history = listener.as_ref().and_then(|_| {
@@ -145,7 +167,8 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
     } else if hud_preview {
         spawn_hud_preview(indicator_sender.clone());
     }
-    let (control_sender, control_receiver) = mpsc::sync_channel(8);
+    let (control_sender, control_receiver) = crate::listener::control_channel(8);
+    let shutdown_wake = control_sender.clone();
     let (listener_start, listener_worker) = match listener {
         Some(listener) => {
             let events = crate::events::EventLog::create(&listener.event_path)?;
@@ -184,6 +207,8 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
             onboarding: false,
             permissions_missing: false,
             open_history_retention: false,
+            appearance: crate::appearance::Appearance::System,
+            language: crate::i18n::LanguagePreference::English,
         })
     });
     let app_window: AppWindowSlot = Rc::new(RefCell::new(None));
@@ -204,16 +229,24 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
                 ),
             };
             if let Err(error) = result {
-                tracing::error!(%error, "could not open HEX");
+                tracing::error!(%error, "could not open Endu");
             }
         });
     }
     let quit_worker = listener_worker.clone();
+    let quit_wake = shutdown_wake.clone();
     application.run(move |cx| {
+        // After GPUI installs its application class, so menus and alerts
+        // follow the Appearance setting even before the window opens.
+        if let Some(appearance) = appearance {
+            appearance.apply_to_application();
+        }
         if let Some(recovery) = recovery {
             cx.set_global(recovery);
         }
-        let status_actions = if preview.is_none() && !hud_preview {
+        // The HUD preview also shows the menu bar glyph, driven by the same
+        // simulated events; its menu opens only the isolated preview window.
+        let status_actions = if preview.is_none() || hud_preview {
             crate::status_item::install()
                 .inspect_err(|error| tracing::error!(%error, "could not install the menu bar item"))
                 .ok()
@@ -242,10 +275,11 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
                     ui.status_actions.is_some(),
                 ));
         if open_on_launch && let Err(error) = ui.open(cx) {
-            tracing::error!(%error, "could not open HEX");
+            tracing::error!(%error, "could not open Endu");
         }
         cx.on_app_quit(move |_| {
             shutdown.store(true, Ordering::Relaxed);
+            quit_wake.wake();
             join_listener(&quit_worker);
             async {}
         })
@@ -257,6 +291,7 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
         .detach();
     });
     shutdown.store(true, Ordering::Relaxed);
+    shutdown_wake.wake();
     join_listener(&listener_worker);
     Ok(())
 }
@@ -282,13 +317,71 @@ fn join_listener(worker: &Rc<RefCell<Option<JoinHandle<()>>>>) {
     }
 }
 
-fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
+/// The application menus, in the current interface language. Called again
+/// when the language changes; actions stay registered by `install_menus`.
+pub(crate) fn set_app_menus(cx: &mut App) {
     use crate::app_window::{
         CloseWindow, HideApplication, MinimizeWindow, QuitApplication, ShowAbout, ShowHistory,
         ShowHud, ShowMicrophone, ShowModels, ShowPostProcessing, ShowProviders, ShowSettings,
         ShowStatistics, ToggleFullscreen,
     };
     use crate::text_input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
+    cx.set_menus(vec![
+        Menu {
+            name: "Endu".into(),
+            items: vec![
+                MenuItem::action(t("About Endu"), ShowAbout),
+                MenuItem::separator(),
+                MenuItem::action(t("Settings"), ShowSettings),
+                MenuItem::action(t("Microphone"), ShowMicrophone),
+                MenuItem::action(t("Providers"), ShowProviders),
+                MenuItem::action(t("Models"), ShowModels),
+                MenuItem::action(t("Post-processing"), ShowPostProcessing),
+                MenuItem::action("HUD", ShowHud),
+                MenuItem::action(t("History"), ShowHistory),
+                MenuItem::action(t("Statistics"), ShowStatistics),
+                MenuItem::separator(),
+                MenuItem::os_submenu(t("Services"), SystemMenuType::Services),
+                MenuItem::separator(),
+                MenuItem::action(t("Hide Endu"), HideApplication),
+                MenuItem::separator(),
+                MenuItem::action(t("Quit Endu"), QuitApplication),
+            ],
+        },
+        Menu {
+            name: t("File").into(),
+            items: vec![MenuItem::action(t("Close Window"), CloseWindow)],
+        },
+        // Text fields handle these through their own key context; the menu
+        // makes the commands discoverable and lets macOS validate them.
+        Menu {
+            name: t("Edit").into(),
+            items: vec![
+                MenuItem::os_action(t("Undo"), Undo, gpui::OsAction::Undo),
+                MenuItem::os_action(t("Redo"), Redo, gpui::OsAction::Redo),
+                MenuItem::separator(),
+                MenuItem::os_action(t("Cut"), Cut, gpui::OsAction::Cut),
+                MenuItem::os_action(t("Copy"), Copy, gpui::OsAction::Copy),
+                MenuItem::os_action(t("Paste"), Paste, gpui::OsAction::Paste),
+                MenuItem::os_action(t("Select All"), SelectAll, gpui::OsAction::SelectAll),
+            ],
+        },
+        Menu {
+            name: t("Window").into(),
+            items: vec![
+                MenuItem::action(t("Minimize"), MinimizeWindow),
+                MenuItem::action(t("Enter Full Screen"), ToggleFullscreen),
+            ],
+        },
+    ]);
+}
+
+fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
+    use crate::app_window::{
+        CloseWindow, HideApplication, MinimizeWindow, QuitApplication, ShowAbout, ShowHistory,
+        ShowHud, ShowMicrophone, ShowModels, ShowPostProcessing, ShowProviders, ShowSettings,
+        ShowStatistics, ToggleFullscreen,
+    };
     cx.bind_keys([
         KeyBinding::new("cmd-w", CloseWindow, None),
         KeyBinding::new("cmd-q", QuitApplication, None),
@@ -351,54 +444,7 @@ fn install_menus(cx: &mut App, ui: &Rc<Ui>) {
     cx.on_action(|_: &QuitApplication, cx| cx.quit());
     cx.on_action(|_: &HideApplication, _| crate::app_settings::hide_application());
     cx.on_action(|_: &ShowAbout, _| crate::app_settings::show_about_panel());
-    cx.set_menus(vec![
-        Menu {
-            name: "Hex".into(),
-            items: vec![
-                MenuItem::action("About Hex", ShowAbout),
-                MenuItem::separator(),
-                MenuItem::action("Settings", ShowSettings),
-                MenuItem::action("Microphone", ShowMicrophone),
-                MenuItem::action("Providers", ShowProviders),
-                MenuItem::action("Models", ShowModels),
-                MenuItem::action("Post-processing", ShowPostProcessing),
-                MenuItem::action("HUD", ShowHud),
-                MenuItem::action("History", ShowHistory),
-                MenuItem::action("Statistics", ShowStatistics),
-                MenuItem::separator(),
-                MenuItem::os_submenu("Services", SystemMenuType::Services),
-                MenuItem::separator(),
-                MenuItem::action("Hide Hex", HideApplication),
-                MenuItem::separator(),
-                MenuItem::action("Quit Hex", QuitApplication),
-            ],
-        },
-        Menu {
-            name: "File".into(),
-            items: vec![MenuItem::action("Close Window", CloseWindow)],
-        },
-        // Text fields handle these through their own key context; the menu
-        // makes the commands discoverable and lets macOS validate them.
-        Menu {
-            name: "Edit".into(),
-            items: vec![
-                MenuItem::os_action("Undo", Undo, gpui::OsAction::Undo),
-                MenuItem::os_action("Redo", Redo, gpui::OsAction::Redo),
-                MenuItem::separator(),
-                MenuItem::os_action("Cut", Cut, gpui::OsAction::Cut),
-                MenuItem::os_action("Copy", Copy, gpui::OsAction::Copy),
-                MenuItem::os_action("Paste", Paste, gpui::OsAction::Paste),
-                MenuItem::os_action("Select All", SelectAll, gpui::OsAction::SelectAll),
-            ],
-        },
-        Menu {
-            name: "Window".into(),
-            items: vec![
-                MenuItem::action("Minimize", MinimizeWindow),
-                MenuItem::action("Enter Full Screen", ToggleFullscreen),
-            ],
-        },
-    ]);
+    set_app_menus(cx);
 }
 
 async fn drive_ui(
@@ -472,8 +518,15 @@ async fn drive_ui(
         if let Some(notice) = &mut paste_notice {
             let _ = cx.update(|_| notice.maintain());
         }
+        let mut animating = indicator
+            .as_ref()
+            .is_some_and(|indicator| !indicator.is_at_rest())
+            || paste_notice
+                .as_ref()
+                .is_some_and(|notice| !notice.is_at_rest());
         if ui.status_actions.is_some() {
             let _ = cx.update(|_| crate::status_item::animate());
+            animating |= crate::status_item::is_animating();
             if Instant::now() >= update_check_at {
                 update_check_at = Instant::now() + UPDATE_CHECK_INTERVAL;
                 let pending = crate::update_check::pending_update();
@@ -519,7 +572,13 @@ async fn drive_ui(
                 return;
             }
         }
-        Timer::after(Duration::from_millis(16)).await;
+        if animating {
+            Timer::after(ACTIVE_UI_TURN).await;
+        } else {
+            // Nothing is recording, pending or fading on screen: sleep until
+            // a sender rings instead of turning at display rate.
+            UI_WAKE.ring_or(Timer::after(IDLE_UI_TURN)).await;
+        }
     }
 }
 
@@ -541,7 +600,10 @@ fn restart_to_update(ui: &Ui, cx: &mut App) {
 
 fn spawn_hud_preview(sender: crate::dictation_indicator::DictationIndicatorSender) {
     thread::spawn(move || {
-        loop {
+        // Cycles in turn: normal speech ending in a check; a muted microphone
+        // ("No audio" while recording and at the end); quiet speech ("Low audio").
+        for cycle in 0_u64.. {
+            let job_id = cycle;
             sender.send(DictationIndicatorEvent::Preparing);
             thread::sleep(Duration::from_millis(900));
             sender.send(DictationIndicatorEvent::Started);
@@ -549,17 +611,29 @@ fn spawn_hud_preview(sender: crate::dictation_indicator::DictationIndicatorSende
             let started = Instant::now();
             while started.elapsed() < Duration::from_secs(4) {
                 let wave = (started.elapsed().as_secs_f32() * 5.0).sin() * 0.5 + 0.5;
+                let gain = match cycle % 3 {
+                    0 => 1.0,
+                    1 => 0.0,
+                    _ => 0.012,
+                };
                 sender.send(DictationIndicatorEvent::Meter {
-                    average: 0.025 + wave * 0.09,
-                    peak: 0.15 + wave * 0.55,
+                    average: (0.025 + wave * 0.09) * gain,
+                    peak: (0.15 + wave * 0.55) * gain,
                 });
                 thread::sleep(Duration::from_millis(20));
             }
-            sender.send(DictationIndicatorEvent::Submitted { job_id: 0 });
-            sender.send(DictationIndicatorEvent::Transcribing { job_id: 0 });
+            sender.send(DictationIndicatorEvent::Submitted { job_id });
+            if cycle % 3 == 2 {
+                sender.send(DictationIndicatorEvent::JobQuiet { job_id });
+            }
+            sender.send(DictationIndicatorEvent::Transcribing { job_id });
             thread::sleep(Duration::from_millis(900));
-            sender.send(DictationIndicatorEvent::JobCompleted { job_id: 0 });
-            thread::sleep(Duration::from_secs(1));
+            sender.send(if cycle % 3 == 1 {
+                DictationIndicatorEvent::JobNoAudio { job_id }
+            } else {
+                DictationIndicatorEvent::JobCompleted { job_id }
+            });
+            thread::sleep(Duration::from_secs(2));
         }
     });
 }
@@ -575,7 +649,7 @@ mod tests {
             ShowProviders, ShowSettings, ShowStatistics,
         };
 
-        let (listener_controls, _controls) = mpsc::sync_channel(1);
+        let (listener_controls, _controls) = crate::listener::control_channel(1);
         let ui = Rc::new(Ui {
             app_window: Rc::new(RefCell::new(None)),
             listener_start: None,
@@ -587,6 +661,8 @@ mod tests {
                 onboarding: false,
                 permissions_missing: false,
                 open_history_retention: false,
+                appearance: crate::appearance::Appearance::System,
+                language: crate::i18n::LanguagePreference::English,
             }),
         });
         cx.update(|cx| install_menus(cx, &ui));

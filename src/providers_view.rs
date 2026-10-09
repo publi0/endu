@@ -1,6 +1,7 @@
 //! Provider credentials and global request limits.
 
-use crate::desktop_ui::{LINE, MUTED, NEGATIVE, settings_panel, settings_section_label};
+use crate::desktop_ui::{LINE, MUTED, NEGATIVE, rgb, settings_panel, settings_section_label};
+use crate::i18n::t;
 use crate::openrouter::{
     Config, KeyStatus,
     settings_view::{self, ConfigChanged, KeyChanged, OpenRouterSettings},
@@ -8,7 +9,6 @@ use crate::openrouter::{
 use crate::providers::Provider;
 use gpui::{
     Context, Entity, EventEmitter, IntoElement, Render, Subscription, Window, div, prelude::*, px,
-    rgb,
 };
 
 /// No credential data is sent to the parent. It can recheck readiness and read
@@ -191,14 +191,14 @@ impl Render for ProvidersView {
                     .text_color(rgb(NEGATIVE))
                     .child(error)
             }))
-            .child(settings_section_label("PROVIDER KEYS"))
+            .child(settings_section_label(t("Provider keys")))
             .child(
                 div()
                     .px_1()
                     .mb_3()
                     .text_size(px(11.0))
                     .text_color(rgb(MUTED))
-                    .child("Keys added here are stored in the macOS Keychain."),
+                    .child(t("Keys added here are stored in the macOS Keychain.")),
             )
             .child(settings_panel().children(self.keys.iter().enumerate().map(
                 |(index, (_, key))| {

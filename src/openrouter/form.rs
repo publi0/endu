@@ -2,6 +2,7 @@
 //! of GPUI so it is testable on any platform.
 
 use super::Config;
+use crate::i18n::t;
 
 /// The primary model plus at most this many fallbacks are editable in Settings.
 pub const MAX_FALLBACKS: usize = 2;
@@ -66,13 +67,14 @@ impl AdvancedForm {
         super::http::validate_url(base_url).map_err(|error| format!("API URL: {error}"))?;
         config.base_url = base_url.to_owned();
         config.transcription.attempt_timeout_seconds =
-            number(&self.attempt_timeout_seconds, "Attempt timeout", 1, 600)?;
+            number(&self.attempt_timeout_seconds, t("Attempt timeout"), 1, 600)?;
         config.transcription.total_timeout_seconds =
-            number(&self.total_timeout_seconds, "Total timeout", 1, 1_800)?;
-        config.transcription.chunk_seconds = number(&self.chunk_seconds, "Chunk length", 10, 200)?;
+            number(&self.total_timeout_seconds, t("Total timeout"), 1, 1_800)?;
+        config.transcription.chunk_seconds =
+            number(&self.chunk_seconds, t("Chunk length"), 10, 200)?;
         config.transcription.rate_limit_retry_max_wait_ms = number(
             &self.rate_limit_retry_max_wait_ms,
-            "Rate-limit retry wait",
+            t("Rate-limit retry wait"),
             0,
             60_000,
         )?;
@@ -83,9 +85,9 @@ impl AdvancedForm {
             let value: f32 = temperature
                 .replace(',', ".")
                 .parse()
-                .map_err(|_| "Temperature must be a number between 0 and 1.".to_owned())?;
+                .map_err(|_| t("Temperature must be a number between 0 and 1.").to_owned())?;
             if !(0.0..=1.0).contains(&value) {
-                return Err("Temperature must be a number between 0 and 1.".into());
+                return Err(t("Temperature must be a number between 0 and 1.").into());
             }
             Some(value)
         };
@@ -98,11 +100,14 @@ impl AdvancedForm {
 /// the editable slots (added by hand to the file) are kept.
 pub fn set_model(base: &Config, slot: usize, model: Option<&str>) -> Result<Config, String> {
     if slot > MAX_FALLBACKS {
-        return Err(format!("At most {MAX_FALLBACKS} fallback models."));
+        return Err(tf!(
+            "At most {max_fallbacks} fallback models.",
+            max_fallbacks = MAX_FALLBACKS
+        ));
     }
     let mut config = base.clone();
     match model.map(str::trim) {
-        None | Some("") if slot == 0 => return Err("Choose a primary model.".into()),
+        None | Some("") if slot == 0 => return Err(t("Choose a primary model.").into()),
         None | Some("") => {
             if slot < config.transcription.models.len() {
                 config.transcription.models.remove(slot);
@@ -110,7 +115,7 @@ pub fn set_model(base: &Config, slot: usize, model: Option<&str>) -> Result<Conf
         }
         Some(model) => {
             if model.chars().any(char::is_whitespace) {
-                return Err("Model ids cannot contain spaces.".into());
+                return Err(t("Model ids cannot contain spaces.").into());
             }
             let model = crate::providers::ModelRef::parse(model).key();
             if let Some(existing) = config
@@ -121,9 +126,13 @@ pub fn set_model(base: &Config, slot: usize, model: Option<&str>) -> Result<Conf
                 && existing != slot
             {
                 return Err(if existing == 0 {
-                    format!("{model} is already the primary model.")
+                    tf!("{model} is already the primary model.", model = model)
                 } else {
-                    format!("{model} is already fallback {existing}.")
+                    tf!(
+                        "{model} is already fallback {existing}.",
+                        model = model,
+                        existing = existing
+                    )
                 });
             }
             if config
@@ -164,7 +173,7 @@ pub fn promote_model(base: &Config, slot: usize) -> Config {
 
 pub fn remove_migrated_key(base: &Config, stored_key: &str) -> Result<Config, String> {
     if base.api_key.as_deref().map(str::trim) != Some(stored_key.trim()) {
-        return Err("The file's API key changed. Reopen Models before moving it.".into());
+        return Err(t("The file's API key changed. Reopen Models before moving it.").into());
     }
     let mut config = base.clone();
     config.api_key = None;
@@ -176,7 +185,14 @@ fn number(text: &str, field: &str, min: u64, max: u64) -> Result<u64, String> {
         .parse::<u64>()
         .ok()
         .filter(|value| (min..=max).contains(value))
-        .ok_or_else(|| format!("{field} must be a whole number from {min} to {max}."))
+        .ok_or_else(|| {
+            tf!(
+                "{field} must be a whole number from {min} to {max}.",
+                field = field,
+                min = min,
+                max = max
+            )
+        })
 }
 
 #[cfg(test)]

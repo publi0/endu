@@ -1,5 +1,6 @@
 //! Persisted sound levels and double-tap timing, independent of capture timing.
 
+use crate::i18n::t;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -61,9 +62,9 @@ impl DoubleTapSensitivity {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Short => "Short",
-            Self::Normal => "Normal",
-            Self::Tolerant => "Tolerant",
+            Self::Short => t("Short"),
+            Self::Normal => t("Normal"),
+            Self::Tolerant => t("Tolerant"),
         }
     }
 

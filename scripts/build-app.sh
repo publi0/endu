@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build "Hex.app" using the persistent release identity. For isolated UI
+# Build "Endu.app" using the persistent release identity. For isolated UI
 # development use cargo run -- preview; never replace the app with an ad hoc build.
 #
 # Usage: scripts/build-app.sh [--prepare]
@@ -25,7 +25,7 @@ if [ "$prepare" = false ] && [ "$identity" = "-" ]; then
   exit 1
 fi
 
-bundle_name="Hex.app"
+bundle_name="Endu.app"
 bundle="$root/target/app/$bundle_name"
 plist="$bundle/Contents/Info.plist"
 icon_output="$root/target/AppIcon.assets"
@@ -35,7 +35,7 @@ cargo build --locked --release --manifest-path "$root/Cargo.toml" >&2
 
 rm -rf "$bundle"
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
-cp "$root/target/release/voice-control" "$bundle/Contents/MacOS/hex"
+cp "$root/target/release/voice-control" "$bundle/Contents/MacOS/endu"
 cp "$root/app/Info.plist" "$plist"
 cp "$root/LICENSE" "$root/THIRD_PARTY_NOTICES.md" "$bundle/Contents/Resources/"
 /usr/bin/plutil -replace CFBundleShortVersionString -string "$version" "$plist"

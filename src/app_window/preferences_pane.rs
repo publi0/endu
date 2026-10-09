@@ -1,6 +1,7 @@
 //! Preference import and export.
 
 use super::*;
+use crate::i18n::t;
 
 impl AppWindow {
     pub(super) fn export_preferences(&mut self, cx: &mut Context<Self>) {
@@ -15,7 +16,7 @@ impl AppWindow {
             .map(std::path::PathBuf::from)
             .unwrap_or_default()
             .join("Documents");
-        let chosen = cx.prompt_for_new_path(&directory, Some("Hex-preferences.json"));
+        let chosen = cx.prompt_for_new_path(&directory, Some("Endu-preferences.json"));
         let settings = self.settings.clone();
         let fixture = self
             .preview
@@ -28,8 +29,9 @@ impl AppWindow {
                         .spawn(async move {
                             let config = match fixture {
                                 Some(config) => config,
-                                None => crate::openrouter::load_config()
-                                    .map_err(|_| "Could not read Models preferences.".to_owned())?,
+                                None => crate::openrouter::load_config().map_err(|_| {
+                                    t("Could not read Models preferences.").to_owned()
+                                })?,
                             };
                             let bytes =
                                 crate::preferences_transfer::export_bytes(&settings, &config)
@@ -39,7 +41,7 @@ impl AppWindow {
                         .await
                 }
                 Ok(Ok(None)) => Ok(()),
-                _ => Err("Could not open the export dialog.".to_owned()),
+                _ => Err(t("Could not open the export dialog.").to_owned()),
             };
             let _ = this.update(cx, |this, cx| {
                 this.preference_transfer_busy = false;
@@ -61,8 +63,9 @@ impl AppWindow {
             return;
         }
         if self.key_operation_pending(cx) {
-            self.preference_transfer_error =
-                Some("Wait for the key operation to finish before importing preferences.".into());
+            self.preference_transfer_error = Some(
+                t("Wait for the key operation to finish before importing preferences.").into(),
+            );
             cx.notify();
             return;
         }
@@ -73,7 +76,7 @@ impl AppWindow {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Import Hex preferences".into()),
+            prompt: Some(t("Import Endu preferences").into()),
         });
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -87,7 +90,7 @@ impl AppWindow {
                     None => Ok(None),
                 },
                 Ok(Ok(None)) => Ok(None),
-                _ => Err("Could not open the import dialog.".to_owned()),
+                _ => Err(t("Could not open the import dialog.").to_owned()),
             };
             let _ = this.update(cx, |this, cx| {
                 this.preference_transfer_busy = false;
@@ -127,6 +130,8 @@ impl AppWindow {
     ) {
         self.cancel_hotkey_capture(cx);
         self.settings = imported.settings;
+        self.settings.appearance.apply(cx);
+        super::apply_language(self.settings.language, cx);
         self.settings_error = None;
         self.settings_feedback = None;
         self.preference_transfer_error = None;
@@ -156,11 +161,14 @@ impl AppWindow {
         }
         let hud = self.settings.hud;
         let sounds = self.settings.effective_sound_volumes();
+        let start_cue = self.settings.start_cue;
         let priority = self.settings.microphone_priority.clone();
         self.hud_settings
             .update(cx, |view, cx| view.set_preferences(hud, None, cx));
-        self.sound_settings
-            .update(cx, |view, cx| view.set_preferences(sounds, None, cx));
+        self.sound_settings.update(cx, |view, cx| {
+            view.set_preferences(sounds, None, cx);
+            view.set_start_cue(start_cue, None, cx);
+        });
         self.microphone_priority.update(cx, |view, cx| {
             view.close_picker(cx);
             view.set_preferences(priority, None, cx);
@@ -198,7 +206,7 @@ impl AppWindow {
         let key_busy = self.key_operation_pending(cx);
         let actions =
             div().flex_none().flex().gap_2().children(
-                ["Export", "Import"]
+                [t("Export"), t("Import")]
                     .into_iter()
                     .enumerate()
                     .map(|(index, label)| {
@@ -225,7 +233,7 @@ impl AppWindow {
             );
         settings_panel().child(settings_row(
             "Import / export",
-            "App and model preferences. Keys, API address, history and permissions stay on this Mac.",
+            t("App and model preferences. Keys, API address, history and permissions stay on this Mac."),
             actions,
         ).border_b_0())
         .when_some(self.preference_transfer_error.clone(), |panel, error| panel.child(
@@ -261,14 +269,14 @@ pub(super) fn read_preferences_export(
 ) -> Result<crate::preferences_transfer::PreferenceBundle, String> {
     use std::io::Read;
     if !preferences_path_allowed(path) {
-        return Err("Choose a preferences export outside Hex's application data.".into());
+        return Err(t("Choose a preferences export outside Endu's application data.").into());
     }
-    let file =
-        std::fs::File::open(path).map_err(|_| "Could not open the preferences file.".to_owned())?;
+    let file = std::fs::File::open(path)
+        .map_err(|_| t("Could not open the preferences file.").to_owned())?;
     let mut bytes = Vec::new();
     file.take(crate::preferences_transfer::MAX_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| "Could not read the preferences file.".to_owned())?;
+        .map_err(|_| t("Could not read the preferences file.").to_owned())?;
     crate::preferences_transfer::decode(&bytes).map_err(|error| error.to_string())
 }
 
@@ -276,7 +284,7 @@ pub(super) fn write_preferences_export(path: &std::path::Path, bytes: &[u8]) -> 
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     if !preferences_path_allowed(path) {
-        return Err("Choose an export location outside Hex's application data.".into());
+        return Err(t("Choose an export location outside Endu's application data.").into());
     }
     let temporary = path.with_extension(format!(
         "hex-export-{}-{}.tmp",
@@ -298,7 +306,7 @@ pub(super) fn write_preferences_export_to(
         .create_new(true)
         .mode(0o600)
         .open(temporary)
-        .map_err(|_| "Could not create the preferences export.".to_owned())?;
+        .map_err(|_| t("Could not create the preferences export.").to_owned())?;
     let result = (|| -> std::io::Result<()> {
         file.write_all(bytes)?;
         file.write_all(b"\n")?;
@@ -308,5 +316,5 @@ pub(super) fn write_preferences_export_to(
     if result.is_err() {
         let _ = std::fs::remove_file(temporary);
     }
-    result.map_err(|_| "Could not write the preferences file.".to_owned())
+    result.map_err(|_| t("Could not write the preferences file.").to_owned())
 }

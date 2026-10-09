@@ -1,10 +1,10 @@
 [package]
 name = "voice-control"
-version = "3.6.1"
+version = "4.0.0"
 edition = "2024"
 default-run = "voice-control"
 license = "MIT"
-repository = "https://github.com/publi0/hex"
+repository = "https://github.com/publi0/endu"
 
 [[test]]
 name = "keyboard_layout"

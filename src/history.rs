@@ -6,6 +6,7 @@
 //! retained here. Every retention choice remains subject to hard
 //! entry and byte caps, writes are atomic, and files are owner-only.
 
+use crate::i18n::t;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -38,13 +39,13 @@ pub enum HistoryRetention {
 impl HistoryRetention {
     pub const ALL: [Self; 5] = [Self::Off, Self::Day, Self::Week, Self::Month, Self::Forever];
 
-    pub const fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
-            Self::Off => "Off",
-            Self::Day => "24 hours",
-            Self::Week => "7 days",
-            Self::Month => "30 days",
-            Self::Forever => "Forever",
+            Self::Off => t("Off"),
+            Self::Day => t("24 hours"),
+            Self::Week => t("7 days"),
+            Self::Month => t("30 days"),
+            Self::Forever => t("Forever"),
         }
     }
 

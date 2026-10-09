@@ -1,10 +1,9 @@
-use gpui::{
-    AnyElement, Context, EventEmitter, FocusHandle, Render, Window, div, prelude::*, px, rgb,
-};
+use crate::i18n::t;
+use gpui::{AnyElement, Context, EventEmitter, FocusHandle, Render, Window, div, prelude::*, px};
 
 use crate::desktop_ui::{
     LINE, MUTED, NEGATIVE, PANE_CONTENT_WIDTH, SURFACE_HOVER, TEXT, compact_panel,
-    compact_panel_header, pane_header, settings_panel, settings_row, settings_section_label,
+    compact_panel_header, pane_header, rgb, settings_panel, settings_row, settings_section_label,
     toggle,
 };
 use crate::post_processing::Preferences;
@@ -65,32 +64,32 @@ impl Rule {
 
     fn title(self) -> &'static str {
         match self {
-            Self::Lowercase => "Lowercase text",
-            Self::Initial => "Lowercase first letter",
-            Self::Punctuation => "Remove punctuation",
-            Self::Ellipses => "Remove ellipses",
-            Self::Period => "Remove final period",
-            Self::Spaces => "Collapse spaces",
-            Self::SingleLine => "Single line",
+            Self::Lowercase => t("Lowercase text"),
+            Self::Initial => t("Lowercase first letter"),
+            Self::Punctuation => t("Remove punctuation"),
+            Self::Ellipses => t("Remove ellipses"),
+            Self::Period => t("Remove final period"),
+            Self::Spaces => t("Collapse spaces"),
+            Self::SingleLine => t("Single line"),
         }
     }
 
     fn description(self, preferences: Preferences) -> &'static str {
         if !self.enabled(preferences) {
             return if self == Self::Initial {
-                "Included in Lowercase text"
+                t("Included in Lowercase text")
             } else {
-                "Included in Remove punctuation"
+                t("Included in Remove punctuation")
             };
         }
         match self {
-            Self::Lowercase => "Converts all letters to lowercase",
-            Self::Initial => "Changes only the first letter; keeps the rest of the text",
-            Self::Punctuation => "Removes punctuation marks while keeping words separated",
-            Self::Ellipses => "Removes … and runs of three or more dots",
-            Self::Period => "Removes the period at the end; keeps other sentence marks",
-            Self::Spaces => "Collapses repeated spaces and tabs; keeps paragraphs",
-            Self::SingleLine => "Joins paragraphs and line breaks with spaces",
+            Self::Lowercase => t("Converts all letters to lowercase"),
+            Self::Initial => t("Changes only the first letter; keeps the rest of the text"),
+            Self::Punctuation => t("Removes punctuation marks while keeping words separated"),
+            Self::Ellipses => t("Removes … and runs of three or more dots"),
+            Self::Period => t("Removes the period at the end; keeps other sentence marks"),
+            Self::Spaces => t("Collapses repeated spaces and tabs; keeps paragraphs"),
+            Self::SingleLine => t("Joins paragraphs and line breaks with spaces"),
         }
     }
 }
@@ -250,26 +249,26 @@ impl Render for PostProcessingView {
         let result = self.vocabulary.read(cx).restore_text(&formatted);
         let content = div()
             .child(self.vocabulary.clone())
-            .child(settings_section_label("LETTER CASE"))
+            .child(settings_section_label(t("Letter case")))
             .child(
                 settings_panel()
                     .child(self.row(Rule::Lowercase, false, cx))
                     .child(self.row(Rule::Initial, true, cx)),
             )
-            .child(settings_section_label("PUNCTUATION"))
+            .child(settings_section_label(t("Punctuation")))
             .child(
                 settings_panel()
                     .child(self.row(Rule::Punctuation, false, cx))
                     .child(self.row(Rule::Ellipses, false, cx))
                     .child(self.row(Rule::Period, true, cx)),
             )
-            .child(settings_section_label("SPACING"))
+            .child(settings_section_label(t("Spacing")))
             .child(
                 settings_panel()
                     .child(self.row(Rule::Spaces, false, cx))
                     .child(self.row(Rule::SingleLine, true, cx)),
             )
-            .child(settings_section_label("EXAMPLE"))
+            .child(settings_section_label(t("Example")))
             .child(
                 div()
                     .flex()
@@ -278,7 +277,7 @@ impl Render for PostProcessingView {
                         compact_panel()
                             .flex_1()
                             .min_w_0()
-                            .child(compact_panel_header("Original", None))
+                            .child(compact_panel_header(t("Original"), None))
                             .child(
                                 div()
                                     .p_4()
@@ -291,7 +290,7 @@ impl Render for PostProcessingView {
                         compact_panel()
                             .flex_1()
                             .min_w_0()
-                            .child(compact_panel_header("Result", None))
+                            .child(compact_panel_header(t("Result"), None))
                             .child(
                                 div()
                                     .p_4()
@@ -305,7 +304,7 @@ impl Render for PostProcessingView {
             .size_full()
             .flex()
             .flex_col()
-            .child(pane_header("Post-processing"))
+            .child(pane_header(t("Post-processing")))
             .child(
                 div()
                     .id("post-processing-scroll")

@@ -289,7 +289,7 @@ pub struct PreventSleep {
 impl PreventSleep {
     fn start() -> std::io::Result<Self> {
         let assertion_type = CFString::from_static_str("NoIdleSleepAssertion");
-        let assertion_name = CFString::from_static_str("HEX intentional recording");
+        let assertion_name = CFString::from_static_str("Endu intentional recording");
         let mut assertion_id = 0;
         // SAFETY: Both Core Foundation strings remain alive for the call and
         // assertion_id points to writable, correctly sized storage. IOKit

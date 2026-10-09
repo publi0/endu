@@ -26,6 +26,23 @@ pub const SAMPLE_RATE: u32 = 16_000;
 const QUIET_SEARCH_SECONDS: usize = 10;
 const QUIET_FRAME_SAMPLES: usize = SAMPLE_RATE as usize / 10;
 
+/// The message of [`NoSpeech`], which listeners match after it becomes text.
+pub const NO_SPEECH: &str = "No speech was detected.";
+
+/// A live session had already sent audio when the finished clip turned out
+/// to hold no speech. The session stops at once and the dictation fails;
+/// there is nothing worth keeping for recovery.
+#[derive(Debug)]
+pub struct NoSpeech;
+
+impl std::fmt::Display for NoSpeech {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(NO_SPEECH)
+    }
+}
+
+impl std::error::Error for NoSpeech {}
+
 /// A finished transcription. `report` is `None` when nothing was sent
 /// because the clip was empty or had no speech.
 pub struct Transcription {

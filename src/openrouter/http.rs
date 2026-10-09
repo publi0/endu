@@ -165,7 +165,7 @@ fn curl_config(url: &str, api_key: &str, body: Option<&str>) -> Result<Vec<u8>> 
     if !api_key.is_empty() {
         options.push(("header", authorization.as_str()));
     }
-    options.push(("header", "X-Title: Hex"));
+    options.push(("header", "X-Title: Endu"));
     if let Some(body) = body {
         options.push(("request", "POST"));
         options.push(("header", "Content-Type: application/json"));

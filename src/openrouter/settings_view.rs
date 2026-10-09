@@ -7,7 +7,7 @@
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
     IntoElement, KeyDownEvent, MouseDownEvent, Render, ScrollHandle, SharedString, Subscription,
-    Window, div, prelude::*, px, rgb,
+    Window, div, prelude::*, px,
 };
 
 use super::catalog::{self, CatalogModel};
@@ -15,9 +15,10 @@ use super::form::{self, AdvancedForm, MAX_FALLBACKS};
 use super::{Config, KeyStatus};
 use crate::desktop_ui::{
     ACCENT, FAINT, LINE, MUTED, NEGATIVE, SURFACE, SURFACE_HOVER, SURFACE_SELECTED, TEXT,
-    TEXT_SOFT, compact_button, disclosure_button, picker_open_key, picker_popup, settings_panel,
-    settings_row, settings_section_label,
+    TEXT_SOFT, compact_button, disclosure_button, picker_open_key, picker_popup, rgb,
+    settings_panel, settings_row, settings_section_label,
 };
+use crate::i18n::t;
 use crate::providers::{Provider, keys};
 use crate::text_input::{Changed, Dismissed, EditFinished, Navigate, Submitted, TextInput};
 
@@ -82,11 +83,11 @@ enum KeyOperation {
 impl KeyOperation {
     fn label(self) -> &'static str {
         match self {
-            Self::Refresh => "Checking key",
-            Self::Save => "Saving key",
-            Self::Test => "Testing key",
-            Self::Remove => "Removing key",
-            Self::Move => "Moving key",
+            Self::Refresh => t("Checking key"),
+            Self::Save => t("Saving key"),
+            Self::Test => t("Testing key"),
+            Self::Remove => t("Removing key"),
+            Self::Move => t("Moving key"),
         }
     }
 }
@@ -162,6 +163,11 @@ pub struct OpenRouterSettings {
     advanced_dirty: bool,
     key_operation: Option<KeyOperation>,
     message: Option<(Scope, bool, String)>,
+    /// Counts reports so each new key result pops its mark in again.
+    message_count: u64,
+    /// The upper slot of the last reorder and its count, so the two swapped
+    /// models glide into place.
+    chain_moved: Option<(usize, u64)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -169,6 +175,11 @@ impl EventEmitter<KeyChanged> for OpenRouterSettings {}
 impl EventEmitter<ConfigChanged> for OpenRouterSettings {}
 
 impl OpenRouterSettings {
+    /// The loaded OpenRouter catalog, empty until it arrives.
+    pub fn catalog_models(&self) -> &[CatalogModel] {
+        self.catalog.models()
+    }
+
     fn new(key_only: bool, preview: bool, cx: &mut Context<Self>) -> Self {
         Self::with_mode(
             if key_only {
@@ -197,12 +208,19 @@ impl OpenRouterSettings {
                 Some((
                     Scope::Configuration,
                     false,
-                    format!("{error:#}. Fix the file before saving settings."),
+                    tf!(
+                        "{error}. Fix the file before saving settings.",
+                        error = format!("{error:#}")
+                    ),
                 )),
             ),
         };
         let mut subscriptions = Vec::new();
-        let key_input = cx.new(|cx| TextInput::new(cx, "Paste API key", "").commit_on_blur());
+        let key_input = cx.new(|cx| {
+            TextInput::new(cx, "", "")
+                .localized_placeholder(|| t("Paste API key"))
+                .commit_on_blur()
+        });
         subscriptions.push(cx.subscribe(&key_input, |this, _, _: &Submitted, cx| {
             this.save_key(cx);
         }));
@@ -217,9 +235,13 @@ impl OpenRouterSettings {
             this.cancel_key_replacement(cx);
         }));
         let form = AdvancedForm::from_config(&config);
-        let mut field = |placeholder: &'static str, value: &str, cx: &mut Context<Self>| {
+        let mut field = |placeholder: fn() -> &'static str, value: &str, cx: &mut Context<Self>| {
             let value = value.to_owned();
-            let entity = cx.new(|cx| TextInput::new(cx, placeholder, &value).commit_on_blur());
+            let entity = cx.new(|cx| {
+                TextInput::new(cx, "", &value)
+                    .localized_placeholder(placeholder)
+                    .commit_on_blur()
+            });
             subscriptions.push(cx.subscribe(&entity, |this, _, _: &Changed, cx| {
                 this.advanced_dirty = true;
                 this.clear_message(Scope::Advanced);
@@ -240,12 +262,12 @@ impl OpenRouterSettings {
             entity
         };
         let advanced = AdvancedInputs {
-            base_url: field("https://openrouter.ai/api/v1", &form.base_url, cx),
-            attempt_timeout: field("30", &form.attempt_timeout_seconds, cx),
-            total_timeout: field("90", &form.total_timeout_seconds, cx),
-            chunk_seconds: field("120", &form.chunk_seconds, cx),
-            rate_limit_wait: field("2000", &form.rate_limit_retry_max_wait_ms, cx),
-            temperature: field("provider default", &form.temperature, cx),
+            base_url: field(|| "https://openrouter.ai/api/v1", &form.base_url, cx),
+            attempt_timeout: field(|| "30", &form.attempt_timeout_seconds, cx),
+            total_timeout: field(|| "90", &form.total_timeout_seconds, cx),
+            chunk_seconds: field(|| "120", &form.chunk_seconds, cx),
+            rate_limit_wait: field(|| "2000", &form.rate_limit_retry_max_wait_ms, cx),
+            temperature: field(|| t("provider default"), &form.temperature, cx),
         };
         let mut view = Self {
             mode,
@@ -273,6 +295,8 @@ impl OpenRouterSettings {
             advanced_dirty: false,
             key_operation: None,
             message,
+            message_count: 0,
+            chain_moved: None,
             _subscriptions: subscriptions,
         };
         if preview {
@@ -294,6 +318,7 @@ impl OpenRouterSettings {
     }
 
     fn report(&mut self, scope: Scope, result: Result<String, String>) {
+        self.message_count += 1;
         self.message = Some(match result {
             Ok(text) => (scope, true, text),
             Err(text) => (scope, false, text),
@@ -311,7 +336,7 @@ impl OpenRouterSettings {
         if self.busy() {
             self.report(
                 scope,
-                Err("Wait for the key operation to finish, then try again.".into()),
+                Err(t("Wait for the key operation to finish, then try again.").into()),
             );
             return false;
         }
@@ -524,8 +549,9 @@ impl OpenRouterSettings {
                         Ok(_) => this.clear_message(Scope::Key),
                         Err(error) => this.report(
                             Scope::Key,
-                            Err(format!(
-                                "Key stored, but the provider could not validate it: {error:#}"
+                            Err(tf!(
+                                "Key stored, but the provider could not validate it: {error}",
+                                error = format!("{error:#}")
                             )),
                         ),
                     }
@@ -542,7 +568,7 @@ impl OpenRouterSettings {
         if self.preview {
             self.report(
                 Scope::Key,
-                Ok("Preview: no network request was made.".into()),
+                Ok(t("Preview: no network request was made.").into()),
             );
             cx.notify();
             return;
@@ -713,7 +739,10 @@ impl OpenRouterSettings {
             return;
         }
         self.ensure_catalog(cx);
-        let search = cx.new(|cx| TextInput::picker(cx, "Search name, provider or feature", ""));
+        let search = cx.new(|cx| {
+            TextInput::picker(cx, "", "")
+                .localized_placeholder(|| t("Search name, provider or feature"))
+        });
         let subscriptions = vec![
             cx.subscribe(&search, |this, _, _: &Changed, cx| {
                 if let Some(picker) = &mut this.picker {
@@ -836,15 +865,15 @@ impl OpenRouterSettings {
         if model.as_deref().is_some_and(|id| !self.model_available(id)) {
             self.report(
                 Scope::Model(slot),
-                Err("Add this provider’s key in Providers before selecting its models.".into()),
+                Err(t("Add this provider’s key in Providers before selecting its models.").into()),
             );
             cx.notify();
             return false;
         }
         let success = match (&model, slot) {
-            (None, _) => "Fallback removed.".to_owned(),
-            (Some(model), 0) => format!("{model} is now the primary model."),
-            (Some(model), slot) => format!("{model} is fallback {slot}."),
+            (None, _) => t("Fallback removed.").to_owned(),
+            (Some(model), 0) => tf!("{model} is now the primary model.", model = model),
+            (Some(model), slot) => tf!("{model} is fallback {slot}.", model = model, slot = slot),
         };
         let saved = self.commit(
             cx,
@@ -860,13 +889,46 @@ impl OpenRouterSettings {
     }
 
     fn promote_model(&mut self, slot: usize, cx: &mut Context<Self>) {
-        self.commit(
+        if self.commit(
             cx,
             Scope::Model(slot),
             |config| Ok(form::promote_model(config, slot)),
-            "Order updated.",
-        );
+            t("Order updated."),
+        ) && slot > 0
+        {
+            let count = self.chain_moved.map_or(0, |(_, count)| count) + 1;
+            self.chain_moved = Some((slot - 1, count));
+        }
         cx.notify();
+    }
+
+    /// The model selector of `slot`, gliding in from the slot it swapped with.
+    fn chain_button(
+        &mut self,
+        slot: usize,
+        model: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let button = self.render_model_button(slot, model, cx);
+        let Some((upper, count)) = self.chain_moved else {
+            return button;
+        };
+        let from = match slot {
+            slot if slot == upper => 14.0,
+            slot if slot == upper + 1 => -14.0,
+            _ => return button,
+        };
+        crate::desktop_ui::animate_once(
+            div().relative().child(button),
+            gpui::ElementId::NamedInteger(format!("chain-move-{slot}").into(), count),
+            260,
+            move |element, progress| {
+                let eased = crate::desktop_ui::ease_out(progress);
+                element
+                    .top(px(from * (1.0 - eased)))
+                    .opacity(0.35 + 0.65 * eased)
+            },
+        )
     }
 
     pub fn trim_silence(&self) -> bool {
@@ -876,9 +938,9 @@ impl OpenRouterSettings {
     pub fn toggle_trim(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
         let enabled = !self.config.transcription.trim_silence;
         let success = if enabled {
-            "Silence is trimmed before sending."
+            t("Silence is trimmed before sending.")
         } else {
-            "Recordings are sent untrimmed."
+            t("Recordings are sent untrimmed.")
         };
         let saved = self.commit(
             cx,
@@ -898,7 +960,7 @@ impl OpenRouterSettings {
                 .message
                 .as_ref()
                 .map(|(_, _, message)| message.clone())
-                .unwrap_or_else(|| "Could not save silence trimming.".into()))
+                .unwrap_or_else(|| t("Could not save silence trimming.").into()))
         }
     }
 
@@ -950,7 +1012,7 @@ impl OpenRouterSettings {
             cx,
             Scope::Advanced,
             |config| form.apply_changes(&original, config),
-            "Saved.",
+            t("Saved."),
         ) {
             self.advanced_saved = AdvancedForm::from_config(&self.config);
             self.load_advanced(&self.advanced_saved.clone(), cx);
@@ -972,7 +1034,7 @@ impl OpenRouterSettings {
             cx,
             Scope::Advanced,
             |config| defaults.apply(config),
-            "Advanced defaults restored.",
+            t("Advanced defaults restored."),
         ) {
             self.load_advanced(&defaults, cx);
             self.advanced_saved = defaults;
@@ -1016,16 +1078,55 @@ impl OpenRouterSettings {
         if ok && scope != Scope::Key {
             return None;
         }
+        let text = div()
+            .flex_1()
+            .min_w_0()
+            .whitespace_normal()
+            .text_size(px(11.0))
+            .line_height(px(16.0))
+            .text_color(rgb(if ok { TEXT_SOFT } else { NEGATIVE }))
+            .child(text);
+        // A key result pops in a mark, so a repeated test visibly answers.
+        let mark = (scope == Scope::Key).then(|| {
+            use crate::desktop_ui::{ThemeColor, symbol_icon};
+            let (symbol, color) = if ok {
+                ("checkmark.circle.fill", ThemeColor::Positive)
+            } else {
+                ("xmark.circle.fill", ThemeColor::Negative)
+            };
+            crate::desktop_ui::animate_once(
+                div()
+                    .flex_none()
+                    .size(px(16.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(symbol_icon(symbol, color, 12.0)),
+                gpui::ElementId::NamedInteger("key-result".into(), self.message_count),
+                320,
+                move |_, progress| {
+                    let pop = 1.0 + 0.35 * (progress * std::f32::consts::PI).sin();
+                    div()
+                        .flex_none()
+                        .size(px(16.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .opacity(crate::desktop_ui::ease_out(progress * 2.0))
+                        .child(symbol_icon(symbol, color, 12.0 * pop))
+                },
+            )
+        });
         Some(
             div()
                 .w_full()
                 .min_w_0()
-                .whitespace_normal()
                 .px_1()
                 .pt_2()
-                .text_size(px(11.0))
-                .line_height(px(16.0))
-                .text_color(rgb(if ok { TEXT_SOFT } else { NEGATIVE }))
+                .flex()
+                .items_start()
+                .gap(px(6.0))
+                .children(mark)
                 .child(text)
                 .into_any_element(),
         )
@@ -1081,7 +1182,7 @@ impl OpenRouterSettings {
                                 .text_color(rgb(MUTED))
                                 .hover(|link| link.text_color(rgb(TEXT_SOFT)))
                                 .cursor_pointer()
-                                .child("Get a key ↗")
+                                .child(t("Get a key ↗"))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     if !this.preview {
                                         cx.open_url(this.key_provider.keys_url());
@@ -1090,7 +1191,7 @@ impl OpenRouterSettings {
                         )
                         .child(div().flex().gap_2().when(has_key, |buttons| {
                             buttons.child(
-                                button("Cancel", false)
+                                button(t("Cancel"), false)
                                     .id("openrouter-cancel-key")
                                     .when(self.busy(), |button| button.opacity(0.45))
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1102,17 +1203,17 @@ impl OpenRouterSettings {
                 .into_any_element();
         }
         let (badge, actions): (String, Vec<AnyElement>) = match &self.key_status {
-            None => ("Checking…".into(), Vec::new()),
+            None => (t("Checking…").into(), Vec::new()),
             Some(KeyStatus::Keychain(suffix)) => (
                 // The suffix is known only once the key was read for a request,
                 // because reading it for display could show a Keychain prompt.
                 if suffix.is_empty() {
-                    "Key saved".into()
+                    t("Key saved").into()
                 } else {
-                    format!("Key saved · …{suffix}")
+                    tf!("Key saved · …{suffix}", suffix = suffix)
                 },
                 vec![
-                    button(self.action_label(KeyOperation::Test, "Test"), false)
+                    button(self.action_label(KeyOperation::Test, t("Test")), false)
                         .id("openrouter-test-key")
                         .when(self.busy(), |button| button.opacity(0.45))
                         .on_click(cx.listener(|this, _, _, cx| this.test_key(cx)))
@@ -1121,9 +1222,9 @@ impl OpenRouterSettings {
                         if self.key_operation == Some(KeyOperation::Remove) {
                             KeyOperation::Remove.label()
                         } else if self.key_remove_armed {
-                            "Really remove?"
+                            t("Really remove?")
                         } else {
-                            "Remove"
+                            t("Remove")
                         },
                         false,
                     )
@@ -1137,15 +1238,15 @@ impl OpenRouterSettings {
                 ],
             ),
             Some(KeyStatus::ConfigFile) => (
-                "Key in openrouter.json".into(),
+                t("Key in openrouter.json").into(),
                 vec![
-                    button(self.action_label(KeyOperation::Test, "Test"), false)
+                    button(self.action_label(KeyOperation::Test, t("Test")), false)
                         .id("openrouter-test-key")
                         .when(self.busy(), |button| button.opacity(0.45))
                         .on_click(cx.listener(|this, _, _, cx| this.test_key(cx)))
                         .into_any_element(),
                     button(
-                        self.action_label(KeyOperation::Move, "Move to Keychain"),
+                        self.action_label(KeyOperation::Move, t("Move to Keychain")),
                         true,
                     )
                     .id("openrouter-move-key")
@@ -1155,9 +1256,9 @@ impl OpenRouterSettings {
                 ],
             ),
             Some(KeyStatus::Environment) => (
-                format!("Key from {}", self.key_provider.env()),
+                tf!("Key from {variable}", variable = self.key_provider.env()),
                 vec![
-                    button(self.action_label(KeyOperation::Test, "Test"), false)
+                    button(self.action_label(KeyOperation::Test, t("Test")), false)
                         .id("openrouter-test-key")
                         .when(self.busy(), |button| button.opacity(0.45))
                         .on_click(cx.listener(|this, _, _, cx| this.test_key(cx)))
@@ -1180,10 +1281,10 @@ impl OpenRouterSettings {
                     .items_center()
                     .gap_2()
                     .rounded(px(crate::desktop_ui::CONTROL_RADIUS))
-                    .bg(rgb(0x17231a))
+                    .bg(rgb(crate::desktop_ui::ThemeColor::PositiveBadge))
                     .text_size(px(11.0))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(0x91bd99))
+                    .text_color(rgb(crate::desktop_ui::ThemeColor::PositiveBadgeText))
                     // Clicking the saved-key badge opens the replacement editor;
                     // the standalone Replace button was removed as redundant.
                     .when(
@@ -1191,13 +1292,20 @@ impl OpenRouterSettings {
                         |badge| {
                             badge
                                 .cursor_pointer()
-                                .hover(|badge| badge.bg(rgb(0x1d2c21)))
+                                .hover(|badge| {
+                                    badge.bg(rgb(crate::desktop_ui::ThemeColor::PositiveBadgeHover))
+                                })
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.begin_key_replacement(window, cx)
                                 }))
                         },
                     )
-                    .child(div().size(px(6.0)).rounded_full().bg(rgb(0x69d89f)))
+                    .child(
+                        div()
+                            .size(px(6.0))
+                            .rounded_full()
+                            .bg(rgb(crate::desktop_ui::ThemeColor::PositiveDot)),
+                    )
                     .child(badge),
             )
             .children(actions)
@@ -1214,13 +1322,13 @@ impl OpenRouterSettings {
             return key_usage(&self.config.transcription.models, self.key_provider);
         }
         match &self.key_status {
-            None => "Looking for this provider’s key…",
-            Some(KeyStatus::Keychain(_)) => "Stored in the macOS Keychain, never in a file",
+            None => t("Looking for this provider’s key…"),
+            Some(KeyStatus::Keychain(_)) => t("Stored in the macOS Keychain, never in a file"),
             Some(KeyStatus::ConfigFile) => {
-                "Read from openrouter.json in plain text; moving it to the Keychain is safer"
+                t("Read from openrouter.json in plain text; moving it to the Keychain is safer")
             }
-            Some(KeyStatus::Environment) => "Set by the environment; it overrides any saved key",
-            Some(KeyStatus::Missing) => "Uses your macOS Keychain",
+            Some(KeyStatus::Environment) => t("Set by the environment; it overrides any saved key"),
+            Some(KeyStatus::Missing) => t("Uses your macOS Keychain"),
         }
         .into()
     }
@@ -1239,7 +1347,7 @@ impl OpenRouterSettings {
     fn row_message(&self, row: gpui::Div, scope: Scope, show: bool) -> gpui::Div {
         div()
             .border_b_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(crate::desktop_ui::DIVIDER))
             .child(row.border_b_0())
             .when(show, |panel| {
                 panel.children(
@@ -1294,7 +1402,7 @@ impl OpenRouterSettings {
                                     .text_size(px(10.0))
                                     .line_height(px(16.0))
                                     .text_color(rgb(MUTED))
-                                    .child(label),
+                                    .child(t(label)),
                             )
                     }),
             )
@@ -1307,14 +1415,8 @@ impl OpenRouterSettings {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let label = model
-            .map(|id| {
-                format!(
-                    "{} · {}",
-                    catalog::provider_label(id),
-                    catalog::label(id, self.catalog.models())
-                )
-            })
-            .unwrap_or_else(|| "Choose a model".into());
+            .map(|id| catalog::selector_label(id, self.catalog.models()))
+            .unwrap_or_else(|| t("Choose a model").into());
         let open = self
             .picker
             .as_ref()
@@ -1360,7 +1462,7 @@ impl OpenRouterSettings {
                         .h(px(16.0))
                         .text_size(px(11.0))
                         .text_color(rgb(NEGATIVE))
-                        .child("Provider key unavailable · connect in Providers")
+                        .child(t("Provider key unavailable · connect in Providers"))
                 }
             }))
             .children(menu.map(picker_popup))
@@ -1414,12 +1516,13 @@ impl OpenRouterSettings {
         let highlight = picker.highlight.min(choices.len().saturating_sub(1));
         let status: Option<AnyElement> = if self.available_providers.is_empty() {
             Some(
-                picker_note("Add a provider key in Providers to choose models.").into_any_element(),
+                picker_note(t("Add a provider key in Providers to choose models."))
+                    .into_any_element(),
             )
         } else {
             match &self.catalog {
             CatalogState::Idle | CatalogState::Loading => {
-                Some(picker_note("Loading OpenRouter models…").into_any_element())
+                Some(picker_note(t("Loading OpenRouter models…")).into_any_element())
             }
             CatalogState::Failed(error) => Some(
                 div()
@@ -1434,10 +1537,10 @@ impl OpenRouterSettings {
                             .min_w_0()
                             .text_size(px(11.0))
                             .text_color(rgb(NEGATIVE))
-                            .child(format!("OpenRouter catalog unavailable: {error}. Showing known models for connected providers.")),
+                            .child(tf!("OpenRouter catalog unavailable: {error}. Showing known models for connected providers.", error = error)),
                     )
                     .child(
-                        button("Retry", false)
+                        button(t("Try again"), false)
                             .id("openrouter-catalog-retry")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.catalog = CatalogState::Idle;
@@ -1467,8 +1570,11 @@ impl OpenRouterSettings {
                     },
                 ),
                 PickerChoice::Custom(id) => (
-                    format!("Use “{id}”"),
-                    format!("{} · Custom model", catalog::provider_label(id)),
+                    tf!("Use “{id}”", id = id),
+                    tf!(
+                        "{provider} · Custom model",
+                        provider = catalog::provider_label(id)
+                    ),
                 ),
             };
             let capabilities = self.render_capabilities(
@@ -1591,7 +1697,7 @@ impl OpenRouterSettings {
             .items_center()
             .gap_1()
             .child(if slot > 0 {
-                icon_button("↑", "Move up")
+                icon_button("↑", t("Move up"))
                     .id(("openrouter-promote", slot))
                     .when(busy, |button| button.opacity(0.5))
                     .on_click(cx.listener(move |this, _, _, cx| this.promote_model(slot, cx)))
@@ -1600,7 +1706,7 @@ impl OpenRouterSettings {
                 placeholder().into_any_element()
             })
             .child(if slot + 1 < chain_len {
-                icon_button("↓", "Move down")
+                icon_button("↓", t("Move down"))
                     .id(("openrouter-demote", slot))
                     .when(busy, |button| button.opacity(0.5))
                     .on_click(cx.listener(move |this, _, _, cx| this.promote_model(slot + 1, cx)))
@@ -1609,7 +1715,7 @@ impl OpenRouterSettings {
                 placeholder().into_any_element()
             })
             .child(if slot > 0 {
-                icon_button("✕", "Remove")
+                icon_button("✕", t("Remove"))
                     .id(("openrouter-remove-model", slot))
                     .when(busy, |button| button.opacity(0.5))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1631,13 +1737,13 @@ impl OpenRouterSettings {
             .items_center()
             .gap_1()
             .child(self.render_order_controls(0, chain_len, cx))
-            .child(self.render_model_button(0, models.first().map(String::as_str), cx));
+            .child(self.chain_button(0, models.first().map(String::as_str), cx));
         let primary_notices = models
             .first()
             .and_then(|id| self.render_model_notices(0, id));
         panel = panel.child(
             self.row_message(
-                settings_row("Primary model", "", primary)
+                settings_row(t("Primary model"), "", primary)
                     .when(primary_notices.is_some(), |row| row.pb_1())
                     .debug_selector(|| "model-row-0".into()),
                 Scope::Model(0),
@@ -1648,7 +1754,7 @@ impl OpenRouterSettings {
         );
         let fallbacks = models.len().saturating_sub(1).min(MAX_FALLBACKS);
         for (slot, model) in models.iter().enumerate().skip(1).take(fallbacks) {
-            let button = self.render_model_button(slot, Some(model.as_str()), cx);
+            let button = self.chain_button(slot, Some(model.as_str()), cx);
             let notices = self.render_model_notices(slot, model);
             let control = div()
                 .flex_none()
@@ -1661,9 +1767,9 @@ impl OpenRouterSettings {
                 self.row_message(
                     settings_row(
                         if slot == 1 {
-                            "Fallback 1"
+                            t("Fallback 1")
                         } else {
-                            "Fallback 2"
+                            t("Fallback 2")
                         },
                         "",
                         control,
@@ -1701,17 +1807,14 @@ impl OpenRouterSettings {
                             .min_w_0()
                             .text_size(px(11.0))
                             .text_color(rgb(MUTED))
-                            .child(format!(
-                                "{} of {MAX_FALLBACKS} fallbacks. Any error — rate limit, timeout, server error — moves on to the next model.",
-                                fallbacks
-                            )),
+                            .child(tf!("{fallbacks} of {max_fallbacks} fallbacks. Any error — rate limit, timeout, server error — moves on to the next model.", fallbacks = fallbacks, max_fallbacks = MAX_FALLBACKS)),
                     )
                     .child(
                         div()
                             .relative()
                             .flex_none()
                             .child(
-                                button("+ Add fallback", false)
+                                button(t("+ Add fallback"), false)
                                     .id("openrouter-add-fallback")
                                     .track_focus(&self.model_focus[slot].clone().tab_stop(!self.busy()))
                                     .focus(|style| style.border_color(rgb(ACCENT)))
@@ -1742,14 +1845,21 @@ impl OpenRouterSettings {
                     .py_3()
                     .text_size(px(11.0))
                     .text_color(rgb(MUTED))
-                    .child(format!(
-                        "{extra} more fallback model{} from openrouter.json are tried after these.",
-                        if extra == 1 { "" } else { "s" }
-                    )),
+                    .child(if extra == 1 {
+                        tf!(
+                            "{extra} more fallback model from openrouter.json is tried after these.",
+                            extra = extra
+                        )
+                    } else {
+                        tf!(
+                            "{extra} more fallback models from openrouter.json are tried after these.",
+                            extra = extra
+                        )
+                    }),
             );
         }
         div()
-            .child(settings_section_label("MODELS"))
+            .child(settings_section_label(t("Models")))
             .child(panel)
             .into_any_element()
     }
@@ -1764,8 +1874,8 @@ impl OpenRouterSettings {
 
     pub(crate) fn render_advanced(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let header = crate::desktop_ui::disclosure_header(
-            "ADVANCED",
-            "Request limits and API URL",
+            t("Advanced"),
+            t("Request limits and API URL"),
             self.advanced_open,
         )
         .id("openrouter-advanced")
@@ -1825,12 +1935,12 @@ impl OpenRouterSettings {
                     .flex()
                     .gap_2()
                     .child(
-                        button("Show file", false)
+                        button(t("Show file"), false)
                             .id("openrouter-reveal")
                             .on_click(cx.listener(|this, _, _, cx| this.reveal_config(cx))),
                     )
                     .child(
-                        button("Defaults", false)
+                        button(t("Defaults"), false)
                             .id("openrouter-defaults")
                             .when(self.busy(), |button| button.opacity(0.45))
                             .on_click(
@@ -1844,28 +1954,28 @@ impl OpenRouterSettings {
             .child(
                 settings_panel()
                     .child(settings_row(
-                        "Attempt timeout (s)",
-                        "Deadline for one request to one model",
+                        t("Attempt timeout (s)"),
+                        t("Deadline for one request to one model"),
                         narrow(&self.advanced.attempt_timeout),
                     ))
                     .child(settings_row(
-                        "Total timeout (s)",
-                        "Deadline for the whole fallback chain",
+                        t("Total timeout (s)"),
+                        t("Deadline for the whole fallback chain"),
                         narrow(&self.advanced.total_timeout),
                     ))
                     .child(settings_row(
-                        "Chunk length (s)",
-                        "Long recordings are split at a quiet point, from 10 to 200",
+                        t("Chunk length (s)"),
+                        t("Long recordings are split at a quiet point, from 10 to 200"),
                         narrow(&self.advanced.chunk_seconds),
                     ))
                     .child(settings_row(
-                        "Rate-limit retry (ms)",
-                        "A 429 asking to wait at most this long is retried once on the same model; 0 falls back at once",
+                        t("Rate-limit retry (ms)"),
+                        t("A 429 asking to wait at most this long is retried once on the same model; 0 falls back at once"),
                         narrow(&self.advanced.rate_limit_wait),
                     ))
                     .child(settings_row(
-                        "OpenRouter API URL",
-                        "Used only by models routed through OpenRouter",
+                        t("OpenRouter API URL"),
+                        t("Used only by models routed through OpenRouter"),
                         sized(&self.advanced.base_url, WIDE_INPUT),
                     ))
                     .child(footer),
@@ -1885,16 +1995,20 @@ fn key_usage(models: &[String], provider: crate::providers::Provider) -> String 
         .filter(|(_, id)| crate::providers::ModelRef::parse(id).provider == provider)
         .map(|(slot, _)| {
             if slot == 0 {
-                "Primary".to_owned()
+                t("Primary").to_owned()
             } else {
-                format!("Fallback {slot}")
+                tf!("Fallback {slot}", slot = slot)
             }
         })
         .collect();
     match slots.as_slice() {
-        [] => "Not used by your models".into(),
-        [only] => format!("Used by {only}"),
-        [rest @ .., last] => format!("Used by {} and {last}", rest.join(", ")),
+        [] => t("Not used by your models").into(),
+        [only] => tf!("Used by {only}", only = only),
+        [rest @ .., last] => tf!(
+            "Used by {rest} and {last}",
+            rest = rest.join(", "),
+            last = last
+        ),
     }
 }
 
@@ -1989,7 +2103,7 @@ impl Render for OpenRouterSettings {
         .children(self.render_message(Scope::Configuration))
         .child(models)
         .child(div().px_1().pt_3().text_size(px(11.0)).text_color(rgb(FAINT))
-            .child("Models are tried from top to bottom until one succeeds. Keys and request limits are in Providers."))
+            .child(t("Models are tried from top to bottom until one succeeds. Keys and request limits are in Providers.")))
         .into_any_element()
     }
 }

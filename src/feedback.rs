@@ -1,7 +1,7 @@
 use std::io::Cursor;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,6 +11,7 @@ use rodio::buffer::SamplesBuffer;
 use rodio::{Decoder, DeviceSinkBuilder, Source};
 
 use crate::interaction_settings::SoundVolumes;
+use crate::start_cue::StartCue;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Tone {
@@ -18,7 +19,13 @@ pub enum Tone {
     DictationStart,
     DictationStop,
     Cancel,
+    /// The selected start cue, played on request from Settings. It stays
+    /// audible while sounds are off so the choice can still be heard.
+    StartPreview,
 }
+
+/// The preview level when the start sound is off: the default start volume.
+const PREVIEW_FALLBACK_VOLUME: f32 = 0.75;
 
 static DICTATION_PLAYER: OnceLock<SyncSender<Tone>> = OnceLock::new();
 static LOADER_STARTED: AtomicBool = AtomicBool::new(false);
@@ -26,6 +33,7 @@ static ENABLED: AtomicBool = AtomicBool::new(true);
 static START_VOLUME: AtomicU32 = AtomicU32::new(0.75_f32.to_bits());
 static STOP_VOLUME: AtomicU32 = AtomicU32::new(0.5_f32.to_bits());
 static ERROR_CANCEL_VOLUME: AtomicU32 = AtomicU32::new(0.5_f32.to_bits());
+static START_CUE: AtomicUsize = AtomicUsize::new(0);
 
 pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
@@ -36,6 +44,17 @@ pub fn set_volumes(volumes: SoundVolumes) {
     START_VOLUME.store(volumes.start.to_bits(), Ordering::Relaxed);
     STOP_VOLUME.store(volumes.stop.to_bits(), Ordering::Relaxed);
     ERROR_CANCEL_VOLUME.store(volumes.error_cancel.to_bits(), Ordering::Relaxed);
+}
+
+pub fn set_start_cue(cue: StartCue) {
+    START_CUE.store(cue.index(), Ordering::Relaxed);
+}
+
+fn start_cue() -> StartCue {
+    StartCue::ALL
+        .get(START_CUE.load(Ordering::Relaxed))
+        .copied()
+        .unwrap_or_default()
 }
 
 fn volumes() -> SoundVolumes {
@@ -49,6 +68,8 @@ fn volumes() -> SoundVolumes {
 fn playback_volume(tone: Tone, volumes: SoundVolumes) -> f32 {
     match tone {
         Tone::DictationStart => volumes.start,
+        Tone::StartPreview if volumes.start > 0.0 => volumes.start,
+        Tone::StartPreview => PREVIEW_FALLBACK_VOLUME,
         Tone::DictationStop => volumes.stop,
         Tone::Error | Tone::Cancel => volumes.error_cancel,
     }
@@ -61,7 +82,14 @@ fn sounds_enabled() -> bool {
 }
 
 fn tone_volume(tone: Tone) -> f32 {
-    if ENABLED.load(Ordering::Relaxed) {
+    if tone == Tone::StartPreview {
+        let volumes = if ENABLED.load(Ordering::Relaxed) {
+            volumes()
+        } else {
+            SoundVolumes::from_legacy(0.0)
+        };
+        playback_volume(tone, volumes)
+    } else if ENABLED.load(Ordering::Relaxed) {
         playback_volume(tone, volumes())
     } else {
         0.0
@@ -75,6 +103,8 @@ fn tone_volume(tone: Tone) -> f32 {
 /// device reopen.
 const IDLE_RELEASE_GRACE: Duration = Duration::from_secs(5 * 60);
 const OPEN_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+/// How soon an open device notices that sounds turned off or the grace ended.
+const OUTPUT_OBSERVATION_INTERVAL: Duration = Duration::from_millis(250);
 
 // Only the playback worker owns a device. It opens lazily for a tone, stays
 // open through the idle grace, and drops within one observation interval once
@@ -101,6 +131,10 @@ impl<S> FeedbackOutput<S> {
             self.sink = Some(open()?);
         }
         Ok(())
+    }
+
+    fn is_open(&self) -> bool {
+        self.sink.is_some()
     }
 
     fn mark_playing(&mut self, now: Instant, duration: Duration) {
@@ -160,10 +194,11 @@ pub fn preload() -> Result<()> {
     let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
         let result = (|| -> Result<_> {
-            let start = decode(include_bytes!(concat!(
+            let classic = decode(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/resources/audio/startRecording.mp3"
             )))?;
+            let start = start_cues(classic);
             let stop = decode(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/resources/audio/stopRecording.mp3"
@@ -189,19 +224,33 @@ pub fn preload() -> Result<()> {
         // The device opens for the first tone, not at startup, so an idle app
         // holds no output stream. Publish before any tone arrives.
         publish_player(&DICTATION_PLAYER, sender, ready_sender, Ok(()));
+        // A preview may play while sounds are off; keep the output until it ends.
+        let mut previewing_until: Option<Instant> = None;
         loop {
-            let tone = match receiver.recv_timeout(Duration::from_millis(250)) {
-                Ok(tone) => Some(tone),
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            // Only a held device needs the periodic release check. Without
+            // one, sleep until the next tone instead of waking the process.
+            let tone = if output.is_open() {
+                match receiver.recv_timeout(OUTPUT_OBSERVATION_INTERVAL) {
+                    Ok(tone) => Some(tone),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                match receiver.recv() {
+                    Ok(tone) => Some(tone),
+                    Err(mpsc::RecvError) => break,
+                }
             };
+            let now = Instant::now();
             let enabled = sounds_enabled();
-            output.release_when_idle(enabled, Instant::now());
-            let Some(tone) = tone.filter(|tone| enabled && tone_volume(*tone) > 0.0) else {
+            let previewing = previewing_until.is_some_and(|until| now < until);
+            output.release_when_idle(enabled || previewing, now);
+            let audible = |tone: Tone| enabled || tone == Tone::StartPreview;
+            let Some(tone) = tone.filter(|tone| audible(*tone) && tone_volume(*tone) > 0.0) else {
                 continue;
             };
             let sound = match tone {
-                Tone::DictationStart => &start,
+                Tone::DictationStart | Tone::StartPreview => &start[start_cue().index()],
                 Tone::DictationStop => &stop,
                 Tone::Cancel => &cancel,
                 Tone::Error => continue,
@@ -211,7 +260,7 @@ pub fn preload() -> Result<()> {
             }
             // Opening may have been slow; recheck the latest preference before
             // retaining the output or playing the queued sound.
-            if !sounds_enabled() {
+            if tone != Tone::StartPreview && !sounds_enabled() {
                 output.release_when_idle(false, Instant::now());
                 continue;
             }
@@ -223,10 +272,11 @@ pub fn preload() -> Result<()> {
                 continue;
             };
             sink.mixer().add(sound.clone().amplify(volume));
-            output.mark_playing(
-                Instant::now(),
-                sound.total_duration().unwrap_or(Duration::ZERO),
-            );
+            let duration = sound.total_duration().unwrap_or(Duration::ZERO);
+            output.mark_playing(Instant::now(), duration);
+            if tone == Tone::StartPreview {
+                previewing_until = Some(Instant::now() + duration);
+            }
         }
     });
     let outcome = ready_receiver.recv_timeout(Duration::from_secs(2));
@@ -239,11 +289,20 @@ pub fn play(tone: Tone) {
         return;
     }
     match tone {
-        Tone::DictationStart | Tone::DictationStop | Tone::Cancel => {
+        Tone::DictationStart | Tone::DictationStop | Tone::Cancel | Tone::StartPreview => {
             enqueue(DICTATION_PLAYER.get(), tone);
         }
         Tone::Error => play_system_sound(tone),
     }
+}
+
+/// Plays the selected start cue for Settings, loading the player off the UI
+/// thread first when dictation has not (previews never start a listener).
+pub fn preview_start_cue() {
+    thread::spawn(|| {
+        let _ = preload();
+        play(Tone::StartPreview);
+    });
 }
 
 fn enqueue(player: Option<&SyncSender<Tone>>, tone: Tone) {
@@ -255,7 +314,7 @@ fn enqueue(player: Option<&SyncSender<Tone>>, tone: Tone) {
 fn play_system_sound(tone: Tone) {
     let sound = match tone {
         Tone::Error => "Basso",
-        Tone::DictationStart | Tone::DictationStop | Tone::Cancel => return,
+        Tone::DictationStart | Tone::DictationStop | Tone::Cancel | Tone::StartPreview => return,
     };
     let volume = tone_volume(tone);
     if volume <= 0.0 {
@@ -277,6 +336,22 @@ fn play_system_sound(tone: Tone) {
             let _ = child.wait();
         });
     }
+}
+
+/// Renders every start cue once, in [`StartCue::ALL`] order, so switching the
+/// preference never synthesizes on the playback path.
+fn start_cues(classic: SamplesBuffer) -> Vec<SamplesBuffer> {
+    StartCue::ALL
+        .map(|cue| match cue.samples() {
+            Some(samples) => SamplesBuffer::new(
+                rodio::ChannelCount::MIN,
+                rodio::SampleRate::new(crate::start_cue::SAMPLE_RATE)
+                    .expect("the cue sample rate is nonzero"),
+                samples,
+            ),
+            None => classic.clone(),
+        })
+        .into()
 }
 
 fn decode(bytes: &'static [u8]) -> Result<SamplesBuffer> {
@@ -362,10 +437,37 @@ mod tests {
         assert!(maximum <= 1.0);
     }
 
-    impl<S> FeedbackOutput<S> {
-        fn is_open(&self) -> bool {
-            self.sink.is_some()
+    #[test]
+    fn preview_plays_the_chosen_level_or_the_default_when_start_is_off() {
+        let volumes = SoundVolumes {
+            start: 0.25,
+            stop: 0.5,
+            error_cancel: 0.5,
+        };
+        assert_eq!(playback_volume(Tone::StartPreview, volumes), 0.25);
+        let silent = SoundVolumes::from_legacy(0.0);
+        assert_eq!(playback_volume(Tone::DictationStart, silent), 0.0);
+        assert_eq!(
+            playback_volume(Tone::StartPreview, silent),
+            PREVIEW_FALLBACK_VOLUME
+        );
+    }
+
+    #[test]
+    fn every_start_cue_loads_in_order_and_stays_below_full_scale() {
+        let classic = decode(include_bytes!("../resources/audio/startRecording.mp3")).unwrap();
+        let cues = start_cues(classic.clone());
+        assert_eq!(cues.len(), StartCue::ALL.len());
+        let loudest = playback_volume(Tone::DictationStart, SoundVolumes::from_legacy(1.0));
+        for (cue, sound) in StartCue::ALL.into_iter().zip(&cues) {
+            let peak = sound
+                .clone()
+                .amplify(loudest)
+                .map(f32::abs)
+                .fold(0.0, f32::max);
+            assert!(peak > 0.0 && peak <= 1.0, "{cue:?} peaks at {peak}");
         }
+        assert!(cues[StartCue::Classic.index()].clone().eq(classic));
     }
 
     #[test]

@@ -31,6 +31,9 @@ struct Uniforms {
     float recording_hue_shift;
     float transcription_hue_shift;
     float brightness;
+    float light;
+    // 1 hides the lines so a written notice can sit in the capsule.
+    float silenced;
 };
 
 struct VertexOutput {
@@ -99,6 +102,32 @@ float3 rotate_hue(float3 color, float turns) {
     return rotated + lower;
 }
 
+// The stroke of y = wave(x): a sine whose amplitude tapers to zero at both
+// ends, so the lines grow out of the capsule's middle.
+float wave(float x, float start, float end, float amplitude, float frequency, float phase) {
+    float progress = clamp((x - start) / max(end - start, 0.001), 0.0, 1.0);
+    return amplitude * sin(progress * 3.14159265) * sin(x * frequency + phase);
+}
+
+// Slope-corrected distance to the wave, so the stroke keeps its width on the
+// steep parts instead of thinning out.
+float wave_distance(float2 point, float start, float end, float amplitude, float frequency, float phase) {
+    float step = 0.05;
+    float y = wave(point.x, start, end, amplitude, frequency, phase);
+    float slope = (wave(point.x + step, start, end, amplitude, frequency, phase)
+        - wave(point.x - step, start, end, amplitude, frequency, phase)) / (2.0 * step);
+    return abs(point.y - y) / sqrt(1.0 + slope * slope);
+}
+
+float segment_distance(float2 point, float2 a, float2 b) {
+    float2 ab = b - a;
+    float along = clamp(dot(point - a, ab) / max(dot(ab, ab), 0.0001), 0.0, 1.0);
+    return length(point - a - ab * along);
+}
+
+// A dark (or, in light mode, Tabatinga) capsule with two fine lines in the
+// phase color: they follow the voice while recording, run quickly while
+// transcribing, rest gray while preparing, and give way to a check when done.
 fragment float4 indicator_fragment(
     VertexOutput input [[stage_in]],
     constant Uniforms &uniforms [[buffer(0)]])
@@ -114,229 +143,98 @@ fragment float4 indicator_fragment(
         / max(uniforms.scale, 0.001);
     float shape = coverage(distance, edge);
     float detail_clarity = exp2(-lifecycle_softness * 0.34);
-    float4 result = 0.0;
-
-    // Opening uses the same capsule geometry, without a beam, audio reaction,
-    // flash, or animated light. Recording and transcription keep their shader.
-    if (uniforms.preparing > 0.5) {
-        composite(result, float3(0.36, 0.37, 0.39), shape * 0.56);
-        float rim = coverage(abs(distance) - 0.3, edge);
-        composite(result, float3(0.55, 0.57, 0.60), rim * 0.22 * detail_clarity);
-        if (uniforms.brightness != 1.0) result.rgb *= uniforms.brightness;
-        return result * uniforms.opacity;
-    }
+    bool light_mode = uniforms.light > 0.5;
 
     float processing = clamp(uniforms.processing, 0.0, 1.0);
     float post_processing = clamp(uniforms.post_processing, 0.0, 1.0);
-    float editing = clamp(uniforms.editing, 0.0, 1.0);
+    float preparing = clamp(uniforms.preparing, 0.0, 1.0);
     float completion = clamp(uniforms.completion, 0.0, 1.0);
-    float recording_flash = clamp(uniforms.recording_flash, 0.0, 1.0)
-        * (1.0 - processing);
+    float recording_flash = clamp(uniforms.recording_flash, 0.0, 1.0) * (1.0 - processing);
     float completion_flash = smoothstep(0.0, 0.16, completion)
         * (1.0 - smoothstep(0.32, 1.0, completion));
-    float recording = 1.0 - processing;
-    float circularity = 1.0 - smoothstep(0.5, 2.25, abs(uniforms.width - uniforms.height));
-
-    float3 red_accent = mix(
-        float3(1.0, 0.025, 0.035),
-        float3(0.05, 0.85, 0.58),
-        editing);
-    red_accent = rotate_hue(red_accent, uniforms.recording_hue_shift);
-    float3 blue_accent = rotate_hue(float3(0.1, 0.34, 1.0), uniforms.transcription_hue_shift);
-    float3 violet_accent = float3(0.64, 0.2, 1.0);
-    float3 pipeline_accent = mix(blue_accent, violet_accent, post_processing);
-    float3 accent = mix(red_accent, pipeline_accent, processing);
-
     float average_power = clamp(uniforms.average, 0.0, 1.0);
     float peak_power = clamp(uniforms.peak, 0.0, 1.0);
-    float average_activation = smoothstep(0.0, 0.1, average_power);
-    float outer = recording * (
-        glow(distance, 4.0 + lifecycle_softness * 0.5) * average_power * 0.72
-        + glow(distance, 8.0 + lifecycle_softness) * average_power * 0.36);
-    outer += processing * glow(distance, 2.6 + lifecycle_softness) * 0.045;
-    outer += glow(distance, 6.0 + lifecycle_softness * 0.5) * completion_flash * 0.22;
-    outer += glow(distance, 7.0 + lifecycle_softness * 0.5) * recording_flash * 0.5;
-    composite(result, accent, outer * (1.0 - shape));
+    float level = max(average_power, peak_power * 0.6);
 
-    float3 recording_base = mix(
-        float3(0.5, 0.0, 0.0),
-        float3(1.0, 0.0, 0.0),
-        average_power);
-    recording_base = mix(recording_base, float3(0.0, 0.48, 0.3), editing);
-    recording_base = mix(recording_base, float3(1.0, 0.08, 0.06), recording_flash * 0.72);
-    recording_base = rotate_hue(recording_base, uniforms.recording_hue_shift);
-    float sphere_light = clamp(0.48 - point.x * 0.035 - point.y * 0.045, 0.0, 1.0);
-    float3 blue_base = mix(
-        float3(0.0, 0.02, 0.32),
-        float3(0.04, 0.18, 0.68),
-        sphere_light);
-    float3 violet_base = mix(
-        float3(0.12, 0.0, 0.3),
-        float3(0.38, 0.04, 0.68),
-        sphere_light);
-    blue_base = rotate_hue(blue_base, uniforms.transcription_hue_shift);
-    float3 pipeline_base = mix(blue_base, violet_base, post_processing);
-    float3 base = mix(recording_base, pipeline_base, processing);
-    composite(result, base, shape);
+    // Palettes rotate these, so Red and Blue stay the defaults.
+    float3 recording_color = rotate_hue(
+        light_mode ? float3(0.80, 0.16, 0.08) : float3(0.98, 0.30, 0.16),
+        uniforms.recording_hue_shift);
+    float3 transcription_color = rotate_hue(
+        light_mode ? float3(0.16, 0.34, 0.80) : float3(0.47, 0.64, 1.0),
+        uniforms.transcription_hue_shift);
+    float3 violet = light_mode ? float3(0.42, 0.16, 0.78) : float3(0.70, 0.50, 1.0);
+    transcription_color = mix(transcription_color, violet, post_processing);
+    float3 resting_color = light_mode ? float3(0.62, 0.60, 0.56) : float3(0.50, 0.51, 0.54);
+    float3 line_color = mix(recording_color, transcription_color, processing);
+    line_color = mix(line_color, resting_color, preparing);
 
-    float inside_edge = clamp(-distance / 4.0, 0.0, 1.0);
-    float inner_edge = shape * (1.0 - inside_edge);
-    float inner_edge_strength = mix(0.48, 0.07, processing);
-    composite(result, accent, inner_edge * inner_edge_strength);
+    float3 fill = light_mode ? float3(0.984, 0.973, 0.945) : float3(0.047, 0.047, 0.055);
+    float3 rim_color = light_mode ? float3(0.84, 0.80, 0.71) : float3(1.0);
+    float rim_strength = light_mode ? 0.9 : 0.14;
+    float glow_strength = light_mode ? 0.55 : 1.0;
 
-    // Match the original Hex recording stack: a padded red fill, a nearly
-    // full-width white beam, and a broad peak-driven red glow.
-    float2 beam_point = point - float2(0.0, -0.5);
-    float red_fill_distance = rounded_box(beam_point, float2(22.0, 2.0), 2.0);
-    float red_fill = glow(red_fill_distance, 2.0) * shape;
-    screen(result, red_accent, red_fill * average_activation * recording * detail_clarity);
+    float4 result = 0.0;
+    float speaking = (1.0 - processing) * (1.0 - preparing);
+    float halo = glow(distance, 5.0 + lifecycle_softness) * (0.06 + 0.3 * level) * speaking
+        + glow(distance, 6.0 + lifecycle_softness * 0.5) * completion_flash * 0.3
+        + glow(distance, 7.0 + lifecycle_softness * 0.5) * recording_flash * 0.45;
+    composite(result, line_color, halo * glow_strength * (1.0 - shape));
 
-    float white_beam_distance = rounded_box(beam_point, float2(21.0, 1.0), 1.0);
-    float white_beam = glow(white_beam_distance, 1.0) * shape;
-    screen(
-        result,
-        float3(1.0),
-        white_beam * average_activation * 0.56 * recording * detail_clarity);
+    composite(result, fill, shape * (light_mode ? 0.97 : 0.94));
+    float rim = coverage(abs(distance) - 0.25, edge);
+    composite(result, rim_color, rim * rim_strength * detail_clarity);
+    composite(result, recording_color, rim * recording_flash * 0.7 * detail_clarity);
 
-    float peak_half_width = 22.0 * min(peak_power + 0.6, 1.0);
-    float peak_distance = rounded_box(beam_point, float2(peak_half_width, 2.0), 2.0);
-    float peak_beam = glow(peak_distance, 4.0) * shape;
-    screen(
-        result,
-        red_accent,
-        peak_beam * smoothstep(0.0, 0.1, peak_power) * 0.5 * recording * detail_clarity);
+    float inset = radius * 0.9;
+    float start = -half_size.x + inset;
+    float end = half_size.x - inset;
+    float time = uniforms.time;
+    float rest = 0.5 + 0.5 * sin(time * 4.0);
+    float amplitude = mix(0.6 + 4.2 * level, 1.5, processing);
+    amplitude = mix(amplitude, 0.35 + 0.25 * rest, preparing);
+    amplitude *= 1.0 - smoothstep(0.0, 0.5, completion);
+    float speed = mix(mix(5.0, 9.0, processing), 2.0, preparing);
+    float frequency = 0.27;
+    float primary = wave_distance(point, start, end, amplitude, frequency, time * speed);
+    float secondary = wave_distance(point, start, end, amplitude * 0.7, frequency, time * speed + 2.2);
+    float span = smoothstep(start - 0.6, start + 0.6, point.x)
+        * (1.0 - smoothstep(end - 0.6, end + 0.6, point.x));
+    float lines_visible = shape * span * detail_clarity
+        * (1.0 - smoothstep(0.3, 0.7, completion))
+        * (preparing > 0.5 ? 0.5 + 0.3 * rest : 1.0)
+        * (1.0 - clamp(uniforms.silenced, 0.0, 1.0));
+    float stroke_edge = 0.3 / max(uniforms.scale, 0.001);
+    float line_glow = glow(primary, 1.6) * 0.35 + glow(secondary, 1.4) * 0.18;
+    composite(result, line_color, line_glow * glow_strength * lines_visible * (1.0 - preparing));
+    composite(result, line_color, coverage(secondary - 0.32, stroke_edge) * 0.55 * lines_visible);
+    composite(result, line_color, coverage(primary - 0.45, stroke_edge) * lines_visible);
 
-    if (processing > 0.0) {
-        float orb_radius = uniforms.height * 0.5 - 0.6;
-        float orb_distance = length(point) - orb_radius;
-        float orb_edge = max(fwidth(orb_distance), 0.26);
-        float orb_mask = coverage(orb_distance, orb_edge) * circularity;
-        float2 sphere_uv = point / max(orb_radius, 0.001);
-        float surface_z = sqrt(max(1.0 - dot(sphere_uv, sphere_uv), 0.0));
-        float depth = mix(0.55, 1.45, clamp(uniforms.sphere_depth, 0.0, 1.0));
-        float normal_z = pow(surface_z, depth);
-        float light_phase = uniforms.light_angle * 6.2831853
-            + uniforms.time * uniforms.line_speed * 0.22;
-        float2 light_direction = float2(cos(light_phase), sin(light_phase));
-        float light = clamp(
-            0.32 + dot(sphere_uv, light_direction) * 0.18 + normal_z * 0.28,
-            0.0,
-            1.0);
-        float3 orb_shadow = mix(float3(0.0, 0.015, 0.24), float3(0.1, 0.0, 0.26), post_processing);
-        float3 orb_light = mix(float3(0.05, 0.22, 0.72), float3(0.4, 0.05, 0.7), post_processing);
-        float3 orb_color = rotate_hue(mix(orb_shadow, orb_light, light), uniforms.transcription_hue_shift);
-        composite(result, orb_color, orb_mask * processing * detail_clarity);
-
-        float rim = pow(1.0 - normal_z, 2.4);
-        composite(result, pipeline_accent, rim * orb_mask * processing * 0.3 * detail_clarity);
-
-        float style = clamp(uniforms.line_style, 0.0, 2.0);
-        float sharpness = clamp(uniforms.line_sharpness, 0.0, 1.0);
-        float blur_amount = 1.0 - sharpness;
-        float highlight_count = clamp(round(uniforms.line_count), 1.0, 6.0);
-        float shine = 0.0;
-        float soft_shine = 0.0;
-        if (style < 0.5) {
-            // A moving area light gives the orb motion without drawing stripes
-            // across its face.
-            float focus = clamp(
-                dot(sphere_uv, light_direction) * 0.55 + normal_z * 0.72,
-                0.0,
-                1.0);
-            shine = pow(focus, mix(3.0, 12.0, sharpness));
-        } else if (style < 1.5) {
-            // Meridian highlights wrap around the sphere instead of crossing
-            // it as flat screen-space lines.
-            float longitude = atan2(sphere_uv.x, normal_z) / 6.2831853;
-            float travel = uniforms.time * uniforms.line_speed * 0.11;
-            for (int index = 0; index < 6; index++) {
-                if (float(index) >= highlight_count) {
-                    break;
-                }
-                float offset = float(index) / highlight_count;
-                float angular_delta = fract(longitude - travel - offset + 0.5) - 0.5;
-                float angular_distance = abs(angular_delta);
-                float core = exp2(-pow(angular_distance / 0.018, 2.0));
-                float halo_radius = mix(0.025, 0.14, blur_amount);
-                float halo = exp2(-pow(angular_distance / halo_radius, 2.0));
-                shine = max(shine, core);
-                soft_shine = max(soft_shine, halo);
-            }
-        } else {
-            // Curved ribbons remain available in the lab for comparison, but
-            // are no longer the production default.
-            float curvature = mix(0.0, 3.0, clamp(uniforms.line_curvature, 0.0, 1.0));
-            float sweep_coordinate = point.x + sphere_uv.y * sphere_uv.y * curvature;
-            float sweep_travel = orb_radius * 2.0 + 18.0;
-            float sweep_start = fmod(
-                uniforms.time * 38.0 * uniforms.line_speed,
-                sweep_travel) - orb_radius - 7.0;
-            float spacing = mix(7.0, 2.8, (highlight_count - 1.0) / 5.0);
-            for (int index = 0; index < 6; index++) {
-                if (float(index) >= highlight_count) {
-                    break;
-                }
-                float line_distance = abs(
-                    sweep_coordinate - (sweep_start - float(index) * spacing));
-                float aa = max(fwidth(line_distance), 0.24);
-                float band = 1.0 - smoothstep(
-                    mix(1.4, 0.25, sharpness) - aa,
-                    mix(4.8, 1.5, sharpness) + aa,
-                    line_distance);
-                shine = max(shine, band);
-            }
-        }
-        float3 shine_color = mix(float3(0.66, 0.84, 1.0), float3(0.92, 0.72, 1.0), post_processing);
-        shine_color = rotate_hue(shine_color, uniforms.transcription_hue_shift);
-        float shine_strength = mix(0.16, 0.68, clamp(uniforms.line_glow, 0.0, 1.0));
-        float surface_wrap = orb_mask * mix(0.28, 1.0, normal_z);
-        float rim_spill = (1.0 - orb_mask) * glow(orb_distance, 2.2);
-        composite(
-            result,
-            shine_color,
-            soft_shine * (surface_wrap + rim_spill * 0.72) * processing * blur_amount
-                * shine_strength * 0.52
-                * detail_clarity);
-        composite(
-            result,
-            shine_color,
-            shine * surface_wrap * processing * shine_strength
-                * mix(1.0, 0.36, blur_amount) * detail_clarity);
+    if (completion > 0.0) {
+        float drawn = smoothstep(0.25, 0.75, completion);
+        float2 a = float2(-3.2, 0.2);
+        float2 b = float2(-1.0, 2.4);
+        float2 c = float2(3.4, -2.4);
+        float check = min(segment_distance(point, a, b), segment_distance(point, b, c));
+        composite(result, line_color, coverage(check - 0.55, stroke_edge) * drawn * shape * detail_clarity);
     }
 
-    // Pending jobs sit beside the foreground state. Keeping this geometry
-    // stationary prevents queue status from reading as part of the sphere.
+    // Pending jobs sit beside the foreground state, stationary so queue
+    // status never reads as part of the lines.
     float queued_count = min(uniforms.queued_count, 4.0);
     for (int index = 0; index < 4; index++) {
         if (float(index) >= queued_count) {
             break;
         }
-        float2 center = float2(
-            uniforms.width * 0.5 + 10.0 + float(index) * 3.4,
-            0.0);
+        float2 center = float2(uniforms.width * 0.5 + 10.0 + float(index) * 3.4, 0.0);
         float dot_distance = length(point - center) - 0.68;
         float dot = coverage(dot_distance, 0.22);
         float leading_processing = index == 0
             ? post_processing * clamp(uniforms.capturing, 0.0, 1.0)
             : 0.0;
-        float3 queued_blue = rotate_hue(float3(0.12, 0.58, 1.0), uniforms.transcription_hue_shift);
-        float3 dot_color = mix(queued_blue, violet_accent, leading_processing);
+        float3 dot_color = mix(transcription_color, violet, leading_processing);
         composite(result, dot_color, dot * (index == 0 ? 0.92 : 0.52));
     }
-
-    screen(result, rotate_hue(float3(0.72, 0.88, 1.0), uniforms.transcription_hue_shift), shape * completion_flash * 0.32);
-    float completion_rim = exp2(-pow(abs(distance) / 0.72, 2.0));
-    screen(result, rotate_hue(float3(0.82, 0.93, 1.0), uniforms.transcription_hue_shift), completion_rim * completion_flash * 0.58);
-
-    float sphere_outline = clamp(uniforms.sphere_outline, 0.0, 1.0);
-    float processing_stroke = mix(0.04, 0.4, sphere_outline);
-    float stroke = coverage(
-        abs(distance) - 0.4,
-        0.38 + lifecycle_softness * 0.3) * mix(0.56, processing_stroke, processing) * detail_clarity;
-    composite(result, mix(accent, float3(1.0), 0.1), stroke);
-    screen(result, rotate_hue(float3(1.0, 0.2, 0.16), uniforms.recording_hue_shift), shape * recording_flash * 0.36);
-    float recording_flash_rim = exp2(-pow(abs(distance) / 0.9, 2.0));
-    screen(result, rotate_hue(float3(1.0, 0.58, 0.48), uniforms.recording_hue_shift), recording_flash_rim * recording_flash * 0.82);
 
     if (uniforms.brightness != 1.0) result.rgb *= uniforms.brightness;
     result *= uniforms.opacity;

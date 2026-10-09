@@ -2,6 +2,7 @@
 //! inspection: no runtime globals, credentials, file access, or network calls.
 
 use super::{ModelRef, Provider, options};
+use crate::i18n::t;
 use crate::openrouter::{AUTO_LANGUAGE, Config};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,10 +25,10 @@ pub fn model_notices(config: &Config, id: &str) -> Vec<ModelNotice> {
     // https://elevenlabs.io/docs/api-reference/speech-to-text/v-1-speech-to-text-realtime
     if model.provider == Provider::ElevenLabs {
         let text = match model.model {
-            "scribe_v2" => Some(
+            "scribe_v2" => Some(t(
                 "Using keyterms adds 20% to the price. Over 100 terms also means a 20-second minimum charge per request.",
-            ),
-            "scribe_v2_realtime" => Some("Using keyterms adds 20% to the price."),
+            )),
+            "scribe_v2_realtime" => Some(t("Using keyterms adds 20% to the price.")),
             _ => None,
         };
         if let Some(text) = text {
@@ -40,7 +41,7 @@ pub fn model_notices(config: &Config, id: &str) -> Vec<ModelNotice> {
 
     if capabilities.streaming && !capabilities.batch && !options.streaming {
         notices.push(ModelNotice {
-            text: "Streaming is off. This realtime-only model will be skipped.",
+            text: t("Streaming is off. This realtime-only model will be skipped."),
             is_error: true,
         });
     }
@@ -51,7 +52,7 @@ pub fn model_notices(config: &Config, id: &str) -> Vec<ModelNotice> {
         && options.language == AUTO_LANGUAGE
     {
         notices.push(ModelNotice {
-            text: "Nova-2 uses recorded audio with Auto. Choose an explicit language to stream.",
+            text: t("Nova-2 uses recorded audio with Auto. Choose an explicit language to stream."),
             is_error: false,
         });
     }
@@ -63,9 +64,9 @@ pub fn model_notices(config: &Config, id: &str) -> Vec<ModelNotice> {
     {
         notices.push(ModelNotice {
             text: if options.language == AUTO_LANGUAGE {
-                "Smart formatting is inactive with Auto. Choose a supported language to enable it."
+                t("Smart formatting is inactive with Auto. Choose a supported language to enable it.")
             } else {
-                "Smart formatting is inactive for this language. Choose a supported language to enable it."
+                t("Smart formatting is inactive for this language. Choose a supported language to enable it.")
             },
             is_error: false,
         });
@@ -73,7 +74,7 @@ pub fn model_notices(config: &Config, id: &str) -> Vec<ModelNotice> {
 
     if model.provider == Provider::Meta && super::meta::language_bias(&options.language).is_err() {
         notices.push(ModelNotice {
-            text: "Muse Voice does not support this language hint. Choose Auto or a supported language.",
+            text: t("Muse Voice does not support this language hint. Choose Auto or a supported language."),
             is_error: true,
         });
     }

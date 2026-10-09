@@ -9,12 +9,13 @@ use crate::desktop_ui::{
     SETTINGS_CONTROL_WIDTH, SURFACE, SURFACE_HOVER, SURFACE_SELECTED, TEXT, TEXT_SOFT,
     compact_panel, compact_panel_header, disclosure_button, empty_message, error_message,
     header_button, pane_body, pane_content, pane_header_with_action, picker_open_key, picker_popup,
-    segmented_control, segmented_item,
+    rgb, segmented_control, segmented_item,
 };
+use crate::i18n::t;
 use crate::providers::{ModelRef, Provider};
 use gpui::{
     AnyElement, Context, Div, FocusHandle, FontWeight, IntoElement, KeyDownEvent, MouseDownEvent,
-    Render, Window, div, prelude::*, px, rgb,
+    Render, Window, div, prelude::*, px,
 };
 
 const CHART_HEIGHT: f32 = 120.0;
@@ -30,10 +31,10 @@ impl Chart {
     const ALL: [Self; 4] = [Self::Words, Self::Dictations, Self::Wait, Self::Failures];
     fn title(self) -> &'static str {
         match self {
-            Self::Words => "Words per day",
-            Self::Dictations => "Successful dictations per day",
-            Self::Wait => "Average wait per day",
-            Self::Failures => "Failed dictations per day",
+            Self::Words => t("Words per day"),
+            Self::Dictations => t("Successful dictations per day"),
+            Self::Wait => t("Average wait per day"),
+            Self::Failures => t("Failed dictations per day"),
         }
     }
     fn value(self, totals: &Totals) -> Option<u64> {
@@ -71,9 +72,9 @@ impl Segment {
     fn labels(self) -> Vec<&'static str> {
         match self {
             Self::Period => Period::ALL.iter().map(|period| period.label()).collect(),
-            Self::Chart => vec!["Words", "Dictations", "Wait", "Failures"],
-            Self::Group => vec!["Providers", "Models"],
-            Self::Mode => vec!["All", "Live", "Recorded"],
+            Self::Chart => vec![t("Words"), t("Dictations"), t("Wait"), t("Failures")],
+            Self::Group => vec![t("Providers"), t("Models")],
+            Self::Mode => vec![t("All"), t("Live"), t("Recorded")],
         }
     }
 }
@@ -126,6 +127,9 @@ pub struct StatisticsView {
     loading: bool,
     resetting: bool,
     generation: u64,
+    /// Counts loaded snapshots so each new period grows its bars and counts
+    /// its numbers up once.
+    shown: u64,
     error: Option<String>,
     reset_armed: bool,
     hovered_bar: Option<usize>,
@@ -148,6 +152,7 @@ impl StatisticsView {
             loading: false,
             resetting: false,
             generation: 0,
+            shown: 0,
             error: None,
             reset_armed: false,
             hovered_bar: None,
@@ -159,6 +164,7 @@ impl StatisticsView {
     pub fn refresh(&mut self) {
         if self.preview {
             self.data = preview_dashboard(self.period);
+            self.shown += 1;
             self.hovered_bar = None;
             if self.preview_cleared {
                 self.data.totals = Totals::default();
@@ -187,6 +193,7 @@ impl StatisticsView {
         match result {
             Ok(data) => {
                 self.data = data;
+                self.shown += 1;
                 self.hovered_bar = None;
                 self.error = None;
             }
@@ -302,6 +309,12 @@ impl StatisticsView {
             .debug_selector(move || format!("statistics-control-{}", segment.index()))
             .w(px(width))
             .flex_none()
+            .relative()
+            .child(crate::desktop_ui::segment_pill(
+                format!("statistics-{}", segment.index()),
+                selected,
+                &vec![item_width; count],
+            ))
             .children(labels.into_iter().enumerate().map(|(index, label)| {
                 let focus =
                     self.controls.as_ref().unwrap().segments[segment.index()][index].clone();
@@ -309,6 +322,7 @@ impl StatisticsView {
                     .w(px(item_width))
                     .px_0()
                     .justify_center()
+                    .bg(gpui::transparent_black())
                     .when(index == selected, |item| {
                         item.debug_selector(move || {
                             format!("statistics-active-{}", segment.index())
@@ -376,9 +390,13 @@ impl StatisticsView {
             Menu::Provider => self
                 .provider_choices()
                 .into_iter()
-                .map(|provider| provider.map_or("All providers", Provider::label).to_owned())
+                .map(|provider| {
+                    provider
+                        .map_or(t("All providers"), Provider::label)
+                        .to_owned()
+                })
                 .collect(),
-            Menu::Sort => ["Attempts", "Average latency", "Success rate"]
+            Menu::Sort => [t("Attempts"), t("Average latency"), t("Success rate")]
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
@@ -575,11 +593,11 @@ impl StatisticsView {
     }
     fn render_header_action(&self, cx: &mut Context<Self>) -> AnyElement {
         let reset = header_button(if self.resetting {
-            "Resetting…"
+            t("Resetting…")
         } else if self.reset_armed {
-            "Really reset?"
+            t("Really reset?")
         } else {
-            "Reset"
+            t("Reset")
         })
         .id("statistics-reset")
         .track_focus(&self.controls.as_ref().unwrap().reset)
@@ -614,13 +632,13 @@ impl StatisticsView {
             .flex()
             .gap_3()
             .child(card(
-                "Words",
-                format_count(totals.words),
+                t("Words"),
+                counting(("statistics-words", self.shown), totals.words),
                 trend(Some(totals.words), previous.map(|old| old.words), true),
             ))
             .child(card(
-                "Successful",
-                format_count(totals.dictations),
+                t("Successful"),
+                counting(("statistics-successful", self.shown), totals.dictations),
                 trend(
                     Some(totals.dictations),
                     previous.map(|old| old.dictations),
@@ -628,19 +646,19 @@ impl StatisticsView {
                 ),
             ))
             .child(card(
-                "Success rate",
+                t("Success rate"),
                 rate(totals.dictations, completed),
                 (
-                    format!(
-                        "{} failed · {} silent",
-                        format_count(totals.failed_dictations),
-                        format_count(totals.skipped_silent)
+                    tf!(
+                        "{failed} failed · {silent} silent",
+                        failed = format_count(totals.failed_dictations),
+                        silent = format_count(totals.skipped_silent)
                     ),
                     MUTED,
                 ),
             ))
             .child(card(
-                "Avg wait",
+                t("Avg wait"),
                 measured_latency(totals.average_latency_ms()),
                 trend(
                     totals.average_latency_ms(),
@@ -653,22 +671,22 @@ impl StatisticsView {
             .flex()
             .gap_3()
             .child(small_card(
-                "Audio recorded",
+                t("Audio recorded"),
                 format_duration(totals.recorded_ms),
                 if trimmed > 0 {
-                    format!(
-                        "{} sent · {} silence trimmed",
-                        format_duration(totals.sent_ms),
-                        rate(trimmed, totals.recorded_ms)
+                    tf!(
+                        "{sent} sent · {trimmed} silence trimmed",
+                        sent = format_duration(totals.sent_ms),
+                        trimmed = rate(trimmed, totals.recorded_ms)
                     )
                 } else if totals.recorded_ms > 0 {
-                    "Nothing trimmed".into()
+                    t("Nothing trimmed").into()
                 } else {
-                    "No recorded audio".into()
+                    t("No recorded audio").into()
                 },
             ))
             .child(small_card(
-                "Cost (USD)",
+                t("Cost (USD)"),
                 cost.map_or_else(
                     || "—".into(),
                     |(amount, estimated)| {
@@ -686,19 +704,19 @@ impl StatisticsView {
             .flex()
             .gap_3()
             .child(recovery_column(
-                "Fallback",
+                t("Fallback"),
                 details.fallback_dictations,
-                "Answered by the next model",
+                t("Answered by the next model"),
             ))
             .child(recovery_column(
-                "Retry",
+                t("Retry"),
                 details.retried_dictations,
-                "Same model asked again",
+                t("Same model asked again"),
             ))
             .child(recovery_column(
-                "Recorded retry",
+                t("Recorded retry"),
                 details.live_recoveries,
-                "Live failed, the recorded clip answered",
+                t("Live failed, the recorded clip answered"),
             ));
         div()
             .flex_none()
@@ -706,24 +724,23 @@ impl StatisticsView {
             .flex_col()
             .gap_3()
             .child(section_title(
-                "Overview",
+                t("Overview"),
                 match self.period {
-                    Period::Today => "compared with yesterday",
-                    Period::Week => "compared with the previous 7 days",
-                    Period::Month => "compared with the previous 30 days",
-                    Period::AllTime => "all retained days (up to 400)",
+                    Period::Today => t("compared with yesterday"),
+                    Period::Week => t("compared with the previous 7 days"),
+                    Period::Month => t("compared with the previous 30 days"),
+                    Period::AllTime => t("all retained days (up to 400)"),
                 },
             ))
             .child(cards)
             .child(secondary)
-            .child(note(
-                "Words are raw transcription output. Avg wait is transcription time, \
-                 including failures; queue and paste are excluded.",
-            ))
+            .child(note(t(
+                "Words are raw transcription output. Avg wait is transcription time, including failures; queue and paste are excluded.",
+            )))
             .child(
                 compact_panel()
                     .flex_none()
-                    .child(compact_panel_header("Recoveries", None))
+                    .child(compact_panel_header(t("Recoveries"), None))
                     .child(
                         div()
                             .px_4()
@@ -753,10 +770,10 @@ impl StatisticsView {
             Some(((day, _), Some(value))) => {
                 format!("{} · {}", short_day(day), self.chart.format(value))
             }
-            Some(((day, _), None)) => format!("{} · no measurement", short_day(day)),
+            Some(((day, _), None)) => tf!("{day} · no measurement", day = short_day(day)),
             None => peak.map_or_else(
-                || "No measurements".into(),
-                |value| format!("Peak {}", self.chart.format(value)),
+                || t("No measurements").into(),
+                |value| tf!("Peak {value}", value = self.chart.format(value)),
             ),
         };
         let gap = if values.len() > 14 { 3.0 } else { 8.0 };
@@ -795,12 +812,11 @@ impl StatisticsView {
                         }
                         cx.notify();
                     }))
-                    .child(
-                        div()
+                    .child({
+                        let bar = div()
                             .debug_selector(move || format!("statistics-bar-{index}"))
                             .w_full()
                             .max_w(px(if height.is_some() { 44.0 } else { 4.0 }))
-                            .h(px(height.unwrap_or(4.0)))
                             .rounded_t(px(3.0))
                             .bg(if value.is_none() {
                                 rgb(FAINT)
@@ -809,8 +825,23 @@ impl StatisticsView {
                             } else {
                                 rgb(LINE)
                             })
-                            .when(highlighted, |bar| bar.opacity(0.75)),
-                    )
+                            .when(highlighted, |bar| bar.opacity(0.75));
+                        let full = height.unwrap_or(4.0);
+                        // Each new period grows its bars from the baseline, left to right.
+                        let delay = index as f32 * 0.4 / values.len().max(1) as f32;
+                        crate::desktop_ui::animate_once(
+                            bar.h(px(full)),
+                            gpui::ElementId::NamedInteger(
+                                format!("statistics-bar-grow-{index}").into(),
+                                self.shown,
+                            ),
+                            700,
+                            move |bar, progress| {
+                                let grown = crate::desktop_ui::ease_out((progress - delay) / 0.6);
+                                bar.h(px((full * grown).max(1.0)))
+                            },
+                        )
+                    })
             })
             .collect();
         // A week fits a label under every bar; longer periods keep the ends.
@@ -862,8 +893,8 @@ impl StatisticsView {
                 .child(div().debug_selector(|| "statistics-chart-plot".into()).h(px(CHART_HEIGHT)).flex_none().flex().items_end()
                     .gap(px(gap)).children(bars))
                 .child(axis)
-                .when(self.chart == Chart::Wait, |chart| chart.child(div().mt_2().child(note("Grey dots mean no wait measurement, rather than zero-latency dictations."))))
-                .when(self.period == Period::AllTime, |chart| chart.child(div().mt_2().child(note("Chart: last 30 days. Overview: all retained daily totals.")))))
+                .when(self.chart == Chart::Wait, |chart| chart.child(div().mt_2().child(note(t("Grey dots mean no wait measurement, rather than zero-latency dictations.")))))
+                .when(self.period == Period::AllTime, |chart| chart.child(div().mt_2().child(note(t("Chart: last 30 days. Overview: all retained daily totals."))))))
             .into_any_element()
     }
     fn render_comparison(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -882,14 +913,14 @@ impl StatisticsView {
                     .flex_1()
                     .min_w_0()
                     .child(if self.group == Group::Provider {
-                        "PROVIDER"
+                        t("Provider")
                     } else {
-                        "MODEL"
+                        t("Model")
                     }),
             )
-            .child(cell("Attempts", 66.0))
-            .child(cell("Success", 66.0))
-            .child(cell("Avg", 64.0))
+            .child(cell(t("Attempts"), 66.0))
+            .child(cell(t("Success"), 66.0))
+            .child(cell(t("Avg"), 64.0))
             .child(cell("~P95", 64.0));
         let body = rows.iter().enumerate().map(|(index, row)| {
             table_row()
@@ -912,20 +943,20 @@ impl StatisticsView {
                 ))
         });
         compact_panel().debug_selector(|| "statistics-comparison".into()).flex_none()
-            .child(compact_panel_header("Request comparison", None))
+            .child(compact_panel_header(t("Request comparison"), None))
             .child(div().px_4().py_3().flex().flex_col().gap_3()
-                .child(note("Filters apply to this table and the panels below; Overview and the chart include everything."))
+                .child(note(t("Filters apply to this table and the panels below; Overview and the chart include everything.")))
                 .child(div().flex().flex_wrap().gap_3()
-                    .child(labelled("Group", self.segments(Segment::Group, SETTINGS_CONTROL_WIDTH, cx)))
-                    .child(labelled("Mode", self.segments(Segment::Mode, SETTINGS_CONTROL_WIDTH, cx))))
+                    .child(labelled(t("Group"), self.segments(Segment::Group, SETTINGS_CONTROL_WIDTH, cx)))
+                    .child(labelled(t("Mode"), self.segments(Segment::Mode, SETTINGS_CONTROL_WIDTH, cx))))
                 .child(div().flex().flex_wrap().gap_3()
-                    .child(labelled("Provider", self.dropdown(Menu::Provider, cx)))
-                    .child(labelled("Sort by", self.dropdown(Menu::Sort, cx)))))
+                    .child(labelled(t("Provider"), self.dropdown(Menu::Provider, cx)))
+                    .child(labelled(t("Sort by"), self.dropdown(Menu::Sort, cx)))))
             .child(headers).children(body)
             .when(rows.is_empty(), |panel| panel.child(empty_message(if self.data.totals.details.dictations == 0 {
-                "No detailed attempts yet. Earlier dictations remain in Overview."
-            } else { "No attempts match these filters." })))
-            .child(div().px_4().py_3().child(note("Live starts during recording and is timed from release to final text; recorded starts after it and is timed from request to response. Avg and ~P95 use successful attempts; ~P95 is approximate and needs 20 measurements.")))
+                t("No detailed attempts yet. Earlier dictations remain in Overview.")
+            } else { t("No attempts match these filters.") })))
+            .child(div().px_4().py_3().child(note(t("Live starts during recording and is timed from release to final text; recorded starts after it and is timed from request to response. Avg and ~P95 use successful attempts; ~P95 is approximate and needs 20 measurements."))))
             .into_any_element()
     }
     fn render_details(&self) -> Option<AnyElement> {
@@ -936,7 +967,7 @@ impl StatisticsView {
         }
         let mut kinds: Vec<_> = combined.errors.iter().collect();
         kinds.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
-        let modes: Vec<_> = [(Mode::Live, "Live"), (Mode::Recorded, "Recorded")]
+        let modes: Vec<_> = [(Mode::Live, t("Live")), (Mode::Recorded, t("Recorded"))]
             .into_iter()
             .filter(|(mode, _)| self.mode == Mode::All || self.mode == *mode)
             .map(|(mode, label)| {
@@ -948,7 +979,7 @@ impl StatisticsView {
         let transport = compact_panel()
             .flex_1()
             .min_w(px(240.0))
-            .child(compact_panel_header("Live vs recorded", None))
+            .child(compact_panel_header(t("Live vs recorded"), None))
             .child(
                 div()
                     .px_4()
@@ -956,62 +987,62 @@ impl StatisticsView {
                     .flex()
                     .gap_4()
                     .border_b_1()
-                    .border_color(rgb(LINE))
+                    .border_color(rgb(crate::desktop_ui::DIVIDER))
                     .children(modes),
             )
             .child(detail_row(
-                "Keywords",
-                format!(
-                    "{} attempts with hints",
-                    format_count(combined.keyword_requests)
+                t("Keywords"),
+                tf!(
+                    "{count} attempts with hints",
+                    count = format_count(combined.keyword_requests)
                 ),
-                format!(
-                    "{} terms sent · confirmed sends only",
-                    format_count(combined.keywords_sent)
+                tf!(
+                    "{count} terms sent · confirmed sends only",
+                    count = format_count(combined.keywords_sent)
                 ),
             ));
-        let errors =
-            compact_panel()
-                .flex_1()
-                .min_w(px(240.0))
-                .child(compact_panel_header("Errors", None))
-                .children(kinds.iter().map(|(kind, count)| {
-                    div()
-                        .px_4()
-                        .py_3()
-                        .flex()
-                        .justify_between()
-                        .gap_3()
-                        .border_b_1()
-                        .border_color(rgb(LINE))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_size(px(12.0))
-                                .text_color(rgb(TEXT_SOFT))
-                                .child(ErrorKind::label_for_key(kind)),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .flex()
-                                .items_baseline()
-                                .gap_2()
-                                .child(div().text_size(px(10.0)).text_color(rgb(FAINT)).child(
-                                    format!("{} of attempts", rate(**count, combined.attempts)),
-                                ))
-                                .child(
-                                    div()
-                                        .text_size(px(12.0))
-                                        .text_color(rgb(NEGATIVE))
-                                        .child(format_count(**count)),
-                                ),
-                        )
-                }))
-                .when(kinds.is_empty(), |panel| {
-                    panel.child(empty_message("No recorded attempt errors."))
-                });
+        let errors = compact_panel()
+            .flex_1()
+            .min_w(px(240.0))
+            .child(compact_panel_header(t("Errors"), None))
+            .children(kinds.iter().map(|(kind, count)| {
+                div()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .justify_between()
+                    .gap_3()
+                    .border_b_1()
+                    .border_color(rgb(crate::desktop_ui::DIVIDER))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(12.0))
+                            .text_color(rgb(TEXT_SOFT))
+                            .child(ErrorKind::label_for_key(kind)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_baseline()
+                            .gap_2()
+                            .child(div().text_size(px(10.0)).text_color(rgb(FAINT)).child(tf!(
+                                "{share} of attempts",
+                                share = rate(**count, combined.attempts)
+                            )))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(NEGATIVE))
+                                    .child(format_count(**count)),
+                            ),
+                    )
+            }))
+            .when(kinds.is_empty(), |panel| {
+                panel.child(empty_message(t("No recorded attempt errors.")))
+            });
         Some(
             div()
                 .flex_none()
@@ -1033,22 +1064,22 @@ impl Render for StatisticsView {
         if self.needs_reload {
             self.reload(cx);
         }
-        let header = pane_header_with_action("Statistics", Some(self.render_header_action(cx)));
+        let header = pane_header_with_action(t("Statistics"), Some(self.render_header_action(cx)));
         let content = if self.loading {
             pane_content().child(empty_message(if self.resetting {
-                "Resetting statistics…"
+                t("Resetting statistics…")
             } else {
-                "Loading statistics…"
+                t("Loading statistics…")
             }))
         } else if let Some(error) = &self.error {
             pane_content().child(error_message(
-                "Statistics could not be loaded.",
+                t("Statistics could not be loaded."),
                 error.clone(),
             ))
         } else {
             pane_content().gap_4().child(self.render_overview()).child(self.render_chart(cx))
                 .child(self.render_comparison(cx)).children(self.render_details())
-                .child(note("Daily totals only, never text or audio. Older records lack transport, retry and percentile details. Costs are what providers reported, not a complete bill."))
+                .child(note(t("Daily totals only, never text or audio. Older records lack transport, retry and percentile details. Costs are what providers reported, not a complete bill.")))
         };
         div()
             .size_full()
@@ -1113,7 +1144,23 @@ fn labelled(title: &'static str, control: AnyElement) -> Div {
         )
         .child(control)
 }
-fn card(title: &'static str, value: String, (detail, tone): (String, u32)) -> Div {
+/// A count that rolls up from zero when a new period appears.
+fn counting(id: (&'static str, u64), value: u64) -> AnyElement {
+    crate::desktop_ui::animate_once(
+        div().child(format_count(0)),
+        gpui::ElementId::NamedInteger(id.0.into(), id.1),
+        700,
+        move |_, progress| {
+            let shown = (value as f64 * f64::from(crate::desktop_ui::ease_out(progress))).round();
+            div().child(format_count(shown as u64))
+        },
+    )
+}
+fn card(
+    title: &'static str,
+    value: impl IntoElement,
+    (detail, tone): (String, crate::desktop_ui::ThemeColor),
+) -> Div {
     div()
         .debug_selector(move || format!("statistics-card-{title}"))
         .flex_1()
@@ -1175,7 +1222,7 @@ fn table_row() -> Div {
         .items_center()
         .gap_2()
         .border_b_1()
-        .border_color(rgb(LINE))
+        .border_color(rgb(crate::desktop_ui::DIVIDER))
 }
 fn cell(text: impl Into<gpui::SharedString>, width: f32) -> Div {
     div()
@@ -1190,7 +1237,7 @@ fn detail_row(title: &'static str, value: String, detail: String) -> Div {
         .px_4()
         .py_3()
         .border_b_1()
-        .border_color(rgb(LINE))
+        .border_color(rgb(crate::desktop_ui::DIVIDER))
         .child(note(title))
         .child(
             div()
@@ -1202,22 +1249,26 @@ fn detail_row(title: &'static str, value: String, detail: String) -> Div {
         .child(note(detail))
 }
 fn coverage(totals: &Totals) -> String {
-    format!(
-        "Counted from {} of {} non-silent dictations with request details.",
-        format_count(totals.details.dictations),
-        format_count(totals.dictations.saturating_add(totals.failed_dictations))
+    tf!(
+        "Counted from {measured} of {total} non-silent dictations with request details.",
+        measured = format_count(totals.details.dictations),
+        total = format_count(totals.dictations.saturating_add(totals.failed_dictations))
     )
 }
 /// Change against the comparison period, coloured by whether it is an improvement.
-fn trend(current: Option<u64>, previous: Option<u64>, higher_is_better: bool) -> (String, u32) {
+fn trend(
+    current: Option<u64>,
+    previous: Option<u64>,
+    higher_is_better: bool,
+) -> (String, crate::desktop_ui::ThemeColor) {
     match (current, previous) {
         (_, None) | (None, _) => (String::new(), MUTED),
-        (Some(0), Some(0)) => ("No change".into(), MUTED),
-        (Some(_), Some(0)) => ("No prior baseline".into(), MUTED),
+        (Some(0), Some(0)) => (t("No change").into(), MUTED),
+        (Some(_), Some(0)) => (t("No prior baseline").into(), MUTED),
         (Some(current), Some(previous)) => {
             let delta = (current as f64 / previous as f64 - 1.0) * 100.0;
             if delta.abs() < 0.5 {
-                return ("No change".into(), MUTED);
+                return (t("No change").into(), MUTED);
             }
             let arrow = if delta > 0.0 { "▲" } else { "▼" };
             let text = if delta > 9_999.0 {
@@ -1296,15 +1347,15 @@ fn mode_column(label: &'static str, metrics: &RequestTotals) -> Div {
             div()
                 .text_size(px(11.0))
                 .text_color(rgb(TEXT_SOFT))
-                .child(format!(
-                    "{} success · {} attempts",
-                    rate(metrics.successes, metrics.attempts),
-                    format_count(metrics.attempts)
+                .child(tf!(
+                    "{rate} success · {count} attempts",
+                    rate = rate(metrics.successes, metrics.attempts),
+                    count = format_count(metrics.attempts)
                 )),
         )
-        .child(note(format!(
-            "average of {} measurements",
-            format_count(metrics.latency.count)
+        .child(note(tf!(
+            "average of {count} measurements",
+            count = format_count(metrics.latency.count)
         )))
 }
 fn rate(part: u64, whole: u64) -> String {
@@ -1334,22 +1385,22 @@ fn overview_cost(totals: &Totals) -> (Option<(f64, bool)>, String) {
     let measured = stats_dashboard::combined_requests(totals, Mode::All, None);
     if measured.cost_reports > 0 || measured.cost_estimates > 0 {
         let mut coverage = match (measured.cost_reports, measured.cost_estimates) {
-            (reports, 0) => format!(
-                "{} of {} detailed attempts reported cost",
-                format_count(reports),
-                format_count(measured.attempts)
+            (reports, 0) => tf!(
+                "{reports} of {attempts} detailed attempts reported cost",
+                reports = format_count(reports),
+                attempts = format_count(measured.attempts)
             ),
-            (0, estimates) => format!(
-                "Estimated from list prices for {} of {} detailed attempts",
-                format_count(estimates),
-                format_count(measured.attempts)
+            (0, estimates) => tf!(
+                "Estimated from list prices for {estimates} of {attempts} detailed attempts",
+                estimates = format_count(estimates),
+                attempts = format_count(measured.attempts)
             ),
-            (reports, estimates) => format!(
-                "{} reported · ≈ {} estimated · {} of {} attempts",
-                format_cost(measured.reported_cost_usd),
-                format_cost(measured.estimated_cost_usd),
-                format_count(reports.saturating_add(estimates)),
-                format_count(measured.attempts)
+            (reports, estimates) => tf!(
+                "{reported} reported · ≈ {estimated} estimated · {covered} of {attempts} attempts",
+                reported = format_cost(measured.reported_cost_usd),
+                estimated = format_cost(measured.estimated_cost_usd),
+                covered = format_count(reports.saturating_add(estimates)),
+                attempts = format_count(measured.attempts)
             ),
         };
         if totals.dictations.saturating_add(totals.failed_dictations) > totals.details.dictations {
@@ -1361,25 +1412,34 @@ fn overview_cost(totals: &Totals) -> (Option<(f64, bool)>, String) {
     if totals.cost_usd.is_finite() && totals.cost_usd > 0.0 {
         return (
             Some((totals.cost_usd, false)),
-            "Historical amounts only · no detailed cost reports".into(),
+            t("Historical amounts only · no detailed cost reports").into(),
         );
     }
     let detail = if measured.attempts > 0 {
-        format!(
-            "0 of {} detailed attempts reported cost",
-            format_count(measured.attempts)
+        tf!(
+            "0 of {attempts} detailed attempts reported cost",
+            attempts = format_count(measured.attempts)
         )
     } else {
-        "No cost reports available".into()
+        t("No cost reports available").into()
     };
     (None, detail)
 }
 fn format_count(value: u64) -> String {
+    group_digits(value, crate::i18n::language())
+}
+
+/// Thousands are grouped with "," in English and "." in Portuguese and Spanish.
+fn group_digits(value: u64, language: crate::i18n::Language) -> String {
+    let separator = match language {
+        crate::i18n::Language::English => ',',
+        crate::i18n::Language::Portuguese | crate::i18n::Language::Spanish => '.',
+    };
     let digits = value.to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
         if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            grouped.push(',');
+            grouped.push(separator);
         }
         grouped.push(digit);
     }
@@ -1397,14 +1457,14 @@ fn format_latency(ms: u64) -> String {
     if ms < 1_000 {
         format!("{ms} ms")
     } else {
-        format!("{:.1} s", ms as f64 / 1_000.0)
+        crate::i18n::decimal(format!("{:.1} s", ms as f64 / 1_000.0))
     }
 }
 fn format_cost(usd: f64) -> String {
     if !usd.is_finite() || usd < 0.0 {
         return "—".into();
     }
-    super::report::format_usd(usd)
+    crate::i18n::decimal(super::report::format_usd(usd))
 }
 /// "Mon" for a `YYYY-MM-DD` day, or `None` when the key is not a date.
 fn weekday(day: &str) -> Option<String> {
@@ -1412,8 +1472,19 @@ fn weekday(day: &str) -> Option<String> {
     let year = parts.next()?.parse().ok()?;
     let month = time::Month::try_from(parts.next()?.parse::<u8>().ok()?).ok()?;
     let date = time::Date::from_calendar_date(year, month, parts.next()?.parse().ok()?).ok()?;
-    let name = date.weekday().to_string();
-    Some(name.chars().take(3).collect())
+    use time::Weekday;
+    Some(
+        t(match date.weekday() {
+            Weekday::Monday => "Mon",
+            Weekday::Tuesday => "Tue",
+            Weekday::Wednesday => "Wed",
+            Weekday::Thursday => "Thu",
+            Weekday::Friday => "Fri",
+            Weekday::Saturday => "Sat",
+            Weekday::Sunday => "Sun",
+        })
+        .to_owned(),
+    )
 }
 
 fn short_day(day: &str) -> String {
@@ -1425,7 +1496,7 @@ fn short_day(day: &str) -> String {
         parts.next().and_then(|v| v.parse::<usize>().ok()),
         parts.next().and_then(|v| v.parse::<u32>().ok()),
     ) {
-        (Some(month @ 1..=12), Some(day)) => format!("{} {day}", MONTHS[month - 1]),
+        (Some(month @ 1..=12), Some(day)) => format!("{} {day}", t(MONTHS[month - 1])),
         _ => day.to_owned(),
     }
 }
@@ -1859,6 +1930,11 @@ mod tests {
             ("▼ 14%".into(), POSITIVE)
         );
         assert_eq!(format_count(1_234_567), "1,234,567");
+        assert_eq!(
+            group_digits(1_234_567, crate::i18n::Language::Portuguese),
+            "1.234.567"
+        );
+        assert_eq!(group_digits(999, crate::i18n::Language::Spanish), "999");
         assert_eq!(format_duration(3_960_000), "1 h 06 min");
         assert_eq!(format_latency(1_340), "1.3 s");
         assert_eq!(short_day("2026-10-08"), "Oct 8");

@@ -3,8 +3,9 @@
 //! control loop. Capture never waits on transcription or paste.
 
 use std::cell::RefCell;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::time::Duration;
 
 use color_eyre::Result;
@@ -14,6 +15,7 @@ use crate::context::{ContextMonitor, ContextSnapshot};
 use crate::dictation::Finish;
 use crate::dictation_audio::{CaptureStart, DictationAudio, DictationAudioEvent};
 use crate::dictation_indicator::{DictationIndicatorEvent, DictationIndicatorSender};
+use crate::doorbell::Doorbell;
 use crate::events::{DictationPhase, EventLog, VoiceEvent, VoiceState, now_ms};
 use crate::feedback::{self, Tone};
 use crate::pipeline::{DictationWorker, WorkerEvent};
@@ -28,9 +30,58 @@ fn capture_start_event(start: CaptureStart) -> Option<DictationIndicatorEvent> {
     }
 }
 
+/// While recording, pending or recovering, the loop turns every 20 ms to
+/// drive the HUD meter and time-based gesture repair.
+const ACTIVE_TURN: Duration = Duration::from_millis(20);
+
+/// An idle loop blocks until input, a control or this fallback. Only
+/// bookkeeping that needs no prompt reaction waits for it: settings and
+/// microphone selection (applied between clips), foreground context, and
+/// audio notifications while no capture exists. Every input edge first drains
+/// all of those, exactly as an active turn does.
+const IDLE_TURN: Duration = Duration::from_secs(1);
+
 #[derive(Debug)]
 pub enum ListenerControl {
     PasteLast,
+}
+
+/// The sending half of the listener's control queue. It also wakes an idle
+/// listener so a control never waits for the idle fallback.
+#[derive(Clone)]
+pub struct ListenerControls {
+    sender: SyncSender<ListenerControl>,
+    wake: Arc<Doorbell>,
+}
+
+impl ListenerControls {
+    pub fn try_send(&self, control: ListenerControl) -> Result<(), TrySendError<ListenerControl>> {
+        self.sender.try_send(control)?;
+        self.wake.ring();
+        Ok(())
+    }
+
+    /// Wakes an idle listener, so it observes shutdown at once.
+    pub fn wake(&self) {
+        self.wake.ring();
+    }
+}
+
+pub struct ListenerControlReceiver {
+    receiver: Receiver<ListenerControl>,
+    wake: Arc<Doorbell>,
+}
+
+pub fn control_channel(capacity: usize) -> (ListenerControls, ListenerControlReceiver) {
+    let (sender, receiver) = mpsc::sync_channel(capacity);
+    let wake = Arc::new(Doorbell::new());
+    (
+        ListenerControls {
+            sender,
+            wake: wake.clone(),
+        },
+        ListenerControlReceiver { receiver, wake },
+    )
 }
 
 /// Everything one control-loop iteration needs to report a capture edge.
@@ -206,16 +257,20 @@ impl Session<'_> {
                 job_id,
                 result: Ok(text),
             } => {
-                let phase = if text.trim().is_empty() {
-                    DictationPhase::Discarded
+                // An empty result means the clip held no speech: the HUD says
+                // so instead of showing a check over nothing.
+                if text.trim().is_empty() {
+                    self.events.dictation(DictationPhase::Discarded, text)?;
+                    self.indicate(DictationIndicatorEvent::JobNoAudio {
+                        job_id: job_id.value(),
+                    });
                 } else {
                     self.indicate(DictationIndicatorEvent::PasteCommitted);
-                    DictationPhase::Pasted
-                };
-                self.events.dictation(phase, text)?;
-                self.indicate(DictationIndicatorEvent::JobCompleted {
-                    job_id: job_id.value(),
-                });
+                    self.events.dictation(DictationPhase::Pasted, text)?;
+                    self.indicate(DictationIndicatorEvent::JobCompleted {
+                        job_id: job_id.value(),
+                    });
+                }
             }
             WorkerEvent::Completed {
                 job_id,
@@ -223,8 +278,21 @@ impl Session<'_> {
             } => {
                 tracing::error!(%error, "dictation failed");
                 feedback::play(Tone::Error);
+                let no_speech = error == crate::openrouter::transcribe::NO_SPEECH;
                 self.events.dictation(DictationPhase::Failed(error), "")?;
-                self.indicate(DictationIndicatorEvent::JobFailed {
+                self.indicate(if no_speech {
+                    // Streamed silence fails, and the HUD names the reason.
+                    DictationIndicatorEvent::JobNoAudio {
+                        job_id: job_id.value(),
+                    }
+                } else {
+                    DictationIndicatorEvent::JobFailed {
+                        job_id: job_id.value(),
+                    }
+                });
+            }
+            WorkerEvent::Quiet { job_id } => {
+                self.indicate(DictationIndicatorEvent::JobQuiet {
                     job_id: job_id.value(),
                 });
             }
@@ -271,7 +339,7 @@ pub fn listen(
     shutdown: &AtomicBool,
     indicator: Option<DictationIndicatorSender>,
     history: Option<crate::history::History>,
-    controls: Option<Receiver<ListenerControl>>,
+    controls: Option<ListenerControlReceiver>,
     recovery: crate::recording_recovery::RecordingRecovery,
 ) -> Result<()> {
     shutdown.store(false, Ordering::Relaxed);
@@ -281,7 +349,10 @@ pub fn listen(
         tracing::warn!(%error, "recording sounds are unavailable; continuing without feedback");
     }
     let mut release_while_idle = crate::app_settings::release_microphone_while_idle();
-    let input_monitor = InputMonitor::start()?;
+    let wake = controls
+        .as_ref()
+        .map_or_else(Arc::default, |controls| controls.wake.clone());
+    let input_monitor = InputMonitor::start(wake.clone())?;
     let context_monitor = ContextMonitor::start();
     let mut context = ContextSnapshot::default();
     let mut hotkey = DictationHotkey::new(
@@ -303,7 +374,12 @@ pub fn listen(
         input_monitor.pending_events(),
         release_while_idle,
     )?;
-    let worker = DictationWorker::start(input_monitor.activity.clone(), history, recovery);
+    let worker = DictationWorker::start(
+        input_monitor.activity.clone(),
+        history,
+        recovery,
+        wake.clone(),
+    );
     let session = Session {
         input: &input,
         worker: &worker,
@@ -337,7 +413,7 @@ pub fn listen(
 
     while !shutdown.load(Ordering::Relaxed) {
         if let Some(controls) = &controls {
-            while let Ok(control) = controls.try_recv() {
+            while let Ok(control) = controls.receiver.try_recv() {
                 match control {
                     ListenerControl::PasteLast => {
                         hotkey.suspend();
@@ -486,11 +562,26 @@ pub fn listen(
             }
         }
 
+        // Nothing is recording, pending or recovering, and no input awaits
+        // processing: sleep until the next edge, control or fallback instead
+        // of polling. Capture boundaries come from event timestamps, so the
+        // wait never moves them.
+        let idle = hotkey.is_quiescent()
+            && !input.is_recording()
+            && !input.is_recovering()
+            && !worker.is_busy()
+            && input_monitor.pending_events().oldest().is_none();
+        if idle {
+            input.discard_recognition_backlog();
+            wake.wait_timeout(IDLE_TURN);
+            continue;
+        }
+
         // The audio projection only drives the HUD meter while recording. Take
         // the newest chunk: a cold-start boundary drain slows this loop, and
         // reading one chunk per turn would let stale audio crowd out every
         // current level.
-        let audio = input.recv_timeout(Duration::from_millis(20))?;
+        let audio = input.recv_timeout(ACTIVE_TURN)?;
         if let Some(audio) = input.latest_recognition(audio)
             && audio.is_current(input.recognition_generation())
             && hotkey.is_recording()

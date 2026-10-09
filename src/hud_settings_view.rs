@@ -1,16 +1,18 @@
 //! HUD controls. The owner persists changes and sends the accepted snapshot back.
 
+use crate::i18n::t;
 use std::rc::Rc;
 
 use gpui::{
     AnyElement, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
-    KeyDownEvent, Render, Subscription, Window, div, prelude::*, px, rgb,
+    KeyDownEvent, Render, Subscription, Window, div, prelude::*, px,
 };
 
 use crate::desktop_ui::{
-    ACCENT, LINE, NEGATIVE, PANE_CONTENT_WIDTH, PickerState, SURFACE, SURFACE_HOVER,
+    ACCENT, ACCENT_SOFT, LINE, NEGATIVE, PANE_CONTENT_WIDTH, PickerState, SURFACE, SURFACE_HOVER,
     SURFACE_SELECTED, TEXT, TEXT_SOFT, compact_button, disclosure_button, pane_header,
-    picker_open_key, picker_popup, settings_panel, settings_row, settings_section_label, toggle,
+    picker_open_key, picker_popup, rgb, settings_panel, settings_row, settings_section_label,
+    toggle,
 };
 use crate::hud_screen::{self, MonitorChoice};
 use crate::hud_settings::{
@@ -27,9 +29,11 @@ pub struct HudChange {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Section {
     Position,
+    Appearance,
     Size,
     Brightness,
     VoiceReaction,
+    AudioNotices,
     Screen,
     Distance,
     Recording,
@@ -46,9 +50,11 @@ pub struct HudSettingsView {
     monitor_picker: PickerState,
     monitor_open: bool,
     position_focus: [FocusHandle; 2],
-    size_focus: [FocusHandle; 3],
+    size_focus: [FocusHandle; 5],
     brightness_focus: [FocusHandle; 3],
+    appearance_focus: [FocusHandle; 3],
     voice_reaction_focus: FocusHandle,
+    audio_notices_focus: FocusHandle,
     color_focus: [[FocusHandle; 6]; 2],
     distance_submit: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
@@ -102,7 +108,9 @@ impl HudSettingsView {
             position_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             size_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             brightness_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
+            appearance_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             voice_reaction_focus: cx.focus_handle().tab_stop(true),
+            audio_notices_focus: cx.focus_handle().tab_stop(true),
             color_focus: std::array::from_fn(|_| {
                 std::array::from_fn(|_| cx.focus_handle().tab_stop(true))
             }),
@@ -167,22 +175,33 @@ impl HudSettingsView {
         }
     }
 
-    fn toggle_voice_reaction(&mut self, cx: &mut Context<Self>) {
-        self.change(
-            Section::VoiceReaction,
-            HudPreferences {
-                voice_reactive: !self.preferences.voice_reactive,
-                ..self.preferences
-            },
-            cx,
-        );
+    fn toggle_preference(&mut self, section: Section, cx: &mut Context<Self>) {
+        let mut next = self.preferences;
+        match section {
+            Section::VoiceReaction => next.voice_reactive = !next.voice_reactive,
+            Section::AudioNotices => next.audio_notices = !next.audio_notices,
+            _ => return,
+        }
+        self.change(section, next, cx);
     }
 
-    fn voice_reaction_control(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn toggle_control(&self, section: Section, cx: &mut Context<Self>) -> AnyElement {
+        let (id, focus, on) = match section {
+            Section::AudioNotices => (
+                "hud-audio-notices",
+                &self.audio_notices_focus,
+                self.preferences.audio_notices,
+            ),
+            _ => (
+                "hud-voice-reaction",
+                &self.voice_reaction_focus,
+                self.preferences.voice_reactive,
+            ),
+        };
         div()
-            .id("hud-voice-reaction")
-            .debug_selector(|| "hud-voice-reaction".into())
-            .track_focus(&self.voice_reaction_focus)
+            .id(id)
+            .debug_selector(move || id.into())
+            .track_focus(focus)
             .w(px(crate::desktop_ui::SETTINGS_CONTROL_WIDTH))
             .h(px(crate::desktop_ui::CONTROL_HEIGHT))
             .flex_none()
@@ -192,18 +211,17 @@ impl HudSettingsView {
             .rounded_sm()
             .cursor_pointer()
             .focus(|style| style.bg(rgb(SURFACE_HOVER)))
-            .child(toggle(if self.preferences.voice_reactive {
-                1.0
-            } else {
-                0.0
-            }))
-            .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+            .child(toggle(if on { 1.0 } else { 0.0 }))
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 if matches!(event, ClickEvent::Mouse(_)) {
-                    this.voice_reaction_focus.focus(window);
-                    this.toggle_voice_reaction(cx);
+                    match section {
+                        Section::AudioNotices => this.audio_notices_focus.focus(window),
+                        _ => this.voice_reaction_focus.focus(window),
+                    }
+                    this.toggle_preference(section, cx);
                 }
             }))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                 let modifiers = event.keystroke.modifiers;
                 if modifiers.platform || modifiers.control || modifiers.alt {
                     return;
@@ -211,7 +229,7 @@ impl HudSettingsView {
                 match event.keystroke.key.as_str() {
                     "enter" | "space" => {
                         if !event.is_held {
-                            this.toggle_voice_reaction(cx);
+                            this.toggle_preference(section, cx);
                         }
                         cx.stop_propagation();
                     }
@@ -269,7 +287,7 @@ impl HudSettingsView {
         if !self.monitors.iter().any(|choice| choice.id == id) {
             self.error = Some((
                 Section::Screen,
-                "That monitor disconnected. Choose another monitor.".into(),
+                t("That monitor disconnected. Choose another monitor.").into(),
             ));
             self.monitor_open = false;
             self.monitor_picker.trigger.focus(window);
@@ -333,23 +351,24 @@ impl HudSettingsView {
     ) -> AnyElement {
         let (selected, focus) = selection;
         let change = Rc::new(change);
-        crate::desktop_ui::settings_segmented_control()
-            .children(choices.iter().enumerate().map(|(index, &value)| {
-                let change = change.clone();
-                crate::desktop_ui::settings_segmented_item(value == selected, choices.len())
-                    .child(label(value))
-                    .id((id, index))
-                    .debug_selector(move || format!("{id}-{index}"))
-                    .track_focus(&focus[index])
-                    .focus(|style| style.border_color(rgb(ACCENT)))
-                    .border_1()
-                    .border_color(gpui::transparent_black())
-                    .when(value == selected, |button| {
-                        button.bg(rgb(SURFACE_SELECTED)).text_color(rgb(TEXT))
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| change(this, value, cx)))
-            }))
-            .into_any_element()
+        crate::desktop_ui::settings_choice(
+            id,
+            choices.iter().position(|value| *value == selected),
+            choices.len(),
+        )
+        .children(choices.iter().enumerate().map(|(index, &value)| {
+            let change = change.clone();
+            crate::desktop_ui::settings_segmented_item(value == selected, choices.len())
+                .child(label(value))
+                .id((id, index))
+                .debug_selector(move || format!("{id}-{index}"))
+                .track_focus(&focus[index])
+                .focus(|style| style.border_color(rgb(ACCENT)))
+                .border_1()
+                .border_color(gpui::transparent_black())
+                .on_click(cx.listener(move |this, _, _, cx| change(this, value, cx)))
+        }))
+        .into_any_element()
     }
 
     fn palette(&self, recording: bool, cx: &mut Context<Self>) -> AnyElement {
@@ -382,7 +401,7 @@ impl HudSettingsView {
                     .h(px(32.0))
                     .gap(px(6.0))
                     .when(color == selected, |button| {
-                        button.bg(rgb(SURFACE_SELECTED)).text_color(rgb(TEXT))
+                        button.bg(rgb(ACCENT_SOFT)).text_color(rgb(ACCENT))
                     })
                     .child(
                         div()
@@ -418,18 +437,18 @@ impl HudSettingsView {
 
     fn screen_control(&self, cx: &mut Context<Self>) -> AnyElement {
         let label = match self.preferences.screen {
-            HudScreen::Pointer => "Follow pointer".to_owned(),
+            HudScreen::Pointer => t("Follow pointer").to_owned(),
             HudScreen::ActiveWindow => HudScreen::ActiveWindow.label().to_owned(),
             HudScreen::FixedMonitor => self
                 .preferences
                 .fixed_monitor
                 .and_then(|id| self.monitors.iter().find(|choice| choice.id == id))
                 .map(|choice| choice.name.clone())
-                .unwrap_or_else(|| "Unavailable display".into()),
+                .unwrap_or_else(|| t("Unavailable display").into()),
         };
         let popup = self.monitor_open.then(|| {
             let labels = [
-                "Follow pointer".to_owned(),
+                t("Follow pointer").to_owned(),
                 HudScreen::ActiveWindow.label().to_owned(),
             ]
             .into_iter()
@@ -538,7 +557,7 @@ impl HudSettingsView {
             .map(|(_, message)| message.clone());
         div()
             .border_b_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(crate::desktop_ui::DIVIDER))
             .child(settings_row(title, description, control).border_b_0())
             .when_some(error, |row, error| {
                 row.child(
@@ -622,7 +641,25 @@ impl Render for HudSettingsView {
             },
             cx,
         );
-        let voice_reaction = self.voice_reaction_control(cx);
+        let appearance = self.choices(
+            "hud-appearance",
+            &crate::appearance::Appearance::ALL,
+            (self.preferences.appearance, &self.appearance_focus),
+            crate::appearance::Appearance::label,
+            |this, appearance, cx| {
+                this.change(
+                    Section::Appearance,
+                    HudPreferences {
+                        appearance,
+                        ..this.preferences
+                    },
+                    cx,
+                )
+            },
+            cx,
+        );
+        let voice_reaction = self.toggle_control(Section::VoiceReaction, cx);
+        let audio_notices = self.toggle_control(Section::AudioNotices, cx);
         let screen = self.screen_control(cx);
         let recording = self.palette(true, cx);
         let transcription = self.palette(false, cx);
@@ -636,63 +673,75 @@ impl Render for HudSettingsView {
                 .iter()
                 .any(|choice| Some(choice.id) == self.preferences.fixed_monitor);
         let display_note = if disconnected {
-            "The saved monitor is unavailable. The HUD follows your pointer until it reconnects."
+            t("The saved monitor is unavailable. The HUD follows your pointer until it reconnects.")
         } else {
-            "Where the HUD and paste notices appear."
+            t("Where the HUD and paste notices appear.")
         };
         let content = div()
-            .child(settings_section_label("PLACEMENT"))
+            .child(settings_section_label(t("Placement")))
             .child(
                 settings_panel()
                     .child(self.row(
                         Section::Position,
-                        "Screen edge",
-                        "Top or bottom of the visible display area, clear of the Dock.",
+                        t("Screen edge"),
+                        t("Top or bottom of the visible display area, clear of the Dock."),
                         position,
                     ))
-                    .child(self.row(Section::Screen, "Display", display_note, screen))
+                    .child(self.row(Section::Screen, t("Display"), display_note, screen))
                     .child(
                         self.row(
                             Section::Distance,
-                            "Edge distance (pt)",
-                            "0–160 points. Saves when you leave the field.",
+                            t("Edge distance (pt)"),
+                            t("0–160 points. Saves when you leave the field."),
                             distance,
                         )
                         .border_b_0(),
                     ),
             )
-            .child(settings_section_label("APPEARANCE"))
+            .child(settings_section_label(t("Appearance")))
             .child(
                 settings_panel()
                     .child(self.row(
+                        Section::Appearance,
+                        t("Light or dark"),
+                        t("System follows your Mac's light or dark mode."),
+                        appearance,
+                    ))
+                    .child(self.row(
                         Section::Size,
-                        "Size",
-                        "Scales the capsule and transcription sphere together.",
+                        t("Size"),
+                        t("Scales the capsule and its lines together."),
                         size,
                     ))
                     .child(self.row(
                         Section::Brightness,
-                        "Brightness",
-                        "Adjusts the light while keeping the current animation.",
+                        t("Brightness"),
+                        t("Adjusts the light while keeping the current animation."),
                         brightness,
                     ))
                     .child(self.row(
                         Section::VoiceReaction,
-                        "React to voice",
-                        "Pulse the recording capsule with your microphone level.",
+                        t("React to voice"),
+                        t("Move the recording lines with your microphone level."),
                         voice_reaction,
                     ))
                     .child(self.row(
+                        Section::AudioNotices,
+                        t("Audio warnings"),
+                        t("Writes “No audio” or “Low audio” in the capsule as soon as the microphone stays silent or too quiet."),
+                        audio_notices,
+                    ))
+                    .child(self.row(
                         Section::Recording,
-                        "Recording",
-                        "Color of the capsule while you speak.",
+                        t("Recording"),
+                        t("Color of the lines while you speak."),
                         recording,
                     ))
                     .child(
                         self.row(
                             Section::Transcription,
-                            "Transcribing",
-                            "Color of the sphere while audio is transcribed.",
+                            t("Transcribing"),
+                            t("Color of the lines while audio is transcribed."),
                             transcription,
                         )
                         .border_b_0(),
@@ -731,7 +780,7 @@ fn parse_distance(value: &str) -> Result<u16, &'static str> {
         .parse::<u16>()
         .ok()
         .filter(|value| (MIN_EDGE_DISTANCE..=MAX_EDGE_DISTANCE).contains(value))
-        .ok_or("Enter a whole number from 0 to 160.")
+        .ok_or(t("Enter a whole number from 0 to 160."))
 }
 
 fn monitor_choices(preview: bool) -> Vec<MonitorChoice> {

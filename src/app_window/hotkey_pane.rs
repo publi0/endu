@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::desktop_ui::CONTROL_TEXT_SIZE;
+use crate::i18n::t;
 
 impl AppWindow {
     pub(super) fn render_hotkey_control(
@@ -11,8 +12,45 @@ impl AppWindow {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let binding_keycaps = hotkey_binding(&self.settings, kind)
-            .map_or_else(|| vec!["Off".into()], HotkeyBinding::keycaps);
-        let idle_width = hotkey_idle_width(binding_keycaps.len());
+            .map_or_else(|| vec![t("Off").into()], HotkeyBinding::keycaps);
+        // Translated labels and the Off keycap vary in width; measure them.
+        let idle_width = hotkey_idle_width(binding_keycaps.len()).max(
+            20.0 + measured_keycaps_width(window, &binding_keycaps)
+                + control_text_width(window, t("Change shortcut")),
+        );
+        if let HotkeyCaptureState::Listening {
+            kind: active,
+            modifiers,
+            message,
+            ..
+        } = &self.hotkey_capture
+            && *active == kind
+        {
+            let label = message.unwrap_or(if modifiers.is_empty() {
+                t("Press shortcut")
+            } else {
+                t("Release to save or add key")
+            });
+            let keycaps = if modifiers.is_empty() || message.is_some() {
+                0.0
+            } else {
+                8.0 + measured_keycaps_width(
+                    window,
+                    &HotkeyBinding {
+                        modifiers: *modifiers,
+                        key: None,
+                    }
+                    .keycaps(),
+                )
+            };
+            let needed = 64.0
+                + keycaps
+                + control_text_width(window, label)
+                + control_text_width(window, t("Cancel"));
+            if self.hotkey_width_spring.target < needed {
+                self.hotkey_width_spring.set_target(needed);
+            }
+        }
         if matches!(
             self.hotkey_capture,
             HotkeyCaptureState::Saved { saved_at, .. }
@@ -20,18 +58,31 @@ impl AppWindow {
         ) {
             self.hotkey_capture = HotkeyCaptureState::Idle;
             self.hotkey_capture_animation.set_enabled(false);
-            self.hotkey_width_spring.set_target(idle_width);
-        } else if matches!(self.hotkey_capture, HotkeyCaptureState::Idle) {
-            self.hotkey_width_spring.set_target(idle_width);
+        }
+        if matches!(self.hotkey_capture, HotkeyCaptureState::Idle) {
+            self.hotkey_width_origin = None;
         }
         let intensity = self.hotkey_capture_animation.render_position(window);
-        let animated_control_width = self.hotkey_width_spring.render_position(window);
         let this_capture = matches!(
             self.hotkey_capture,
             HotkeyCaptureState::Listening { kind: active, .. }
                 | HotkeyCaptureState::Saved { kind: active, .. }
                 if active == kind
         );
+        // One width spring serves whichever control is capturing; it starts
+        // from that control's own width. Idle controls never drive it, or the
+        // two would pull it back and forth and redraw the window forever.
+        if this_capture && self.hotkey_width_origin != Some(kind) {
+            let target = self.hotkey_width_spring.target;
+            self.hotkey_width_spring = ToggleSpring::at(idle_width);
+            self.hotkey_width_spring.set_target(target);
+            self.hotkey_width_origin = Some(kind);
+        }
+        let animated_control_width = if this_capture {
+            self.hotkey_width_spring.render_position(window)
+        } else {
+            idle_width
+        };
         let control_width = if this_capture {
             animated_control_width
         } else {
@@ -43,9 +94,9 @@ impl AppWindow {
             self.hotkey_capture,
             HotkeyCaptureState::Saved { kind: active, .. } if active == kind
         ) {
-            rgb(0x1b2420)
+            rgb(crate::desktop_ui::ThemeColor::SavedCapture)
         } else {
-            rgb(0x251c1b)
+            rgb(crate::desktop_ui::ThemeColor::ListeningCapture)
         };
         let pulse = match &self.hotkey_capture {
             HotkeyCaptureState::Listening {
@@ -72,9 +123,9 @@ impl AppWindow {
                 ..
             } if *active == kind => {
                 let label = message.unwrap_or(if modifiers.is_empty() {
-                    "Press shortcut"
+                    t("Press shortcut")
                 } else {
-                    "Release to save or add key"
+                    t("Release to save or add key")
                 });
                 div()
                     .flex()
@@ -121,7 +172,7 @@ impl AppWindow {
                             .hover(|button| {
                                 button.bg(rgb(SURFACE_HOVER)).text_color(rgb(TEXT_SOFT))
                             })
-                            .child("Cancel")
+                            .child(t("Cancel"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.cancel_hotkey_capture(cx);
@@ -153,7 +204,7 @@ impl AppWindow {
                     div()
                         .text_size(px(CONTROL_TEXT_SIZE))
                         .text_color(rgb(TEXT_SOFT))
-                        .child("Change shortcut"),
+                        .child(t("Change shortcut")),
                 )
                 .into_any_element(),
         };
@@ -172,13 +223,14 @@ impl AppWindow {
             .overflow_hidden()
             .rounded(px(6.0))
             .border_1()
+            // At rest it shares the segmented track; capture tints it.
             .border_color(mix_color(
-                rgb(LINE),
+                rgb(crate::desktop_ui::ThemeColor::Track),
                 rgb(TEXT_SOFT),
                 control_intensity * 0.55,
             ))
             .bg(mix_color(
-                rgb(CANVAS),
+                rgb(crate::desktop_ui::ThemeColor::Track),
                 capture_color,
                 control_intensity * (0.55 + pulse * 0.15),
             ))
@@ -231,9 +283,9 @@ impl AppWindow {
                     .w(px(HOTKEY_SIDE_SELECTOR_WIDTH))
                     .children(
                         [
-                            ("Left", ModifierSide::Left),
-                            ("Either", ModifierSide::Either),
-                            ("Right", ModifierSide::Right),
+                            (t("Left"), ModifierSide::Left),
+                            (t("Either"), ModifierSide::Either),
+                            (t("Right"), ModifierSide::Right),
                         ]
                         .into_iter()
                         .enumerate()
@@ -269,7 +321,7 @@ impl AppWindow {
             .child(side_selector)
             .child(hotkey)
             .child(
-                compact_button("Reset")
+                compact_button(t("Reset"))
                     .id(("reset-hotkey", hotkey_kind_index(kind)))
                     .debug_selector(move || format!("reset-hotkey-{}", hotkey_kind_index(kind)))
                     .track_focus(
@@ -305,14 +357,15 @@ impl AppWindow {
         }
         if hotkey_binding_conflicts(&self.settings, kind, &binding) {
             let other = match kind {
-                HotkeyKind::Dictation => "Paste last dictation",
-                HotkeyKind::PasteLast => "Dictation",
+                HotkeyKind::Dictation => t("Paste last dictation"),
+                HotkeyKind::PasteLast => t("Dictation"),
             };
             self.settings_feedback = Some(SettingsFeedback {
                 control: hotkey_feedback_scope(kind),
                 success: false,
-                message: format!(
-                    "The default shortcut is used by {other}. Change that shortcut first."
+                message: tf!(
+                    "The default shortcut is used by {other}. Change that shortcut first.",
+                    other = other
                 ),
             });
             cx.notify();
@@ -377,7 +430,7 @@ impl AppWindow {
             }
         };
         if modifiers.is_empty() && !is_function_key(&key.label) {
-            self.set_hotkey_capture_message("Add a modifier", cx);
+            self.set_hotkey_capture_message(t("Add a modifier"), cx);
             return;
         }
         let binding = HotkeyBinding {
@@ -457,7 +510,7 @@ impl AppWindow {
 
     pub(super) fn save_hotkey_binding(&mut self, binding: HotkeyBinding, cx: &mut Context<Self>) {
         if binding.is_empty() {
-            self.set_hotkey_capture_message("Press a shortcut", cx);
+            self.set_hotkey_capture_message(t("Press a shortcut"), cx);
             return;
         }
         let kind = match self.hotkey_capture {
@@ -465,14 +518,14 @@ impl AppWindow {
             HotkeyCaptureState::Idle | HotkeyCaptureState::Saved { .. } => return,
         };
         if hotkey_binding_conflicts(&self.settings, kind, &binding) {
-            self.set_hotkey_capture_message("Already in use", cx);
+            self.set_hotkey_capture_message(t("Already in use"), cx);
             return;
         }
         let keycap_count = binding.keycaps().len();
         if !self.update_settings(hotkey_feedback_scope(kind), cx, |settings| {
             set_hotkey_binding(settings, kind, binding)
         }) {
-            self.set_hotkey_capture_message("Could not save shortcut. Try again.", cx);
+            self.set_hotkey_capture_message(t("Could not save shortcut. Try again."), cx);
             return;
         }
         self.hotkey_width_spring
@@ -502,6 +555,26 @@ pub(super) fn set_hotkey_binding(
         }
         HotkeyKind::PasteLast => settings.paste_last_hotkey = Some(binding),
     }
+}
+
+/// Rendered width of control text, so translated labels never clip.
+fn control_text_width(window: &Window, text: &str) -> f32 {
+    let run = window.text_style().to_run(text.len());
+    f32::from(
+        window
+            .text_system()
+            .shape_line(text.to_owned().into(), px(CONTROL_TEXT_SIZE), &[run], None)
+            .width,
+    )
+}
+
+/// Keycaps are at least 34 points wide, with 8-point padding and a border.
+fn measured_keycaps_width(window: &Window, parts: &[String]) -> f32 {
+    parts
+        .iter()
+        .map(|part| (control_text_width(window, part) + 18.0).max(34.0))
+        .sum::<f32>()
+        + 3.0 * parts.len().saturating_sub(1) as f32
 }
 
 pub(super) fn hotkey_idle_width(keycap_count: usize) -> f32 {
@@ -671,12 +744,12 @@ pub(super) fn hotkey_key(key: &str) -> Result<HotkeyKey, &'static str> {
     }
     let mut characters = key.chars();
     let Some(character) = characters.next() else {
-        return Err("Unsupported key");
+        return Err(t("Unsupported key"));
     };
     if characters.next().is_some() {
-        return Err("Unsupported key");
+        return Err(t("Unsupported key"));
     }
-    let code = crate::keyboard::key_code_for(character).map_err(|_| "Unsupported key")?;
+    let code = crate::keyboard::key_code_for(character).map_err(|_| t("Unsupported key"))?;
     Ok(HotkeyKey {
         code,
         label: character.to_uppercase().collect(),

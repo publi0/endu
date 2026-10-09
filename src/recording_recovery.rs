@@ -2,6 +2,7 @@
 //! Audio is written before a remote attempt. Recovery is independent of normal
 //! History retention; only an explicit delete removes an unrecovered recording.
 
+use crate::i18n::t;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -29,8 +30,8 @@ enum UnusableTranscript {
 impl std::fmt::Display for UnusableTranscript {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::EmptyResponse => "The transcription returned no text. The saved audio has been kept.",
-            Self::EmptyAfterFormatting => "Post-processing removed all text. Change its settings before Retry; the saved audio was kept.",
+            Self::EmptyResponse => t("The transcription returned no text. The saved audio has been kept."),
+            Self::EmptyAfterFormatting => t("Post-processing removed all text. Change its settings before Retry; the saved audio was kept."),
         })
     }
 }
@@ -68,18 +69,18 @@ impl RecoveryEntry {
         self.application
             .as_deref()
             .filter(|name| !name.trim().is_empty())
-            .unwrap_or("Unknown app")
+            .unwrap_or(t("Unknown app"))
     }
 
     pub fn title(&self) -> &'static str {
         if self.busy {
-            "Transcribing saved audio"
+            t("Transcribing saved audio")
         } else {
             match self.status {
-                RecoveryStatus::Pending => "Interrupted transcription",
-                RecoveryStatus::Failed => "Transcription failed",
-                RecoveryStatus::Recovered => "Recovered dictation",
-                RecoveryStatus::Resolved => "Dictation completed",
+                RecoveryStatus::Pending => t("Interrupted transcription"),
+                RecoveryStatus::Failed => t("Transcription failed"),
+                RecoveryStatus::Recovered => t("Recovered dictation"),
+                RecoveryStatus::Resolved => t("Dictation completed"),
             }
         }
     }
@@ -113,7 +114,7 @@ impl RecordingRecovery {
         Ok(Self::open(directory.clone()).unwrap_or_else(|error| {
             tracing::warn!(%error, "recording recovery storage could not be opened");
             Self { directory: Arc::new(directory), state: Arc::new(Mutex::new(State::default())),
-                load_warning: Some("Saved audio could not be loaded. New recordings may remain only in memory; keep Hex open and check disk space and permissions.".into()) }
+                load_warning: Some(t("Saved audio could not be loaded. New recordings may remain only in memory; keep Endu open and check disk space and permissions.").into()) }
         }))
     }
 
@@ -185,7 +186,7 @@ impl RecordingRecovery {
                         application: None,
                         status: RecoveryStatus::Pending,
                         message: Some(
-                            "Transcription was interrupted. The saved audio is ready to retry."
+                            t("Transcription was interrupted. The saved audio is ready to retry.")
                                 .into(),
                         ),
                         text: None,
@@ -262,14 +263,14 @@ impl RecordingRecovery {
 
     fn audio_path(&self, id: &str) -> io::Result<PathBuf> {
         if !valid_id(id) {
-            return Err(io::Error::other("Invalid recording identity"));
+            return Err(io::Error::other(t("Invalid recording identity")));
         }
         Ok(self.directory.join(format!("{id}.wav")))
     }
 
     fn save_metadata(&self, entry: &RecoveryEntry) -> io::Result<()> {
         if !valid_id(&entry.id) {
-            return Err(io::Error::other("Invalid recording identity"));
+            return Err(io::Error::other(t("Invalid recording identity")));
         }
         let path = self.directory.join(format!("{}.json", entry.id));
         let temporary = path.with_extension("json.tmp");
@@ -335,7 +336,7 @@ impl RecordingRecovery {
         if let Err(error) = self.save_audio(&entry.id, samples) {
             tracing::warn!(%error,"could not persist recording recovery audio");
             entry.volatile = true;
-            entry.message = Some("Audio is only in memory because it could not be saved. Keep Hex open and free disk space before retrying.".into());
+            entry.message = Some(t("Audio is only in memory because it could not be saved. Keep Endu open and free disk space before retrying.").into());
         } else if let Err(error) = self.save_metadata(&entry) {
             tracing::warn!(%error,"could not persist recording recovery metadata; WAV remains recoverable");
         }
@@ -355,7 +356,7 @@ impl RecordingRecovery {
         entry.status = RecoveryStatus::Failed;
         entry.message = Some(if entry.volatile {
             format!(
-                "{message} Audio could not be saved to disk and is only in memory. Keep Hex open until recovery."
+                "{message} Audio could not be saved to disk and is only in memory. Keep Endu open until recovery."
             )
         } else {
             message.to_owned()
@@ -407,8 +408,17 @@ impl RecordingRecovery {
             }
             Ok(transcription)
         });
+        let no_speech = result.as_ref().is_err_and(|error| {
+            error
+                .downcast_ref::<crate::openrouter::transcribe::NoSpeech>()
+                .is_some()
+        });
         match &result {
-            Ok(_) => {
+            // Silence has nothing to recover, so it resolves like a success.
+            Err(error) if !no_speech => {
+                self.finish_failure(entry, &transcription_failure_reason(error));
+            }
+            _ => {
                 // A terminal marker prevents an orphan WAV from being presented
                 // again if cleanup stops between its two removals.
                 entry.status = RecoveryStatus::Resolved;
@@ -421,11 +431,10 @@ impl RecordingRecovery {
                 } else {
                     self.finish_failure(
                         entry,
-                        "Transcription completed, but cleanup failed. Audio retained.",
+                        t("Transcription completed, but cleanup failed. Audio retained."),
                     );
                 }
             }
-            Err(error) => self.finish_failure(entry, &transcription_failure_reason(error)),
         }
         result
     }
@@ -482,16 +491,16 @@ impl RecordingRecovery {
         let entry = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.retrying || state.active.contains(id) {
-                return Err(io::Error::other(
+                return Err(io::Error::other(t(
                     "A transcription is already running. Wait for it to finish.",
-                ));
+                )));
             }
             let entry = state
                 .entries
                 .get(id)
                 .filter(|e| e.status != RecoveryStatus::Recovered)
                 .cloned()
-                .ok_or_else(|| io::Error::other("This recording is not available to retry"))?;
+                .ok_or_else(|| io::Error::other(t("This recording is not available to retry")))?;
             state.active.insert(id.to_owned());
             state.retrying = true;
             state.revision += 1;
@@ -537,7 +546,7 @@ impl RecordingRecovery {
             || spec.bits_per_sample != 32
             || spec.sample_format != hound::SampleFormat::Float
         {
-            return Err(io::Error::other("Saved audio has an unsupported format"));
+            return Err(io::Error::other(t("Saved audio has an unsupported format")));
         }
         Ok(Arc::new(
             reader
@@ -559,7 +568,7 @@ impl RecordingRecovery {
             Err(_) => {
                 self.finish_failure(
                     entry,
-                    "Could not read the saved audio. The recovery files were preserved.",
+                    t("Could not read the saved audio. The recovery files were preserved."),
                 );
                 return;
             }
@@ -578,7 +587,7 @@ impl RecordingRecovery {
                 let formatted = preferences.process(transcription.text.trim());
                 let text = vocabulary.restore(formatted.trim()).text;
                 if text.is_empty() {
-                    self.finish_failure(entry, "Post-processing removed all text. Change its settings before Retry; the saved audio was kept.");
+                    self.finish_failure(entry, t("Post-processing removed all text. Change its settings before Retry; the saved audio was kept."));
                     return;
                 }
                 entry.status = RecoveryStatus::Recovered;
@@ -589,7 +598,7 @@ impl RecordingRecovery {
                 if self.save_metadata(&entry).is_err() {
                     self.finish_failure(
                         entry,
-                        "Could not save the recovered text. Audio retained; keep Hex open.",
+                        t("Could not save the recovered text. Audio retained; keep Endu open."),
                     );
                     return;
                 }
@@ -603,7 +612,7 @@ impl RecordingRecovery {
             }
             Ok(_) => self.finish_failure(
                 entry,
-                "The transcription returned no text. The saved audio has been kept.",
+                t("The transcription returned no text. The saved audio has been kept."),
             ),
             Err(error) => self.finish_failure(entry, &transcription_failure_reason(&error)),
         }
@@ -613,12 +622,12 @@ impl RecordingRecovery {
         self.audio_path(id)?;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.active.contains(id) {
-            return Err(io::Error::other(
+            return Err(io::Error::other(t(
                 "Wait for the transcription to finish before deleting it",
-            ));
+            )));
         }
         if !state.entries.contains_key(id) {
-            return Err(io::Error::other("Recording no longer exists"));
+            return Err(io::Error::other(t("Recording no longer exists")));
         }
         remove_recording_files(&self.directory, id)?;
         state.entries.remove(id);
@@ -636,7 +645,7 @@ fn transcription_failure_reason(error: &color_eyre::Report) -> String {
     use crate::openrouter::transcribe::ChainFailure;
     if let Some(chain) = error.downcast_ref::<ChainFailure>() {
         if chain.failures.is_empty() {
-            return "No transcription models are configured. Choose a model in Models.".into();
+            return t("No transcription models are configured. Choose a model in Models.").into();
         }
         let mut reasons = Vec::new();
         for failure in &chain.failures {
@@ -663,16 +672,17 @@ fn transcription_failure_reason(error: &color_eyre::Report) -> String {
     }
     let detail = format!("{error:#}").to_lowercase();
     if detail.contains("api key not found") {
-        return "The OpenRouter API key is missing. Add it in Models before retrying.".into();
+        return t("The OpenRouter API key is missing. Add it in Models before retrying.").into();
     }
     if detail.contains("no openrouter transcription models") {
-        return "No transcription models are configured. Choose a model in Models.".into();
+        return t("No transcription models are configured. Choose a model in Models.").into();
     }
     if error.downcast_ref::<serde_json::Error>().is_some() {
-        return "The local transcription configuration is invalid. Check Models settings.".into();
+        return t("The local transcription configuration is invalid. Check Models settings.")
+            .into();
     }
     if detail.contains("could not start curl") || detail.contains("curl stdin unavailable") {
-        return "The network client could not be started.".into();
+        return t("The network client could not be started.").into();
     }
     if let Some(reason) = network_reason(&detail) {
         return reason;
@@ -680,10 +690,10 @@ fn transcription_failure_reason(error: &color_eyre::Report) -> String {
     if let Some(error) = error.downcast_ref::<io::Error>() {
         return match error.kind() {
             io::ErrorKind::PermissionDenied => {
-                "Permission denied while reading local transcription settings."
+                t("Permission denied while reading local transcription settings.")
             }
             io::ErrorKind::NotFound => {
-                "A local file required for transcription could not be found."
+                t("A local file required for transcription could not be found.")
             }
             io::ErrorKind::TimedOut => return attempt_reason(ErrorKind::Timeout, None, ""),
             _ => "A local I/O error prevented transcription.",
@@ -704,7 +714,7 @@ fn attempt_reason(
         .unwrap_or_default();
     match kind {
         ErrorKind::RateLimited => {
-            "The API rate limit was reached (HTTP 429). Wait before retrying.".into()
+            t("The API rate limit was reached (HTTP 429). Wait before retrying.").into()
         }
         ErrorKind::Auth => format!(
             "The API rejected the key or its access permissions{http}. Check the key in Models."
@@ -713,10 +723,10 @@ fn attempt_reason(
             format!("The API returned a server error{http}. Retry when the service is available.")
         }
         ErrorKind::Rejected => match status {
-            Some(402) => "The API requires payment or additional credits (HTTP 402).".into(),
-            Some(404) => "The requested model or API endpoint was not found (HTTP 404).".into(),
+            Some(402) => t("The API requires payment or additional credits (HTTP 402).").into(),
+            Some(404) => t("The requested model or API endpoint was not found (HTTP 404).").into(),
             Some(413) => {
-                "The API rejected the audio because the request was too large (HTTP 413).".into()
+                t("The API rejected the audio because the request was too large (HTTP 413).").into()
             }
             _ => {
                 format!("The API rejected the transcription request{http}. Check Models settings.")
@@ -725,7 +735,7 @@ fn attempt_reason(
         ErrorKind::Timeout => {
             let lower = detail.to_lowercase();
             if lower.ends_with(": not tried, chain deadline reached") {
-                return "A fallback could not be attempted because the transcription time limit was reached.".into();
+                return t("A fallback could not be attempted because the transcription time limit was reached.").into();
             }
             let milliseconds = lower.split("timed out after ").nth(1).and_then(|rest| {
                 let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
@@ -740,7 +750,7 @@ fn attempt_reason(
                 let seconds = if ms % 1000 == 0 {
                     (ms / 1000).to_string()
                 } else {
-                    format!("{:.1}", ms as f64 / 1000.0)
+                    crate::i18n::decimal(format!("{:.1}", ms as f64 / 1000.0))
                 };
                 format!(
                     "The API request timed out after {seconds} seconds{http}. No transcription was returned."
@@ -750,10 +760,10 @@ fn attempt_reason(
             }
         }
         ErrorKind::Network => network_reason(&detail.to_lowercase()).unwrap_or_else(|| {
-            "The network connection to the API failed. Check your internet connection.".into()
+            t("The network connection to the API failed. Check your internet connection.").into()
         }),
         ErrorKind::InvalidResponse => {
-            "The API returned an invalid or empty transcription response.".into()
+            t("The API returned an invalid or empty transcription response.").into()
         }
     }
 }
@@ -773,7 +783,7 @@ fn network_reason(detail: &str) -> Option<String> {
         || detail.contains("curl: (6)")
     {
         Some(
-            "The API server address could not be resolved (DNS error). Check your connection."
+            t("The API server address could not be resolved (DNS error). Check your connection.")
                 .into(),
         )
     } else if detail.contains("certificate")
@@ -785,16 +795,17 @@ fn network_reason(detail: &str) -> Option<String> {
                 .into(),
         )
     } else if detail.contains("connection reset") {
-        Some("The connection to the API was reset before transcription completed.".into())
+        Some(t("The connection to the API was reset before transcription completed.").into())
     } else if detail.contains("failed to connect")
         || detail.contains("couldn't connect")
         || detail.contains("connection refused")
     {
         Some(
-            "The API server could not be reached. Check your connection or try again later.".into(),
+            t("The API server could not be reached. Check your connection or try again later.")
+                .into(),
         )
     } else if detail.contains("network") || detail.contains("offline") || detail.contains("curl") {
-        Some("The network connection to the API failed. Check your internet connection.".into())
+        Some(t("The network connection to the API failed. Check your internet connection.").into())
     } else {
         None
     }
@@ -818,7 +829,7 @@ impl Drop for ActiveAttempt {
 
 fn remove_recording_files(directory: &Path, id: &str) -> io::Result<()> {
     if !valid_id(id) {
-        return Err(io::Error::other("Invalid recording identity"));
+        return Err(io::Error::other(t("Invalid recording identity")));
     }
     // Metadata is last: a resolved marker survives interrupted cleanup.
     for suffix in ["wav", "wav.tmp", "json.tmp", "json"] {

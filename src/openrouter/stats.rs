@@ -586,13 +586,13 @@ pub enum Period {
 impl Period {
     pub const ALL: [Self; 4] = [Self::Today, Self::Week, Self::Month, Self::AllTime];
 
-    pub const fn label(self) -> &'static str {
-        match self {
+    pub fn label(self) -> &'static str {
+        crate::i18n::t(match self {
             Self::Today => "Today",
             Self::Week => "7 days",
             Self::Month => "30 days",
             Self::AllTime => "All saved",
-        }
+        })
     }
 
     const fn days(self) -> Option<i64> {

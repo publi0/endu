@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::t;
+
 /// Longest model label stored; model ids are short, this bounds bad config.
 const MAX_MODEL_CHARS: usize = 120;
 const MAX_FAILED_MODELS: usize = 8;
@@ -99,24 +101,29 @@ impl StepReport {
             .len()
             .saturating_add(self.omitted_executions);
         if total == 0 {
-            return "Not recorded".into();
+            return t("Not recorded").into();
         }
         if costs.is_empty() {
-            return "Not reported".into();
+            return t("Not reported").into();
         }
         let sum: f64 = costs.iter().sum();
         if !sum.is_finite() {
-            return "Exceeds display range; see individual attempts".into();
+            return t("Exceeds display range; see individual attempts").into();
         }
         let amount = if estimated {
-            format!("≈ {} (estimated)", format_cost(sum))
+            tf!("≈ {cost} (estimated)", cost = format_cost(sum))
         } else {
             format_cost(sum)
         };
         if costs.len() == total {
             amount
         } else {
-            format!("{amount} · partial ({} of {total} attempts)", costs.len())
+            tf!(
+                "{amount} · partial ({count} of {total} attempts)",
+                amount = amount,
+                count = costs.len(),
+                total = total
+            )
         }
     }
 
@@ -153,8 +160,8 @@ impl StepReport {
                         valid_cost(execution.cost_usd).map_or_else(
                             || {
                                 valid_cost(execution.estimated_cost_usd).map_or_else(
-                                    || "Cost not reported".into(),
-                                    |cost| format!("≈ {} (estimated)", format_cost(cost)),
+                                    || t("Cost not reported").into(),
+                                    |cost| tf!("≈ {cost} (estimated)", cost = format_cost(cost)),
                                 )
                             },
                             format_cost,
@@ -235,8 +242,12 @@ impl StepReport {
     /// `(value, detail)` for the audio summary, mentioning trimming only when it happened.
     pub fn audio_summary(&self) -> Option<(String, Option<String>)> {
         self.audio.map(|audio| {
-            let trimmed = (audio.sent_ms < audio.recorded_ms)
-                .then(|| format!("of {} recorded", seconds(audio.recorded_ms)));
+            let trimmed = (audio.sent_ms < audio.recorded_ms).then(|| {
+                tf!(
+                    "of {seconds} recorded",
+                    seconds = seconds(audio.recorded_ms)
+                )
+            });
             (seconds(audio.sent_ms), trimmed)
         })
     }
@@ -294,7 +305,7 @@ impl AttemptView {
         let mut parts = vec![self.provider.clone()];
         match self.streaming {
             Some(true) => parts.push("Live streaming".into()),
-            Some(false) => parts.push("After recording".into()),
+            Some(false) => parts.push(t("After recording").into()),
             None => {}
         }
         match self.keyword_count {
@@ -310,8 +321,8 @@ impl AttemptView {
 pub fn duration_label(ms: u64) -> String {
     match ms {
         0..=999 => format!("{ms} ms"),
-        1_000..=9_999 => format!("{:.2} s", ms as f64 / 1_000.0),
-        _ => format!("{:.1} s", ms as f64 / 1_000.0),
+        1_000..=9_999 => crate::i18n::decimal(format!("{:.2} s", ms as f64 / 1_000.0)),
+        _ => crate::i18n::decimal(format!("{:.1} s", ms as f64 / 1_000.0)),
     }
 }
 
@@ -359,7 +370,7 @@ fn deserialize_cost<'de, D: serde::Deserializer<'de>>(
 }
 
 fn format_cost(cost: f64) -> String {
-    format!("{} USD", format_usd(cost))
+    crate::i18n::decimal(format!("{} USD", format_usd(cost)))
 }
 
 /// A dollar amount that never rounds a positive cost to zero. Shared with Statistics.
@@ -379,7 +390,7 @@ pub fn format_usd(cost: f64) -> String {
 }
 
 pub fn seconds(ms: u64) -> String {
-    format!("{:.1} s", ms as f64 / 1_000.0)
+    crate::i18n::decimal(format!("{:.1} s", ms as f64 / 1_000.0))
 }
 
 fn bound(model: &str) -> String {

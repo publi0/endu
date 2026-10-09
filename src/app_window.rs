@@ -1,6 +1,7 @@
 //! The app window: Settings, Models, HUD, History, and Statistics, plus first-run
 //! setup sheet.
 
+use crate::i18n::t;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::SyncSender;
@@ -10,7 +11,7 @@ use gpui::{
     AnyElement, App, Bounds, Context, Div, Entity, FocusHandle, FontWeight, IntoElement,
     KeyDownEvent, Modifiers as GpuiModifiers, ModifiersChangedEvent, MouseDownEvent,
     PathPromptOptions, Render, SharedString, Subscription, Timer, TitlebarOptions, Window,
-    WindowBounds, WindowHandle, WindowOptions, actions, div, prelude::*, px, rgb, rgba, size,
+    WindowBounds, WindowHandle, WindowOptions, actions, div, prelude::*, px, rgba, size,
 };
 
 use crate::app_settings::{
@@ -19,13 +20,12 @@ use crate::app_settings::{
 };
 use crate::desktop_ui::{
     ACCENT, CANVAS, CONTROL_RADIUS, FAINT, LINE, MUTED, NEGATIVE, NavigationIcon,
-    PANE_CONTENT_WIDTH, PANE_LIST_WIDTH, PANEL_RADIUS, POSITIVE, PickerState, SIDEBAR_WIDTH,
-    SURFACE, SURFACE_HOVER, SURFACE_SELECTED, TEXT, TEXT_SOFT, compact_button, compact_panel,
-    disclosure_button, error_message, header_button, hotkey_keycaps, mix_color, navigation_item,
-    pane_body, pane_content, pane_header, pane_header_with_action, pane_list, picker_open_key,
-    picker_popup, section_label, settings_copy, settings_panel, settings_row,
-    settings_section_label, sidebar_frame, sliding_segmented_control, sliding_segmented_item,
-    toggle, window_frame,
+    PANE_CONTENT_WIDTH, PANEL_RADIUS, POSITIVE, PickerState, SIDEBAR_WIDTH, SURFACE, SURFACE_HOVER,
+    SURFACE_SELECTED, TEXT, TEXT_SOFT, compact_button, compact_panel, disclosure_button,
+    error_message, header_button, hotkey_keycaps, mix_color, navigation_item, pane_body,
+    pane_content, pane_header, pane_header_with_action, pane_list, picker_open_key, picker_popup,
+    rgb, section_label, settings_copy, settings_panel, settings_row, settings_section_label,
+    sidebar_frame, sliding_segmented_control, sliding_segmented_item, toggle, window_frame,
 };
 use crate::history::{History, HistoryEntry, HistoryRetention};
 use crate::hud_settings_view::{HudChange, HudSettingsView};
@@ -39,7 +39,9 @@ use crate::openrouter::settings_view::{KeyChanged, OpenRouterSettings};
 use crate::openrouter::stats_view::StatisticsView;
 use crate::post_processing_view::{PostProcessingChange, PostProcessingView};
 use crate::recording_recovery::{RecordingRecovery, RecoveryEntry, RecoveryStatus};
-use crate::sound_settings_view::{SoundEvent, SoundSettingsView, SoundVolumeChange};
+use crate::sound_settings_view::{
+    SoundEvent, SoundSettingsView, SoundVolumeChange, StartCueChange, StartCuePreview,
+};
 use crate::text_input::{
     Changed as TextChanged, Dismissed as TextDismissed, EditFinished as TextEditFinished,
     Submitted as TextSubmitted, TextInput,
@@ -263,7 +265,7 @@ fn open_new(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions {
-                title: Some("Hex".into()),
+                title: Some("Endu".into()),
                 appears_transparent: true,
                 ..Default::default()
             }),
@@ -344,6 +346,9 @@ pub struct AppWindowPreview {
     pub onboarding: bool,
     pub permissions_missing: bool,
     pub open_history_retention: bool,
+    /// Previews never read the saved Appearance; this applies instead.
+    pub appearance: crate::appearance::Appearance,
+    pub language: crate::i18n::LanguagePreference,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -373,14 +378,14 @@ impl Pane {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Settings => "Settings",
-            Self::Microphone => "Microphone",
-            Self::Models => "Models",
-            Self::Providers => "Providers",
-            Self::PostProcessing => "Post-processing",
+            Self::Settings => t("Settings"),
+            Self::Microphone => t("Microphone"),
+            Self::Models => t("Models"),
+            Self::Providers => t("Providers"),
+            Self::PostProcessing => t("Post-processing"),
             Self::Hud => "HUD",
-            Self::History => "History",
-            Self::Statistics => "Statistics",
+            Self::History => t("History"),
+            Self::Statistics => t("Statistics"),
         }
     }
 
@@ -487,6 +492,12 @@ impl ToggleSpring {
     }
 
     fn render_position(&mut self, window: &mut Window) -> f32 {
+        if crate::desktop_ui::reduce_motion() {
+            self.position = self.target;
+            self.velocity = 0.0;
+            self.last_frame = Instant::now();
+            return self.position;
+        }
         let now = Instant::now();
         self.advance(now.duration_since(self.last_frame));
         self.last_frame = now;
@@ -520,12 +531,15 @@ enum SettingControl {
     LowerVolume,
     Dock,
     Sound,
+    StartCue,
     Retention,
     Trim,
     Hud,
     MicrophonePriority,
     DoubleTapSensitivity,
     PostProcessing,
+    Appearance,
+    Language,
 }
 
 struct SettingsFeedback {
@@ -546,6 +560,9 @@ pub struct AppWindow {
     pane: Pane,
     listener_start: Option<SyncSender<()>>,
     setup_status: SetupStatus,
+    /// Counts each permission becoming ready while Endu runs, so its check
+    /// draws itself then rather than on every visit.
+    setup_granted: [u64; 3],
     setup_visible: bool,
     onboarding_completed: bool,
     permission_refresh_at: Instant,
@@ -557,6 +574,8 @@ pub struct AppWindow {
     sound_settings: Entity<SoundSettingsView>,
     microphone_priority: Entity<MicrophonePriorityView>,
     sensitivity_focus: [FocusHandle; 3],
+    appearance_focus: [FocusHandle; 3],
+    language_focus: [FocusHandle; 4],
     preference_transfer_busy: bool,
     preference_transfer_error: Option<String>,
     preference_transfer_focus: [FocusHandle; 2],
@@ -590,6 +609,8 @@ pub struct AppWindow {
     hotkey_capture: HotkeyCaptureState,
     hotkey_capture_animation: ToggleSpring,
     hotkey_width_spring: ToggleSpring,
+    /// The control whose capture the width spring is animating.
+    hotkey_width_origin: Option<HotkeyKind>,
     hotkey_side_animations: [ToggleSpring; 2],
     hotkey_side_selection_springs: [ToggleSpring; 2],
     window_focus: FocusHandle,
@@ -606,15 +627,31 @@ pub struct AppWindow {
     recovery_entries: Vec<RecoveryEntry>,
     selected_recovery: Option<String>,
     recovery_delete_armed: bool,
-    recovery_copied: bool,
-    recovery_error: Option<String>,
+    /// The failed recording a Retry or Delete error belongs to, and the error.
+    recovery_error: Option<(String, String)>,
+    /// A Retry that copies its recovered text once the worker finishes.
+    recovery_copy_pending: Option<String>,
     recovery_action_focus: [FocusHandle; 3],
     selected_history: Option<u64>,
+    /// The entry last opened, highlighted in the list after going back.
+    history_last_opened: Option<HistoryItem>,
+    history_scroll: gpui::ScrollHandle,
     history_error: Option<String>,
     history_clear_armed: bool,
+    /// The list row whose trash was clicked once and now awaits confirmation.
+    history_row_delete_armed: Option<history_pane::HistoryItem>,
+    /// Counts arming clicks so each one shakes the trash anew.
+    history_delete_armed_count: u64,
+    /// A row folding away; it is deleted once the fold finishes.
+    history_removing: Option<history_pane::HistoryItem>,
+    /// When the copy check appeared; it returns to the copy symbol after a moment.
+    history_copied_at: Option<Instant>,
+    history_copied_count: u64,
+    /// A recording that Retry just recovered, so its text can fade in.
+    history_recovered: Option<(String, Instant)>,
     history_retention_open: bool,
     history_retention_picker_state: PickerState,
-    history_copied: Option<u64>,
+    history_copied: Option<HistoryItem>,
     pending_update: Option<String>,
     update_error: Option<String>,
     update_restarting: bool,
@@ -636,6 +673,7 @@ impl AppWindow {
                     let changed = window.poll_setup(false)
                         | window.poll_login_item()
                         | window.poll_history(cx)
+                        | window.poll_history_feedback()
                         | window.poll_microphone();
                     if changed {
                         cx.notify();
@@ -657,7 +695,10 @@ impl AppWindow {
                     tracing::error!(%error, "could not load app settings");
                     (
                         AppSettings::default(),
-                        Some(format!("Could not load app settings: {error:#}")),
+                        Some(tf!(
+                            "Could not load app settings: {error}",
+                            error = format!("{error:#}")
+                        )),
                     )
                 }
             }
@@ -665,6 +706,17 @@ impl AppWindow {
         if !preview_mode {
             crate::app_settings::set_dock_icon_visible(true);
         }
+        preview
+            .as_ref()
+            .map_or(settings.appearance, |preview| preview.appearance)
+            .apply_to_application();
+        crate::i18n::set_language(
+            preview
+                .as_ref()
+                .map_or(settings.language, |preview| preview.language)
+                .resolve(),
+        );
+        crate::desktop_ui::sync_appearance(native_window.appearance());
         let window_focus = cx.focus_handle();
         window_focus.focus(native_window);
         let hotkey_focus = cx.focus_handle();
@@ -674,6 +726,14 @@ impl AppWindow {
             true
         });
         let mut subscriptions = vec![
+            // The palette follows the effective appearance: the Appearance
+            // setting, or the system while it is System.
+            cx.observe_window_appearance(native_window, |_, window, cx| {
+                if crate::desktop_ui::sync_appearance(window.appearance()) {
+                    window.refresh();
+                }
+                cx.notify();
+            }),
             cx.observe_window_bounds(native_window, move |_, window, _| {
                 if !preview_mode && let WindowBounds::Windowed(bounds) = window.window_bounds() {
                     save_window_bounds(bounds);
@@ -741,7 +801,8 @@ impl AppWindow {
                 cx.notify();
             }),
         );
-        let history_search = cx.new(|cx| TextInput::picker(cx, "Search history", ""));
+        let history_search = cx
+            .new(|cx| TextInput::picker(cx, "", "").localized_placeholder(|| t("Search history")));
         subscriptions.push(
             cx.subscribe(&history_search, |this, _, _: &TextChanged, cx| {
                 this.reload_history(cx);
@@ -864,8 +925,9 @@ impl AppWindow {
             },
         ));
         let hud_settings = cx.new(|cx| HudSettingsView::new(settings.hud, preview_mode, cx));
-        let sound_settings =
-            cx.new(|cx| SoundSettingsView::new(settings.effective_sound_volumes(), cx));
+        let sound_settings = cx.new(|cx| {
+            SoundSettingsView::new(settings.effective_sound_volumes(), settings.start_cue, cx)
+        });
         let microphone_priority = cx.new(|cx| {
             MicrophonePriorityView::new(settings.microphone_priority.clone(), preview_mode, cx)
         });
@@ -940,6 +1002,27 @@ impl AppWindow {
             },
         ));
         subscriptions.push(cx.subscribe(
+            &sound_settings,
+            |this, _, change: &StartCueChange, cx| {
+                let saved = this.update_settings(SettingControl::StartCue, cx, |settings| {
+                    settings.start_cue = change.0
+                });
+                let cue = this.settings.start_cue;
+                let error = this.feedback_error(SettingControl::StartCue);
+                this.sound_settings
+                    .update(cx, |view, cx| view.set_start_cue(cue, error, cx));
+                // Choosing a cue previews it, as Play does.
+                if saved {
+                    crate::feedback::preview_start_cue();
+                }
+            },
+        ));
+        subscriptions.push(
+            cx.subscribe(&sound_settings, |_, _, _: &StartCuePreview, _| {
+                crate::feedback::preview_start_cue()
+            }),
+        );
+        subscriptions.push(cx.subscribe(
             &microphone_priority,
             |this, _, change: &PriorityChange, cx| {
                 this.update_settings(SettingControl::MicrophonePriority, cx, |settings| {
@@ -968,7 +1051,15 @@ impl AppWindow {
                 Err(error) => (None, Some(error.to_string())),
             }
         };
-        subscriptions.push(cx.observe(&openrouter_settings, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.observe(&openrouter_settings, |this, editor, cx| {
+            let models = editor.read(cx).catalog_models();
+            if this.model_options.read(cx).catalog() != models {
+                let models = models.to_vec();
+                this.model_options
+                    .update(cx, |view, cx| view.set_catalog(models, cx));
+            }
+            cx.notify();
+        }));
         subscriptions.push(
             cx.subscribe(&openrouter_setup, |this, _, event: &KeyChanged, cx| {
                 this.providers.update(cx, |view, cx| {
@@ -1005,6 +1096,7 @@ impl AppWindow {
             },
             listener_start,
             setup_status,
+            setup_granted: [0; 3],
             setup_visible,
             onboarding_completed,
             permission_refresh_at: Instant::now() + PERMISSION_REFRESH_INTERVAL,
@@ -1046,6 +1138,7 @@ impl AppWindow {
             hotkey_capture: HotkeyCaptureState::Idle,
             hotkey_capture_animation: ToggleSpring::new(false),
             hotkey_width_spring: ToggleSpring::at(HOTKEY_MIN_WIDTH),
+            hotkey_width_origin: None,
             hotkey_side_animations: [
                 ToggleSpring::new(dictation_side.is_some()),
                 ToggleSpring::new(paste_side.is_some()),
@@ -1071,6 +1164,8 @@ impl AppWindow {
             sound_settings,
             microphone_priority,
             sensitivity_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
+            appearance_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
+            language_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             preference_transfer_busy: false,
             preference_transfer_error: None,
             preference_transfer_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
@@ -1090,12 +1185,20 @@ impl AppWindow {
             recovery_entries: Vec::new(),
             selected_recovery: None,
             recovery_delete_armed: false,
-            recovery_copied: false,
             recovery_error: None,
+            recovery_copy_pending: None,
             recovery_action_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             selected_history: None,
+            history_last_opened: None,
+            history_scroll: gpui::ScrollHandle::new(),
             history_error: None,
             history_clear_armed: false,
+            history_row_delete_armed: None,
+            history_delete_armed_count: 0,
+            history_removing: None,
+            history_copied_at: None,
+            history_copied_count: 0,
+            history_recovered: None,
             history_retention_open: preview
                 .as_ref()
                 .is_some_and(|preview| preview.open_history_retention),
@@ -1111,15 +1214,6 @@ impl AppWindow {
             .position(|value| *value == window.settings.history_retention)
             .unwrap_or(0);
         window.reload_history(cx);
-        if window.preview {
-            window.selected_recovery = window
-                .recovery_entries
-                .first()
-                .map(|entry| entry.id.clone());
-            if window.selected_recovery.is_none() {
-                window.selected_history = window.history_entries.first().map(|entry| entry.id);
-            }
-        }
         window
     }
 
@@ -1153,6 +1247,13 @@ impl AppWindow {
             .update(cx, |view, cx| view.close_picker(cx));
         self.hud_settings
             .update(cx, |view, cx| view.close_picker(cx));
+        if pane != Pane::History {
+            // Copying long after leaving History would surprise; Copy remains.
+            self.recovery_copy_pending = None;
+        }
+        if self.pane != pane {
+            crate::desktop_ui::note_navigation();
+        }
         self.pane = pane;
         self.history_retention_open = false;
         self.microphone_picker_open = false;
@@ -1227,6 +1328,24 @@ impl AppWindow {
         let mut changed = false;
         let status = crate::onboarding::status();
         if status != self.setup_status {
+            let permissions = |status: crate::onboarding::SetupStatus| {
+                [
+                    status.microphone,
+                    status.input_monitoring,
+                    status.accessibility,
+                ]
+                .map(|state| state == crate::onboarding::PermissionState::Ready)
+            };
+            let (before, after) = (permissions(self.setup_status), permissions(status));
+            for (index, count) in self.setup_granted.iter_mut().enumerate() {
+                if after[index] && !before[index] {
+                    *count += 1;
+                }
+            }
+            // The last permission granted: the wordmark waves once.
+            if after.iter().all(|ready| *ready) && !before.iter().all(|ready| *ready) {
+                crate::desktop_ui::play_wordmark();
+            }
             self.setup_status = status;
             changed = true;
         }
@@ -1361,8 +1480,13 @@ impl AppWindow {
             message: result
                 .as_ref()
                 .err()
-                .map(|error| format!("Could not save settings: {error:#}"))
-                .unwrap_or_else(|| "Saved.".into()),
+                .map(|error| {
+                    tf!(
+                        "Could not save settings: {error}",
+                        error = format!("{error:#}")
+                    )
+                })
+                .unwrap_or_else(|| t("Saved.").into()),
         });
         if result.is_ok() {
             self.settings_error = None;
@@ -1383,7 +1507,7 @@ impl AppWindow {
             self.settings_feedback = Some(SettingsFeedback {
                 control: SettingControl::LowerVolume,
                 success: false,
-                message: "Enter a percentage from 0 to 100.".into(),
+                message: t("Enter a percentage from 0 to 100.").into(),
             });
             cx.notify();
             return;
@@ -1471,8 +1595,8 @@ impl AppWindow {
         (self.settings.recording_audio_behavior == RecordingAudioBehavior::LowerVolume).then(|| {
             self.setting_row(
                 SettingControl::LowerVolume,
-                "Volume while dictating (%)",
-                "Percentage of the previous volume to keep. Applies to the next dictation; the original level returns when you stop.",
+                t("Volume while dictating (%)"),
+                t("Percentage of the previous volume to keep. Applies to the next dictation; the original level returns when you stop."),
                 div().flex_none().w(px(crate::desktop_ui::NUMBER_INPUT_WIDTH))
                     .child(self.lower_volume_input.clone()),
             ).border_b_0().into_any_element()
@@ -1518,7 +1642,7 @@ impl AppWindow {
         };
         div()
             .border_b_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(crate::desktop_ui::DIVIDER))
             .child(settings_row(title, description, content).border_b_0())
             .when(!popup, |row| {
                 row.children(
@@ -1561,10 +1685,11 @@ impl AppWindow {
         sidebar_frame()
             .w(px(SIDEBAR_WIDTH))
             .px(px(14.0))
-            .pt(px(52.0))
+            .pt(px(44.0))
             .pb_4()
             .flex()
             .flex_col()
+            .child(crate::desktop_ui::sidebar_brand())
             .child(div().flex().flex_col().gap(px(2.0)).children(items))
             .child(div().flex_1())
             .child(self.render_update_footer(cx))
@@ -1591,7 +1716,7 @@ impl AppWindow {
                 .items_center()
                 .text_size(px(11.0))
                 .text_color(rgb(MUTED))
-                .child(format!("Hex {}", env!("CARGO_PKG_VERSION")))
+                .child(format!("Endu {}", env!("CARGO_PKG_VERSION")))
                 .into_any_element();
         };
         let restarting = self.update_restarting;
@@ -1616,7 +1741,7 @@ impl AppWindow {
                             .text_size(px(12.0))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(TEXT))
-                            .child("Update ready"),
+                            .child(t("Update ready")),
                     ),
             )
             .child(
@@ -1624,9 +1749,7 @@ impl AppWindow {
                     .text_size(px(11.0))
                     .line_height(px(15.0))
                     .text_color(rgb(MUTED))
-                    .child(format!(
-                        "Hex {version} is installed. Restart to start using it."
-                    )),
+                    .child(tf!("Endu {version} is installed. Restart to start using it.", version = version)),
             )
             .child(
                 div()
@@ -1640,7 +1763,7 @@ impl AppWindow {
                     .bg(rgb(ACCENT))
                     .text_size(px(12.0))
                     .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(0xffffff))
+                    .text_color(rgb(crate::desktop_ui::ON_ACCENT))
                     .when(restarting, |button| button.opacity(0.6))
                     .when(!restarting, |button| {
                         button
@@ -1648,7 +1771,7 @@ impl AppWindow {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let Some(bundle) = crate::update_check::bundle_path() else {
                                     this.update_error = Some(
-                                    "Hex is not running from its app bundle. Reopen it manually."
+                                    t("Endu is not running from its app bundle. Reopen it manually.")
                                         .into(),
                                 );
                                     cx.notify();
@@ -1660,7 +1783,7 @@ impl AppWindow {
                                     crate::update_check::relaunch_and_quit(&bundle);
                                 if !this.update_restarting {
                                     this.update_error = Some(
-                                        "Could not schedule the restart. Quit Hex and reopen it."
+                                        t("Could not schedule the restart. Quit Endu and reopen it.")
                                             .into(),
                                     );
                                 }
@@ -1668,9 +1791,9 @@ impl AppWindow {
                             }))
                     })
                     .child(if restarting {
-                        "Restarting…"
+                        t("Restarting…")
                     } else {
-                        "Restart now"
+                        t("Restart now")
                     }),
             )
             .children(self.update_error.as_ref().map(|error| {
@@ -1730,7 +1853,7 @@ impl AppWindow {
             .models
             .retain(|id| available.contains(&crate::providers::ModelRef::parse(id).provider));
         configuration_pane(
-            "Models",
+            t("Models"),
             "models-scroll",
             div()
                 .child(
@@ -1759,8 +1882,8 @@ impl AppWindow {
     fn render_clipboard_fallback(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
             .child(settings_row(
-                "Copy when auto-paste fails",
-                "Keeps the dictation on the clipboard when Hex detects a paste error or the destination changes.",
+                t("Copy when auto-paste fails"),
+                t("Keeps the dictation on the clipboard when Endu detects a paste error or the destination changes."),
                 toggle(if self.settings.copy_on_paste_failure { 1.0 } else { 0.0 }),
             )
                 .border_b_0()
@@ -1783,11 +1906,16 @@ impl AppWindow {
         let hotkey_control = self.render_hotkey_setting_control(HotkeyKind::Dictation, window, cx);
         let paste_last_control =
             self.render_hotkey_setting_control(HotkeyKind::PasteLast, window, cx);
-        let mode_control = crate::desktop_ui::settings_segmented_control().children(
-            DictationMode::ALL
-                .into_iter()
-                .enumerate()
-                .map(|(index, mode)| {
+        let mode_control =
+            crate::desktop_ui::settings_choice(
+                "dictation-mode",
+                DictationMode::ALL
+                    .iter()
+                    .position(|value| *value == self.settings.dictation_mode),
+                DictationMode::ALL.len(),
+            )
+            .children(DictationMode::ALL.into_iter().enumerate().map(
+                |(index, mode)| {
                     crate::desktop_ui::settings_segmented_item(
                         mode == self.settings.dictation_mode,
                         DictationMode::ALL.len(),
@@ -1799,17 +1927,17 @@ impl AppWindow {
                     .focus(|style| style.border_color(rgb(ACCENT)))
                     .child(mode.label())
                     .on_click(cx.listener(move |this, _, _, cx| this.set_dictation_mode(mode, cx)))
-                }),
-        );
+                },
+            ));
         let mode_description = match self.settings.dictation_mode {
             DictationMode::TapOrHold => {
-                "Tap to keep recording; press again to stop. Or hold and release to finish."
+                t("Tap to keep recording; press again to stop. Or hold and release to finish.")
             }
             DictationMode::Hold => {
-                "Hold the shortcut while speaking; release to transcribe and paste."
+                t("Hold the shortcut while speaking; release to transcribe and paste.")
             }
             DictationMode::DoubleTap => {
-                "Hold to dictate, or double-tap to keep recording until the next press."
+                t("Hold to dictate, or double-tap to keep recording until the next press.")
             }
         };
         self.double_tap_only_visibility.set_enabled(
@@ -1822,11 +1950,16 @@ impl AppWindow {
             .clamp(0.0, 1.0);
         let dock_icon_position = self.dock_icon_toggle.render_position(window);
         let launch_at_login_position = self.launch_at_login_toggle.render_position(window);
-        let sensitivity_control = crate::desktop_ui::settings_segmented_control().children(
-            DoubleTapSensitivity::ALL
-                .into_iter()
-                .enumerate()
-                .map(|(index, sensitivity)| {
+        let sensitivity_control =
+            crate::desktop_ui::settings_choice(
+                "double-tap-sensitivity",
+                DoubleTapSensitivity::ALL
+                    .iter()
+                    .position(|value| *value == self.settings.double_tap_sensitivity),
+                DoubleTapSensitivity::ALL.len(),
+            )
+            .children(DoubleTapSensitivity::ALL.into_iter().enumerate().map(
+                |(index, sensitivity)| {
                     crate::desktop_ui::settings_segmented_item(
                         self.settings.double_tap_sensitivity == sensitivity,
                         DoubleTapSensitivity::ALL.len(),
@@ -1844,6 +1977,68 @@ impl AppWindow {
                             |settings| settings.double_tap_sensitivity = sensitivity,
                         );
                     }))
+                },
+            ));
+        let appearance_control = crate::desktop_ui::settings_choice(
+            "appearance",
+            crate::appearance::Appearance::ALL
+                .iter()
+                .position(|value| *value == self.settings.appearance),
+            crate::appearance::Appearance::ALL.len(),
+        )
+        .children(
+            crate::appearance::Appearance::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(index, appearance)| {
+                    crate::desktop_ui::settings_segmented_item(
+                        self.settings.appearance == appearance,
+                        crate::appearance::Appearance::ALL.len(),
+                    )
+                    .id(("appearance", index))
+                    .track_focus(&self.appearance_focus[index])
+                    .border_1()
+                    .border_color(gpui::transparent_black())
+                    .focus(|style| style.border_color(rgb(ACCENT)))
+                    .child(appearance.label())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.update_settings(SettingControl::Appearance, cx, |settings| {
+                            settings.appearance = appearance
+                        }) {
+                            appearance.apply(cx);
+                        }
+                    }))
+                }),
+        );
+        let language_control = crate::desktop_ui::settings_choice(
+            "language",
+            crate::i18n::LanguagePreference::ALL
+                .iter()
+                .position(|value| *value == self.settings.language),
+            crate::i18n::LanguagePreference::ALL.len(),
+        )
+        .children(
+            crate::i18n::LanguagePreference::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(index, language)| {
+                    crate::desktop_ui::settings_segmented_item(
+                        self.settings.language == language,
+                        crate::i18n::LanguagePreference::ALL.len(),
+                    )
+                    .id(("language", index))
+                    .track_focus(&self.language_focus[index])
+                    .border_1()
+                    .border_color(gpui::transparent_black())
+                    .focus(|style| style.border_color(rgb(ACCENT)))
+                    .child(language.label())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.update_settings(SettingControl::Language, cx, |settings| {
+                            settings.language = language
+                        }) {
+                            apply_language(language, cx);
+                        }
+                    }))
                 }),
         );
         let launch_at_login_control = if self.launch_at_login_status.is_none() {
@@ -1851,13 +2046,13 @@ impl AppWindow {
                 .text_size(px(11.0))
                 .text_color(rgb(MUTED))
                 .child(if self.login_item_worker.is_some() {
-                    "Checking…"
+                    t("Checking…")
                 } else {
-                    "Unavailable"
+                    t("Unavailable")
                 })
                 .into_any_element()
         } else if self.launch_at_login_status == Some(LoginItemStatus::RequiresApproval) {
-            compact_button("Open Settings")
+            compact_button(t("Open Settings"))
                 .id("launch-at-login-approval")
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.request_login_item(LoginItemRequest::OpenSettings);
@@ -1868,21 +2063,21 @@ impl AppWindow {
             toggle(launch_at_login_position)
         };
         configuration_pane(
-            "Settings",
+            t("Settings"),
             "settings-scroll",
             div()
                 .children(permission_warnings)
-                .child(settings_section_label("DICTATION"))
+                .child(settings_section_label(t("Dictation")))
                 .child(
                     settings_panel()
                         .child(self.setting_row(SettingControl::Dictation,
-                            "Dictation shortcut",
-                            "Start and stop dictation with this shortcut",
+                            t("Dictation shortcut"),
+                            t("Start and stop dictation with this shortcut"),
                             hotkey_control,
                         ))
                         .child(
                             self.setting_row(SettingControl::DictationMode,
-                                "Recording gesture", mode_description, mode_control,
+                                t("Recording gesture"), mode_description, mode_control,
                             ),
                         )
                         .child(
@@ -1892,8 +2087,8 @@ impl AppWindow {
                                 .opacity(double_tap_only_visibility)
                                 .child(
                                     self.setting_row(SettingControl::DoubleTapOnly,
-                                        "Double-tap only",
-                                        "Wait for two complete shortcut taps before recording",
+                                        t("Double-tap only"),
+                                        t("Wait for two complete shortcut taps before recording"),
                                         toggle(if self.settings.double_tap_only { 1.0 } else { 0.0 }),
                                     )
                                     .border_b_0()
@@ -1906,14 +2101,14 @@ impl AppWindow {
                         )
                         .when(self.settings.dictation_mode == DictationMode::DoubleTap, |panel| panel.child(
                             self.setting_row(SettingControl::DoubleTapSensitivity,
-                                "Double-tap timing",
-                                format!("Time between taps: {} ms. Choose how quickly the second tap must follow.", self.settings.double_tap_sensitivity.window().as_millis()),
+                                t("Double-tap timing"),
+                                tf!("Time between taps: {ms} ms. Choose how quickly the second tap must follow.", ms = self.settings.double_tap_sensitivity.window().as_millis()),
                                 sensitivity_control,
                             )
                         ))
                         .child(self.setting_row(SettingControl::EnterSubmit,
-                            "Enter to paste and send",
-                            "During locked recording, Enter stops, transcribes, pastes, then presses Enter in the input. This can send a chat message.",
+                            t("Enter to paste and send"),
+                            t("During locked recording, Enter stops, transcribes, pastes, then presses Enter in the input. This can send a chat message."),
                             toggle(if self.settings.enter_to_submit { 1.0 } else { 0.0 }),
                         ).border_b_0().id("enter-to-submit")
                             .track_focus(&self.enter_submit_focus)
@@ -1922,12 +2117,12 @@ impl AppWindow {
                                 this.update_settings(SettingControl::EnterSubmit, cx, |settings| settings.enter_to_submit = !settings.enter_to_submit);
                             }))),
                 )
-                .child(settings_section_label("PASTE LAST"))
+                .child(settings_section_label(t("Paste last")))
                 .child(
                     settings_panel().child(
                         self.setting_row(SettingControl::PasteLast,
-                            "Paste last dictation",
-                            "Pastes the most recent transcript again; also in the menu bar",
+                            t("Paste last dictation"),
+                            t("Pastes the most recent transcript again; also in the menu bar"),
                             div()
                                 .flex()
                                 .items_center()
@@ -1935,7 +2130,7 @@ impl AppWindow {
                                 .child(paste_last_control)
                                 .when(self.settings.paste_last_hotkey.is_some(), |row| {
                                     row.child(
-                                        compact_button("Disable")
+                                        compact_button(t("Disable"))
                                             .id("disable-paste-last-hotkey")
                                             .flex_none()
                                             .border_1()
@@ -1950,13 +2145,25 @@ impl AppWindow {
                         ),
                     ).child(self.render_clipboard_fallback(cx)),
                 )
-                .child(settings_section_label("APPLICATION"))
+                .child(settings_section_label(t("Application")))
                 .child(
                     settings_panel()
+                        .child(self.setting_row(
+                            SettingControl::Language,
+                            t("Language"),
+                            t("System follows your Mac's language"),
+                            language_control,
+                        ))
+                        .child(self.setting_row(
+                            SettingControl::Appearance,
+                            t("Appearance"),
+                            t("System follows your Mac's light or dark mode"),
+                            appearance_control,
+                        ))
                         .child(
                             settings_row(
-                                "Launch at login",
-                                "Start Hex when you sign in to your Mac",
+                                t("Launch at login"),
+                                t("Start Endu when you sign in to your Mac"),
                                 launch_at_login_control,
                             )
                             .id("launch-at-login-setting")
@@ -1985,8 +2192,8 @@ impl AppWindow {
                         })
                         .child(
                             self.setting_row(SettingControl::Dock,
-                                "Show Dock icon",
-                                "When off, Hex lives in the menu bar while this window is closed",
+                                t("Show Dock icon"),
+                                t("When off, Endu lives in the menu bar while this window is closed"),
                                 toggle(dock_icon_position),
                             )
                             .border_b_0()
@@ -2002,12 +2209,20 @@ impl AppWindow {
                         )
                         ,
                 )
-                .child(settings_section_label("SOUNDS"))
+                .child(settings_section_label(t("Sounds")))
                 .child(self.sound_settings.clone())
-                .child(settings_section_label("PREFERENCES"))
+                .child(settings_section_label(t("Preferences")))
                 .child(self.render_preference_transfer(cx)),
         )
     }
+}
+
+/// Switches the interface language at once: the window repaints and the app
+/// menus are rebuilt; the menu bar item retitles itself when it next opens.
+pub(crate) fn apply_language(language: crate::i18n::LanguagePreference, cx: &mut App) {
+    crate::i18n::set_language(language.resolve());
+    crate::desktop::set_app_menus(cx);
+    cx.refresh_windows();
 }
 
 impl Drop for AppWindow {
@@ -2033,7 +2248,7 @@ impl Render for AppWindow {
                 Pane::Microphone => self.render_microphone(window, cx),
                 Pane::Models => self.render_models(cx),
                 Pane::Providers => configuration_pane(
-                    "Providers",
+                    t("Providers"),
                     "providers-scroll",
                     div().child(self.providers.clone()),
                 ),
@@ -2058,6 +2273,13 @@ impl Render for AppWindow {
                     } else {
                         window.focus_next();
                     }
+                    cx.stop_propagation();
+                    return;
+                }
+                if this.pane == Pane::History
+                    && !this.setup_visible
+                    && this.history_detail_key(event, window, cx)
+                {
                     cx.stop_propagation();
                     return;
                 }
@@ -2136,7 +2358,7 @@ impl Render for AppWindow {
                             div()
                                 .px_5()
                                 .py_2()
-                                .child(error_message("Settings error:", error)),
+                                .child(error_message(t("Settings error:"), error)),
                         )
                     })
                     .child(div().flex_1().min_h_0().child(content)),
@@ -2184,6 +2406,8 @@ mod tests {
                 onboarding: false,
                 permissions_missing: false,
                 open_history_retention: false,
+                appearance: crate::appearance::Appearance::System,
+                language: crate::i18n::LanguagePreference::English,
             }),
             window,
             cx,
@@ -2968,6 +3192,199 @@ mod tests {
         });
         cx.run_until_parked();
         assert_layout_probes_fit(cx, "Models with one model");
+        // Every History dictation, including one with a fallback request.
+        let folder = std::env::temp_dir().join(format!(
+            "hex-history-layout-{}-{}",
+            std::process::id(),
+            crate::history::now_ms()
+        ));
+        let ids: Vec<u64> = cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.history = history_pane::preview_history_in(folder.clone());
+                view.reload_history(cx);
+                view.history_entries.iter().map(|entry| entry.id).collect()
+            })
+        });
+        assert!(ids.len() >= 3);
+        for id in ids {
+            crate::desktop_ui::layout_probes::record();
+            cx.update(|_, cx| {
+                view.update(cx, |view, cx| {
+                    view.select_pane(Pane::History, cx);
+                    view.selected_recovery = None;
+                    view.selected_history = Some(id);
+                    cx.notify();
+                })
+            });
+            cx.run_until_parked();
+            assert_layout_probes_fit(cx, &format!("History entry {id}"));
+        }
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[gpui::test]
+    fn history_entries_open_across_the_pane_and_return_to_the_list(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(preview_fixture);
+        let folder = std::env::temp_dir().join(format!(
+            "hex-history-navigation-{}-{}",
+            std::process::id(),
+            crate::history::now_ms()
+        ));
+        let ids: Vec<u64> = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.history = history_pane::preview_history_in(folder.clone());
+                view.select_pane(Pane::History, cx);
+                view.window_focus.focus(window);
+                view.history_entries.iter().map(|entry| entry.id).collect()
+            })
+        });
+        assert!(ids.len() >= 2);
+        let open =
+            |cx: &mut gpui::VisualTestContext| cx.update(|_, cx| view.read(cx).open_history_item());
+        cx.run_until_parked();
+        assert_eq!(open(cx), None, "History starts on the list");
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.show_history_item(HistoryItem::Dictation(ids[0]), cx)
+            })
+        });
+        cx.simulate_keystrokes("down");
+        assert_eq!(open(cx), Some(HistoryItem::Dictation(ids[1])));
+        cx.simulate_keystrokes("up up");
+        assert_eq!(open(cx), Some(HistoryItem::Dictation(ids[0])));
+        cx.simulate_keystrokes("escape");
+        assert_eq!(open(cx), None);
+        cx.update(|_, cx| {
+            assert_eq!(
+                view.read(cx).history_last_opened,
+                Some(HistoryItem::Dictation(ids[0]))
+            );
+        });
+        // Escape in the search field cancels the search draft, not the entry.
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.show_history_item(HistoryItem::Dictation(ids[1]), cx);
+                gpui::Focusable::focus_handle(view.history_search.read(cx), cx).focus(window);
+            })
+        });
+        cx.simulate_keystrokes("escape");
+        assert_eq!(open(cx), Some(HistoryItem::Dictation(ids[1])));
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[gpui::test]
+    fn failed_recordings_keep_their_place_and_act_from_the_list(cx: &mut gpui::TestAppContext) {
+        let folder = std::env::temp_dir().join(format!(
+            "hex-history-timeline-{}-{}",
+            std::process::id(),
+            crate::history::now_ms()
+        ));
+        let store = RecordingRecovery::open(folder.clone()).unwrap();
+        assert!(
+            store
+                .transcribe_original(
+                    &[0.1; 1600],
+                    Some("Notes"),
+                    crate::post_processing::Preferences::default(),
+                    |_| Err(color_eyre::eyre::eyre!("offline fixture"))
+                )
+                .is_err()
+        );
+        let failed_at = store.entries("")[0].timestamp_ms;
+        let recovery = HistoryItem::Recovery(store.entries("")[0].id.clone());
+        let (view, cx) = cx.add_window_view(preview_fixture);
+        let (older, newer) = cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let mut history = crate::history::HistoryStore::open(
+                    folder.join("normal-history.json"),
+                    HistoryRetention::Week,
+                    failed_at,
+                );
+                let mut record = |text: &str, timestamp_ms| {
+                    history
+                        .record(
+                            crate::history::HistoryDraft {
+                                text: text.into(),
+                                application: Some("Notes".into()),
+                                audio_ms: 100,
+                                inference_ms: 100,
+                                total_ms: 100,
+                                transcription: None,
+                            },
+                            timestamp_ms,
+                        )
+                        .unwrap()
+                };
+                let older = record("Before the failure", failed_at - 60_000);
+                let newer = record("After the failure", failed_at + 60_000);
+                view.recovery = Some(store.clone());
+                view.history = Some(History::new(history));
+                view.select_pane(Pane::History, cx);
+                (older.unwrap(), newer.unwrap())
+            })
+        });
+        cx.update(|_, cx| {
+            assert_eq!(
+                view.read(cx).history_items(),
+                [
+                    HistoryItem::Dictation(newer),
+                    recovery.clone(),
+                    HistoryItem::Dictation(older),
+                ],
+                "a failed recording stays in recording order"
+            );
+        });
+        cx.run_until_parked();
+        let center = |cx: &mut gpui::VisualTestContext, selector: &'static str| {
+            cx.debug_bounds(selector).unwrap().center()
+        };
+        let retry = center(cx, "recovery-row-retry-0");
+        cx.simulate_click(retry, gpui::Modifiers::none());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while store.retry_in_progress() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                assert_eq!(view.open_history_item(), None, "Retry stays on the list");
+                view.poll_history(cx);
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            assert!(
+                !view.can_retry_recovery(&view.recovery_entries[0]),
+                "a recovered recording no longer offers Retry"
+            );
+            assert_eq!(
+                view.history_copied,
+                Some(recovery.clone()),
+                "Retry & copy copies the recovered text"
+            );
+            assert_eq!(view.recovery_copy_pending, None);
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some("Recovered preview dictation.".into())
+            );
+        });
+        // Copy stays available for the recovered text.
+        cx.update(|_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("other".into())));
+        let copy = center(cx, "recovery-row-copy-0");
+        cx.simulate_click(copy, gpui::Modifiers::none());
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            assert_eq!(view.open_history_item(), None, "Copy stays on the list");
+            assert_eq!(view.history_copied, Some(recovery.clone()));
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some("Recovered preview dictation.".into())
+            );
+        });
+        drop(store);
+        std::fs::remove_dir_all(folder).unwrap();
     }
 
     #[gpui::test]

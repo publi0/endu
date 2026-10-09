@@ -2,6 +2,7 @@
 
 import copy
 import hashlib
+import json
 import os
 from pathlib import Path
 import plistlib
@@ -10,7 +11,16 @@ import unittest
 from unittest.mock import patch
 import zipfile
 
-from release import CASK, Publisher, archive_checksum, release_plan, render_cask, run
+from release import (
+    CASK,
+    CASK_RENAMES,
+    LEGACY_CASK,
+    Publisher,
+    archive_checksum,
+    release_plan,
+    render_cask,
+    run,
+)
 
 
 class FakeGitHub:
@@ -71,14 +81,14 @@ class FakeGitHub:
 
 
 def make_archive(root, version="3.0.0", app_version=None):
-    path = root / "target" / "app" / f"Hex-{version}.zip"
+    path = root / "target" / "app" / f"Endu-{version}.zip"
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr("Hex.app/Contents/Info.plist", plistlib.dumps({
+        archive.writestr("Endu.app/Contents/Info.plist", plistlib.dumps({
             "CFBundleIdentifier": "dev.publio.hex-openrouter",
             "CFBundleShortVersionString": app_version or version,
         }))
-        archive.writestr("Hex.app/Contents/MacOS/hex", b"synthetic executable")
+        archive.writestr("Endu.app/Contents/MacOS/endu", b"synthetic executable")
     return path
 
 
@@ -146,8 +156,23 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(self.github.uploads, 1)
         cask = self.remote_file(CASK)
         self.assertIn('version "3.0.0"', cask)
-        self.assertIn('/v#{version}/Hex-#{version}.zip', cask)
+        self.assertIn('/v#{version}/Endu-#{version}.zip', cask)
         self.assertIn(archive_checksum(self.archive, "3.0.0"), cask)
+
+    def test_first_endu_release_replaces_the_legacy_cask_and_maps_its_token(self):
+        self.git("mv", str(CASK), str(LEGACY_CASK))
+        self.git("commit", "-m", "legacy cask only")
+        self.git("push", "origin", "main")
+        self.publisher().publish()
+        self.assertIn('cask "endu" do', self.remote_file(CASK))
+        self.assertIn('app "Endu.app"', self.remote_file(CASK))
+        self.assertEqual(
+            json.loads(self.remote_file(CASK_RENAMES)),
+            {"hex-openrouter": "endu"},
+        )
+        listing = run("git", "--git-dir", str(self.remote), "ls-tree", "-r",
+                      "--name-only", "main").stdout.split()
+        self.assertNotIn(str(LEGACY_CASK), listing)
 
     def test_published_version_skips_build_and_is_not_overwritten(self):
         self.publisher().publish()

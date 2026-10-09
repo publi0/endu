@@ -1,5 +1,6 @@
 //! A brief, click-through notice for a result kept after the destination changed.
 
+use crate::i18n::t;
 use std::time::{Duration, Instant};
 
 use objc2::MainThreadMarker;
@@ -16,20 +17,21 @@ const HEIGHT: f64 = 76.0;
 fn notice_copy(copied_to_clipboard: bool, paste_last: Option<&str>) -> (&'static str, String) {
     if copied_to_clipboard {
         (
-            "Dictation copied",
+            t("Dictation copied"),
             "Auto-paste did not complete. Press ⌘V\nto paste the text in the app you choose."
                 .into(),
         )
     } else if let Some(shortcut) = paste_last {
         (
-            "Dictation ready",
-            format!(
-                "Auto-paste paused. Press {shortcut} to insert\nthe text in the app you choose."
+            t("Dictation ready"),
+            tf!(
+                "Auto-paste paused. Press {shortcut} to insert\nthe text in the app you choose.",
+                shortcut = shortcut
             ),
         )
     } else {
         (
-            "Dictation ready",
+            t("Dictation ready"),
             "Auto-paste paused. Use Paste Last Dictation in the\nmenu bar to insert the text in the app you choose."
                 .into(),
         )
@@ -71,7 +73,7 @@ impl PasteNotice {
                 &NSColor::colorWithSRGBRed_green_blue_alpha(0.12, 0.13, 0.15, 0.97).CGColor(),
             ));
         }
-        let title = NSTextField::labelWithString(&NSString::from_str("Dictation ready"), mtm);
+        let title = NSTextField::labelWithString(&NSString::from_str(t("Dictation ready")), mtm);
         title.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
         title.setTextColor(Some(&NSColor::whiteColor()));
         title.setAlignment(NSTextAlignment::Center);
@@ -99,7 +101,7 @@ impl PasteNotice {
         ));
         view.addSubview(&detail);
         window.setContentView(Some(&view));
-        window.setTitle(&NSString::from_str("Hex — dictation ready"));
+        window.setTitle(&NSString::from_str(t("Endu — dictation ready")));
         window.setBackgroundColor(Some(&NSColor::clearColor()));
         window.setOpaque(false);
         window.setIgnoresMouseEvents(true);
@@ -156,6 +158,11 @@ impl PasteNotice {
     pub fn hide(&mut self) {
         self.until = None;
         self.visibility.update(&mut self.window, false);
+    }
+
+    /// Hidden with nothing left to maintain until the next `show`.
+    pub fn is_at_rest(&self) -> bool {
+        self.until.is_none() && !self.visibility.is_ordered()
     }
 
     pub fn maintain(&mut self) {

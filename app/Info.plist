@@ -3,9 +3,9 @@
 <plist version="1.0">
 <dict>
   <key>CFBundleDisplayName</key>
-  <string>Hex</string>
+  <string>Endu</string>
   <key>CFBundleExecutable</key>
-  <string>hex</string>
+  <string>endu</string>
   <key>CFBundleIdentifier</key>
   <string>dev.publio.hex-openrouter</string>
   <key>CFBundleInfoDictionaryVersion</key>
@@ -15,7 +15,7 @@
   <key>CFBundleIconName</key>
   <string>AppIcon</string>
   <key>CFBundleName</key>
-  <string>Hex</string>
+  <string>Endu</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
@@ -27,12 +27,12 @@
   <key>LSUIElement</key>
   <true/>
   <key>NSAppleEventsUsageDescription</key>
-  <string>Hex uses automation to pause supported media players while you dictate.</string>
+  <string>Endu uses automation to pause supported media players while you dictate.</string>
   <key>NSAccessibilityUsageDescription</key>
-  <string>Hex uses Accessibility to paste the transcript into the app you are using.</string>
+  <string>Endu uses Accessibility to paste the transcript into the app you are using.</string>
   <key>NSInputMonitoringUsageDescription</key>
-  <string>Hex uses Input Monitoring to detect your dictation shortcut in every app.</string>
+  <string>Endu uses Input Monitoring to detect your dictation shortcut in every app.</string>
   <key>NSMicrophoneUsageDescription</key>
-  <string>Hex records when you tap or hold the dictation shortcut and sends the recording to your selected speech provider for transcription. Audio is saved temporarily; failed recordings remain locally for Retry in History.</string>
+  <string>Endu records when you tap or hold the dictation shortcut and sends the recording to your selected speech provider for transcription. Audio is saved temporarily; failed recordings remain locally for Retry in History.</string>
 </dict>
 </plist>

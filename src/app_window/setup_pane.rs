@@ -1,6 +1,7 @@
 //! Setup gate, permission warnings and the provider key notice.
 
 use super::*;
+use crate::i18n::t;
 
 impl AppWindow {
     pub(super) fn render_permission_warnings(
@@ -13,7 +14,7 @@ impl AppWindow {
         }
         Some(
             div()
-                .child(settings_section_label("PERMISSIONS NEEDED"))
+                .child(settings_section_label(t("Permissions needed")))
                 .child(
                     settings_panel().children(warnings.into_iter().map(|warning| {
                         let (name, description) = permission_warning_copy(warning.kind);
@@ -48,7 +49,7 @@ impl AppWindow {
                 .py_4()
                 .bg(rgb(SURFACE))
                 .border_b_1()
-                .border_color(rgb(LINE))
+                .border_color(rgb(crate::desktop_ui::DIVIDER))
                 .child(
                     div()
                         .w_full()
@@ -64,12 +65,12 @@ impl AppWindow {
                                 .border_color(rgb(ACCENT))
                                 .pl_3()
                                 .child(settings_copy(
-                                    "Connect a provider to start dictating",
-                                    "Add a key in Providers, then choose its models in Models. Keys stay in your Keychain.",
+                                    t("Connect a provider to start dictating"),
+                                    t("Add a key in Providers, then choose its models in Models. Keys stay in your Keychain."),
                                 )),
                         )
                         .child(
-                            compact_button("Open Providers")
+                            compact_button(t("Open Providers"))
                                 .id("open-key-models")
                                 .flex_none()
                                 .bg(rgb(ACCENT))
@@ -106,9 +107,30 @@ impl AppWindow {
     pub(super) fn render_setup(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let status = self.setup_status;
         let mut permission_rows = Vec::new();
-        if status.microphone != PermissionState::Ready {
+        // A granted permission keeps its row with a check, drawn as it arrives.
+        let granted = |index: usize, title: &'static str, description: &'static str| {
+            let count = self.setup_granted[index];
+            setup_row(
+                title,
+                description,
+                crate::desktop_ui::drawn_check(
+                    (count > 0).then(|| {
+                        gpui::ElementId::NamedInteger(format!("setup-check-{index}").into(), count)
+                    }),
+                    crate::desktop_ui::ThemeColor::Positive,
+                    20.0,
+                ),
+            )
+        };
+        if status.microphone == PermissionState::Ready {
+            permission_rows.push(granted(
+                0,
+                t("Microphone"),
+                t("Capture your voice while you dictate."),
+            ));
+        } else {
             let action = match status.microphone {
-                PermissionState::NeedsSettings => compact_button("Open Settings")
+                PermissionState::NeedsSettings => compact_button(t("Open Settings"))
                     .id("setup-microphone")
                     .bg(rgb(SURFACE_SELECTED))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -118,7 +140,7 @@ impl AppWindow {
                         cx.notify();
                     })),
                 PermissionState::NeedsRequest | PermissionState::Ready => {
-                    compact_button("Grant Access")
+                    compact_button(t("Grant Access"))
                         .id("setup-microphone")
                         .bg(rgb(SURFACE_SELECTED))
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -130,16 +152,22 @@ impl AppWindow {
                 }
             };
             permission_rows.push(setup_row(
-                "Microphone",
-                "Capture your voice while you dictate.",
+                t("Microphone"),
+                t("Capture your voice while you dictate."),
                 action.into_any_element(),
             ));
         }
-        if status.input_monitoring != PermissionState::Ready {
+        if status.input_monitoring == PermissionState::Ready {
+            permission_rows.push(granted(
+                1,
+                t("Input Monitoring"),
+                t("Recognize the dictation shortcut in any app."),
+            ));
+        } else {
             permission_rows.push(setup_row(
-                "Input Monitoring",
-                "Recognize the dictation shortcut in any app.",
-                compact_button("Grant Access")
+                t("Input Monitoring"),
+                t("Recognize the dictation shortcut in any app."),
+                compact_button(t("Grant Access"))
                     .id("setup-input-monitoring")
                     .bg(rgb(SURFACE_SELECTED))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -151,11 +179,17 @@ impl AppWindow {
                     .into_any_element(),
             ));
         }
-        if status.accessibility != PermissionState::Ready {
+        if status.accessibility == PermissionState::Ready {
+            permission_rows.push(granted(
+                2,
+                t("Accessibility"),
+                t("Paste the transcript into the app you are using."),
+            ));
+        } else {
             permission_rows.push(setup_row(
-                "Accessibility",
-                "Paste the transcript into the app you are using.",
-                compact_button("Grant Access")
+                t("Accessibility"),
+                t("Paste the transcript into the app you are using."),
+                compact_button(t("Grant Access"))
                     .id("setup-accessibility")
                     .bg(rgb(SURFACE_SELECTED))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -178,7 +212,12 @@ impl AppWindow {
             .items_center()
             .justify_center()
             .py_4()
-            .bg(rgba(0x000000dd))
+            // A jenipapo veil reads as dimming on Tabatinga; black would be harsh.
+            .bg(rgba(if crate::desktop_ui::dark_appearance() {
+                0x000000dd
+            } else {
+                0x1b2a3a99
+            }))
             .child(
                 // Scrolls instead of clipping when the window is shorter than
                 // the sheet with every permission still missing.
@@ -200,7 +239,7 @@ impl AppWindow {
                                 div()
                                     .text_size(px(22.0))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Set up Hex"),
+                                    .child(t("Set up Endu")),
                             )
                             .child(
                                 div()
@@ -208,7 +247,7 @@ impl AppWindow {
                                     .text_size(px(12.0))
                                     .line_height(px(19.0))
                                     .text_color(rgb(MUTED))
-                                    .child("Tap the shortcut to keep recording and tap again to stop, or hold and release. Hex trims silence, transcribes with your selected provider, and pastes the text once these permissions and your key are in place."),
+                                    .child(t("Tap the shortcut to keep recording and tap again to stop, or hold and release. Endu trims silence, transcribes with your selected provider, and pastes the text once these permissions and your key are in place.")),
                             ),
                     )
                     .when(!permission_rows.is_empty(), |setup| {
@@ -216,11 +255,11 @@ impl AppWindow {
                             div()
                                 .mx_7()
                                 .pb_5()
-                                .child(setup_group_label("PERMISSIONS"))
+                                .child(setup_group_label(t("Permissions")))
                                 .child(
                                     div()
                                         .border_t_1()
-                                        .border_color(rgb(LINE))
+                                        .border_color(rgb(crate::desktop_ui::DIVIDER))
                                         .children(permission_rows),
                                 ),
                         )
@@ -229,21 +268,21 @@ impl AppWindow {
                         div()
                             .mx_7()
                             .pb_6()
-                            .child(setup_group_label("PROVIDER"))
+                            .child(setup_group_label(t("Provider")))
                             .child(if status.api_key {
                                 div()
                                     .border_t_1()
-                                    .border_color(rgb(LINE))
+                                    .border_color(rgb(crate::desktop_ui::DIVIDER))
                                     .child(setup_row(
-                                        "Provider ready",
-                                        "Choose models and fallbacks in Models.",
+                                        t("Provider ready"),
+                                        t("Choose models and fallbacks in Models."),
                                         setup_ready_badge(),
                                     ))
                                     .into_any_element()
                             } else {
                                 div().child(self.openrouter_setup.clone())
                                     .child(div().mt_2().flex().child(
-                                        compact_button("Use another provider…").id("setup-choose-provider")
+                                        compact_button(t("Use another provider…")).id("setup-choose-provider")
                                             .border_1()
                                             .border_color(rgb(LINE))
                                             .on_click(cx.listener(|this, _, window, cx| {
@@ -272,7 +311,7 @@ pub(super) fn setup_row(
         .items_center()
         .gap_4()
         .border_b_1()
-        .border_color(rgb(LINE))
+        .border_color(rgb(crate::desktop_ui::DIVIDER))
         .child(
             div()
                 .flex_1()
@@ -298,37 +337,37 @@ pub(super) fn setup_ready_badge() -> AnyElement {
         .flex()
         .items_center()
         .rounded_sm()
-        .bg(rgb(0x17231a))
+        .bg(rgb(crate::desktop_ui::ThemeColor::PositiveBadge))
         .text_size(px(11.0))
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(0x91bd99))
-        .child("Ready")
+        .text_color(rgb(crate::desktop_ui::ThemeColor::PositiveBadgeText))
+        .child(t("Ready"))
         .into_any_element()
 }
 
-pub(super) const fn permission_warning_copy(kind: PermissionKind) -> (&'static str, &'static str) {
+pub(super) fn permission_warning_copy(kind: PermissionKind) -> (&'static str, &'static str) {
     match kind {
         PermissionKind::Microphone => (
-            "Microphone access is off",
-            "Hex cannot record dictation until microphone access is restored.",
+            t("Microphone access is off"),
+            t("Endu cannot record dictation until microphone access is restored."),
         ),
         PermissionKind::InputMonitoring => (
-            "Input Monitoring is off",
-            "Hex cannot recognize the dictation shortcut in other apps.",
+            t("Input Monitoring is off"),
+            t("Endu cannot recognize the dictation shortcut in other apps."),
         ),
         PermissionKind::Accessibility => (
-            "Accessibility is off",
-            "Hex cannot paste the transcript into the foreground app.",
+            t("Accessibility is off"),
+            t("Endu cannot paste the transcript into the foreground app."),
         ),
     }
 }
 
-pub(super) const fn permission_action_label(action: PermissionAction) -> &'static str {
+pub(super) fn permission_action_label(action: PermissionAction) -> &'static str {
     match action {
-        PermissionAction::OpenMicrophoneSettings => "Open Settings",
+        PermissionAction::OpenMicrophoneSettings => t("Open Settings"),
         PermissionAction::RequestMicrophone
         | PermissionAction::OpenInputMonitoringSettings
-        | PermissionAction::OpenAccessibilitySettings => "Grant Access",
+        | PermissionAction::OpenAccessibilitySettings => t("Grant Access"),
     }
 }
 

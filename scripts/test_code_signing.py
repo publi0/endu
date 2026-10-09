@@ -101,7 +101,7 @@ extendedKeyUsage=critical,codeSigning
                 archives.append(p12.read_bytes())
             hashes = []
             for version, signer in enumerate((0, 0, 1)):
-                bundle = root / f"Build{version}" / "Hex.app"
+                bundle = root / f"Build{version}" / "Endu.app"
                 (bundle / "Contents/MacOS").mkdir(parents=True)
                 (bundle / "Contents/Info.plist").write_bytes(plistlib.dumps({
                     "CFBundleIdentifier": signing.BUNDLE_ID,

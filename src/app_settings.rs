@@ -1,3 +1,4 @@
+use crate::i18n::t;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -371,12 +372,12 @@ pub enum RecordingAudioBehavior {
 }
 
 impl RecordingAudioBehavior {
-    pub const fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
-            Self::Mute => "Mute",
-            Self::LowerVolume => "Lower",
-            Self::PauseMedia => "Pause",
-            Self::DoNothing => "Keep",
+            Self::Mute => t("Mute"),
+            Self::LowerVolume => t("Lower"),
+            Self::PauseMedia => t("Pause"),
+            Self::DoNothing => t("Keep"),
         }
     }
 
@@ -414,9 +415,9 @@ impl DictationMode {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::TapOrHold => "Tap or hold",
-            Self::Hold => "Hold only",
-            Self::DoubleTap => "Double tap",
+            Self::TapOrHold => t("Tap or hold"),
+            Self::Hold => t("Hold only"),
+            Self::DoubleTap => t("Double tap"),
         }
     }
 
@@ -436,6 +437,7 @@ pub struct AppSettings {
     pub sound_effects: bool,
     pub sound_effect_volume: f32,
     pub sound_volumes: Option<crate::interaction_settings::SoundVolumes>,
+    pub start_cue: crate::start_cue::StartCue,
     pub microphone: Option<String>,
     pub microphone_priority: Vec<crate::microphone::DevicePreference>,
     pub microphone_channel: Option<crate::microphone::ChannelSelection>,
@@ -450,6 +452,8 @@ pub struct AppSettings {
     pub paste_last_hotkey: Option<HotkeyBinding>,
     pub copy_on_paste_failure: bool,
     pub show_dock_icon: bool,
+    pub appearance: crate::appearance::Appearance,
+    pub language: crate::i18n::LanguagePreference,
     pub history_retention: crate::history::HistoryRetention,
     pub hud: crate::hud_settings::HudPreferences,
     pub post_processing: crate::post_processing::Preferences,
@@ -463,6 +467,7 @@ impl Default for AppSettings {
             sound_effects: true,
             sound_effect_volume: 0.5,
             sound_volumes: None,
+            start_cue: crate::start_cue::StartCue::default(),
             microphone: None,
             microphone_priority: Vec::new(),
             microphone_channel: None,
@@ -477,6 +482,8 @@ impl Default for AppSettings {
             paste_last_hotkey: Some(HotkeyBinding::paste_last_default()),
             copy_on_paste_failure: false,
             show_dock_icon: true,
+            appearance: crate::appearance::Appearance::default(),
+            language: crate::i18n::LanguagePreference::default(),
             history_retention: crate::history::HistoryRetention::default(),
             hud: crate::hud_settings::HudPreferences::default(),
             post_processing: crate::post_processing::Preferences::default(),
@@ -588,6 +595,7 @@ impl AppSettings {
     }
 
     pub(crate) fn apply_runtime(&self) {
+        crate::i18n::set_language(self.language.resolve());
         self.hud.apply_runtime();
         self.post_processing.apply_runtime();
         self.vocabulary.apply_runtime();
@@ -595,6 +603,7 @@ impl AppSettings {
         RELEASE_MICROPHONE_WHILE_IDLE.store(self.release_microphone_while_idle, Ordering::Release);
         crate::feedback::set_enabled(self.sound_effects);
         crate::feedback::set_volumes(self.effective_sound_volumes());
+        crate::feedback::set_start_cue(self.start_cue);
         DOUBLE_TAP_SENSITIVITY.store(
             match self.double_tap_sensitivity {
                 crate::interaction_settings::DoubleTapSensitivity::Short => 0,
@@ -790,7 +799,7 @@ pub fn set_dock_icon_visible(visible: bool) {
 
 pub fn hide_application() {
     let Some(marker) = MainThreadMarker::new() else {
-        tracing::warn!("cannot hide HEX outside the main thread");
+        tracing::warn!("cannot hide Endu outside the main thread");
         return;
     };
     NSApplication::sharedApplication(marker).hide(None);

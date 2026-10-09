@@ -1,5 +1,6 @@
 //! Persisted HUD choices and a coherent snapshot for the renderer.
 
+use crate::i18n::t;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::RwLock;
@@ -19,8 +20,8 @@ impl HudPosition {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Top => "Top",
-            Self::Bottom => "Bottom",
+            Self::Top => t("Top"),
+            Self::Bottom => t("Bottom"),
         }
     }
 
@@ -68,12 +69,12 @@ impl HudColor {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Red => "Red",
-            Self::Orange => "Orange",
-            Self::Green => "Green",
-            Self::Teal => "Teal",
-            Self::Blue => "Blue",
-            Self::Purple => "Purple",
+            Self::Red => t("Red"),
+            Self::Orange => t("Orange"),
+            Self::Green => t("Green"),
+            Self::Teal => t("Teal"),
+            Self::Blue => t("Blue"),
+            Self::Purple => t("Purple"),
         }
     }
 
@@ -103,28 +104,44 @@ impl HudColor {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum HudSize {
+    Smaller,
     Small,
+    /// Saved names keep their place in the scale, so an existing Normal moves
+    /// to today's Normal: the size the capsule's lines need to read well.
     #[default]
     Normal,
     Large,
+    #[serde(alias = "extra_large")]
+    Larger,
 }
 
 impl HudSize {
-    pub const ALL: [Self; 3] = [Self::Small, Self::Normal, Self::Large];
+    pub const ALL: [Self; 5] = [
+        Self::Smaller,
+        Self::Small,
+        Self::Normal,
+        Self::Large,
+        Self::Larger,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Small => "Small",
-            Self::Normal => "Normal",
-            Self::Large => "Large",
+            Self::Smaller => t("Smaller"),
+            Self::Small => t("Small"),
+            Self::Normal => t("Normal"),
+            Self::Large => t("Large"),
+            Self::Larger => t("Larger"),
         }
     }
 
+    /// Quarter steps over the base geometry, centered on Normal.
     pub fn scale(self) -> f32 {
         match self {
-            Self::Small => 0.8,
-            Self::Normal => 1.0,
-            Self::Large => 1.25,
+            Self::Smaller => 1.0,
+            Self::Small => 1.25,
+            Self::Normal => 1.5,
+            Self::Large => 1.75,
+            Self::Larger => 2.0,
         }
     }
 }
@@ -143,9 +160,9 @@ impl HudBrightness {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Subtle => "Subtle",
-            Self::Normal => "Normal",
-            Self::Intense => "Intense",
+            Self::Subtle => t("Subtle"),
+            Self::Normal => t("Normal"),
+            Self::Intense => t("Intense"),
         }
     }
 
@@ -172,9 +189,9 @@ impl HudScreen {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Pointer => "Pointer",
-            Self::ActiveWindow => "Active window",
-            Self::FixedMonitor => "Fixed monitor",
+            Self::Pointer => t("Pointer"),
+            Self::ActiveWindow => t("Active window"),
+            Self::FixedMonitor => t("Fixed monitor"),
         }
     }
 }
@@ -268,10 +285,13 @@ pub struct HudPreferences {
     pub size: HudSize,
     pub brightness: HudBrightness,
     pub voice_reactive: bool,
+    /// Writes "No audio" or "Low audio" in the capsule, live and at the end.
+    pub audio_notices: bool,
     pub screen: HudScreen,
     pub fixed_monitor: Option<MonitorId>,
     #[serde(deserialize_with = "deserialize_edge_distance")]
     pub edge_distance: u16,
+    pub appearance: crate::appearance::Appearance,
 }
 
 impl HudPreferences {
@@ -282,9 +302,11 @@ impl HudPreferences {
         size: HudSize::Normal,
         brightness: HudBrightness::Normal,
         voice_reactive: true,
+        audio_notices: true,
         screen: HudScreen::Pointer,
         fixed_monitor: None,
         edge_distance: 12,
+        appearance: crate::appearance::Appearance::System,
     };
 
     pub fn normalized(mut self) -> Self {
@@ -372,14 +394,15 @@ mod tests {
     }
 
     #[test]
-    fn older_preferences_keep_the_original_size_brightness_and_placement() {
+    fn older_preferences_keep_brightness_and_placement_and_take_the_default_size() {
         let preferences: HudPreferences = serde_json::from_str(
             r#"{"position":"bottom","recording_color":"green","transcription_color":"purple"}"#,
         )
         .unwrap();
+        // Files from before size existed take today's Normal.
         assert_eq!(preferences.size, HudSize::Normal);
         assert!(preferences.voice_reactive);
-        assert_eq!(preferences.size.scale(), 1.0);
+        assert_eq!(preferences.size.scale(), 1.5);
         assert_eq!(preferences.brightness.factor(), 1.0);
         assert_eq!(preferences.edge_distance, 12);
         assert_eq!(preferences.screen, HudScreen::Pointer);
@@ -450,6 +473,24 @@ mod tests {
             let content_bottom = top - 64.0 + 24.0;
             let content_top = top - 24.0;
             assert!(content_bottom >= -200.0 && content_top <= -100.0);
+        }
+    }
+
+    #[test]
+    fn sizes_step_by_a_quarter_around_normal_and_keep_saved_names() {
+        let scales = HudSize::ALL.map(HudSize::scale);
+        assert_eq!(scales, [1.0, 1.25, 1.5, 1.75, 2.0]);
+        assert_eq!(HudSize::default(), HudSize::Normal);
+        for (name, size) in [
+            ("smaller", HudSize::Smaller),
+            ("small", HudSize::Small),
+            ("normal", HudSize::Normal),
+            ("large", HudSize::Large),
+            ("larger", HudSize::Larger),
+            ("extra_large", HudSize::Larger),
+        ] {
+            let json = format!("\"{name}\"");
+            assert_eq!(serde_json::from_str::<HudSize>(&json).unwrap(), size);
         }
     }
 

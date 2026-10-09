@@ -1,3 +1,4 @@
+use crate::i18n::t;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -10,8 +11,8 @@ use objc2::runtime::{AnyObject, Bool, NSObjectProtocol, Sel};
 use objc2::{DefinedClass, MainThreadOnly, msg_send, sel};
 use objc2_app_kit::{
     NSAccessibility, NSAffineTransformNSAppKitAdditions, NSBezierPath, NSColor,
-    NSCompositingOperation, NSEventModifierFlags, NSGraphicsContext, NSImage, NSMenu,
-    NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem, NSWorkspace,
+    NSCompositingOperation, NSEventModifierFlags, NSGraphicsContext, NSImage, NSLineCapStyle,
+    NSLineJoinStyle, NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem, NSWorkspace,
 };
 use objc2_foundation::{
     MainThreadMarker, NSAffineTransform, NSObject, NSPoint, NSRect, NSSize, NSString,
@@ -34,9 +35,9 @@ enum IconPhase {
 impl IconPhase {
     fn label(self) -> &'static str {
         match self {
-            Self::Idle => "Hex",
-            Self::Recording => "Hex — recording",
-            Self::Processing => "Hex — transcribing",
+            Self::Idle => "Endu",
+            Self::Recording => t("Endu — recording"),
+            Self::Processing => t("Endu — transcribing"),
         }
     }
 }
@@ -62,11 +63,13 @@ impl IconActivity {
             DictationIndicatorEvent::JobCompleted { job_id }
             | DictationIndicatorEvent::JobCancelled { job_id }
             | DictationIndicatorEvent::JobFailed { job_id }
+            | DictationIndicatorEvent::JobNoAudio { job_id }
             | DictationIndicatorEvent::JobReadyToPaste { job_id, .. } => {
                 self.jobs.remove(&job_id);
             }
             // A late Transcribing event must not resurrect a cancelled job.
             DictationIndicatorEvent::Transcribing { .. }
+            | DictationIndicatorEvent::JobQuiet { .. }
             | DictationIndicatorEvent::Meter { .. }
             | DictationIndicatorEvent::ReadyToPaste { .. }
             | DictationIndicatorEvent::PasteCommitted => {}
@@ -86,9 +89,9 @@ impl IconActivity {
 
 fn animation_frame(phase: IconPhase, elapsed: Duration, reduce_motion: bool) -> usize {
     if reduce_motion {
-        // A static 30-degree turn distinguishes processing from the idle hexagon.
+        // A still, half-written e distinguishes processing from the idle glyph.
         return if phase == IconPhase::Processing {
-            PROCESSING_FRAMES / 12
+            PROCESSING_FRAMES * 3 / 8
         } else {
             0
         };
@@ -101,6 +104,97 @@ fn animation_frame(phase: IconPhase, elapsed: Duration, reduce_motion: bool) -> 
     ((elapsed.as_millis() * ICON_FPS / 1_000) % count as u128) as usize
 }
 
+/// The menu bar glyph is Endu's single-stroke "e": a zigzag crossbar, the
+/// voice, that turns into the letter's arc. Coordinates use a 24-point design
+/// square with the origin at the top left, matching the app icon.
+const GLYPH_SIZE: f64 = 18.0;
+const GLYPH_SCALE: f64 = GLYPH_SIZE / 24.0;
+const GLYPH_STROKE: f64 = 2.1;
+const WAVE_X: [f64; 8] = [4.5, 6.0, 8.0, 10.5, 13.0, 15.0, 16.5, 20.0];
+const WAVE_Y: [f64; 8] = [0.0, 0.0, -3.5, 3.5, -3.0, 1.5, 0.0, 0.0];
+const ARC_CENTER: f64 = 12.0;
+const ARC_RADIUS: f64 = 8.0;
+/// The arc leaves the crossbar's right end, passes over the top, and stops
+/// 45 degrees below where it began, leaving the e open.
+const ARC_END_DEGREES: f64 = 45.0;
+const ARC_SWEEP_DEGREES: f64 = 360.0 - ARC_END_DEGREES;
+const BADGE_CENTER: (f64, f64) = (20.5, 3.5);
+const BADGE_RADIUS: f64 = 2.6;
+/// The clear ring around the update badge, so it never touches the arc.
+const BADGE_GAP: f64 = 1.6;
+/// Writing finishes three quarters into the loop, then holds the whole e.
+const WRITING_SHARE: f64 = 0.75;
+const WRITING_GHOST_ALPHA: f64 = 0.28;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Glyph {
+    Still,
+    /// Per-vertex zigzag amplitude while listening.
+    Listening([f64; 8]),
+    /// The share of the stroke written so far, over a faint whole glyph.
+    Writing(f64),
+}
+
+/// Integer frequencies loop seamlessly across the recording frames.
+fn listening_amplitudes(cycle: f64) -> [f64; 8] {
+    const FREQUENCY: [f64; 8] = [0.0, 0.0, 1.0, 2.0, 3.0, 2.0, 0.0, 0.0];
+    const PHASE: [f64; 8] = [0.0, 0.0, 0.3, 1.7, 0.9, 2.4, 0.0, 0.0];
+    std::array::from_fn(|index| 0.35 + 0.95 * (cycle * FREQUENCY[index] + PHASE[index]).sin().abs())
+}
+
+fn writing_progress(frame: usize) -> f64 {
+    (frame as f64 / (PROCESSING_FRAMES as f64 * WRITING_SHARE)).min(1.0)
+}
+
+fn wave_points(amplitudes: [f64; 8]) -> [(f64, f64); 8] {
+    std::array::from_fn(|index| {
+        (
+            WAVE_X[index],
+            ARC_CENTER + WAVE_Y[index] * amplitudes[index],
+        )
+    })
+}
+
+/// The stroke's length in design points, for revealing it progressively.
+fn glyph_length(amplitudes: [f64; 8]) -> f64 {
+    let wave = wave_points(amplitudes)
+        .windows(2)
+        .map(|pair| (pair[1].0 - pair[0].0).hypot(pair[1].1 - pair[0].1))
+        .sum::<f64>();
+    wave + ARC_RADIUS * ARC_SWEEP_DEGREES.to_radians()
+}
+
+fn glyph_path(amplitudes: [f64; 8]) -> Retained<NSBezierPath> {
+    let path = NSBezierPath::bezierPath();
+    for (index, (x, y)) in wave_points(amplitudes).into_iter().enumerate() {
+        let point = NSPoint::new(x, y);
+        if index == 0 {
+            path.moveToPoint(point);
+        } else {
+            path.lineToPoint(point);
+        }
+    }
+    // Decreasing angles in this flipped space travel up and over the top.
+    path.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise(
+        NSPoint::new(ARC_CENTER, ARC_CENTER),
+        ARC_RADIUS,
+        0.0,
+        ARC_END_DEGREES,
+        true,
+    );
+    path.setLineWidth(GLYPH_STROKE);
+    path.setLineCapStyle(NSLineCapStyle::Round);
+    path.setLineJoinStyle(NSLineJoinStyle::Round);
+    path
+}
+
+fn circle(center: (f64, f64), radius: f64) -> Retained<NSBezierPath> {
+    NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
+        NSPoint::new(center.0 - radius, center.1 - radius),
+        NSSize::new(radius * 2.0, radius * 2.0),
+    ))
+}
+
 struct IconImages {
     idle: Retained<NSImage>,
     update: Retained<NSImage>,
@@ -110,25 +204,11 @@ struct IconImages {
 
 impl IconImages {
     fn new() -> Result<Self> {
-        let symbol = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-            &NSString::from_str("hexagon"),
-            Some(&NSString::from_str("Hex")),
-        )
-        .ok_or_else(|| eyre!("Hex status symbol is unavailable"))?;
-        let source_size = symbol.size();
-        let side = source_size.width.max(source_size.height);
-        let size = NSSize::new(side, side);
-        let idle = Self::frame(&symbol, size, 0.0, None, IconPhase::Idle, false);
-        let update = Self::frame(&symbol, size, 0.0, None, IconPhase::Idle, true);
         let recording = (0..RECORDING_FRAMES)
             .map(|index| {
                 let cycle = index as f64 / RECORDING_FRAMES as f64 * std::f64::consts::TAU;
-                let opacity = 0.775 + 0.225 * cycle.cos();
                 Self::frame(
-                    &symbol,
-                    size,
-                    0.0,
-                    Some(opacity),
+                    Glyph::Listening(listening_amplitudes(cycle)),
                     IconPhase::Recording,
                     false,
                 )
@@ -137,77 +217,67 @@ impl IconImages {
         let processing = (0..PROCESSING_FRAMES)
             .map(|index| {
                 Self::frame(
-                    &symbol,
-                    size,
-                    -(index as f64) * 360.0 / PROCESSING_FRAMES as f64,
-                    None,
+                    Glyph::Writing(writing_progress(index)),
                     IconPhase::Processing,
                     false,
                 )
             })
             .collect();
         Ok(Self {
-            idle,
-            update,
+            idle: Self::frame(Glyph::Still, IconPhase::Idle, false),
+            update: Self::frame(Glyph::Still, IconPhase::Idle, true),
             recording,
             processing,
         })
     }
 
-    fn frame(
-        symbol: &Retained<NSImage>,
-        size: NSSize,
-        angle: f64,
-        dot: Option<f64>,
-        phase: IconPhase,
-        update_badge: bool,
-    ) -> Retained<NSImage> {
-        let source = symbol.clone();
+    fn frame(glyph: Glyph, phase: IconPhase, update_badge: bool) -> Retained<NSImage> {
+        let size = NSSize::new(GLYPH_SIZE, GLYPH_SIZE);
         // A drawing-backed template stays sharp at either backing scale. All
         // frames have equal bounds, so neighboring menu bar items never move.
         let draw = RcBlock::new(move |_: NSRect| {
             autoreleasepool(|_| {
                 NSGraphicsContext::saveGraphicsState_class();
                 let transform = NSAffineTransform::transform();
-                transform.translateXBy_yBy(size.width / 2.0, size.height / 2.0);
-                transform.rotateByDegrees(angle);
+                transform.scaleBy(GLYPH_SCALE);
                 transform.concat();
-                let source_size = source.size();
-                source.drawInRect_fromRect_operation_fraction(
-                    NSRect::new(
-                        NSPoint::new(-source_size.width / 2.0, -source_size.height / 2.0),
-                        source_size,
-                    ),
-                    NSRect::ZERO,
-                    NSCompositingOperation::SourceOver,
-                    1.0,
-                );
-                if let Some(opacity) = dot {
-                    NSColor::colorWithCalibratedWhite_alpha(0.0, opacity).setFill();
-                    let diameter = size.width * 0.24;
-                    NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
-                        NSPoint::new(-diameter / 2.0, -diameter / 2.0),
-                        NSSize::new(diameter, diameter),
-                    ))
-                    .fill();
+                let amplitudes = match glyph {
+                    Glyph::Listening(amplitudes) => amplitudes,
+                    Glyph::Still | Glyph::Writing(_) => [1.0; 8],
+                };
+                let path = glyph_path(amplitudes);
+                let ink = NSColor::colorWithCalibratedWhite_alpha(0.0, 1.0);
+                if let Glyph::Writing(progress) = glyph {
+                    NSColor::colorWithCalibratedWhite_alpha(0.0, WRITING_GHOST_ALPHA).setStroke();
+                    path.stroke();
+                    if progress > 0.0 {
+                        let length = glyph_length(amplitudes);
+                        let pattern = [length * progress, length];
+                        // SAFETY: the pattern outlives the call, which copies it.
+                        unsafe { path.setLineDash_count_phase(pattern.as_ptr(), 2, 0.0) };
+                        ink.setStroke();
+                        path.stroke();
+                    }
+                } else {
+                    ink.setStroke();
+                    path.stroke();
                 }
                 if update_badge {
                     // A filled dot at the top-right corner mirrors macOS app
                     // icon badges without leaving the template appearance.
-                    NSColor::colorWithCalibratedWhite_alpha(0.0, 1.0).setFill();
-                    let diameter = size.width * 0.3;
-                    let offset = size.width * 0.28;
-                    NSBezierPath::bezierPathWithOvalInRect(NSRect::new(
-                        NSPoint::new(offset - diameter / 2.0, offset - diameter / 2.0),
-                        NSSize::new(diameter, diameter),
-                    ))
-                    .fill();
+                    if let Some(context) = NSGraphicsContext::currentContext() {
+                        context.setCompositingOperation(NSCompositingOperation::Clear);
+                        circle(BADGE_CENTER, BADGE_RADIUS + BADGE_GAP).fill();
+                        context.setCompositingOperation(NSCompositingOperation::SourceOver);
+                    }
+                    ink.setFill();
+                    circle(BADGE_CENTER, BADGE_RADIUS).fill();
                 }
                 NSGraphicsContext::restoreGraphicsState_class();
                 Bool::YES
             })
         });
-        let image = NSImage::imageWithSize_flipped_drawingHandler(size, false, &draw);
+        let image = NSImage::imageWithSize_flipped_drawingHandler(size, true, &draw);
         image.setTemplate(true);
         image.setAccessibilityDescription(Some(&NSString::from_str(phase.label())));
         image
@@ -256,57 +326,57 @@ objc2::define_class!(
     impl StatusItemTarget {
         #[unsafe(method(openSettings:))]
         fn open_settings(&self, _sender: &AnyObject) {
-            let _ = self.ivars().actions.try_send(StatusItemAction::OpenSettings);
+            send_action(&self.ivars().actions, StatusItemAction::OpenSettings);
         }
 
         #[unsafe(method(openProviders:))]
         fn open_providers(&self, _sender: &AnyObject) {
-            let _ = self.ivars().actions.try_send(StatusItemAction::OpenProviders);
+            send_action(&self.ivars().actions, StatusItemAction::OpenProviders);
         }
 
         #[unsafe(method(openModels:))]
         fn open_models(&self, _sender: &AnyObject) {
-            let _ = self.ivars().actions.try_send(StatusItemAction::OpenModels);
+            send_action(&self.ivars().actions, StatusItemAction::OpenModels);
         }
 
         #[unsafe(method(openMicrophone:))]
         fn open_microphone(&self, _sender: &AnyObject) {
-            let _ = self.ivars().actions.try_send(StatusItemAction::OpenMicrophone);
+            send_action(&self.ivars().actions, StatusItemAction::OpenMicrophone);
         }
 
         #[unsafe(method(openPostProcessing:))]
         fn open_post_processing(&self, _sender: &AnyObject) {
-            let _ = self.ivars().actions.try_send(StatusItemAction::OpenPostProcessing);
+            send_action(&self.ivars().actions, StatusItemAction::OpenPostProcessing);
         }
 
         #[unsafe(method(openHud:))]
         fn open_hud(&self, _sender: &AnyObject) {
-            let _ = self.ivars().actions.try_send(StatusItemAction::OpenHud);
+            send_action(&self.ivars().actions, StatusItemAction::OpenHud);
         }
 
         #[unsafe(method(openHistory:))]
         fn open_history(&self, _sender: &AnyObject) {
-            let _ = self.ivars().actions.try_send(StatusItemAction::OpenHistory);
+            send_action(&self.ivars().actions, StatusItemAction::OpenHistory);
         }
 
         #[unsafe(method(openStatistics:))]
         fn open_statistics(&self, _sender: &AnyObject) {
-            let _ = self.ivars().actions.try_send(StatusItemAction::OpenStatistics);
+            send_action(&self.ivars().actions, StatusItemAction::OpenStatistics);
         }
 
         #[unsafe(method(pasteLast:))]
         fn paste_last(&self, _sender: &AnyObject) {
-            let _ = self.ivars().actions.try_send(StatusItemAction::PasteLast);
+            send_action(&self.ivars().actions, StatusItemAction::PasteLast);
         }
 
         #[unsafe(method(restartToUpdate:))]
         fn restart_to_update(&self, _sender: &AnyObject) {
-            let _ = self.ivars().actions.try_send(StatusItemAction::RestartToUpdate);
+            send_action(&self.ivars().actions, StatusItemAction::RestartToUpdate);
         }
 
         #[unsafe(method(quit:))]
         fn quit(&self, _sender: &AnyObject) {
-            let _ = self.ivars().actions.try_send(StatusItemAction::Quit);
+            send_action(&self.ivars().actions, StatusItemAction::Quit);
         }
     }
 
@@ -331,6 +401,8 @@ struct StatusItemController {
     permission_item: Retained<NSMenuItem>,
     paste_item: Retained<NSMenuItem>,
     update_item: Retained<NSMenuItem>,
+    /// Fixed rows and their English keys, retitled before the menu opens.
+    localized: Vec<(Retained<NSMenuItem>, &'static str)>,
     images: IconImages,
     activity: IconActivity,
     phase: IconPhase,
@@ -382,12 +454,12 @@ impl StatusItemController {
     fn update_label(&self, mtm: MainThreadMarker) {
         if let Some(button) = self.item.button(mtm) {
             let phase = if self.phase == IconPhase::Idle && self.ready_to_paste {
-                "Dictation ready — choose an app, then Paste Last Dictation"
+                t("Dictation ready — choose an app, then Paste Last Dictation")
             } else {
                 self.phase.label()
             };
             let phase = if self.update_version.is_some() {
-                format!("{phase} · update available")
+                tf!("{phase} · update available", phase = phase)
             } else {
                 phase.to_string()
             };
@@ -395,6 +467,13 @@ impl StatusItemController {
             button.setToolTip(Some(&label));
             button.setAccessibilityLabel(Some(&label));
         }
+    }
+}
+
+/// Queues a menu action and wakes the UI loop, which sleeps while idle.
+fn send_action(actions: &SyncSender<StatusItemAction>, action: StatusItemAction) {
+    if actions.try_send(action).is_ok() {
+        crate::desktop::wake_ui();
     }
 }
 
@@ -408,10 +487,13 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
     let (actions, receiver) = sync_channel(8);
     let images = IconImages::new()?;
     let target = StatusItemTarget::new(actions, mtm);
-    let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Hex"));
+    let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Endu"));
 
-    // The first rows say what Hex is doing and what, if anything, blocks it.
-    let status_line = add_item(&menu, &target, "Hex", sel!(openSettings:), mtm);
+    // The first rows say what Endu is doing and what, if anything, blocks it.
+    // Fixed rows keep their English key so they follow a language change the
+    // next time the menu opens.
+    let mut localized = Vec::new();
+    let status_line = add_item(&menu, &target, "Endu", sel!(openSettings:), mtm);
     unsafe { status_line.setAction(None) };
     status_line.setEnabled(false);
     let permission_item = add_item(
@@ -422,6 +504,7 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
         mtm,
     );
     permission_item.setHidden(true);
+    localized.push((permission_item.clone(), "Grant Permissions…"));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     let paste_item = add_item(
         &menu,
@@ -431,24 +514,28 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
         mtm,
     );
     menu.addItem(&NSMenuItem::separatorItem(mtm));
-    add_item(&menu, &target, "History", sel!(openHistory:), mtm);
-    add_item(&menu, &target, "Statistics", sel!(openStatistics:), mtm);
-    let settings = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Settings"));
+    for (title, action) in [
+        ("History", sel!(openHistory:)),
+        ("Statistics", sel!(openStatistics:)),
+    ] {
+        localized.push((add_item(&menu, &target, title, action, mtm), title));
+    }
+    let settings = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str(t("Settings")));
     let general = add_item(&settings, &target, "General", sel!(openSettings:), mtm);
     general.setKeyEquivalent(&NSString::from_str(","));
-    add_item(&settings, &target, "Microphone", sel!(openMicrophone:), mtm);
-    add_item(&settings, &target, "Providers", sel!(openProviders:), mtm);
-    add_item(&settings, &target, "Models", sel!(openModels:), mtm);
-    add_item(
-        &settings,
-        &target,
-        "Post-processing",
-        sel!(openPostProcessing:),
-        mtm,
-    );
+    localized.push((general, "General"));
+    for (title, action) in [
+        ("Microphone", sel!(openMicrophone:)),
+        ("Providers", sel!(openProviders:)),
+        ("Models", sel!(openModels:)),
+        ("Post-processing", sel!(openPostProcessing:)),
+    ] {
+        localized.push((add_item(&settings, &target, title, action, mtm), title));
+    }
     add_item(&settings, &target, "HUD", sel!(openHud:), mtm);
     let settings_item = add_item(&menu, &target, "Settings", sel!(openSettings:), mtm);
     settings_item.setSubmenu(Some(&settings));
+    localized.push((settings_item, "Settings"));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     let update_item = add_item(
         &menu,
@@ -458,16 +545,17 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
         mtm,
     );
     update_item.setHidden(true);
-    let quit = add_item(&menu, &target, "Quit Hex", sel!(quit:), mtm);
+    let quit = add_item(&menu, &target, "Quit Endu", sel!(quit:), mtm);
     quit.setKeyEquivalent(&NSString::from_str("q"));
+    localized.push((quit, "Quit Endu"));
 
     let item = NSStatusBar::systemStatusBar().statusItemWithLength(-2.0);
     let button = item
         .button(mtm)
         .ok_or_else(|| eyre!("status item button is unavailable"))?;
     button.setImage(Some(&images.idle));
-    button.setToolTip(Some(&NSString::from_str("Hex")));
-    button.setAccessibilityLabel(Some(&NSString::from_str("Hex")));
+    button.setToolTip(Some(&NSString::from_str("Endu")));
+    button.setAccessibilityLabel(Some(&NSString::from_str("Endu")));
     menu.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*target)));
     item.setMenu(Some(&menu));
 
@@ -479,6 +567,7 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
             permission_item,
             paste_item,
             update_item,
+            localized,
             images,
             activity: IconActivity::default(),
             phase: IconPhase::Idle,
@@ -498,14 +587,14 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
 fn add_item(
     menu: &NSMenu,
     target: &StatusItemTarget,
-    title: &str,
+    title: &'static str,
     action: Sel,
     mtm: MainThreadMarker,
 ) -> Retained<NSMenuItem> {
     let item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
-            &NSString::from_str(title),
+            &NSString::from_str(t(title)),
             Some(action),
             &NSString::new(),
         )
@@ -549,6 +638,16 @@ pub fn animate() {
     });
 }
 
+/// Whether the glyph still animates and needs the UI loop's frame ticks.
+pub fn is_animating() -> bool {
+    STATUS_ITEM.with(|controller| {
+        controller
+            .borrow()
+            .as_ref()
+            .is_some_and(|controller| controller.phase != IconPhase::Idle)
+    })
+}
+
 pub fn set_ready_to_paste(ready: bool) {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
@@ -559,9 +658,9 @@ pub fn set_ready_to_paste(ready: bool) {
             controller
                 .paste_item
                 .setTitle(&NSString::from_str(if ready {
-                    "Paste Last Dictation (ready)"
+                    t("Paste Last Dictation (ready)")
                 } else {
-                    "Paste Last Dictation"
+                    t("Paste Last Dictation")
                 }));
             controller.update_label(mtm);
         }
@@ -591,6 +690,16 @@ fn refresh_menu() {
                     crate::app_settings::dictation_mode(),
                     dictation.as_deref(),
                 )));
+            for (item, title) in &controller.localized {
+                item.setTitle(&NSString::from_str(t(title)));
+            }
+            controller
+                .paste_item
+                .setTitle(&NSString::from_str(if controller.ready_to_paste {
+                    t("Paste Last Dictation (ready)")
+                } else {
+                    t("Paste Last Dictation")
+                }));
             controller.permission_item.setHidden(!permissions_missing);
             let (key, modifiers) =
                 paste_last_key_equivalent(crate::app_settings::paste_last_binding().as_ref())
@@ -605,11 +714,10 @@ fn refresh_menu() {
                 .update_item
                 .setHidden(controller.update_version.is_none());
             if let Some(version) = &controller.update_version {
-                controller
-                    .update_item
-                    .setTitle(&NSString::from_str(&format!(
-                        "Restart to Update to Hex {version}"
-                    )));
+                controller.update_item.setTitle(&NSString::from_str(&tf!(
+                    "Restart to Update to Endu {version}",
+                    version = version
+                )));
             }
         }
     });
@@ -624,26 +732,27 @@ fn status_headline(
 ) -> String {
     use crate::app_settings::DictationMode;
     match phase {
-        IconPhase::Recording => return "Recording…".into(),
-        IconPhase::Processing => return "Transcribing…".into(),
+        IconPhase::Recording => return t("Recording…").into(),
+        IconPhase::Processing => return t("Transcribing…").into(),
         IconPhase::Idle => {}
     }
     if permissions_missing {
-        return "Dictation needs permissions".into();
+        return t("Dictation needs permissions").into();
     }
     if ready_to_paste {
-        return "Dictation ready to paste".into();
+        return t("Dictation ready to paste").into();
     }
     match dictation {
-        Some(shortcut) => format!(
-            "{} {shortcut} to dictate",
-            match mode {
-                DictationMode::TapOrHold => "Tap or hold",
-                DictationMode::Hold => "Hold",
-                DictationMode::DoubleTap => "Double-tap",
-            }
+        Some(shortcut) => tf!(
+            "{gesture} {shortcut} to dictate",
+            gesture = match mode {
+                DictationMode::TapOrHold => t("Tap or hold"),
+                DictationMode::Hold => t("Hold"),
+                DictationMode::DoubleTap => t("Double-tap"),
+            },
+            shortcut = shortcut
         ),
-        None => "Ready to dictate".into(),
+        None => t("Ready to dictate").into(),
     }
 }
 
@@ -825,7 +934,7 @@ mod tests {
         for seconds in [0, 1, 30] {
             assert_eq!(
                 animation_frame(IconPhase::Processing, Duration::from_secs(seconds), true),
-                5
+                PROCESSING_FRAMES * 3 / 8
             );
             assert_eq!(
                 animation_frame(IconPhase::Recording, Duration::from_secs(seconds), true),
@@ -835,14 +944,31 @@ mod tests {
     }
 
     #[test]
-    fn native_images_keep_fixed_bounds_and_only_recording_has_a_center_dot() {
+    fn listening_loops_and_writing_reaches_the_whole_glyph() {
+        let first = listening_amplitudes(0.0);
+        let last = listening_amplitudes(std::f64::consts::TAU);
+        for (start, end) in first.iter().zip(last) {
+            assert!((start - end).abs() < 1e-9);
+        }
+        assert_ne!(first, listening_amplitudes(1.0));
+        assert_eq!(writing_progress(0), 0.0);
+        assert_eq!(writing_progress(PROCESSING_FRAMES - 1), 1.0);
+        assert!(writing_progress(PROCESSING_FRAMES * 3 / 8) > 0.4);
+        assert!(writing_progress(PROCESSING_FRAMES * 3 / 8) < 0.6);
+        let length = glyph_length([1.0; 8]);
+        assert!(length > ARC_RADIUS * 5.0 && length < 80.0);
+    }
+
+    #[test]
+    fn native_glyphs_keep_fixed_bounds_and_each_phase_draws_distinctly() {
         use objc2_app_kit::NSBitmapImageRep;
 
         autoreleasepool(|_| {
             let images = IconImages::new().unwrap();
             let size = images.idle.size();
-            assert!(size.width > 0.0 && size.height > 0.0);
-            for image in std::iter::once(&images.idle)
+            assert_eq!((size.width, size.height), (GLYPH_SIZE, GLYPH_SIZE));
+            for image in [&images.idle, &images.update]
+                .into_iter()
                 .chain(images.recording.iter())
                 .chain(images.processing.iter())
             {
@@ -852,31 +978,51 @@ mod tests {
             let rasterize = |image: &NSImage| {
                 NSBitmapImageRep::imageRepWithData(&image.TIFFRepresentation().unwrap()).unwrap()
             };
-            let idle = rasterize(&images.idle);
-            let recording = rasterize(&images.recording[0]);
-            let processing = rasterize(&images.processing[5]);
-            let center_alpha = |bitmap: &NSBitmapImageRep| {
-                bitmap
-                    .colorAtX_y(bitmap.pixelsWide() / 2, bitmap.pixelsHigh() / 2)
-                    .unwrap()
-                    .alphaComponent()
+            let alpha = |bitmap: &NSBitmapImageRep, x: f64, y: f64| {
+                let column = (x / 24.0 * bitmap.pixelsWide() as f64) as isize;
+                let row = (y / 24.0 * bitmap.pixelsHigh() as f64) as isize;
+                bitmap.colorAtX_y(column, row).unwrap().alphaComponent()
             };
-            assert!(center_alpha(&idle) < 0.1);
-            assert!(center_alpha(&recording) > 0.9);
-            assert!(center_alpha(&processing) < 0.1);
+            let coverage = |bitmap: &NSBitmapImageRep| {
+                (0..bitmap.pixelsHigh())
+                    .flat_map(|y| (0..bitmap.pixelsWide()).map(move |x| (x, y)))
+                    .map(|(x, y)| bitmap.colorAtX_y(x, y).unwrap().alphaComponent())
+                    .sum::<f64>()
+            };
+            let idle = rasterize(&images.idle);
+            // The arc's top and the zigzag's first peak are inked; the open
+            // counter and the badge corner are not.
+            assert!(alpha(&idle, 12.0, 4.0) > 0.5);
+            assert!(alpha(&idle, 8.0, 8.6) > 0.3);
+            assert!(alpha(&idle, 12.0, 17.0) < 0.1);
+            assert!(alpha(&idle, BADGE_CENTER.0, BADGE_CENTER.1) < 0.1);
+
+            let update = rasterize(&images.update);
+            assert!(alpha(&update, BADGE_CENTER.0, BADGE_CENTER.1) > 0.9);
+
+            let still = coverage(&idle);
+            assert!(still > 0.0);
             let outline = |bitmap: &NSBitmapImageRep| {
                 (0..bitmap.pixelsHigh())
-                    .flat_map(|y| {
-                        (0..bitmap.pixelsWide())
-                            .map(move |x| bitmap.colorAtX_y(x, y).unwrap().alphaComponent() > 0.2)
-                    })
+                    .flat_map(|y| (0..bitmap.pixelsWide()).map(move |x| (x, y)))
+                    .map(|(x, y)| bitmap.colorAtX_y(x, y).unwrap().alphaComponent() > 0.2)
                     .collect::<Vec<_>>()
             };
-            let idle_outline = outline(&idle);
-            let rotated_outline = outline(&processing);
-            assert!(idle_outline.iter().any(|filled| *filled));
-            assert!(rotated_outline.iter().any(|filled| *filled));
-            assert_ne!(idle_outline, rotated_outline);
+            assert_ne!(outline(&idle), outline(&rasterize(&images.recording[0])));
+            let started = rasterize(&images.processing[1]);
+            let written = rasterize(&images.processing[PROCESSING_FRAMES - 1]);
+            assert!(coverage(&started) < coverage(&written) * 0.6);
+            // Once written, the whole e is inked where the still one is; only
+            // antialiased edges differ, where the faint ghost adds a little.
+            let differing = outline(&written)
+                .iter()
+                .zip(outline(&idle))
+                .filter(|(left, right)| **left != *right)
+                .count();
+            assert!(
+                differing * 20 < outline(&idle).len(),
+                "{differing} pixels differ"
+            );
         });
     }
 }

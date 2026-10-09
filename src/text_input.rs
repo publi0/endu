@@ -5,16 +5,16 @@ use gpui::{
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     ShapedLine, SharedString, Style, Subscription, TextAlign, TextRun, UTF16Selection,
-    UnderlineStyle, Window, WrappedLine, actions, div, fill, point, prelude::*, px, relative, rgb,
-    rgba, size,
+    UnderlineStyle, Window, WrappedLine, actions, div, fill, point, prelude::*, px, relative, rgba,
+    size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::desktop_ui::{
-    CANVAS, CONTROL_TEXT_SIZE, LINE, MULTILINE_INPUT_HEIGHT, MUTED, TEXT, TEXT_INPUT_HEIGHT,
+    CANVAS, CONTROL_TEXT_SIZE, LINE, MULTILINE_INPUT_HEIGHT, MUTED, TEXT, TEXT_INPUT_HEIGHT, rgb,
 };
 
-const FOCUS: u32 = crate::desktop_ui::ACCENT;
+const FOCUS: crate::desktop_ui::ThemeColor = crate::desktop_ui::ACCENT;
 const SELECTION: u32 = 0x4776b866;
 
 actions!(
@@ -122,6 +122,8 @@ pub struct TextInput {
     focus_handle: FocusHandle,
     content: SharedString,
     placeholder: SharedString,
+    /// Looked up on every render so the placeholder follows the language.
+    localized_placeholder: Option<fn() -> &'static str>,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -288,6 +290,7 @@ impl TextInput {
             focus_handle: cx.focus_handle().tab_stop(!picker),
             content,
             placeholder: placeholder.into(),
+            localized_placeholder: None,
             selected_range: cursor..cursor,
             selection_reversed: false,
             marked_range: None,
@@ -314,6 +317,12 @@ impl TextInput {
 
     /// Settings fields finish editing when focus leaves, without a save button.
     /// Search/picker fields retain their explicit submission behavior.
+    /// Uses interface text as the placeholder, translated when shown.
+    pub fn localized_placeholder(mut self, text: fn() -> &'static str) -> Self {
+        self.localized_placeholder = Some(text);
+        self
+    }
+
     pub fn commit_on_blur(mut self) -> Self {
         self.commit_on_blur = true;
         self
@@ -1096,7 +1105,12 @@ impl Element for TextElement {
         let selected_range = input.selected_range.clone();
         let style = window.text_style();
         let (display_text, color) = if content.is_empty() {
-            (input.placeholder.clone(), rgb(MUTED).into())
+            (
+                input
+                    .localized_placeholder
+                    .map_or_else(|| input.placeholder.clone(), |text| text().into()),
+                rgb(MUTED).into(),
+            )
         } else {
             (content, style.color)
         };

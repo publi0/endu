@@ -69,11 +69,12 @@ pub const LANGUAGES: &[(&str, &str)] = &[
     ("hu", "Hungarian"),
 ];
 
-pub fn language_name(code: &str) -> &str {
+/// The language's name in the interface language, or its code if unknown.
+pub fn language_label(code: &str) -> String {
     LANGUAGES
         .iter()
-        .find_map(|(candidate, name)| (*candidate == code).then_some(*name))
-        .unwrap_or(code)
+        .find_map(|(candidate, name)| (*candidate == code).then(|| crate::i18n::t(name)))
+        .map_or_else(|| code.to_owned(), str::to_owned)
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -396,7 +397,10 @@ pub fn check_key(config: &Config) -> Result<String> {
     let response = http::get(&config.endpoint("key"), &key, Duration::from_secs(15))?;
     if response.status == 401 {
         forget_cached_key();
-        bail!("OpenRouter rejected the key (HTTP 401).");
+        bail!(
+            "{}",
+            crate::i18n::t("OpenRouter rejected the key (HTTP 401).")
+        );
     }
     if !response.is_success() {
         bail!("HTTP {}: {}", response.status, excerpt(&response.body));
@@ -408,20 +412,23 @@ fn describe_key(body: &[u8]) -> Result<String> {
     let value: serde_json::Value = serde_json::from_slice(body)
         .wrap_err_with(|| format!("invalid JSON response: {}", excerpt(body)))?;
     let data = value.get("data").unwrap_or(&value);
-    let mut parts = vec!["Key works".to_owned()];
+    let mut parts = vec![crate::i18n::t("Key works").to_owned()];
     if let Some(label) = data.get("label").and_then(serde_json::Value::as_str) {
-        parts.push(format!("label {label}"));
+        parts.push(tf!("label {label}", label = label));
     }
     if let Some(usage) = data.get("usage").and_then(serde_json::Value::as_f64) {
-        parts.push(format!("used ${usage:.2}"));
+        parts.push(tf!("used ${usage}", usage = format!("{usage:.2}")));
     }
     match data
         .get("limit_remaining")
         .and_then(serde_json::Value::as_f64)
     {
-        Some(remaining) => parts.push(format!("${remaining:.2} left")),
+        Some(remaining) => parts.push(tf!(
+            "${remaining} left",
+            remaining = format!("{remaining:.2}")
+        )),
         None if data.get("limit").is_some_and(serde_json::Value::is_null) => {
-            parts.push("no limit".into())
+            parts.push(crate::i18n::t("no limit").into())
         }
         None => {}
     }
@@ -586,8 +593,8 @@ mod tests {
                 .iter()
                 .all(|(code, _)| *code == AUTO_LANGUAGE || code.len() == 2)
         );
-        assert_eq!(language_name("pt"), "Portuguese");
-        assert_eq!(language_name("xx"), "xx");
+        assert_eq!(language_label("pt"), "Portuguese");
+        assert_eq!(language_label("xx"), "xx");
     }
 
     #[test]

@@ -147,8 +147,8 @@ pub fn status() -> SetupStatus {
 pub fn status_with_api_key(api_key: bool) -> SetupStatus {
     SetupStatus {
         microphone: microphone_state(),
-        input_monitoring: settings(CGPreflightListenEventAccess()),
-        accessibility: settings(CGPreflightPostEventAccess()),
+        input_monitoring: settings(input_monitoring_granted()),
+        accessibility: settings(accessibility_granted()),
         api_key,
     }
 }
@@ -220,10 +220,33 @@ unsafe extern "C" {
     static AVMediaTypeAudio: *const NSString;
 }
 
+/// The CoreGraphics preflights keep answering "denied" for the life of the
+/// process after the user grants access in System Settings, which forced a
+/// relaunch. The Accessibility and IOHID checks read the current grant.
+fn accessibility_granted() -> bool {
+    AXIsProcessTrusted() || CGPreflightPostEventAccess()
+}
+
+fn input_monitoring_granted() -> bool {
+    const LISTEN_EVENT: u32 = 1;
+    const GRANTED: u32 = 0;
+    IOHIDCheckAccess(LISTEN_EVENT) == GRANTED || CGPreflightListenEventAccess()
+}
+
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     safe fn CGPreflightListenEventAccess() -> bool;
     safe fn CGPreflightPostEventAccess() -> bool;
+}
+
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    safe fn AXIsProcessTrusted() -> bool;
+}
+
+#[link(name = "IOKit", kind = "framework")]
+unsafe extern "C" {
+    safe fn IOHIDCheckAccess(request: u32) -> u32;
 }
 
 #[cfg(test)]

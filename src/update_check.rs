@@ -1,6 +1,6 @@
 //! Detects a newer app bundle on disk and relaunches into it.
 //!
-//! Homebrew replaces `/Applications/Hex.app` while the running process keeps
+//! Homebrew replaces `/Applications/Endu.app` while the running process keeps
 //! executing the old binary. Comparing the on-disk bundle version with the
 //! compiled version lets the window offer a "Restart to update" action. A
 //! detached helper waits for this process to exit and only then reopens the
@@ -162,18 +162,18 @@ mod tests {
 
     #[test]
     fn bundle_paths_resolve_from_the_executable_location() {
-        let app = Path::new("/Applications/Hex.app");
-        let bundled = app.join("Contents/MacOS/hex");
+        let app = Path::new("/Applications/Endu.app");
+        let bundled = app.join("Contents/MacOS/endu");
         assert_eq!(bundle_from_executable(&bundled).as_deref(), Some(app));
         // A binary outside a bundle's Contents directory never counts.
         assert_eq!(bundle_from_executable(Path::new("/tmp/hex")), None);
         assert_eq!(
-            bundle_from_executable(Path::new("/tmp/Hex.app/Contents")),
+            bundle_from_executable(Path::new("/tmp/Endu.app/Contents")),
             None
         );
         // A directory named like a bundle next to the executable is not enough.
         assert_eq!(
-            bundle_from_executable(Path::new("/tmp/Hex.app/other/hex")),
+            bundle_from_executable(Path::new("/tmp/Endu.app/other/endu")),
             None
         );
     }

@@ -1,5 +1,6 @@
 //! Explicit channel preferences and in-memory diagnostics. No gain processing.
 
+use crate::i18n::t;
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -70,9 +71,13 @@ pub struct InputDescription {
 impl InputDescription {
     pub fn channel_label(&self) -> String {
         match self.channel {
-            Some(channel) => format!("Channel {channel} of {}", self.channels),
-            None if self.channels == 1 => "Mono input".into(),
-            None => format!("Mix of {} channels", self.channels),
+            Some(channel) => tf!(
+                "Channel {channel} of {count}",
+                channel = channel,
+                count = self.channels
+            ),
+            None if self.channels == 1 => t("Mono input").into(),
+            None => tf!("Mix of {count} channels", count = self.channels),
         }
     }
 
@@ -146,17 +151,29 @@ impl Levels {
         dbfs(self.peak)
     }
 
+    /// Too quiet to transcribe reliably: no signal, or a low level and peak.
+    pub fn is_quiet(&self) -> bool {
+        self.samples > 0 && (self.peak == 0.0 || self.is_very_quiet())
+    }
+
+    fn is_very_quiet(&self) -> bool {
+        self.rms_dbfs().is_some_and(|value| value < -45.0)
+            && self.peak_dbfs().is_some_and(|value| value < -35.0)
+    }
+
     pub fn warning(&self) -> Option<&'static str> {
         if self.invalid_samples > 0 {
-            Some("Invalid audio samples detected. Check the input device.")
+            Some(t("Invalid audio samples detected. Check the input device."))
         } else if self.full_scale_samples > 0 {
-            Some("Possible clipping. Check the microphone's input gain.")
+            Some(t("Possible clipping. Check the microphone's input gain."))
         } else if self.peak == 0.0 {
-            Some("No signal in this recording. Check the microphone and input channel.")
-        } else if self.rms_dbfs().is_some_and(|value| value < -45.0)
-            && self.peak_dbfs().is_some_and(|value| value < -35.0)
-        {
-            Some("Very quiet recording. Check the input gain or select the microphone's channel.")
+            Some(t(
+                "No signal in this recording. Check the microphone and input channel.",
+            ))
+        } else if self.is_very_quiet() {
+            Some(t(
+                "Very quiet recording. Check the input gain or select the microphone's channel.",
+            ))
         } else {
             None
         }
@@ -188,16 +205,20 @@ static LAST: OnceLock<Mutex<Option<RecordingDiagnostic>>> = OnceLock::new();
 
 /// Called by the transcription worker, before silence trimming. Does not retain
 /// samples, write files, open a device, or block the capture callback.
-pub fn record(samples: &[f32], input: Option<InputDescription>) {
+/// Returns whether the clip was quiet, for the HUD's "Low audio" notice.
+pub fn record(samples: &[f32], input: Option<InputDescription>) -> bool {
+    let levels = Levels::measure(samples);
+    let quiet = levels.is_quiet();
     let diagnostic = RecordingDiagnostic {
         input,
-        levels: Levels::measure(samples),
+        levels,
         duration_ms: samples.len() as u64 * 1_000 / 16_000,
     };
     *LAST
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|error| error.into_inner()) = Some(diagnostic);
+    quiet
 }
 
 pub fn latest() -> Option<RecordingDiagnostic> {

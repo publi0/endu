@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sign prepared releases with the pinned Hex identity in a disposable keychain.
+"""Sign prepared releases with the pinned Endu identity in a disposable keychain.
 
 Private material comes only from Actions secrets; the repository contains the
 public certificate. No trust overrides, login-keychain imports, or TCC changes.
@@ -120,12 +120,12 @@ def verify_archive(archive, certificate):
         for item in zipped.infolist():
             path = PurePosixPath(item.filename)
             if (path.is_absolute() or ".." in path.parts or "\\" in item.filename or not path.parts
-                    or path.parts[0] not in ("Hex.app", "__MACOSX")
+                    or path.parts[0] not in ("Endu.app", "__MACOSX")
                     or stat.S_ISLNK(item.external_attr >> 16)):
                 raise ValueError("Unexpected path in release archive")
     with tempfile.TemporaryDirectory(prefix="hex-verify-") as folder:
         run("/usr/bin/ditto", "-x", "-k", str(archive), folder)
-        verify_bundle(Path(folder) / "Hex.app", identity)
+        verify_bundle(Path(folder) / "Endu.app", identity)
 
 
 def read_secrets(environment):
@@ -194,7 +194,7 @@ def check_identity(root):
 def sign_release(root):
     archive, password, identity = signing_material(root)
     certificate = root / CERTIFICATE
-    bundle = root / "target/app/Hex.app"
+    bundle = root / "target/app/Endu.app"
     version = tomllib.loads((root / "Cargo.toml").read_text())["package"]["version"]
     if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version):
         raise ValueError("Invalid package version")
@@ -207,7 +207,7 @@ def sign_release(root):
         run("/usr/bin/codesign", "--force", "--keychain", str(keychain), "--sign", identity.upper(),
             "--timestamp=none", "--entitlements", str(root / "app/VoiceControl.entitlements"), str(bundle))
     verify_bundle(bundle, identity)
-    destination = root / f"target/app/Hex-{version}.zip"
+    destination = root / f"target/app/Endu-{version}.zip"
     destination.unlink(missing_ok=True)
     run("/usr/bin/ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(bundle), str(destination))
     verify_archive(destination, certificate)

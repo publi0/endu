@@ -484,7 +484,7 @@ fn send(request: &Request, config: &Config, timeout: Duration) -> Result<Respons
         .post(&request.url)
         .header(header, authorization)
         .header("Content-Type", request.content_type.as_str())
-        .header("X-Title", "Hex")
+        .header("X-Title", "Endu")
         .send(request.body.as_slice())
         .map_err(|error| TransportFailure(http_error_kind(&error, false), 0))?;
     let status = response.status().as_u16();
@@ -1160,18 +1160,24 @@ fn transcribe_configured(
         None
     };
     if matches!(trimmed, Some(Trimmed::Silent)) {
+        let streamed = live.is_some();
         let sent_ms = duration_ms(
             live.as_ref()
                 .map_or(0, streaming::PendingLive::sent_samples),
         );
+        // Dropping the live session stops it at once.
         drop(live);
         record_sample(Sample {
-            skipped_silent: true,
+            // Streamed silence was already sent, so it counts as a failure.
+            skipped_silent: !streamed,
             recorded_ms,
             sent_ms,
             telemetry: Some(DictationTelemetry::default()),
             ..Sample::default()
         });
+        if streamed {
+            return Err(crate::openrouter::transcribe::NoSpeech.into());
+        }
         return Ok(Transcription {
             text: String::new(),
             report: None,
@@ -3260,19 +3266,29 @@ mod tests {
     }
 
     #[test]
-    fn final_vad_discards_live_hallucinations_without_hiding_sent_audio() {
+    fn final_vad_fails_streamed_silence_without_hiding_sent_audio() {
         take_samples();
-        let result = transcribe(
+        let error = transcribe(
             &[0.0; 1600],
             &Snapshot::default(),
             Some(live_fixture("hallucinated text", 800, true)),
         )
-        .unwrap();
-        assert!(result.text.is_empty());
-        assert!(result.report.is_none());
+        .err()
+        .expect("streamed silence fails instead of pasting a hallucination");
+        assert!(
+            error
+                .downcast_ref::<crate::openrouter::transcribe::NoSpeech>()
+                .is_some()
+        );
+        assert_eq!(
+            format!("{error:#}"),
+            crate::openrouter::transcribe::NO_SPEECH
+        );
         let samples = take_samples();
         assert_eq!(samples.len(), 1);
-        assert!(samples[0].skipped_silent);
+        // Audio already went out, so it is a failed dictation, not skipped silence.
+        assert!(!samples[0].skipped_silent);
+        assert_eq!(samples[0].words, None);
         assert_eq!(samples[0].sent_ms, 50);
         assert!(samples[0].telemetry.as_ref().unwrap().attempts.is_empty());
     }

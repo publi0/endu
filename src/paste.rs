@@ -326,7 +326,7 @@ impl Paster {
                     snapshot
                 };
                 if self.clipboard.changeCount() != previous_change_count {
-                    return Err(eyre!("clipboard changed while HEX was preserving it"));
+                    return Err(eyre!("clipboard changed while Endu was preserving it"));
                 }
                 Ok((restore, previous, previous_change_count))
             },
@@ -1341,13 +1341,22 @@ mod tests {
         assert!(should_preserve_flavor(SYSTEM_TRANSLATED_FLAVOR, false));
     }
 
+    /// A valid 1×1 transparent PNG.
+    const ONE_PIXEL_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
     #[test]
     fn image_snapshot_keeps_its_authoritative_format() {
         let _test = PASTEBOARD_TEST.lock().unwrap();
         let clipboard = NSPasteboard::pasteboardWithUniqueName();
         let item = NSPasteboardItem::new();
         assert!(item.setData_forType(
-            &NSData::with_bytes(include_bytes!("../app/AppIcon.icon/Assets/Image.png")),
+            &NSData::with_bytes(ONE_PIXEL_PNG),
             &NSString::from_str("public.png")
         ));
         clipboard.clearContents();

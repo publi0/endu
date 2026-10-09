@@ -1,5 +1,6 @@
 //! Separate credentials for direct providers. No key enters argv or diagnostics.
 
+use crate::i18n::t;
 use std::collections::BTreeMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -94,7 +95,7 @@ pub fn api_key(provider: Provider, config: &Config) -> Result<String> {
 
 pub(crate) fn unavailable_message(provider: &str) -> String {
     format!(
-        "macOS did not allow Hex to read the {provider} key. Open Providers and press Test to allow access."
+        "macOS did not allow Endu to read the {provider} key. Open Providers and press Test to allow access."
     )
 }
 
@@ -392,8 +393,15 @@ pub fn check_key(provider: Provider, config: &Config) -> Result<String> {
     );
     let (name, value) = authorization(provider, &key);
     let response = agent.get(endpoint).header(name, value).call();
-    let mut response =
-        response.map_err(|_| eyre!("Could not reach {} to check the key.", provider.label()))?;
+    let mut response = response.map_err(|_| {
+        eyre!(
+            "{}",
+            tf!(
+                "Could not reach {provider} to check the key.",
+                provider = provider.label()
+            )
+        )
+    })?;
     let status = response.status().as_u16();
     if status == 401 {
         invalidate(provider);
@@ -404,27 +412,46 @@ pub fn check_key(provider: Provider, config: &Config) -> Result<String> {
         .with_config()
         .limit(2 * 1024 * 1024)
         .read_to_vec()
-        .map_err(|_| eyre!("The key-check response could not be read safely."))?;
+        .map_err(|_| eyre!("{}", t("The key-check response could not be read safely.")))?;
     if !serde_json::from_slice::<serde_json::Value>(&body).is_ok_and(|body| body.is_object()) {
-        bail!("The provider returned an invalid key-check response.");
+        bail!(
+            "{}",
+            t("The provider returned an invalid key-check response.")
+        );
     }
     Ok(message)
 }
 
 fn check_status(provider: Provider, status: u16) -> Result<String> {
     match status {
-        200..=299 => Ok("Key accepted. Speech-to-text access is checked when transcribing.".into()),
-        401 => Err(eyre!("{} rejected the key (HTTP 401).", provider.label())),
+        200..=299 => {
+            Ok(t("Key accepted. Speech-to-text access is checked when transcribing.").into())
+        }
+        401 => Err(eyre!(
+            "{}",
+            tf!(
+                "{provider} rejected the key (HTTP 401).",
+                provider = provider.label()
+            )
+        )),
         403 => Err(eyre!(
-            "{} denied this key check (HTTP 403). The key may lack read permission; transcription access has not been tested.",
-            provider.label()
+            "{}",
+            tf!(
+                "{provider} denied this key check (HTTP 403). The key may lack read permission; transcription access has not been tested.",
+                provider = provider.label()
+            )
         )),
         429 => Err(eyre!(
-            "The key check was rate limited (HTTP 429). Try again later."
+            "{}",
+            t("The key check was rate limited (HTTP 429). Try again later.")
         )),
         _ => Err(eyre!(
-            "{} key check failed (HTTP {status}).",
-            provider.label()
+            "{}",
+            tf!(
+                "{provider} key check failed (HTTP {status}).",
+                provider = provider.label(),
+                status = status
+            )
         )),
     }
 }

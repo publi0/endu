@@ -583,7 +583,11 @@ impl Owner {
                     captured_through,
                     self.pending_input.oldest(),
                 );
-                self.forward_recognition(samples);
+                // The meter projection serves only a capture. A warm idle
+                // microphone would otherwise fill it for nobody to read.
+                if self.capture.is_recording() {
+                    self.forward_recognition(samples);
+                }
             }
             RecoveringAudioInputEvent::Timeout => {}
             RecoveringAudioInputEvent::Interrupted => {
@@ -886,6 +890,12 @@ mod tests {
     fn meter_reads_the_newest_chunk_and_frees_the_backlog() {
         let (mut owner, input, samples) = owner_for_test(true);
         let at = capture_time();
+        // A warm idle microphone feeds the timeline, never the meter projection.
+        samples.send((vec![0.5; 480], at)).unwrap();
+        let event = owner.input.recv_timeout(Duration::from_millis(100), false);
+        owner.handle_input(event);
+        assert!(input.recv_timeout(Duration::ZERO).unwrap().is_none());
+        start(&mut owner, at);
         for index in 1..=8u64 {
             samples
                 .send((
@@ -1266,7 +1276,7 @@ mod tests {
     #[test]
     fn startup_microphone_failure_keeps_audio_owner_alive() {
         let input = DictationAudio::open(
-            Some("HEX nonexistent microphone for startup recovery test"),
+            Some("Endu nonexistent microphone for startup recovery test"),
             0,
             None,
             &[],
@@ -1364,12 +1374,15 @@ mod tests {
         assert_eq!(input.sample_rate(), 48_000);
         assert_eq!(input.device_name(), "Test microphone");
         samples.send((vec![0.25; 480], capture_time())).unwrap();
-        let audio = input.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
-        assert_eq!(audio.samples, vec![0.25; 480]);
-        assert!(audio.is_current(input.recognition_generation()));
-        assert_eq!(input.captured_through(), capture_time());
         assert_eq!(input.start(capture_time()).unwrap(), CaptureStart::Ready);
+        assert_eq!(input.captured_through(), capture_time());
         assert!(input.is_recording());
+        let after_start = capture_time() + Duration::from_millis(10);
+        samples.send((vec![0.5; 480], after_start)).unwrap();
+        let audio = input.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(audio.samples, vec![0.5; 480]);
+        assert!(audio.is_current(input.recognition_generation()));
+        assert_eq!(input.captured_through(), after_start);
         input.cancel().unwrap();
         assert!(!input.is_recording());
         assert!(!input.is_recovering());

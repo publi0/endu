@@ -43,6 +43,60 @@ fn validate_audio_length(provider: Provider, samples: usize) -> Result<()> {
     Ok(())
 }
 const MAX_TEXT: usize = 2 * 1024 * 1024;
+/// ElevenLabs commits on its own once roughly 36 s of audio accumulate, even
+/// in manual mode, and each commit starts a new segment. A commit inside a
+/// phrase can lose the words right after it, so commit first and in a real
+/// pause: after 15 s once 400 ms have been quiet, or regardless at 30 s.
+const ELEVENLABS_COMMIT_AFTER: usize = 15 * 16_000;
+const ELEVENLABS_FORCE_COMMIT: usize = 30 * 16_000;
+const ELEVENLABS_PAUSE: usize = 6_400;
+/// About -38 dBFS for 16-bit PCM: a pause rather than speech.
+const ELEVENLABS_QUIET_RMS: f64 = 400.0;
+
+fn elevenlabs_commit_due(pending_frames: usize, quiet_frames: usize) -> bool {
+    pending_frames >= ELEVENLABS_FORCE_COMMIT
+        || (pending_frames >= ELEVENLABS_COMMIT_AFTER && quiet_frames >= ELEVENLABS_PAUSE)
+}
+
+/// A completed clip goes out in one-second messages: ElevenLabs closes the
+/// session (`queue_overflow`) when 100 ms chunks arrive faster than real time.
+const ELEVENLABS_COMPLETED_BLOCK: usize = 16_000;
+
+/// Commit points for a completed ElevenLabs clip: the middle of the first
+/// quietest 500 ms between 15 and 30 s after the previous commit, so each
+/// commit falls in the clearest pause rather than inside a phrase.
+fn elevenlabs_commit_points(samples: &[f32]) -> Vec<usize> {
+    const WINDOW: usize = 5 * BLOCK;
+    let energy = |start: usize| -> f64 {
+        samples[start..start + WINDOW]
+            .iter()
+            .map(|sample| f64::from(*sample).powi(2))
+            .sum()
+    };
+    let mut points = Vec::new();
+    let mut start = 0;
+    while samples.len() - start > ELEVENLABS_FORCE_COMMIT {
+        let quietest = (start + ELEVENLABS_COMMIT_AFTER..=start + ELEVENLABS_FORCE_COMMIT - WINDOW)
+            .step_by(BLOCK)
+            .min_by(|&a, &b| energy(a).total_cmp(&energy(b)))
+            .unwrap_or(start + ELEVENLABS_FORCE_COMMIT - WINDOW);
+        start = quietest + WINDOW / 2;
+        points.push(start);
+    }
+    points
+}
+
+fn pcm16_rms(pcm: &[u8]) -> f64 {
+    let samples = pcm.len() / 2;
+    if samples == 0 {
+        return 0.0;
+    }
+    let energy: f64 = pcm
+        .chunks_exact(2)
+        .map(|pair| f64::from(i16::from_le_bytes([pair[0], pair[1]])).powi(2))
+        .sum();
+    (energy / samples as f64).sqrt()
+}
 const MAX_SESSIONS: usize = 4;
 static SESSION_COUNT: LazyLock<Arc<AtomicUsize>> = LazyLock::new(|| Arc::new(AtomicUsize::new(0)));
 struct SessionPermit(Arc<AtomicUsize>);
@@ -534,10 +588,14 @@ pub fn transcribe_completed(
         control.check(deadline)?;
         let mut connection = Connection::open(config, model_id, vocabulary, deadline, &control)?;
         connection.ready(deadline, &control)?;
-        for chunk in samples.chunks(BLOCK) {
-            control.check(deadline)?;
-            connection.audio(chunk, deadline)?;
-            connection.poll(deadline, &control)?;
+        if provider == Provider::ElevenLabs {
+            connection.send_completed_elevenlabs(samples, deadline, &control)?;
+        } else {
+            for chunk in samples.chunks(BLOCK) {
+                control.check(deadline)?;
+                connection.audio(chunk, deadline)?;
+                connection.poll(deadline, &control)?;
+            }
         }
         connection.finish(deadline)?;
         let text = connection.complete(deadline, &control)?;
@@ -1017,6 +1075,14 @@ struct Protocol {
     completed_items: BTreeMap<String, String>,
     segments: BTreeMap<(u64, u64), String>,
     grok: GrokFinals,
+    /// ElevenLabs: commits sent before Finish, audio since the last one,
+    /// whether Finish needed no commit of its own, and segments received.
+    elevenlabs_commits: usize,
+    elevenlabs_pending: usize,
+    /// Consecutive quiet audio at the end of what was sent.
+    elevenlabs_quiet: usize,
+    elevenlabs_skip_final: bool,
+    elevenlabs_segments: Vec<String>,
 }
 impl Protocol {
     fn new(provider: Provider) -> Self {
@@ -1032,7 +1098,33 @@ impl Protocol {
             completed_items: BTreeMap::new(),
             segments: BTreeMap::new(),
             grok: GrokFinals::default(),
+            elevenlabs_commits: 0,
+            elevenlabs_pending: 0,
+            elevenlabs_quiet: 0,
+            elevenlabs_skip_final: false,
+            elevenlabs_segments: Vec::new(),
         }
+    }
+    /// The joined transcript once every requested commit has answered after
+    /// Finish. A segment nobody asked for is an automatic commit we did not
+    /// anticipate, so the live result cannot be trusted.
+    fn elevenlabs_result(&self) -> Result<Option<String>> {
+        let expected =
+            self.elevenlabs_commits + usize::from(self.finishing && !self.elevenlabs_skip_final);
+        if self.elevenlabs_segments.len() > expected {
+            return Err(failure("The streaming provider committed before Finish."));
+        }
+        if !self.finishing || self.elevenlabs_segments.len() < expected {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.elevenlabs_segments
+                .iter()
+                .map(|segment| segment.trim())
+                .filter(|segment| !segment.is_empty())
+                .collect::<Vec<_>>()
+                .join(" "),
+        ))
     }
     fn event(&mut self, event: &Value) -> Result<Option<String>> {
         let kind = event
@@ -1147,16 +1239,15 @@ impl Protocol {
                     self.ready = true;
                 }
                 if kind == "committed_transcript" {
-                    if !self.finishing {
-                        return Err(failure("The streaming provider committed before Finish."));
-                    }
                     let text = event["text"]
                         .as_str()
                         .ok_or_else(|| failure("Streaming response had no final text."))?;
-                    if text.len() > MAX_TEXT {
+                    let retained: usize = self.elevenlabs_segments.iter().map(String::len).sum();
+                    if retained.saturating_add(text.len()) > MAX_TEXT {
                         return Err(failure("Streaming response exceeded its limit."));
                     }
-                    return Ok(Some(text.to_owned()));
+                    self.elevenlabs_segments.push(text.to_owned());
+                    return self.elevenlabs_result();
                 }
             }
             Provider::Deepgram => {
@@ -1389,6 +1480,9 @@ struct Connection {
     sent_samples: Arc<AtomicUsize>,
     activity_started: bool,
     pacing_started: Option<Instant>,
+    /// ElevenLabs: whether the next chunk commits, when the caller planned
+    /// the commits (completed clips) instead of detecting pauses (live).
+    planned_commit: Option<bool>,
     control: Arc<SessionControl>,
 }
 impl Connection {
@@ -1524,6 +1618,7 @@ impl Connection {
             sent_samples: control.sent_samples.clone(),
             activity_started: false,
             pacing_started: None,
+            planned_commit: None,
             control: control.clone(),
         };
         match model.provider {
@@ -1607,7 +1702,27 @@ impl Connection {
         {
             match self.protocol.provider {
             Provider::OpenAi => self.json(json!({"type":"input_audio_buffer.append","audio":crate::openrouter::transcribe::encode_base64(&pcm)})),
-            Provider::ElevenLabs => self.json(json!({"message_type":"input_audio_chunk","audio_base_64":crate::openrouter::transcribe::encode_base64(&pcm),"commit":false,"sample_rate":16000})),
+            Provider::ElevenLabs => {
+                let pending = self.protocol.elevenlabs_pending + frames;
+                let quiet = if pcm16_rms(&pcm) < ELEVENLABS_QUIET_RMS {
+                    self.protocol.elevenlabs_quiet + frames
+                } else {
+                    0
+                };
+                let commit = match self.planned_commit.as_mut() {
+                    Some(planned) => std::mem::take(planned),
+                    None => elevenlabs_commit_due(pending, quiet),
+                };
+                self.protocol.elevenlabs_quiet = if commit { 0 } else { quiet };
+                self.json(json!({"message_type":"input_audio_chunk","audio_base_64":crate::openrouter::transcribe::encode_base64(&pcm),"commit":commit,"sample_rate":16000}))?;
+                if commit {
+                    self.protocol.elevenlabs_commits += 1;
+                    self.protocol.elevenlabs_pending = 0;
+                } else {
+                    self.protocol.elevenlabs_pending = pending;
+                }
+                Ok(())
+            }
             Provider::Google => self.json(json!({"realtimeInput":{"audio":{"data":crate::openrouter::transcribe::encode_base64(&pcm),"mimeType":"audio/pcm;rate=16000"}}})),
             Provider::Deepgram | Provider::Grok | Provider::Meta => {
                 self.socket.send(Message::Binary(pcm.into())).map_err(|error| websocket_failure("Streaming write failed.", &error))?;
@@ -1631,6 +1746,18 @@ impl Connection {
         let pcm = self.encoder.push(&[], true)?;
         self.send_pcm(pcm)?;
         self.protocol.finishing = true;
+        if self.protocol.provider == Provider::ElevenLabs
+            && self.protocol.elevenlabs_pending == 0
+            && self.protocol.elevenlabs_commits > 0
+        {
+            // The last audio already went out with a commit; an empty one
+            // would only ask for an extra, empty segment.
+            self.protocol.elevenlabs_skip_final = true;
+            if let Some(text) = self.protocol.elevenlabs_result()? {
+                self.completed = Some(text);
+            }
+            return Ok(());
+        }
         self.json(finish_message(self.protocol.provider)?)
     }
     fn keep_alive(&mut self) -> Result<()> {
@@ -1684,6 +1811,42 @@ impl Connection {
         }?;
         if result.is_some() {
             self.completed = result;
+        }
+        Ok(())
+    }
+    /// Sends a completed clip segment by segment, committing in pauses and
+    /// waiting for each committed transcript before the next segment, so no
+    /// audio arrives while ElevenLabs finalizes the previous one.
+    fn send_completed_elevenlabs(
+        &mut self,
+        samples: &[f32],
+        deadline: Instant,
+        control: &SessionControl,
+    ) -> Result<()> {
+        self.planned_commit = Some(false);
+        let mut start = 0;
+        for point in elevenlabs_commit_points(samples) {
+            self.send_completed_segment(&samples[start..point], true, deadline, control)?;
+            while self.protocol.elevenlabs_segments.len() < self.protocol.elevenlabs_commits {
+                self.poll(deadline, control)?;
+            }
+            start = point;
+        }
+        self.send_completed_segment(&samples[start..], false, deadline, control)
+    }
+    fn send_completed_segment(
+        &mut self,
+        segment: &[f32],
+        commit: bool,
+        deadline: Instant,
+        control: &SessionControl,
+    ) -> Result<()> {
+        let count = segment.len().div_ceil(ELEVENLABS_COMPLETED_BLOCK);
+        for (index, chunk) in segment.chunks(ELEVENLABS_COMPLETED_BLOCK).enumerate() {
+            control.check(deadline)?;
+            self.planned_commit = Some(commit && index + 1 == count);
+            self.audio(chunk, deadline)?;
+            self.poll(deadline, control)?;
         }
         Ok(())
     }
@@ -2752,6 +2915,8 @@ mod tests {
                 .event(&json!({"message_type":"committed_transcript","text":"early"}))
                 .is_err()
         );
+        // An unrequested commit discards the live session; a new one finishes.
+        let mut protocol = Protocol::new(Provider::ElevenLabs);
         protocol.finishing = true;
         assert_eq!(
             protocol
@@ -2776,6 +2941,120 @@ mod tests {
                 .keywords_rejected
         );
         assert!(!rejected.to_string().contains("PRIVATE"));
+    }
+
+    #[test]
+    fn scribe_joins_every_requested_segment_in_order() {
+        let mut protocol = Protocol::new(Provider::ElevenLabs);
+        protocol.elevenlabs_commits = 2;
+        for text in ["first part.", "  second part. "] {
+            assert!(
+                protocol
+                    .event(&json!({"message_type":"committed_transcript","text":text}))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        protocol.finishing = true;
+        assert_eq!(
+            protocol
+                .event(&json!({"message_type":"committed_transcript","text":"end"}))
+                .unwrap(),
+            Some("first part. second part. end".into())
+        );
+    }
+
+    #[test]
+    fn scribe_late_segments_wait_for_the_final_commit() {
+        let mut protocol = Protocol::new(Provider::ElevenLabs);
+        protocol.elevenlabs_commits = 1;
+        protocol.finishing = true;
+        assert!(
+            protocol
+                .event(&json!({"message_type":"committed_transcript","text":"one"}))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            protocol
+                .event(&json!({"message_type":"committed_transcript","text":"two"}))
+                .unwrap(),
+            Some("one two".into())
+        );
+    }
+
+    #[test]
+    fn scribe_unrequested_commits_and_skipped_finals_are_exact() {
+        let mut protocol = Protocol::new(Provider::ElevenLabs);
+        protocol.elevenlabs_commits = 1;
+        protocol
+            .event(&json!({"message_type":"committed_transcript","text":"asked"}))
+            .unwrap();
+        assert!(
+            protocol
+                .event(&json!({"message_type":"committed_transcript","text":"surprise"}))
+                .is_err()
+        );
+
+        let mut skipped = Protocol::new(Provider::ElevenLabs);
+        skipped.elevenlabs_commits = 1;
+        skipped.elevenlabs_skip_final = true;
+        skipped.finishing = true;
+        assert_eq!(
+            skipped
+                .event(&json!({"message_type":"committed_transcript","text":"only"}))
+                .unwrap(),
+            Some("only".into())
+        );
+    }
+
+    #[test]
+    fn scribe_commits_in_a_real_pause_after_fifteen_seconds_and_always_by_thirty() {
+        assert!(!elevenlabs_commit_due(14 * 16_000, ELEVENLABS_PAUSE));
+        assert!(elevenlabs_commit_due(15 * 16_000, ELEVENLABS_PAUSE));
+        // A short gap inside a phrase is not a pause.
+        assert!(!elevenlabs_commit_due(20 * 16_000, ELEVENLABS_PAUSE - 1));
+        assert!(!elevenlabs_commit_due(29 * 16_000, 0));
+        assert!(elevenlabs_commit_due(30 * 16_000, 0));
+        let silence = vec![0_u8; 3_200];
+        assert!(pcm16_rms(&silence) < ELEVENLABS_QUIET_RMS);
+        let speech: Vec<u8> = (0..1_600_i32)
+            .flat_map(|n| (((n as f64 * 0.2).sin() * 8_000.0) as i16).to_le_bytes())
+            .collect();
+        assert!(pcm16_rms(&speech) > ELEVENLABS_QUIET_RMS);
+        assert_eq!(pcm16_rms(&[]), 0.0);
+    }
+
+    #[test]
+    fn completed_scribe_clips_commit_in_their_pauses() {
+        let speech = |seconds: usize| -> Vec<f32> {
+            (0..seconds * 16_000)
+                .map(|n| (n as f32 * 0.05).sin() * 0.3)
+                .collect()
+        };
+        assert!(elevenlabs_commit_points(&speech(30)).is_empty());
+
+        let mut clip = speech(24);
+        clip.extend(vec![0.0; 16_000]);
+        clip.extend(speech(22));
+        clip.extend(vec![0.0; 16_000]);
+        clip.extend(speech(20));
+        let points = elevenlabs_commit_points(&clip);
+        assert_eq!(points.len(), 2);
+        assert!((24 * 16_000..25 * 16_000).contains(&points[0]));
+        assert!((47 * 16_000..48 * 16_000).contains(&points[1]));
+
+        // Without a pause, each segment still ends within the 30 s window.
+        let points = elevenlabs_commit_points(&speech(95));
+        assert!(points.len() >= 3);
+        let mut start = 0;
+        for point in points {
+            assert!(
+                (start + ELEVENLABS_COMMIT_AFTER..start + ELEVENLABS_FORCE_COMMIT).contains(&point)
+            );
+            start = point;
+        }
+        assert!(95 * 16_000 - start <= ELEVENLABS_FORCE_COMMIT);
     }
 
     #[test]

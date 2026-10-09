@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{self, Receiver, SendError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -14,6 +14,7 @@ use crate::app_settings::HotkeyBinding;
 use crate::app_settings::{DictationMode, HOTKEY_MODIFIERS_MASK, RuntimeHotkey, RuntimeHotkeys};
 use crate::audio::CaptureInstant;
 use crate::dictation::MINIMUM_HOLD_DURATION;
+use crate::doorbell::Doorbell;
 use crate::interaction_settings::DoubleTapSensitivity;
 
 const ESCAPE_KEY_CODE: u16 = 53;
@@ -224,8 +225,14 @@ impl InputActivity {
 }
 
 impl InputMonitor {
-    pub fn start() -> Result<Self> {
+    /// Starts the event tap. `wake` rings after every queued event so an
+    /// idle listener can block instead of polling.
+    pub fn start(wake: Arc<Doorbell>) -> Result<Self> {
         let (sender, events) = mpsc::channel::<ObservedInputEvent>();
+        let sender = InputSender {
+            events: sender,
+            wake,
+        };
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let activity = InputActivity::default();
         let tap_activity = activity.clone();
@@ -308,8 +315,21 @@ impl Drop for InputMonitor {
     }
 }
 
+struct InputSender {
+    events: Sender<ObservedInputEvent>,
+    wake: Arc<Doorbell>,
+}
+
+impl InputSender {
+    fn send(&self, event: ObservedInputEvent) -> Result<(), SendError<ObservedInputEvent>> {
+        self.events.send(event)?;
+        self.wake.ring();
+        Ok(())
+    }
+}
+
 struct EventTapContext {
-    sender: Sender<ObservedInputEvent>,
+    sender: InputSender,
     activity: InputActivity,
     escape_cancels: Arc<AtomicBool>,
     submit_guard_state: Arc<AtomicU64>,
@@ -321,7 +341,7 @@ struct EventTapContext {
 }
 
 fn run_event_tap(
-    sender: Sender<ObservedInputEvent>,
+    sender: InputSender,
     activity: InputActivity,
     escape_cancels: Arc<AtomicBool>,
     submit_guard_state: Arc<AtomicU64>,
@@ -890,6 +910,16 @@ impl DictationHotkey {
 
     pub fn is_recording(&self) -> bool {
         matches!(self.state, State::Recording { .. } | State::Locked)
+    }
+
+    /// Only a new input event can change this machine: no key is held and no
+    /// stale-key repair is waiting on time. Double-tap windows are measured
+    /// against the next event's timestamp, so waiting never expires them.
+    pub fn is_quiescent(&self) -> bool {
+        matches!(
+            self.state,
+            State::Idle { .. } | State::AwaitingSecondTap { .. }
+        ) && self.pressed_keys.is_empty()
     }
 
     pub fn set_double_tap_enabled(&mut self, enabled: bool) {
@@ -1731,7 +1761,10 @@ mod tests {
     fn callback_input(timestamps_and_events: &[(u64, InputEvent)]) -> Vec<ObservedInputEvent> {
         let (sender, receiver) = mpsc::channel();
         let mut context = EventTapContext {
-            sender,
+            sender: InputSender {
+                events: sender,
+                wake: Arc::default(),
+            },
             activity: InputActivity::default(),
             escape_cancels: Arc::new(AtomicBool::new(false)),
             submit_guard_state: Arc::new(AtomicU64::new(0)),

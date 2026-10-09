@@ -178,6 +178,11 @@ impl OverlayVisibility {
         }
     }
 
+    /// Whether the panel may still be on screen, so maintenance must continue.
+    pub fn is_ordered(&self) -> bool {
+        self.state.ordered
+    }
+
     /// Finish an existing fade without restoring the panel in a new Space.
     pub fn maintain_fading(&mut self, panel: &mut Retained<NSPanel>) {
         if self.observer.take_change() {

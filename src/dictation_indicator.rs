@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -17,9 +17,10 @@ use metal::{
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSPanel, NSStatusWindowLevel, NSView, NSWindowStyleMask,
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSFont, NSFontWeightSemibold, NSPanel,
+    NSStatusWindowLevel, NSTextAlignment, NSTextField, NSView, NSWindowStyleMask,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use objc2_quartz_core::CALayer;
 
 const WINDOW_WIDTH: f32 = 112.0;
@@ -34,6 +35,16 @@ const HIDDEN_SOFTNESS: f32 = 4.0;
 const PROCESSING_MORPH_DURATION: Duration = Duration::from_millis(250);
 const RECORDING_FLASH_HALF_LIFE: Duration = Duration::from_millis(280);
 const METER_STALE_AFTER: Duration = Duration::from_millis(250);
+/// While recording, a second without any signal (or any meter sample) means
+/// the microphone delivers nothing: the HUD says "No audio" at once.
+const LIVE_NO_AUDIO_AFTER: Duration = Duration::from_secs(1);
+/// After this long, peaks that never reach [`LIVE_LOW_PEAK`] mean speech is
+/// too quiet to transcribe well: the HUD says "Low audio" until it rises.
+const LIVE_LOW_AUDIO_AFTER: Duration = Duration::from_millis(2_500);
+/// About -35 dBFS, the quiet-recording limit of the Microphone diagnostics.
+const LIVE_LOW_PEAK: f32 = 0.0178;
+/// Below about -80 dBFS a peak is no signal at all.
+const LIVE_SILENT_PEAK: f32 = 0.0001;
 const VOICE_WIDTH_GAIN: f32 = 12.0;
 const VOICE_NOISE_FLOOR: f32 = 0.045;
 
@@ -60,6 +71,14 @@ pub enum DictationIndicatorEvent {
         job_id: u64,
     },
     JobFailed {
+        job_id: u64,
+    },
+    /// The clip held no speech: the HUD says "No audio" instead of a check.
+    JobNoAudio {
+        job_id: u64,
+    },
+    /// The clip was very quiet; a successful result says "Low audio".
+    JobQuiet {
         job_id: u64,
     },
     JobReadyToPaste {
@@ -108,7 +127,9 @@ pub struct DictationIndicatorSender(Sender<DictationIndicatorEvent>);
 
 impl DictationIndicatorSender {
     pub fn send(&self, event: DictationIndicatorEvent) {
-        let _ = self.0.send(event);
+        if self.0.send(event).is_ok() {
+            crate::desktop::wake_ui();
+        }
     }
 
     pub fn meter(&self, samples: &[f32]) {
@@ -181,10 +202,20 @@ impl DictationIndicatorUi {
             indicator.maintain();
         }
     }
+
+    /// Finished, hidden and not drawing: only a new event can change it.
+    pub fn is_at_rest(&self) -> bool {
+        self.indicator
+            .as_ref()
+            .is_none_or(MetalIndicator::is_at_rest)
+    }
 }
 
 struct MetalIndicator {
     window: Retained<NSPanel>,
+    /// A written notice over the capsule, such as "No audio".
+    notice: Retained<NSTextField>,
+    notice_shown: u32,
     renderer: Arc<SharedRenderer>,
     display_link: CVDisplayLink,
     display_link_context: *const SharedRenderer,
@@ -215,7 +246,18 @@ impl MetalIndicator {
         let cocoa_layer = unsafe { &*metal_layer.cast::<CALayer>() };
         cocoa_layer.setOpaque(false);
         view.setLayer(Some(cocoa_layer));
-        window.setContentView(Some(&view));
+        // The Metal view hosts its layer, so the notice is its sibling in a
+        // plain container rather than its subview.
+        let resizing = NSAutoresizingMaskOptions::ViewWidthSizable
+            | NSAutoresizingMaskOptions::ViewHeightSizable;
+        view.setAutoresizingMask(resizing);
+        let container = NSView::initWithFrame(mtm.alloc(), frame);
+        container.addSubview(&view);
+        let notice = NSTextField::labelWithString(&NSString::from_str(""), mtm);
+        notice.setAlignment(NSTextAlignment::Center);
+        notice.setAlphaValue(0.0);
+        container.addSubview(&notice);
+        window.setContentView(Some(&container));
         window.setBackgroundColor(Some(&NSColor::clearColor()));
         window.setOpaque(false);
         window.setIgnoresMouseEvents(true);
@@ -239,6 +281,8 @@ impl MetalIndicator {
 
         let mut indicator = Self {
             window,
+            notice,
+            notice_shown: 0,
             renderer,
             display_link,
             display_link_context,
@@ -268,7 +312,62 @@ impl MetalIndicator {
         }
     }
 
+    /// Shows the renderer's written notice at the capsule's own opacity.
+    fn update_notice(&mut self) {
+        let (code, alpha) = self.renderer.notice();
+        if code != 0 && code != self.notice_shown {
+            let text = if code == HudNotice::NoAudio.code() {
+                crate::i18n::t("No audio")
+            } else {
+                crate::i18n::t("Low audio")
+            };
+            self.notice.setStringValue(&NSString::from_str(text));
+            let preferences = crate::hud_settings::current();
+            let dark = preferences
+                .appearance
+                .is_dark(crate::appearance::system_is_dark());
+            let ink = if dark {
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.86, 0.86, 0.86, 1.0)
+            } else {
+                // Jenipapo on the Tabatinga capsule.
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.106, 0.165, 0.227, 1.0)
+            };
+            self.notice.setTextColor(Some(&ink));
+            self.layout_notice();
+        }
+        if code != 0 {
+            self.notice_shown = code;
+        }
+        self.notice.setAlphaValue(f64::from(alpha));
+    }
+
+    fn layout_notice(&self) {
+        let size_factor = crate::hud_settings::current().size.scale();
+        let font_size = f64::from(7.5 * size_factor);
+        unsafe {
+            self.notice.setFont(Some(&NSFont::systemFontOfSize_weight(
+                font_size,
+                NSFontWeightSemibold,
+            )));
+        }
+        let frame = self.window.frame();
+        let height = font_size * 1.35;
+        self.notice.setFrame(NSRect::new(
+            NSPoint::new(0.0, (frame.size.height - height) / 2.0),
+            NSSize::new(frame.size.width, height),
+        ));
+    }
+
+    /// A maintenance pass after the renderer finished stopped the display
+    /// link and hid the panel, so further passes would change nothing.
+    fn is_at_rest(&self) -> bool {
+        !self.renderer.is_active()
+            && !self.display_link.is_running()
+            && !self.visibility.is_ordered()
+    }
+
     fn maintain(&mut self) {
+        self.update_notice();
         if self.renderer.is_active() {
             self.position_on_selected_screen();
             if self.renderer.has_live_work() {
@@ -346,6 +445,10 @@ struct SharedRenderer {
     renderer: Mutex<MetalRenderer>,
     active: AtomicBool,
     live_work: AtomicBool,
+    /// The notice code and its opacity's bits, published after each frame
+    /// so the UI thread never waits on the render lock.
+    notice_code: AtomicU32,
+    notice_alpha: AtomicU32,
 }
 
 // Metal command queues and layers are designed for cross-thread submission. Access to mutable
@@ -359,7 +462,22 @@ impl SharedRenderer {
             renderer: Mutex::new(MetalRenderer::new()?),
             active: AtomicBool::new(false),
             live_work: AtomicBool::new(false),
+            notice_code: AtomicU32::new(0),
+            notice_alpha: AtomicU32::new(0),
         })
+    }
+
+    fn publish_notice(&self, renderer: &MetalRenderer) {
+        let (code, alpha) = renderer.notice_state(Instant::now());
+        self.notice_code.store(code, Ordering::Release);
+        self.notice_alpha.store(alpha.to_bits(), Ordering::Release);
+    }
+
+    fn notice(&self) -> (u32, f32) {
+        (
+            self.notice_code.load(Ordering::Acquire),
+            f32::from_bits(self.notice_alpha.load(Ordering::Acquire)),
+        )
     }
 
     fn layer(&self) -> *const metal::MetalLayerRef {
@@ -369,6 +487,7 @@ impl SharedRenderer {
     fn handle(&self, event: DictationIndicatorEvent) {
         let mut renderer = self.renderer.lock().unwrap();
         renderer.handle(event);
+        self.publish_notice(&renderer);
         self.live_work.store(
             renderer.capture_phase.is_some() || !renderer.jobs.is_empty(),
             Ordering::Release,
@@ -390,7 +509,9 @@ impl SharedRenderer {
             return;
         }
         let mut renderer = self.renderer.lock().unwrap();
-        if !renderer.draw() {
+        let keep_rendering = renderer.draw();
+        self.publish_notice(&renderer);
+        if !keep_rendering {
             self.active.store(false, Ordering::Release);
         }
     }
@@ -413,6 +534,24 @@ enum Phase {
     Completed,
     Cancelled,
     Failed,
+    /// A short written notice inside the capsule, in place of its lines.
+    Notice,
+}
+
+/// What a [`Phase::Notice`] says.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HudNotice {
+    NoAudio,
+    LowAudio,
+}
+
+impl HudNotice {
+    const fn code(self) -> u32 {
+        match self {
+            Self::NoAudio => 1,
+            Self::LowAudio => 2,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -446,6 +585,8 @@ impl Phase {
             Self::Completed => Some(Duration::from_millis(240)),
             Self::Cancelled => Some(Duration::ZERO),
             Self::Failed => Some(Duration::from_millis(600)),
+            // Long enough to read two words.
+            Self::Notice => Some(Duration::from_millis(1_600)),
             _ => None,
         }
     }
@@ -483,9 +624,13 @@ struct Uniforms {
     recording_hue_shift: f32,
     transcription_hue_shift: f32,
     brightness: f32,
+    /// 1 paints the light capsule, 0 the original dark one.
+    light: f32,
+    /// 1 hides the lines so a written notice can sit in the capsule.
+    silenced: f32,
 }
 
-const _: () = assert!(std::mem::size_of::<Uniforms>() == 120);
+const _: () = assert!(std::mem::size_of::<Uniforms>() == 128);
 
 fn recording_flash(elapsed: Duration) -> f32 {
     2.0_f32.powf(-elapsed.as_secs_f32() / RECORDING_FLASH_HALF_LIFE.as_secs_f32())
@@ -524,6 +669,9 @@ struct MetalRenderer {
     capture_phase: Option<CapturePhase>,
     preparing: f32,
     jobs: BTreeMap<u64, JobPhase>,
+    /// Jobs whose recording was very quiet.
+    quiet_jobs: BTreeSet<u64>,
+    notice: Option<HudNotice>,
     phase_started: Instant,
     render_started: Instant,
     last_frame: Instant,
@@ -534,6 +682,10 @@ struct MetalRenderer {
     target_average: f32,
     target_peak: f32,
     last_meter: Option<Instant>,
+    /// Recent raw meter peaks while recording, for the live notices.
+    peak_history: VecDeque<(Instant, f32)>,
+    /// A notice shown during recording, and when it appeared.
+    live_notice: Option<(HudNotice, Instant)>,
     average: Spring,
     peak: Spring,
     width: Spring,
@@ -542,6 +694,9 @@ struct MetalRenderer {
     softness: Spring,
     processing: Spring,
     tuning: HudTuning,
+    /// The system appearance, sampled when the HUD opens so a System HUD
+    /// matches macOS without querying defaults every frame.
+    system_dark: bool,
 }
 
 impl MetalRenderer {
@@ -602,6 +757,8 @@ impl MetalRenderer {
             capture_phase: None,
             preparing: 0.0,
             jobs: BTreeMap::new(),
+            quiet_jobs: BTreeSet::new(),
+            notice: None,
             phase_started: now,
             render_started: now,
             last_frame: now,
@@ -612,6 +769,8 @@ impl MetalRenderer {
             target_average: 0.0,
             target_peak: 0.0,
             last_meter: None,
+            peak_history: VecDeque::new(),
+            live_notice: None,
             average: Spring::new(0.0),
             peak: Spring::new(0.0),
             width: Spring::new(CAPSULE_WIDTH),
@@ -620,6 +779,7 @@ impl MetalRenderer {
             softness: Spring::new(HIDDEN_SOFTNESS),
             processing: Spring::new(0.0),
             tuning: HudTuning::default(),
+            system_dark: crate::appearance::system_is_dark(),
         })
     }
 
@@ -627,6 +787,7 @@ impl MetalRenderer {
         let now = Instant::now();
         match event {
             DictationIndicatorEvent::Preparing | DictationIndicatorEvent::Started => {
+                self.system_dark = crate::appearance::system_is_dark();
                 let preparing = matches!(event, DictationIndicatorEvent::Preparing);
                 let was_preparing = self.capture_phase == Some(CapturePhase::Preparing);
                 self.capture_phase = Some(if preparing {
@@ -655,6 +816,8 @@ impl MetalRenderer {
                 self.target_average = 0.0;
                 self.target_peak = 0.0;
                 self.last_meter = None;
+                self.peak_history.clear();
+                self.live_notice = None;
                 self.average.reset(0.0);
                 self.peak.reset(0.0);
                 self.width.reset(CAPSULE_WIDTH);
@@ -668,6 +831,16 @@ impl MetalRenderer {
                     self.target_average = visual_meter_level(average, 9.0);
                     self.target_peak = visual_meter_level(peak, 3.0);
                     self.last_meter = Some(now);
+                    self.peak_history
+                        .push_back((now, if peak.is_finite() { peak.abs() } else { 0.0 }));
+                    while self
+                        .peak_history
+                        .front()
+                        .is_some_and(|(at, _)| now.duration_since(*at) > LIVE_LOW_AUDIO_AFTER)
+                    {
+                        self.peak_history.pop_front();
+                    }
+                    self.update_live_notice(now);
                 }
             }
             DictationIndicatorEvent::Submitted { job_id } => {
@@ -703,7 +876,27 @@ impl MetalRenderer {
                 }
             }
             DictationIndicatorEvent::JobCompleted { job_id } => {
-                self.finish_job(job_id, now, Phase::Completed);
+                if self.quiet_jobs.contains(&job_id) && crate::hud_settings::current().audio_notices
+                {
+                    self.notice = Some(HudNotice::LowAudio);
+                    self.finish_job(job_id, now, Phase::Notice);
+                } else {
+                    self.finish_job(job_id, now, Phase::Completed);
+                }
+            }
+            DictationIndicatorEvent::JobNoAudio { job_id } => {
+                if crate::hud_settings::current().audio_notices {
+                    self.notice = Some(HudNotice::NoAudio);
+                    self.finish_job(job_id, now, Phase::Notice);
+                } else {
+                    // Without notices, silence simply leaves; a check would claim success.
+                    self.finish_job(job_id, now, Phase::Hidden);
+                }
+            }
+            DictationIndicatorEvent::JobQuiet { job_id } => {
+                if self.jobs.contains_key(&job_id) {
+                    self.quiet_jobs.insert(job_id);
+                }
             }
             DictationIndicatorEvent::JobCancelled { job_id } => {
                 self.finish_job(job_id, now, Phase::Cancelled);
@@ -746,6 +939,7 @@ impl MetalRenderer {
     }
 
     fn finish_job(&mut self, job_id: u64, now: Instant, terminal: Phase) {
+        self.quiet_jobs.remove(&job_id);
         if self.jobs.remove(&job_id).is_none() {
             return;
         }
@@ -763,6 +957,67 @@ impl MetalRenderer {
             self.completion_pending = false;
             self.freeze_visual_state();
         }
+    }
+
+    /// The notice to show and its opacity: it eases in with the hidden lines
+    /// and leaves with the capsule.
+    /// The live notice for the recording so far, judged from the meter only;
+    /// it never touches the captured audio.
+    fn live_notice_for(&self, now: Instant) -> Option<HudNotice> {
+        if self.phase != Phase::Recording || self.capture_phase != Some(CapturePhase::Recording) {
+            return None;
+        }
+        let recording_for = now.saturating_duration_since(self.phase_started);
+        if recording_for < LIVE_NO_AUDIO_AFTER {
+            return None;
+        }
+        let loudest = |window: Duration| {
+            self.peak_history
+                .iter()
+                .filter(|(at, _)| now.saturating_duration_since(*at) <= window)
+                .map(|(_, peak)| *peak)
+                .fold(None, |loudest: Option<f32>, peak| {
+                    Some(loudest.map_or(peak, |l| l.max(peak)))
+                })
+        };
+        match loudest(LIVE_NO_AUDIO_AFTER) {
+            None => return Some(HudNotice::NoAudio),
+            Some(peak) if peak < LIVE_SILENT_PEAK => return Some(HudNotice::NoAudio),
+            Some(_) => {}
+        }
+        (recording_for >= LIVE_LOW_AUDIO_AFTER
+            && loudest(LIVE_LOW_AUDIO_AFTER).is_some_and(|peak| peak < LIVE_LOW_PEAK))
+        .then_some(HudNotice::LowAudio)
+    }
+
+    fn update_live_notice(&mut self, now: Instant) {
+        let notice = if crate::hud_settings::current().audio_notices {
+            self.live_notice_for(now)
+        } else {
+            None
+        };
+        if notice != self.live_notice.map(|(notice, _)| notice) {
+            self.live_notice = notice.map(|notice| (notice, now));
+        }
+    }
+
+    /// How far a notice has eased in over the capsule's lines.
+    fn notice_ease(&self, now: Instant) -> Option<(HudNotice, f32)> {
+        let (notice, since) = match (self.phase, self.notice, self.live_notice) {
+            (Phase::Notice, Some(notice), _) => (notice, self.phase_started),
+            (Phase::Recording, _, Some((notice, since))) => (notice, since),
+            _ => return None,
+        };
+        Some((
+            notice,
+            (now.saturating_duration_since(since).as_secs_f32() / 0.18).clamp(0.0, 1.0),
+        ))
+    }
+
+    fn notice_state(&self, now: Instant) -> (u32, f32) {
+        self.notice_ease(now).map_or((0, 0.0), |(notice, ease)| {
+            (notice.code(), self.opacity.value.clamp(0.0, 1.0) * ease)
+        })
     }
 
     fn freeze_visual_state(&mut self) {
@@ -812,10 +1067,11 @@ impl MetalRenderer {
         now: Instant,
         next_drawable: impl FnOnce(&metal::MetalLayerRef) -> Option<&metal::MetalDrawableRef>,
     ) -> bool {
+        // A microphone that stops delivering samples also needs the notice.
+        self.update_live_notice(now);
         if self.completion_pending
             && now.duration_since(self.phase_started) >= PROCESSING_MORPH_DURATION
         {
-            self.width.reset(CAPSULE_HEIGHT);
             self.processing.reset(1.0);
             self.phase = Phase::Completed;
             self.phase_started = now;
@@ -846,13 +1102,16 @@ impl MetalRenderer {
         let target_width = match self.phase {
             Phase::Preparing => CAPSULE_WIDTH,
             Phase::Recording => recording_width(recording_average),
-            Phase::Transcribing => CAPSULE_HEIGHT,
-            Phase::Hidden | Phase::Completed | Phase::Cancelled | Phase::Failed => self.width.value,
+            // The capsule keeps its width; its lines change color and pace.
+            Phase::Transcribing => CAPSULE_WIDTH,
+            Phase::Hidden | Phase::Completed | Phase::Cancelled | Phase::Failed | Phase::Notice => {
+                self.width.value
+            }
         };
         let target_processing = match self.phase {
             Phase::Preparing | Phase::Recording => 0.0,
             Phase::Transcribing => 1.0,
-            Phase::Hidden | Phase::Completed | Phase::Cancelled | Phase::Failed => {
+            Phase::Hidden | Phase::Completed | Phase::Cancelled | Phase::Failed | Phase::Notice => {
                 self.processing.value
             }
         };
@@ -964,6 +1223,12 @@ impl MetalRenderer {
             recording_hue_shift,
             transcription_hue_shift,
             brightness: preferences.brightness.factor(),
+            light: if preferences.appearance.is_dark(self.system_dark) {
+                0.0
+            } else {
+                1.0
+            },
+            silenced: self.notice_ease(now).map_or(0.0, |(_, ease)| ease),
         };
         encoder.set_fragment_bytes(
             0,
@@ -1142,6 +1407,56 @@ mod tests {
     }
 
     #[test]
+    fn recording_warns_at_once_about_a_silent_or_quiet_microphone() {
+        let mut renderer = MetalRenderer::new().expect("local macOS checks require Metal");
+        renderer.handle(DictationIndicatorEvent::Started);
+        let start = Instant::now();
+        renderer.phase_started = start;
+        let feed = |renderer: &mut MetalRenderer, from_ms: u64, to_ms: u64, peak: f32| {
+            for ms in (from_ms..to_ms).step_by(20) {
+                renderer
+                    .peak_history
+                    .push_back((start + Duration::from_millis(ms), peak));
+            }
+        };
+        let at = |ms: u64| start + Duration::from_millis(ms);
+
+        // Nothing is judged in the first second.
+        feed(&mut renderer, 0, 900, 0.0);
+        assert_eq!(renderer.live_notice_for(at(900)), None);
+        // A muted or disconnected microphone: a second of digital silence.
+        feed(&mut renderer, 900, 1_200, 0.0);
+        assert_eq!(
+            renderer.live_notice_for(at(1_200)),
+            Some(HudNotice::NoAudio)
+        );
+        // No samples arriving at all is the same.
+        renderer.peak_history.clear();
+        assert_eq!(
+            renderer.live_notice_for(at(1_200)),
+            Some(HudNotice::NoAudio)
+        );
+
+        // Faint room sound is not "No audio", but stays "Low audio" once
+        // the speaker had time to talk.
+        feed(&mut renderer, 0, 2_000, 0.004);
+        assert_eq!(renderer.live_notice_for(at(2_000)), None);
+        feed(&mut renderer, 2_000, 2_600, 0.004);
+        assert_eq!(
+            renderer.live_notice_for(at(2_600)),
+            Some(HudNotice::LowAudio)
+        );
+        // Normal speech clears it immediately.
+        feed(&mut renderer, 2_600, 2_700, 0.2);
+        assert_eq!(renderer.live_notice_for(at(2_700)), None);
+
+        // Never outside recording.
+        renderer.handle(DictationIndicatorEvent::Submitted { job_id: 1 });
+        renderer.peak_history.clear();
+        assert_eq!(renderer.live_notice_for(at(5_000)), None);
+    }
+
+    #[test]
     fn entrance_reaches_recording_state_in_about_250ms_without_overshoot() {
         let simulate = |frame_rate: usize| {
             let mut opacity = Spring::new(0.0);
@@ -1223,7 +1538,7 @@ mod tests {
 
     #[test]
     fn rust_uniform_layout_matches_metal() {
-        assert_eq!(std::mem::size_of::<Uniforms>(), 120);
+        assert_eq!(std::mem::size_of::<Uniforms>(), 128);
         assert_eq!(std::mem::align_of::<Uniforms>(), 8);
         assert_eq!(std::mem::offset_of!(Uniforms, sphere_outline), 92);
         assert_eq!(std::mem::offset_of!(Uniforms, recording_flash), 100);
@@ -1231,6 +1546,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Uniforms, recording_hue_shift), 108);
         assert_eq!(std::mem::offset_of!(Uniforms, transcription_hue_shift), 112);
         assert_eq!(std::mem::offset_of!(Uniforms, brightness), 116);
+        assert_eq!(std::mem::offset_of!(Uniforms, light), 120);
     }
 
     #[test]
@@ -1305,30 +1621,27 @@ mod tests {
     }
 
     #[test]
-    fn processing_morph_duration_matches_geometry_spring() {
-        let mut width = Spring::new(CAPSULE_WIDTH);
+    fn transcription_transition_settles_before_completion() {
+        let mut processing = Spring::new(0.0);
         for _ in 0..15 {
-            width.step_critical(CAPSULE_HEIGHT, 1.0 / 60.0, GEOMETRY_ANGULAR_FREQUENCY);
+            processing.step_critical(1.0, 1.0 / 60.0, GEOMETRY_ANGULAR_FREQUENCY);
         }
-        assert!(width.value < CAPSULE_HEIGHT + 0.7);
+        assert!(processing.value > 0.98);
         assert_eq!(PROCESSING_MORPH_DURATION, Duration::from_millis(250));
     }
 
     #[test]
-    fn processing_morph_only_contracts_the_capsule() {
-        let mut width = Spring::new(CAPSULE_WIDTH);
-        let mut height = Spring::new(CAPSULE_HEIGHT);
-        let mut previous_width = width.value;
-
-        for _ in 0..15 {
-            width.step_critical(CAPSULE_HEIGHT, 1.0 / 60.0, GEOMETRY_ANGULAR_FREQUENCY);
-            height.step_critical(CAPSULE_HEIGHT, 1.0 / 60.0, GEOMETRY_ANGULAR_FREQUENCY);
-            assert!((CAPSULE_HEIGHT..=previous_width).contains(&width.value));
-            assert_eq!(height.value, CAPSULE_HEIGHT);
-            previous_width = width.value;
+    fn transcription_keeps_the_capsule_width() {
+        let mut renderer = MetalRenderer::new().expect("local macOS checks require Metal");
+        renderer.handle(DictationIndicatorEvent::Started);
+        renderer.handle(DictationIndicatorEvent::Submitted { job_id: 1 });
+        renderer.handle(DictationIndicatorEvent::Transcribing { job_id: 1 });
+        let start = Instant::now();
+        for frame in 1..=30 {
+            renderer.draw_with(start + Duration::from_millis(frame * 16), |_| None);
         }
-
-        assert!(width.value < CAPSULE_HEIGHT + 0.7);
+        assert!(matches!(renderer.phase, Phase::Transcribing));
+        assert!(renderer.width.value > CAPSULE_WIDTH - 0.5);
     }
 
     #[test]

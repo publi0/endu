@@ -51,7 +51,7 @@ jobs:
             needed=false
           elif [ "$EVENT" = "workflow_dispatch" ] || [ "$BUILD" = "true" ]; then
             needed=true
-          elif grep -qx "  version \"$VERSION\"" Casks/hex-openrouter.rb; then
+          elif grep -qx "  version \"$VERSION\"" Casks/endu.rb 2>/dev/null; then
             # Published and already in the cask: nothing to build or repair.
             needed=false
           else

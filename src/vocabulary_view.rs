@@ -1,12 +1,13 @@
+use crate::i18n::t;
 use std::time::Duration;
 
 use gpui::{
     AnyElement, Context, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, Render,
-    ScrollHandle, Subscription, Window, div, prelude::*, px, rgb,
+    ScrollHandle, Subscription, Window, div, prelude::*, px,
 };
 
 use crate::desktop_ui::{
-    ACCENT, LINE, MUTED, NEGATIVE, SURFACE_HOVER, TEXT, compact_button, settings_panel,
+    ACCENT, LINE, MUTED, NEGATIVE, SURFACE_HOVER, TEXT, compact_button, rgb, settings_panel,
     settings_row, settings_section_label, toggle,
 };
 use crate::text_input::{self, Changed, Dismissed, EditFinished, Submitted, TextInput};
@@ -48,9 +49,13 @@ impl EventEmitter<VocabularyChange> for VocabularyView {}
 impl VocabularyView {
     pub fn new(preferences: Vocabulary, preview: bool, cx: &mut Context<Self>) -> Self {
         let names = cx.new(|cx| {
-            TextInput::new(cx, "Add a name or phrase, then press Enter", "").commit_on_blur()
+            TextInput::new(cx, "", "")
+                .localized_placeholder(|| t("Add a name or phrase, then press Enter"))
+                .commit_on_blur()
         });
-        let sample = cx.new(|cx| TextInput::new(cx, "Try a name or a sentence", ""));
+        let sample = cx.new(|cx| {
+            TextInput::new(cx, "", "").localized_placeholder(|| t("Try a name or a sentence"))
+        });
         let subscriptions = vec![
             cx.subscribe(&names, |_, _, _: &Changed, cx| cx.notify()),
             cx.subscribe(&names, |this, _, _: &Submitted, cx| this.finish(cx)),
@@ -483,7 +488,7 @@ impl VocabularyView {
     }
 
     fn render_example(&self) -> AnyElement {
-        let column = |title: &'static str, text: String, color: u32| {
+        let column = |title: &'static str, text: String, color: crate::desktop_ui::ThemeColor| {
             div()
                 .flex_1()
                 .min_w_0()
@@ -499,12 +504,12 @@ impl VocabularyView {
         div()
             .p_4()
             .border_b_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(crate::desktop_ui::DIVIDER))
             .child(
                 div()
                     .text_size(px(13.0))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child("Example"),
+                    .child(t("Example")),
             )
             .child(
                 div()
@@ -512,17 +517,19 @@ impl VocabularyView {
                     .mb_3()
                     .text_size(px(11.0))
                     .text_color(rgb(MUTED))
-                    .child(format!(
-                        "With {}, {} and {} in the list",
-                        EXAMPLE_NAMES[0], EXAMPLE_NAMES[1], EXAMPLE_NAMES[2]
+                    .child(tf!(
+                        "With {first}, {second} and {third} in the list",
+                        first = EXAMPLE_NAMES[0],
+                        second = EXAMPLE_NAMES[1],
+                        third = EXAMPLE_NAMES[2]
                     )),
             )
             .child(
                 div()
                     .flex()
                     .gap_4()
-                    .child(column("Original", EXAMPLE.into(), MUTED))
-                    .child(column("Result", self.example_result(), TEXT)),
+                    .child(column(t("Original"), EXAMPLE.into(), MUTED))
+                    .child(column(t("Result"), self.example_result(), TEXT)),
             )
             .into_any_element()
     }
@@ -533,7 +540,10 @@ impl VocabularyView {
 
     fn recheck(&mut self, cx: &mut Context<Self>) {
         if self.preview {
-            self.support = vec![("Preview".into(), "Model checks are simulated here".into())];
+            self.support = vec![(
+                t("Preview").into(),
+                t("Model checks are simulated here").into(),
+            )];
         } else {
             crate::openrouter::vocabulary_support::schedule(true);
             self.support = crate::openrouter::vocabulary_support::status();
@@ -554,35 +564,35 @@ impl Render for VocabularyView {
         let editor = self.render_names(window, cx);
         let names = div().p_4().border_b_1().border_color(rgb(LINE))
             .child(div().text_size(px(13.0)).font_weight(gpui::FontWeight::SEMIBOLD)
-                .child(if self.remote { "Shared keywords" } else { "Names and terms" }))
+                .child(if self.remote { t("Shared keywords") } else { t("Names and terms") }))
             .child(div().mt_1().mb_3().text_size(px(11.0)).text_color(rgb(MUTED))
-                .child(if self.remote { "Press Enter to add a phrase. Paste a list separated by commas or new lines. Shared by compatible models, in this order." }
-                    else { "Press Enter to add a name or phrase. Paste a list separated by commas or new lines. Shared with Keywords in Models." }))
+                .child(if self.remote { t("Press Enter to add a phrase. Paste a list separated by commas or new lines. Shared by compatible models, in this order.") }
+                    else { t("Press Enter to add a name or phrase. Paste a list separated by commas or new lines. Shared with Keywords in Models.") }))
             .child(editor)
             .when_some(self.error.clone(), |row, error| row.child(div().mt_2().text_size(px(11.0)).text_color(rgb(NEGATIVE)).child(error)));
         let mut panel = settings_panel().child(names);
         if self.remote {
             panel = panel.child(self.rule(
                 0,
-                "Send keywords",
-                "Only terms that fit each model’s supported limits are sent",
+                t("Send keywords"),
+                t("Only terms that fit each model’s supported limits are sent"),
                 self.preferences.remote_hints,
                 cx,
             ));
         } else {
             panel = panel
-                .child(self.rule(1, "Restore names locally", "Restores case, spacing and punctuation after other formatting", self.preferences.restore_names, cx))
-                .child(self.rule(2, "Correct small spelling errors", "Only long names with one changed letter and a single clear match; URLs and code stay unchanged", self.preferences.approximate, cx))
+                .child(self.rule(1, t("Restore names locally"), t("Restores case, spacing and punctuation after other formatting"), self.preferences.restore_names, cx))
+                .child(self.rule(2, t("Correct small spelling errors"), t("Only long names with one changed letter and a single clear match; URLs and code stay unchanged"), self.preferences.approximate, cx))
                 .child(self.render_example())
-                .child(div().p_4().child(div().mb_2().text_size(px(11.0)).text_color(rgb(MUTED)).child("Try the local correction"))
+                .child(div().p_4().child(div().mb_2().text_size(px(11.0)).text_color(rgb(MUTED)).child(t("Try the local correction")))
                     .child(self.sample.clone())
                     .when(!result.is_empty(), |row| row.child(div().mt_2().text_size(px(12.0)).text_color(rgb(TEXT)).child(result))));
         }
         div()
             .child(settings_section_label(if self.remote {
-                "KEYWORDS"
+                t("Keywords")
             } else {
-                "LOCAL VOCABULARY"
+                t("Local vocabulary")
             }))
             .child(panel)
             .when(self.remote, |view| {
@@ -595,13 +605,13 @@ impl Render for VocabularyView {
                             .justify_between()
                             .child(div().text_size(px(11.0)).text_color(rgb(MUTED)).child(
                                 if self.preview {
-                                    "OpenRouter support · isolated preview"
+                                    t("OpenRouter support · isolated preview")
                                 } else {
-                                    "OpenRouter support · cached verification"
+                                    t("OpenRouter support · cached verification")
                                 },
                             ))
                             .child(
-                                compact_button("Recheck OpenRouter")
+                                compact_button(t("Recheck OpenRouter"))
                                     .id("vocabulary-recheck")
                                     .track_focus(&self.focus[3])
                                     .on_click(cx.listener(|this, event, _, cx| {

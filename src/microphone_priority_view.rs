@@ -3,13 +3,14 @@
 
 use gpui::{
     AnyElement, ClickEvent, Context, EventEmitter, FocusHandle, IntoElement, KeyDownEvent,
-    MouseDownEvent, Render, Window, div, prelude::*, px, rgb,
+    MouseDownEvent, Render, Window, div, prelude::*, px,
 };
 
 use crate::desktop_ui::{
     ACCENT, LINE, MUTED, NEGATIVE, PickerState, SURFACE, SURFACE_HOVER, SURFACE_SELECTED, TEXT,
-    TEXT_SOFT, compact_button, picker_open_key, picker_popup, settings_row,
+    TEXT_SOFT, compact_button, picker_open_key, picker_popup, rgb, settings_row,
 };
+use crate::i18n::t;
 use crate::microphone::DevicePreference;
 
 pub struct PriorityChange(pub Vec<DevicePreference>);
@@ -231,9 +232,9 @@ impl MicrophonePriorityView {
     fn render_picker(&self, cx: &mut Context<Self>) -> AnyElement {
         let choices = self.choices();
         let message = if self.loading {
-            Some("Looking for microphones…")
+            Some(t("Looking for microphones…"))
         } else if choices.is_empty() && self.catalog_error.is_none() {
-            Some("No more connected microphones to add.")
+            Some(t("No more connected microphones to add."))
         } else {
             None
         };
@@ -351,7 +352,7 @@ impl Render for MicrophonePriorityView {
             .relative()
             .flex_none()
             .child(
-                compact_button("Add microphone")
+                compact_button(t("Add microphone"))
                     .id("microphone-priority-add")
                     .track_focus(&self.picker.trigger.clone().tab_stop(self.pending.is_none()))
                     .border_1()
@@ -388,8 +389,8 @@ impl Render for MicrophonePriorityView {
                 }
             })
             .child(settings_row(
-                "Automatic priority",
-                "Used when Input device is Automatic",
+                t("Automatic priority"),
+                t("Used when Input device is Automatic"),
                 add,
             ))
             .children(
@@ -407,7 +408,7 @@ impl Render for MicrophonePriorityView {
                             .items_center()
                             .gap_3()
                             .border_b_1()
-                            .border_color(rgb(LINE))
+                            .border_color(rgb(crate::desktop_ui::DIVIDER))
                             .child(
                                 div()
                                     .flex_none()
@@ -427,7 +428,7 @@ impl Render for MicrophonePriorityView {
                                             div()
                                                 .text_size(px(10.0))
                                                 .text_color(rgb(MUTED))
-                                                .child("Disconnected — kept in this order"),
+                                                .child(t("Disconnected — kept in this order")),
                                         )
                                     }),
                             )
@@ -438,7 +439,7 @@ impl Render for MicrophonePriorityView {
                                     .gap_1()
                                     .child(self.row_button(index, 0, "↑", cx))
                                     .child(self.row_button(index, 1, "↓", cx))
-                                    .child(self.row_button(index, 2, "Remove", cx)),
+                                    .child(self.row_button(index, 2, t("Remove"), cx)),
                             )
                     }),
             )
@@ -447,7 +448,7 @@ impl Render for MicrophonePriorityView {
                     .px_4()
                     .py_3()
                     .border_b_1()
-                    .border_color(rgb(LINE))
+                    .border_color(rgb(crate::desktop_ui::DIVIDER))
                     .text_size(px(11.0))
                     .text_color(rgb(MUTED))
                     .child(self.priority_note()),
@@ -465,7 +466,10 @@ impl Render for MicrophonePriorityView {
 impl MicrophonePriorityView {
     fn priority_note(&self) -> String {
         if !self.preferences.is_empty() {
-            return "Unavailable microphones are skipped. The system default is tried after this list.".into();
+            return t(
+                "Unavailable microphones are skipped. The system default is tried after this list.",
+            )
+            .into();
         }
         let connected = self
             .catalog
@@ -473,14 +477,18 @@ impl MicrophonePriorityView {
             .map(crate::audio::legacy_automatic_preferences)
             .unwrap_or_default();
         if connected.is_empty() {
-            "Using the system default microphone. Add microphones to choose your own order.".into()
+            t("Using the system default microphone. Add microphones to choose your own order.")
+                .into()
         } else {
             let names = connected
                 .iter()
                 .map(|device| device.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("Using {names} when connected, then the system default.")
+            tf!(
+                "Using {names} when connected, then the system default.",
+                names = names
+            )
         }
     }
 }

@@ -1,9 +1,14 @@
+#[cfg(target_os = "macos")]
+#[macro_use]
+mod i18n;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod app_paths;
 #[cfg(target_os = "macos")]
 mod app_settings;
 #[cfg(target_os = "macos")]
 mod app_window;
+#[cfg(target_os = "macos")]
+mod appearance;
 #[cfg(target_os = "macos")]
 mod audio;
 #[cfg(target_os = "macos")]
@@ -18,6 +23,8 @@ mod dictation;
 mod dictation_audio;
 #[cfg(target_os = "macos")]
 mod dictation_indicator;
+#[cfg(target_os = "macos")]
+mod doorbell;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod events;
 #[cfg(target_os = "macos")]
@@ -47,6 +54,8 @@ mod microphone_priority_view;
 #[cfg(target_os = "macos")]
 mod model_options_view;
 #[cfg(target_os = "macos")]
+mod nav_icons;
+#[cfg(target_os = "macos")]
 mod onboarding;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod openrouter;
@@ -75,6 +84,8 @@ mod recording_environment;
 mod recording_recovery;
 #[cfg(target_os = "macos")]
 mod sound_settings_view;
+#[cfg(target_os = "macos")]
+mod start_cue;
 #[cfg(target_os = "macos")]
 mod status_item;
 #[cfg(target_os = "macos")]
@@ -146,6 +157,12 @@ enum Command {
         hud_brightness: Option<hud_settings::HudBrightness>,
         #[arg(long, value_parser = clap::value_parser!(u16).range(0..=160))]
         hud_distance: Option<u16>,
+        /// Light or dark override for the preview window, or the HUD in dictation-hud.
+        #[arg(long, value_enum)]
+        appearance: Option<appearance::Appearance>,
+        /// Interface language for the preview window (default: English).
+        #[arg(long, value_enum)]
+        language: Option<i18n::LanguagePreference>,
     },
 }
 
@@ -204,6 +221,8 @@ fn main() -> Result<()> {
             hud_size,
             hud_brightness,
             hud_distance,
+            appearance,
+            language,
         } => {
             if (hud_position.is_some()
                 || recording_color.is_some()
@@ -228,6 +247,7 @@ fn main() -> Result<()> {
                             size: hud_size.unwrap_or(defaults.size),
                             brightness: hud_brightness.unwrap_or(defaults.brightness),
                             edge_distance: hud_distance.unwrap_or(defaults.edge_distance),
+                            appearance: appearance.unwrap_or(defaults.appearance),
                             ..defaults
                         }),
                     );
@@ -253,6 +273,8 @@ fn main() -> Result<()> {
                     onboarding: matches!(target, AppPreviewTarget::Onboarding),
                     permissions_missing,
                     open_history_retention,
+                    appearance: appearance.unwrap_or_default(),
+                    language: language.unwrap_or(i18n::LanguagePreference::English),
                 }),
             )
         }
@@ -262,7 +284,7 @@ fn main() -> Result<()> {
 #[cfg(not(target_os = "macos"))]
 fn main() -> Result<()> {
     let _ = &SHUTDOWN;
-    color_eyre::eyre::bail!("HEX runs on macOS only")
+    color_eyre::eyre::bail!("Endu runs on macOS only")
 }
 
 #[cfg(all(test, target_os = "macos"))]

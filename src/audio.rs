@@ -407,7 +407,7 @@ impl RecoveringAudioInput {
     #[cfg(test)]
     pub fn pending_for_test() -> (Self, Sender<InputOpenResult>) {
         let mut input = Self::closed(
-            Some("HEX nonexistent microphone for pending open test"),
+            Some("Endu nonexistent microphone for pending open test"),
             0,
             None,
             &[],
@@ -1524,7 +1524,7 @@ mod tests {
     #[test]
     fn startup_recovery_opens_even_when_a_capture_is_pending() {
         let mut input = RecoveringAudioInput::closed(
-            Some("HEX nonexistent microphone for pending recovery test"),
+            Some("Endu nonexistent microphone for pending recovery test"),
             3,
             None,
             &[],

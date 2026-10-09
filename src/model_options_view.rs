@@ -4,14 +4,15 @@
 use crate::desktop_ui::{
     ACCENT, LINE, NEGATIVE, NUMBER_INPUT_WIDTH, PickerState, SETTINGS_CONTROL_WIDTH, SURFACE,
     SURFACE_HOVER, SURFACE_SELECTED, TEXT_SOFT, disclosure_button, picker_open_key, picker_popup,
-    settings_panel, settings_row, settings_section_label, toggle,
+    rgb, settings_panel, settings_row, settings_section_label, toggle,
 };
-use crate::openrouter::{Config, LANGUAGES, settings_view::ConfigChanged};
+use crate::i18n::t;
+use crate::openrouter::{Config, LANGUAGES, catalog, settings_view::ConfigChanged};
 use crate::providers::{self, ModelOptions, ModelRef};
 use crate::text_input::{Changed, Dismissed, EditFinished, Submitted, TextInput};
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyDownEvent,
-    MouseDownEvent, Render, Subscription, Window, div, prelude::*, px, rgb,
+    MouseDownEvent, Render, Subscription, Window, div, prelude::*, px,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -36,6 +37,8 @@ enum Edit {
 pub struct ModelOptionsView {
     config: Config,
     available_providers: Vec<providers::Provider>,
+    /// OpenRouter display names, shared with the primary/fallback selectors.
+    catalog: Vec<catalog::CatalogModel>,
     preview: bool,
     selected: Option<String>,
     saved: ModelOptions,
@@ -64,10 +67,15 @@ impl ModelOptionsView {
             .map(|id| providers::options(&config, id))
             .unwrap_or_default();
         let context = cx.new(|cx| {
-            TextInput::new(cx, "Optional context for this model", &saved.prompt).commit_on_blur()
+            TextInput::new(cx, "", &saved.prompt)
+                .localized_placeholder(|| t("Optional context for this model"))
+                .commit_on_blur()
         });
-        let temperature =
-            cx.new(|cx| TextInput::new(cx, "Default", temperature_text(&saved)).commit_on_blur());
+        let temperature = cx.new(|cx| {
+            TextInput::new(cx, "", temperature_text(&saved))
+                .localized_placeholder(|| t("Default"))
+                .commit_on_blur()
+        });
         let mut subscriptions = Vec::new();
         for (index, input) in [context.clone(), temperature.clone()]
             .into_iter()
@@ -98,6 +106,7 @@ impl ModelOptionsView {
             } else {
                 Vec::new()
             },
+            catalog: Vec::new(),
             preview,
             selected,
             saved,
@@ -111,6 +120,17 @@ impl ModelOptionsView {
             model_open: false,
             toggles: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             _subscriptions: subscriptions,
+        }
+    }
+
+    pub fn catalog(&self) -> &[catalog::CatalogModel] {
+        &self.catalog
+    }
+
+    pub fn set_catalog(&mut self, models: Vec<catalog::CatalogModel>, cx: &mut Context<Self>) {
+        if models != self.catalog {
+            self.catalog = models;
+            cx.notify();
         }
     }
 
@@ -390,7 +410,7 @@ impl ModelOptionsView {
                 row.children(self.error_note(field))
             })
             .border_b_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(crate::desktop_ui::DIVIDER))
             .into_any_element()
     }
     fn toggle_row(
@@ -424,8 +444,8 @@ impl ModelOptionsView {
         let label = self
             .selected
             .as_deref()
-            .map(|id| ModelRef::parse(id).label())
-            .unwrap_or_else(|| "No model with a configured provider".into());
+            .map(|id| catalog::selector_label(id, &self.catalog))
+            .unwrap_or_else(|| t("No model with a configured provider").into());
         let menu =
             self.model_open.then(|| {
                 menu_frame("provider-options-model-menu")
@@ -445,7 +465,7 @@ impl ModelOptionsView {
                             .children(self.available_models().iter().enumerate().map(
                                 |(index, id)| {
                                     choice(
-                                        ModelRef::parse(id).label(),
+                                        catalog::selector_label(id, &self.catalog),
                                         index == self.model_picker.highlight,
                                     )
                                     .id(("provider-model-choice", index))
@@ -499,7 +519,7 @@ impl ModelOptionsView {
                         .overflow_y_scroll()
                         .track_scroll(&self.language_picker.scroll)
                         .children(LANGUAGES.iter().enumerate().map(|(index, (_, name))| {
-                            choice((*name).into(), index == self.language_picker.highlight)
+                            choice(t(name).into(), index == self.language_picker.highlight)
                                 .id(("provider-language-choice", index))
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.choose_language(index, window, cx)
@@ -513,23 +533,21 @@ impl ModelOptionsView {
             .relative()
             .flex_none()
             .child(
-                disclosure_button(
-                    crate::openrouter::language_name(&self.saved.language).to_owned(),
-                )
-                .id("provider-model-language")
-                .track_focus(&self.language_picker.trigger)
-                .focus(|style| style.border_color(rgb(ACCENT)))
-                .on_click(cx.listener(|this, event, window, cx| {
-                    if matches!(event, gpui::ClickEvent::Mouse(_)) {
-                        this.toggle_language(window, cx);
-                    }
-                }))
-                .on_key_down(cx.listener(|this, event, window, cx| {
-                    if picker_open_key(event) {
-                        this.toggle_language(window, cx);
-                        cx.stop_propagation();
-                    }
-                })),
+                disclosure_button(crate::openrouter::language_label(&self.saved.language))
+                    .id("provider-model-language")
+                    .track_focus(&self.language_picker.trigger)
+                    .focus(|style| style.border_color(rgb(ACCENT)))
+                    .on_click(cx.listener(|this, event, window, cx| {
+                        if matches!(event, gpui::ClickEvent::Mouse(_)) {
+                            this.toggle_language(window, cx);
+                        }
+                    }))
+                    .on_key_down(cx.listener(|this, event, window, cx| {
+                        if picker_open_key(event) {
+                            this.toggle_language(window, cx);
+                            cx.stop_propagation();
+                        }
+                    })),
             )
             .children(menu.map(picker_popup))
             .into_any_element()
@@ -539,27 +557,27 @@ impl ModelOptionsView {
 impl Render for ModelOptionsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut panel = settings_panel().child(settings_row(
-            "Model",
-            "Options are remembered for each model, including after removal from the chain.",
+            t("Model"),
+            t("Options are remembered for each model, including after removal from the chain."),
             self.render_model_selector(cx),
         ));
         if let Some(id) = &self.selected {
             let caps = ModelRef::parse(id).capabilities();
             panel = panel.child(self.row(
                 Field::Language,
-                "Language",
-                "Spoken-language hint for this model",
+                t("Language"),
+                t("Spoken-language hint for this model"),
                 self.render_language(cx),
             ));
             if caps.streaming {
-                panel = panel.child(self.toggle_row(Field::Streaming, 0, "Streaming", "Transcribe while recording. Silence trimming applies only to recorded-audio requests.", self.saved.streaming, cx));
+                panel = panel.child(self.toggle_row(Field::Streaming, 0, t("Streaming"), t("Transcribe while recording. Silence trimming applies only to recorded-audio requests."), self.saved.streaming, cx));
             }
             if caps.prompt {
                 panel = panel.child(
                     self.row(
                         Field::Context,
-                        "Context",
-                        "Optional instructions or context supported by this model",
+                        t("Context"),
+                        t("Optional instructions or context supported by this model"),
                         div()
                             .debug_selector(|| "model-options-context".into())
                             .w(px(SETTINGS_CONTROL_WIDTH))
@@ -572,8 +590,8 @@ impl Render for ModelOptionsView {
                 panel = panel.child(
                     self.row(
                         Field::Temperature,
-                        "Temperature",
-                        "0 to 1; leave empty to use the provider default",
+                        t("Temperature"),
+                        t("0 to 1; leave empty to use the provider default"),
                         div()
                             .w(px(NUMBER_INPUT_WIDTH))
                             .child(self.temperature.clone())
@@ -587,9 +605,9 @@ impl Render for ModelOptionsView {
                     Field::SmartFormat,
                     1,
                     if google {
-                        "Smart transcription"
+                        t("Smart transcription")
                     } else {
-                        "Smart formatting"
+                        t("Smart formatting")
                     },
                     formatting_description(ModelRef::parse(id).provider),
                     self.saved.smart_format,
@@ -600,8 +618,8 @@ impl Render for ModelOptionsView {
                 panel = panel.child(self.toggle_row(
                     Field::Punctuate,
                     2,
-                    "Punctuation",
-                    "Ask the provider to add punctuation",
+                    t("Punctuation"),
+                    t("Ask the provider to add punctuation"),
                     self.saved.punctuate,
                     cx,
                 ));
@@ -610,8 +628,8 @@ impl Render for ModelOptionsView {
                 panel = panel.child(self.toggle_row(
                     Field::Numerals,
                     3,
-                    "Numerals",
-                    "Ask the provider to render numbers as digits",
+                    t("Numerals"),
+                    t("Ask the provider to render numbers as digits"),
                     self.saved.numerals,
                     cx,
                 ));
@@ -620,8 +638,8 @@ impl Render for ModelOptionsView {
                 panel = panel.child(self.toggle_row(
                     Field::NoVerbatim,
                     4,
-                    "Clean transcription",
-                    "Use this model's non-verbatim transcription option",
+                    t("Clean transcription"),
+                    t("Use this model's non-verbatim transcription option"),
                     self.saved.no_verbatim,
                     cx,
                 ));
@@ -638,16 +656,16 @@ impl Render for ModelOptionsView {
                     cx.stop_propagation();
                 }
             })
-            .child(settings_section_label("MODEL OPTIONS"))
+            .child(settings_section_label(t("Model options")))
             .child(panel)
     }
 }
 
 fn formatting_description(provider: providers::Provider) -> &'static str {
     if provider == providers::Provider::Google {
-        "Remove fillers and repetitions and format the transcript together"
+        t("Remove fillers and repetitions and format the transcript together")
     } else {
-        "Let the provider format dates, amounts and similar expressions"
+        t("Let the provider format dates, amounts and similar expressions")
     }
 }
 
@@ -674,7 +692,7 @@ fn parse_temperature(text: &str) -> Result<Option<f32>, String> {
         .ok()
         .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
         .map(Some)
-        .ok_or_else(|| "Temperature must be between 0 and 1.".into())
+        .ok_or_else(|| t("Temperature must be between 0 and 1.").into())
 }
 fn edit_model(base: &Config, id: &str, edit: &Edit) -> Result<Config, String> {
     let model = ModelRef::parse(id);
@@ -689,7 +707,7 @@ fn edit_model(base: &Config, id: &str, edit: &Edit) -> Result<Config, String> {
         Edit::Toggle(Field::Punctuate, value) if caps.punctuate => options.punctuate = *value,
         Edit::Toggle(Field::Numerals, value) if caps.numerals => options.numerals = *value,
         Edit::Toggle(Field::NoVerbatim, value) if caps.no_verbatim => options.no_verbatim = *value,
-        _ => return Err("This model does not support that option.".into()),
+        _ => return Err(t("This model does not support that option.").into()),
     }
     options.validate()?;
     let mut config = base.clone();

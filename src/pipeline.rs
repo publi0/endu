@@ -7,22 +7,22 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use color_eyre::eyre::Result;
 
 use crate::context::ContextSnapshot;
 use crate::dictation::DictationClip;
+use crate::doorbell::Doorbell;
 use crate::history::{History, HistoryDraft};
 use crate::openrouter::StepReport;
 use crate::paste::{PasteOptions, PasteOutcome, Paster};
 use crate::suppression::InputActivity;
 
 const MAX_PENDING_OUTPUTS: usize = 16;
-const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 pub enum WorkerEvent {
     ReadyToPaste {
@@ -35,6 +35,10 @@ pub enum WorkerEvent {
     },
     /// The job left the queue and is being transcribed.
     Transcribing {
+        job_id: DictationJobId,
+    },
+    /// The job's recording was very quiet.
+    Quiet {
         job_id: DictationJobId,
     },
     Cancelled {
@@ -88,6 +92,8 @@ struct LastTranscript {
 
 enum OutputJob {
     PreparePaste,
+    /// Wakes the blocked worker so it observes shutdown.
+    Shutdown,
     Completed {
         job_id: DictationJobId,
         control: Arc<JobControl>,
@@ -105,7 +111,7 @@ enum OutputJob {
 impl OutputJob {
     fn sequence(&self) -> u64 {
         match self {
-            Self::PreparePaste => u64::MAX,
+            Self::PreparePaste | Self::Shutdown => u64::MAX,
             Self::Completed { job_id, .. } | Self::Cancelled { job_id } => job_id.0,
             Self::PasteLast { sequence, .. } => *sequence,
         }
@@ -212,13 +218,32 @@ impl WorkerState {
     }
 }
 
+/// Worker events for the listener. Each send rings its doorbell: the output
+/// worker stops reporting busy just before its final event, and an idle
+/// listener must still report that event at once.
+#[derive(Clone)]
+struct WorkerEvents {
+    sender: mpsc::Sender<WorkerEvent>,
+    wake: Arc<Doorbell>,
+}
+
+impl WorkerEvents {
+    fn send(&self, event: WorkerEvent) -> Result<(), mpsc::SendError<WorkerEvent>> {
+        self.sender.send(event)?;
+        self.wake.ring();
+        Ok(())
+    }
+}
+
 impl DictationWorker {
     pub fn start(
         activity: InputActivity,
         history: Option<History>,
         recovery: crate::recording_recovery::RecordingRecovery,
+        wake: Arc<Doorbell>,
     ) -> Self {
         Self::start_with(
+            wake,
             history,
             move |samples, context, vocabulary, live, preferences| {
                 recovery.transcribe_original(
@@ -243,6 +268,7 @@ impl DictationWorker {
     }
 
     fn start_with(
+        wake: Arc<Doorbell>,
         history: Option<History>,
         transcribe: impl FnMut(
             &[f32],
@@ -259,6 +285,10 @@ impl DictationWorker {
             mpsc::sync_channel::<TranscriptionJob>(4);
         let (output_jobs, output_receiver) = mpsc::sync_channel::<OutputJob>(8);
         let (event_sender, events) = mpsc::channel();
+        let event_sender = WorkerEvents {
+            sender: event_sender,
+            wake,
+        };
         let state = Arc::new(Mutex::new(WorkerState::default()));
 
         let output_worker = thread::spawn({
@@ -403,7 +433,12 @@ impl DictationWorker {
             state.pending_pastes = 0;
         }
         self.transcription_jobs.take();
-        self.output_jobs.take();
+        // A detached transcription worker can keep its sender alive, so the
+        // output worker would not see a disconnect. If the queue is full, the
+        // worker is not waiting and checks shutdown after its next job.
+        if let Some(output_jobs) = self.output_jobs.take() {
+            let _ = output_jobs.try_send(OutputJob::Shutdown);
+        }
         join_worker(self.output_worker.take(), "dictation output");
         if let Some(worker) = self.transcription_worker.take()
             && worker.is_finished()
@@ -424,7 +459,7 @@ impl Drop for DictationWorker {
 fn run_transcription_worker(
     jobs: Receiver<TranscriptionJob>,
     output: &SyncSender<OutputJob>,
-    events: &mpsc::Sender<WorkerEvent>,
+    events: &WorkerEvents,
     state: &Mutex<WorkerState>,
     mut transcribe: impl FnMut(
         &[f32],
@@ -449,7 +484,9 @@ fn run_transcription_worker(
         let input_description = job.clip.input.clone();
         let live = job.clip.live.take().map(|live| *live);
         let samples = job.clip.into_transcription_samples();
-        crate::microphone::record(&samples, input_description);
+        if crate::microphone::record(&samples, input_description) {
+            let _ = events.send(WorkerEvent::Quiet { job_id: job.job_id });
+        }
         let started = Instant::now();
         let result = transcribe(
             &samples,
@@ -506,17 +543,16 @@ fn run_output_worker(
     paste: &mut PasteFn<'_>,
     history: Option<History>,
     state: &Mutex<WorkerState>,
-    events: &mpsc::Sender<WorkerEvent>,
+    events: &WorkerEvents,
 ) {
     let mut last_transcript = None;
     let mut ordered = OrderedOutputs::default();
     while !is_shutting_down(state) {
-        let job = match jobs.recv_timeout(SHUTDOWN_POLL_INTERVAL) {
-            Ok(job) => job,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
+        // Blocks while idle: shutdown sends its own wake-up job.
+        let Ok(job) = jobs.recv() else {
+            break;
         };
-        if is_shutting_down(state) {
+        if is_shutting_down(state) || matches!(job, OutputJob::Shutdown) {
             break;
         }
         if matches!(job, OutputJob::PreparePaste) {
@@ -553,7 +589,7 @@ fn run_output_worker(
                 WorkerEvent::Pasted { .. } | WorkerEvent::ReadyToPaste { job_id: None, .. } => {
                     state.pending_pastes = state.pending_pastes.saturating_sub(1);
                 }
-                WorkerEvent::Transcribing { .. } => {}
+                WorkerEvent::Transcribing { .. } | WorkerEvent::Quiet { .. } => {}
             }
             drop(state);
             if events.send(event).is_err() {
@@ -588,7 +624,9 @@ fn finish_output(
     state: &Mutex<WorkerState>,
 ) -> WorkerEvent {
     match job {
-        OutputJob::PreparePaste => unreachable!("paste preparation bypasses ordered output"),
+        OutputJob::PreparePaste | OutputJob::Shutdown => {
+            unreachable!("paste preparation and shutdown bypass ordered output")
+        }
         OutputJob::Completed {
             job_id,
             control,
@@ -775,6 +813,8 @@ fn queue_error(error: TrySendError<impl Sized>) -> &'static str {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::Duration;
 
     fn completed(job_id: u64, text: &str) -> OutputJob {
         completed_for(job_id, text, ContextSnapshot::default())
@@ -1022,6 +1062,7 @@ mod tests {
         let (pasted, pastes) = mpsc::channel();
         let mut count = 0;
         let worker = DictationWorker::start_with(
+            Arc::default(),
             None,
             move |_, _, _, _, _| {
                 count += 1;
@@ -1238,6 +1279,10 @@ mod tests {
         let (jobs, receiver) = mpsc::sync_channel(4);
         let (output, outputs) = mpsc::sync_channel(4);
         let (events, _) = mpsc::channel();
+        let events = WorkerEvents {
+            sender: events,
+            wake: Arc::default(),
+        };
         for (index, preferences) in [
             formatted,
             Preferences::default(),
@@ -1485,6 +1530,10 @@ mod tests {
         let (jobs, receiver) = mpsc::sync_channel(4);
         let (output, outputs) = mpsc::sync_channel(4);
         let (events, _events) = mpsc::channel();
+        let events = WorkerEvents {
+            sender: events,
+            wake: Arc::default(),
+        };
         let control = Arc::new(JobControl::default());
         jobs.send(TranscriptionJob {
             vocabulary: crate::vocabulary::Snapshot::default(),
@@ -1556,6 +1605,7 @@ mod tests {
         let (network_alive, network_stopped) = mpsc::channel::<()>();
         let (pasted, pastes) = mpsc::channel();
         let worker = DictationWorker::start_with(
+            Arc::default(),
             None,
             {
                 let calls = calls.clone();
@@ -1618,6 +1668,7 @@ mod tests {
             let (release, paste_release) = mpsc::channel();
             let (pasted, pastes) = mpsc::channel();
             let worker = DictationWorker::start_with(
+                Arc::default(),
                 None,
                 |_, _, _, _, _| Ok(test_transcription("previous")),
                 move || {

@@ -1,6 +1,7 @@
 //! Microphone pane: input device, channel, levels and capture options.
 
 use super::*;
+use crate::i18n::t;
 
 impl AppWindow {
     pub(super) fn microphone_choices(&self) -> Vec<Option<String>> {
@@ -35,7 +36,7 @@ impl AppWindow {
             &self.microphone_picker_state,
             choices,
             self.settings.microphone.clone(),
-            |device| device.clone().unwrap_or_else(|| "Automatic".into()),
+            |device| device.clone().unwrap_or_else(|| t("Automatic").into()),
             self.microphone_picker_error
                 .clone()
                 .or_else(|| self.feedback_error(SettingControl::Microphone)),
@@ -117,18 +118,19 @@ impl AppWindow {
         ) {
             (Some(description), _) => {
                 let mode = if self.settings.microphone.is_some() {
-                    "Fixed"
+                    t("Fixed")
                 } else {
-                    "Automatic"
+                    t("Automatic")
                 };
-                format!(
-                    "Current: {} — {} ({mode})",
-                    description.name,
-                    description.channel_label()
+                tf!(
+                    "Current: {microphone} — {channel} ({mode})",
+                    microphone = description.name,
+                    channel = description.channel_label(),
+                    mode = mode
                 )
             }
-            (None, Some(error)) => format!("Microphone unavailable: {error}"),
-            (None, None) => "Checking the available microphones…".to_string(),
+            (None, Some(error)) => tf!("Microphone unavailable: {error}", error = error),
+            (None, None) => t("Checking the available microphones…").to_string(),
         }
     }
 
@@ -201,7 +203,7 @@ impl AppWindow {
             self.settings_feedback = Some(SettingsFeedback {
                 control: SettingControl::Channel,
                 success: false,
-                message: "Microphone changed. The channel choice was not applied.".into(),
+                message: t("Microphone changed. The channel choice was not applied.").into(),
             });
             cx.notify();
             return false;
@@ -292,33 +294,37 @@ impl AppWindow {
             return self
                 .setting_row(
                     SettingControl::Channel,
-                    "Input channel",
+                    t("Input channel"),
                     self.microphone_description_error
                         .clone()
-                        .unwrap_or_else(|| "Input metadata is unavailable".into()),
+                        .unwrap_or_else(|| t("Input metadata is unavailable").into()),
                     div()
                         .text_size(px(11.0))
                         .text_color(rgb(MUTED))
-                        .child("Unavailable"),
+                        .child(t("Unavailable")),
                 )
                 .into_any_element();
         };
         let note = if description.channel_unavailable() {
-            format!(
-                "{}: saved channel unavailable; using the existing mix",
-                description.name
+            tf!(
+                "{microphone}: saved channel unavailable; using the existing mix",
+                microphone = description.name
             )
         } else if let Some(previous) = &description.fallback_from {
-            format!(
-                "Using {} because {previous} is unavailable",
-                description.name
+            tf!(
+                "Using {microphone} because {previous} is unavailable",
+                microphone = description.name,
+                previous = previous
             )
         } else if description.channels == 1 {
-            format!("{} · one input channel", description.name)
+            tf!(
+                "{microphone} · one input channel",
+                microphone = description.name
+            )
         } else {
-            format!(
-                "{} · all channels are mixed until you select one",
-                description.name
+            tf!(
+                "{microphone} · all channels are mixed until you select one",
+                microphone = description.name
             )
         };
         let menu = self.microphone_channel_picker_open.then(|| {
@@ -332,8 +338,8 @@ impl AppWindow {
                 source.channel,
                 |channel| {
                     channel.map_or_else(
-                        || "Mix channels".into(),
-                        |channel| format!("Channel {channel}"),
+                        || t("Mix channels").into(),
+                        |channel| tf!("Channel {channel}", channel = channel),
                     )
                 },
                 self.feedback_error(SettingControl::Channel),
@@ -359,7 +365,7 @@ impl AppWindow {
             return self
                 .setting_row(
                     SettingControl::Channel,
-                    "Input channel",
+                    t("Input channel"),
                     note,
                     div()
                         .text_size(px(11.0))
@@ -370,7 +376,7 @@ impl AppWindow {
         }
         self.setting_row(
             SettingControl::Channel,
-            "Input channel",
+            t("Input channel"),
             note,
             div()
                 .relative()
@@ -403,40 +409,47 @@ impl AppWindow {
     pub(super) fn render_microphone_diagnostic(&self) -> AnyElement {
         let Some(report) = &self.microphone_diagnostic else {
             return settings_row(
-                "Input levels",
-                "Measured from the last analyzed recording, before silence trimming",
+                t("Input levels"),
+                t("Measured from the last analyzed recording, before silence trimming"),
                 div()
                     .text_size(px(11.0))
                     .text_color(rgb(MUTED))
-                    .child("Record a short dictation first"),
+                    .child(t("Record a short dictation first")),
             )
             .into_any_element();
         };
         let db = |value: Option<f64>| {
-            value.map_or_else(|| "−∞ dBFS".into(), |value| format!("{value:.1} dBFS"))
+            value.map_or_else(
+                || "−∞ dBFS".into(),
+                |value| crate::i18n::decimal(format!("{value:.1} dBFS")),
+            )
         };
         let source = report.input.as_ref().map_or_else(
-            || "Input not identified".into(),
+            || t("Input not identified").into(),
             |input| format!("{} · {}", input.name, input.channel_label()),
         );
         div()
             .border_b_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(crate::desktop_ui::DIVIDER))
             .child(
                 settings_row(
-                    "Input levels",
-                    format!(
-                        "Last analyzed recording: {source} · {:.1} s",
-                        report.duration_ms as f64 / 1_000.0
+                    t("Input levels"),
+                    tf!(
+                        "Last analyzed recording: {source} · {seconds} s",
+                        source = source,
+                        seconds = crate::i18n::decimal(format!(
+                            "{:.1}",
+                            report.duration_ms as f64 / 1_000.0
+                        ))
                     ),
                     level_meter(
                         report.levels.rms_dbfs(),
                         report.levels.peak_dbfs(),
                         report.levels.warning().is_none(),
-                        format!(
-                            "RMS {} · Peak {}",
-                            db(report.levels.rms_dbfs()),
-                            db(report.levels.peak_dbfs())
+                        tf!(
+                            "RMS {rms} · Peak {peak}",
+                            rms = db(report.levels.rms_dbfs()),
+                            peak = db(report.levels.peak_dbfs())
                         ),
                     ),
                 )
@@ -462,7 +475,7 @@ impl AppWindow {
         self.settings_feedback = Some(SettingsFeedback {
             control: SettingControl::Trim,
             success: result.is_ok(),
-            message: result.err().unwrap_or_else(|| "Saved.".into()),
+            message: result.err().unwrap_or_else(|| t("Saved.").into()),
         });
         cx.notify();
     }
@@ -487,7 +500,7 @@ impl AppWindow {
             .settings
             .microphone
             .clone()
-            .unwrap_or_else(|| "Automatic".into());
+            .unwrap_or_else(|| t("Automatic").into());
         let microphone_picker = self
             .microphone_picker_open
             .then(|| self.render_microphone_picker(cx));
@@ -526,35 +539,36 @@ impl AppWindow {
             &[crate::desktop_ui::settings_segment_width(2); 2],
         )
         .children(
-            [("Keep ready (fast)", false), ("Release when idle", true)]
-                .into_iter()
-                .enumerate()
-                .map(|(index, (label, release))| {
-                    sliding_segmented_item(
-                        crate::desktop_ui::settings_segment_width(2),
-                        self.settings.release_microphone_while_idle == release,
-                    )
-                    .id(("microphone-mode", index))
-                    .child(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if this.settings.release_microphone_while_idle != release
-                            && this.update_settings(
-                                SettingControl::MicrophoneMode,
-                                cx,
-                                |settings| settings.release_microphone_while_idle = release,
-                            )
-                        {
-                            this.release_microphone_toggle.set_enabled(release);
-                        }
-                    }))
-                }),
+            [
+                (t("Keep ready (fast)"), false),
+                (t("Release when idle"), true),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (label, release))| {
+                sliding_segmented_item(
+                    crate::desktop_ui::settings_segment_width(2),
+                    self.settings.release_microphone_while_idle == release,
+                )
+                .id(("microphone-mode", index))
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.settings.release_microphone_while_idle != release
+                        && this.update_settings(SettingControl::MicrophoneMode, cx, |settings| {
+                            settings.release_microphone_while_idle = release
+                        })
+                    {
+                        this.release_microphone_toggle.set_enabled(release);
+                    }
+                }))
+            }),
         );
-        configuration_pane("Microphone", "microphone-scroll", div().children(permission_warnings)
-                .child(settings_section_label("INPUT AND RECORDING"))
+        configuration_pane(t("Microphone"), "microphone-scroll", div().children(permission_warnings)
+                .child(settings_section_label(t("Input and recording")))
                 .child(
                     settings_panel()
                         .child(self.setting_row(SettingControl::Microphone,
-                            "Input device",
+                            t("Input device"),
                             self.input_device_description(),
                             div()
                                 .relative()
@@ -582,27 +596,27 @@ impl AppWindow {
                         .child(microphone_channel)
                         .child(microphone_diagnostic)
                         .child(self.setting_row(SettingControl::MicrophoneMode,
-                            "Microphone mode",
+                            t("Microphone mode"),
                             if self.settings.release_microphone_while_idle {
-                                "Opens on the shortcut: the orange indicator only shows while dictating, but the first syllable can be lost"
+                                t("Opens on the shortcut: the orange indicator only shows while dictating, but the first syllable can be lost")
                             } else {
-                                "Keeps the microphone open so a short pre-roll catches the start of speech"
+                                t("Keeps the microphone open so a short pre-roll catches the start of speech")
                             },
                             microphone_mode,
                         ))
                         .child(self.setting_row(SettingControl::Trim,
-                            "Trim silence",
-                            "Trims completed clips before upload. Live streaming sends continuous audio, including pauses",
+                            t("Trim silence"),
+                            t("Trims completed clips before upload. Live streaming sends continuous audio, including pauses"),
                             trim_control,
                         ))
                         .child(
                             self.setting_row(SettingControl::AudioBehavior,
-                                "While dictating",
+                                t("While dictating"),
                                 match self.settings.recording_audio_behavior {
-                                    RecordingAudioBehavior::Mute => "Fades system audio out and back in quickly; preserves detected manual volume changes",
-                                    RecordingAudioBehavior::LowerVolume => "Lowers system audio with a quick fade; preserves detected manual volume changes",
-                                    RecordingAudioBehavior::PauseMedia => "Pauses playing media and resumes it after dictation",
-                                    RecordingAudioBehavior::DoNothing => "Leaves other audio unchanged while dictating",
+                                    RecordingAudioBehavior::Mute => t("Fades system audio out and back in quickly; preserves detected manual volume changes"),
+                                    RecordingAudioBehavior::LowerVolume => t("Lowers system audio with a quick fade; preserves detected manual volume changes"),
+                                    RecordingAudioBehavior::PauseMedia => t("Pauses playing media and resumes it after dictation"),
+                                    RecordingAudioBehavior::DoNothing => t("Leaves other audio unchanged while dictating"),
                                 },
                                 audio_behavior,
                             )
@@ -638,7 +652,11 @@ pub(super) fn level_meter(
                 .text_size(px(12.0))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(tone))
-                .child(if good { "Good level" } else { "Check level" }),
+                .child(if good {
+                    t("Good level")
+                } else {
+                    t("Check level")
+                }),
         )
         .child(
             div()

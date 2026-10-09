@@ -11,12 +11,14 @@ use crate::app_settings::{
     AppSettings, DictationMode, HotkeyBinding, HotkeyKey, HotkeyModifiers, ModifierSide,
     RecordingAudioBehavior,
 };
+use crate::appearance::Appearance;
 use crate::hud_settings::{
     HudBrightness, HudColor, HudPosition, HudPreferences, HudScreen, HudSize, MonitorId,
 };
 use crate::interaction_settings::{DoubleTapSensitivity, SoundVolumes};
 use crate::microphone::{ChannelSelection, DevicePreference};
 use crate::openrouter::{self, Config, TranscriptionConfig};
+use crate::start_cue::StartCue;
 
 pub const MAX_FILE_BYTES: usize = 256 * 1024;
 const VERSION: u32 = 1;
@@ -59,6 +61,10 @@ struct AppPreferences {
     dictation_hotkey: ShortcutPreferences,
     paste_last_hotkey: Option<ShortcutPreferences>,
     show_dock_icon: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    appearance: Option<Appearance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    language: Option<crate::i18n::LanguagePreference>,
     hud: HudTransfer,
     #[serde(default)]
     post_processing: Option<crate::post_processing::Preferences>,
@@ -73,6 +79,8 @@ struct SoundPreferences {
     start: f32,
     stop: f32,
     error_cancel: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    start_cue: Option<StartCue>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -124,10 +132,14 @@ struct HudTransfer {
     brightness: HudBrightness,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     voice_reactive: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    audio_notices: Option<bool>,
     screen: HudScreen,
     fixed_monitor: Option<MonitorId>,
     // Do not use HudPreferences's deserializer: imports reject, rather than clamp.
     edge_distance: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    appearance: Option<Appearance>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -168,7 +180,7 @@ pub fn decode(bytes: &[u8]) -> Result<PreferenceBundle> {
     // Serde diagnostics can quote arbitrary field names/values from the file.
     // Keep neither that text nor its error source in a user-visible error chain.
     let bundle: PreferenceBundle = serde_json::from_slice(bytes)
-        .map_err(|_| eyre!("This is not a valid Hex preferences file."))?;
+        .map_err(|_| eyre!("This is not a valid Endu preferences file."))?;
     bundle.validate()?;
     Ok(bundle)
 }
@@ -476,6 +488,7 @@ impl AppPreferences {
                 start: sounds.start,
                 stop: sounds.stop,
                 error_cancel: sounds.error_cancel,
+                start_cue: Some(settings.start_cue),
             },
             microphone: settings.microphone.clone(),
             microphone_priority: settings
@@ -509,6 +522,8 @@ impl AppPreferences {
                 .as_ref()
                 .map(ShortcutPreferences::from_binding),
             show_dock_icon: settings.show_dock_icon,
+            appearance: Some(settings.appearance),
+            language: Some(settings.language),
             post_processing: Some(settings.post_processing),
             vocabulary: Some(settings.vocabulary.clone()),
             hud: HudTransfer {
@@ -518,9 +533,11 @@ impl AppPreferences {
                 size: hud.size,
                 brightness: hud.brightness,
                 voice_reactive: Some(hud.voice_reactive),
+                audio_notices: Some(hud.audio_notices),
                 screen: hud.screen,
                 fixed_monitor: hud.fixed_monitor,
                 edge_distance: hud.edge_distance,
+                appearance: Some(hud.appearance),
             },
         }
     }
@@ -536,6 +553,9 @@ impl AppPreferences {
             stop: self.sounds.stop,
             error_cancel: self.sounds.error_cancel,
         });
+        if let Some(cue) = self.sounds.start_cue {
+            settings.start_cue = cue;
+        }
         settings.microphone.clone_from(&self.microphone);
         settings.microphone_priority = self
             .microphone_priority
@@ -573,6 +593,12 @@ impl AppPreferences {
             .as_ref()
             .map(ShortcutPreferences::binding);
         settings.show_dock_icon = self.show_dock_icon;
+        if let Some(appearance) = self.appearance {
+            settings.appearance = appearance;
+        }
+        if let Some(language) = self.language {
+            settings.language = language;
+        }
         if let Some(preferences) = self.post_processing {
             settings.post_processing = preferences;
         }
@@ -587,9 +613,11 @@ impl AppPreferences {
             size: hud.size,
             brightness: hud.brightness,
             voice_reactive: hud.voice_reactive.unwrap_or(current.hud.voice_reactive),
+            audio_notices: hud.audio_notices.unwrap_or(current.hud.audio_notices),
             screen: hud.screen,
             fixed_monitor: hud.fixed_monitor,
             edge_distance: hud.edge_distance,
+            appearance: hud.appearance.unwrap_or(current.hud.appearance),
         };
         settings
     }
@@ -640,6 +668,7 @@ mod tests {
             sound_effects: false,
             sound_effect_volume: 0.4,
             sound_volumes: None,
+            start_cue: StartCue::Glass,
             microphone: None,
             microphone_priority: Vec::new(),
             microphone_channel: None,
@@ -667,6 +696,8 @@ mod tests {
                 }),
             }),
             show_dock_icon: false,
+            appearance: Appearance::Dark,
+            language: crate::i18n::LanguagePreference::Spanish,
             history_retention: crate::history::HistoryRetention::Off,
             hud: HudPreferences::default(),
             post_processing: crate::post_processing::Preferences::default(),
@@ -852,6 +883,60 @@ mod tests {
                 bytes
             );
         }
+    }
+
+    #[test]
+    fn appearances_export_and_legacy_imports_preserve_local_choices() {
+        let mut source = settings();
+        source.appearance = Appearance::Light;
+        source.hud.appearance = Appearance::Dark;
+        let bytes = export_bytes(&source, &Config::default()).unwrap();
+        let local = settings();
+        let imported = decode(&bytes).unwrap().app.apply_to(&local);
+        assert_eq!(imported.appearance, Appearance::Light);
+        assert_eq!(imported.hud.appearance, Appearance::Dark);
+
+        let mut legacy: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        legacy["app"].as_object_mut().unwrap().remove("appearance");
+        legacy["app"]["hud"]
+            .as_object_mut()
+            .unwrap()
+            .remove("appearance");
+        let local = AppSettings {
+            appearance: Appearance::Dark,
+            hud: HudPreferences {
+                appearance: Appearance::Light,
+                ..HudPreferences::default()
+            },
+            ..settings()
+        };
+        let imported = decode(&serde_json::to_vec(&legacy).unwrap())
+            .unwrap()
+            .app
+            .apply_to(&local);
+        assert_eq!(imported.appearance, Appearance::Dark);
+        assert_eq!(imported.hud.appearance, Appearance::Light);
+    }
+
+    #[test]
+    fn start_cue_exports_and_legacy_imports_preserve_local_choice() {
+        let mut source = settings();
+        source.start_cue = StartCue::Pen;
+        let bytes = export_bytes(&source, &Config::default()).unwrap();
+        let local = AppSettings {
+            start_cue: StartCue::Wood,
+            ..settings()
+        };
+        let imported = decode(&bytes).unwrap();
+        assert_eq!(imported.app.apply_to(&local).start_cue, StartCue::Pen);
+
+        let mut legacy: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        legacy["app"]["sounds"]
+            .as_object_mut()
+            .unwrap()
+            .remove("start_cue");
+        let imported = decode(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(imported.app.apply_to(&local).start_cue, StartCue::Wood);
     }
 
     #[test]
