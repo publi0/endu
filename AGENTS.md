@@ -150,8 +150,10 @@ not reintroduce seams for them.
   anything else uses the keyboard.
 - Release dictation starts only after Microphone, Input Monitoring,
   Accessibility, and a usable configured model/provider key are ready.
-- `Release microphone while idle` opens the device on the shortcut with no
-  pre-roll and closes it once capture is idle.
+- `Release microphone while idle` (the default) opens the device on the
+  shortcut with no pre-roll and closes it once capture is idle. While
+  dictating, system audio lowers to 30% by default. New defaults only fill
+  missing fields; saved choices are never rewritten.
 - API keys never reach argv, logs, or temporary files. Secrets are saved, read
   and removed through Apple's `/usr/bin/security -i`, one command on stdin, with
   the secret quoted only after validation and returned on stdout. Hex is
@@ -194,6 +196,13 @@ not reintroduce seams for them.
   still OpenRouter. Filters for request comparisons must not silently change the
   scope of overview cards. Load one consistent period snapshot off the UI thread,
   preserve unreadable statistics and discard stale asynchronous reloads.
+  A live session that sent audio but ends without a recorded dictation sample
+  (cancel, discard, interruption, cancellation after Finish) is counted once,
+  by its last owner after the socket closes, as "Cancelled while streaming":
+  sessions, sent duration and a separate ≈ list-price estimate (unknown when
+  unpriced). It is never a dictation, failure or reported cost, and its stats
+  I/O never runs on the capture or shortcut thread. Streamed silence is already
+  a failed dictation and is not counted again.
 - Each accepted dictation snapshots its post-processing preferences. Format
   once before ordered output; History and Paste Last retain that result and
   its casing policy. Continuation must not undo explicit lowercase choices.
@@ -252,6 +261,15 @@ not reintroduce seams for them.
   Model-specific prices, prerequisites and restrictions belong immediately below
   that model's primary/fallback selector, not in a shared footer or every search
   result. Keep them conditional and specific to the selected transport/model.
+  Only the primary model opens a live session; fallbacks always receive the
+  finished recording. A live-only model (streaming without an upload
+  transport) can therefore only be the primary: fallback pickers omit it,
+  set/promote reject it in a fallback slot, loading drops it from fallback
+  slots (keeping its profile) and imports reject it there. It always streams,
+  whatever its saved option. In Model options, Streaming is fixed on for a
+  live-only model and fixed off (with the reason) for a fallback.
+  Model pickers never offer a model already in another chain slot, even
+  typed as an id; set_model still rejects duplicates as a safeguard.
   Selectors filter on cached provider-key availability, never resolving keys or
   making requests during render. Missing keys hide choices but retain saved
   selections/profiles with an unavailable notice. Nova-2 with Auto language uses

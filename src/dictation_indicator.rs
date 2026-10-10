@@ -1717,4 +1717,33 @@ mod tests {
         assert_eq!(renderer.scale, 1.0);
         assert_eq!(renderer.size_factor, 1.5);
     }
+
+    #[test]
+    fn quiet_and_silent_jobs_end_with_a_written_notice_instead_of_a_check() {
+        let mut renderer = MetalRenderer::new().expect("local macOS checks require Metal");
+        renderer.handle(DictationIndicatorEvent::Started);
+        renderer.handle(DictationIndicatorEvent::Submitted { job_id: 1 });
+        renderer.handle(DictationIndicatorEvent::JobQuiet { job_id: 1 });
+        renderer.handle(DictationIndicatorEvent::JobCompleted { job_id: 1 });
+        assert_eq!(renderer.phase, Phase::Notice);
+        assert_eq!(renderer.notice, Some(HudNotice::LowAudio));
+        assert!(renderer.quiet_jobs.is_empty());
+
+        renderer.handle(DictationIndicatorEvent::Started);
+        renderer.handle(DictationIndicatorEvent::Submitted { job_id: 2 });
+        renderer.handle(DictationIndicatorEvent::JobNoAudio { job_id: 2 });
+        assert_eq!(renderer.phase, Phase::Notice);
+        assert_eq!(renderer.notice, Some(HudNotice::NoAudio));
+
+        // A normal job still ends with the check.
+        renderer.handle(DictationIndicatorEvent::Started);
+        renderer.handle(DictationIndicatorEvent::Submitted { job_id: 3 });
+        renderer.handle(DictationIndicatorEvent::JobCompleted { job_id: 3 });
+        assert_ne!(renderer.phase, Phase::Notice);
+        assert!(renderer.completion_pending);
+
+        // A quiet mark for an unknown job is ignored.
+        renderer.handle(DictationIndicatorEvent::JobQuiet { job_id: 99 });
+        assert!(renderer.quiet_jobs.is_empty());
+    }
 }

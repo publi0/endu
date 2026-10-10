@@ -10,13 +10,13 @@ use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use serde::{Deserialize, Serialize};
 
 static COPY_ON_PASTE_FAILURE: AtomicBool = AtomicBool::new(false);
-static RECORDING_AUDIO_BEHAVIOR: AtomicU8 = AtomicU8::new(0);
+static RECORDING_AUDIO_BEHAVIOR: AtomicU8 = AtomicU8::new(3);
 static DOUBLE_TAP_SENSITIVITY: AtomicU8 = AtomicU8::new(1);
-static LOWER_VOLUME_PERCENT: AtomicU8 = AtomicU8::new(80);
+static LOWER_VOLUME_PERCENT: AtomicU8 = AtomicU8::new(30);
 static DICTATION_MODE: AtomicU8 = AtomicU8::new(0);
 static ENTER_TO_SUBMIT: AtomicBool = AtomicBool::new(false);
 static DOUBLE_TAP_ONLY: AtomicBool = AtomicBool::new(false);
-static RELEASE_MICROPHONE_WHILE_IDLE: AtomicBool = AtomicBool::new(false);
+static RELEASE_MICROPHONE_WHILE_IDLE: AtomicBool = AtomicBool::new(true);
 static HOTKEYS: OnceLock<RwLock<RuntimeHotkeys>> = OnceLock::new();
 static PASTE_LAST_BINDING: RwLock<Option<HotkeyBinding>> = RwLock::new(None);
 static DICTATION_BINDING: RwLock<Option<HotkeyBinding>> = RwLock::new(None);
@@ -365,9 +365,9 @@ impl Default for RuntimeHotkeys {
 #[serde(rename_all = "snake_case")]
 pub enum RecordingAudioBehavior {
     Mute,
+    #[default]
     LowerVolume,
     PauseMedia,
-    #[default]
     DoNothing,
 }
 
@@ -463,7 +463,9 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            release_microphone_while_idle: false,
+            // The microphone opens on the shortcut, so macOS shows its
+            // indicator only while dictating.
+            release_microphone_while_idle: true,
             sound_effects: true,
             sound_effect_volume: 0.5,
             sound_volumes: None,
@@ -471,8 +473,8 @@ impl Default for AppSettings {
             microphone: None,
             microphone_priority: Vec::new(),
             microphone_channel: None,
-            recording_audio_behavior: RecordingAudioBehavior::DoNothing,
-            lower_volume_percent: 80,
+            recording_audio_behavior: RecordingAudioBehavior::LowerVolume,
+            lower_volume_percent: 30,
             dictation_mode: DictationMode::TapOrHold,
             enter_to_submit: false,
             double_tap_lock: false,
@@ -825,16 +827,16 @@ mod tests {
     #[test]
     fn missing_fields_receive_defaults() {
         let settings: AppSettings = serde_json::from_str("{}").unwrap();
-        assert!(!settings.release_microphone_while_idle);
+        assert!(settings.release_microphone_while_idle);
         assert!(!settings.copy_on_paste_failure);
         assert!(settings.sound_effects);
         assert_eq!(settings.sound_effect_volume, 0.5);
-        assert_eq!(settings.lower_volume_percent, 80);
+        assert_eq!(settings.lower_volume_percent, 30);
         assert_eq!(settings.microphone, None);
         assert_eq!(settings.microphone_channel, None);
         assert_eq!(
             settings.recording_audio_behavior,
-            RecordingAudioBehavior::DoNothing
+            RecordingAudioBehavior::LowerVolume
         );
         assert_eq!(settings.dictation_mode, DictationMode::TapOrHold);
         assert!(!settings.enter_to_submit);
@@ -860,7 +862,7 @@ mod tests {
         )
         .unwrap();
         assert!(!settings.double_tap_lock);
-        assert_eq!(settings.lower_volume_percent, 80);
+        assert_eq!(settings.lower_volume_percent, 30);
     }
 
     #[test]

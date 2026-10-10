@@ -697,15 +697,20 @@ impl OpenRouterSettings {
             return;
         }
         if self.preview {
+            // The preview's offline catalog: its OpenRouter routes, named like
+            // the remote catalog would. Native models carry their own names.
             self.catalog = CatalogState::Loaded(
                 self.config
                     .transcription
                     .models
                     .iter()
+                    .filter(|id| {
+                        crate::providers::ModelRef::parse(id).provider == Provider::OpenRouter
+                    })
                     .map(|id| CatalogModel {
                         id: id.clone(),
-                        name: id.clone(),
-                        provider: catalog::provider_label(id).into(),
+                        name: catalog::label(id, &[]),
+                        provider: "OpenRouter".into(),
                     })
                     .collect(),
             );
@@ -851,6 +856,23 @@ impl OpenRouterSettings {
             self.model_available(id) && self.verified_keywords(id)
         });
         choices.retain(|choice| self.model_available(choice.id()));
+        if picker.slot > 0 {
+            // Fallbacks answer the finished recording; live-only models cannot.
+            choices.retain(|choice| !crate::providers::is_realtime_only(choice.id()));
+        }
+        // A model already elsewhere in the chain is not offered again.
+        let taken: Vec<String> = self
+            .config
+            .transcription
+            .models
+            .iter()
+            .enumerate()
+            .filter(|(slot, _)| *slot != picker.slot)
+            .map(|(_, id)| crate::providers::ModelRef::parse(id).key())
+            .collect();
+        choices.retain(|choice| {
+            !taken.contains(&crate::providers::ModelRef::parse(choice.id()).key())
+        });
         if query.is_empty()
             && let Some(current) = self.config.transcription.models.get(picker.slot)
             && self.model_available(current)
@@ -892,7 +914,7 @@ impl OpenRouterSettings {
         if self.commit(
             cx,
             Scope::Model(slot),
-            |config| Ok(form::promote_model(config, slot)),
+            |config| form::promote_model(config, slot),
             t("Order updated."),
         ) && slot > 0
         {
@@ -1691,12 +1713,19 @@ impl OpenRouterSettings {
                 .flex_none()
         };
         let busy = self.busy();
+        // A live-only primary can never move into a fallback slot.
+        let primary_locked = self
+            .config
+            .transcription
+            .models
+            .first()
+            .is_some_and(|id| crate::providers::is_realtime_only(id));
         div()
             .flex_none()
             .flex()
             .items_center()
             .gap_1()
-            .child(if slot > 0 {
+            .child(if slot > 0 && !(slot == 1 && primary_locked) {
                 icon_button("↑", t("Move up"))
                     .id(("openrouter-promote", slot))
                     .when(busy, |button| button.opacity(0.5))
@@ -1705,7 +1734,7 @@ impl OpenRouterSettings {
             } else {
                 placeholder().into_any_element()
             })
-            .child(if slot + 1 < chain_len {
+            .child(if slot + 1 < chain_len && !(slot == 0 && primary_locked) {
                 icon_button("↓", t("Move down"))
                     .id(("openrouter-demote", slot))
                     .when(busy, |button| button.opacity(0.5))
@@ -2131,8 +2160,13 @@ mod tests {
                     assert!(view.picker_choices(cx).is_empty());
                     view.set_available_providers(vec![Provider::Google], cx);
                     let choices = view.picker_choices(cx);
-                    assert_eq!(choices.len(), 1);
-                    assert_eq!(choices[0].id(), "google::gemini-3.5-transcribe-live");
+                    // The live-only model is offered only for the primary slot.
+                    if slot == 0 {
+                        assert_eq!(choices.len(), 1);
+                        assert_eq!(choices[0].id(), "google::gemini-3.5-transcribe-live");
+                    } else {
+                        assert!(choices.is_empty());
+                    }
                 }
             });
         });
@@ -2500,7 +2534,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_rejected_model_keeps_the_picker_and_keyboard_focus(cx: &mut gpui::TestAppContext) {
+    fn a_model_already_in_the_chain_is_not_offered_and_keeps_keyboard_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
         cx.update(|cx| cx.bind_keys(crate::text_input::key_bindings()));
         let (view, cx) = cx.add_window_view(|_, cx| OpenRouterSettings::new(false, true, cx));
         cx.update(|window, cx| {
@@ -2518,10 +2554,11 @@ mod tests {
             let picker = view
                 .picker
                 .as_ref()
-                .expect("invalid duplicate must leave the menu open");
+                .expect("a duplicate is not offered, so the menu stays open");
             assert!(picker.search.focus_handle(cx).is_focused(window));
             assert_eq!(view.config.transcription.models[1], "test/two");
-            assert!(matches!(view.message, Some((Scope::Model(1), false, _))));
+            // Nothing was chosen, so there is no error to show.
+            assert!(!matches!(view.message, Some((Scope::Model(1), false, _))));
         });
         cx.simulate_keystrokes("escape");
         cx.update(|window, cx| assert!(view.read(cx).model_focus[1].is_focused(window)));
@@ -2662,5 +2699,41 @@ mod tests {
         );
         assert!(picker_choices(&catalog, "no such thing", |_| false).is_empty());
         assert!(picker_choices(&[], "acme/x y", |_| false).is_empty());
+    }
+
+    #[gpui::test]
+    fn pickers_never_offer_a_model_already_elsewhere_in_the_chain(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| OpenRouterSettings::new(false, true, cx));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_available_providers(Provider::ALL.to_vec(), cx);
+                let chain = view.config.transcription.models.clone();
+                assert!(chain.len() >= 2, "the preview chain has fallbacks");
+                for slot in 0..=chain.len().min(MAX_FALLBACKS) {
+                    view.open_picker(slot, window, cx);
+                    let offered: Vec<String> = view
+                        .picker_choices(cx)
+                        .iter()
+                        .map(|choice| crate::providers::ModelRef::parse(choice.id()).key())
+                        .collect();
+                    for (other, id) in chain.iter().enumerate() {
+                        if other != slot {
+                            assert!(
+                                !offered.contains(&crate::providers::ModelRef::parse(id).key()),
+                                "slot {slot} offers {id}, already at slot {other}"
+                            );
+                        }
+                    }
+                    // Even typed as an id, a model in another slot is not offered.
+                    let search = view.picker.as_ref().unwrap().search.clone();
+                    let elsewhere = chain[if slot == 0 { 1 } else { 0 }].clone();
+                    search.update(cx, |input, cx| input.set_text(&elsewhere, cx));
+                    assert!(!view.picker_choices(cx).iter().any(|choice| {
+                        crate::providers::ModelRef::parse(choice.id()).key()
+                            == crate::providers::ModelRef::parse(&elsewhere).key()
+                    }));
+                }
+            });
+        });
     }
 }

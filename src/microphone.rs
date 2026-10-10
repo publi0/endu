@@ -324,4 +324,16 @@ mod tests {
         assert_eq!(resolve_channel(Some(3), 2), None);
         assert_eq!(resolve_channel(Some(0), 2), None);
     }
+
+    #[test]
+    fn quiet_clips_are_flagged_for_the_hud_notice() {
+        assert!(Levels::measure(&[0.0; 160]).is_quiet(), "no signal");
+        assert!(Levels::measure(&[0.003; 1600]).is_quiet(), "about -50 dBFS");
+        assert!(!Levels::measure(&[0.2; 1600]).is_quiet(), "speech level");
+        // A short loud peak means the level is not the problem.
+        let mut clip = vec![0.003; 1600];
+        clip[800] = 0.5;
+        assert!(!Levels::measure(&clip).is_quiet());
+        assert!(!Levels::measure(&[]).is_quiet(), "nothing measured");
+    }
 }

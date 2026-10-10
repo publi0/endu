@@ -1438,4 +1438,26 @@ mod tests {
         assert!(!store.audio_path(&id).unwrap().exists());
         assert!(fixture.store().entries("").is_empty());
     }
+
+    #[test]
+    fn streamed_silence_fails_without_keeping_audio_for_recovery() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let error = store
+            .transcribe_original(
+                &[0.0; 160],
+                Some("Notes"),
+                crate::post_processing::Preferences::default(),
+                |_| Err(crate::openrouter::transcribe::NoSpeech.into()),
+            )
+            .err()
+            .expect("streamed silence is a failure");
+        assert!(
+            error
+                .downcast_ref::<crate::openrouter::transcribe::NoSpeech>()
+                .is_some()
+        );
+        assert!(store.entries("").is_empty());
+        assert!(fs::read_dir(&fixture.0).unwrap().next().is_none());
+    }
 }

@@ -128,10 +128,12 @@ impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
             model_options: Default::default(),
+            // Live ElevenLabs first; an OpenRouter route and native Grok
+            // answer when it fails. Any one of their keys makes Endu ready.
             models: vec![
-                "openai/whisper-large-v3-turbo".into(),
-                "openai/gpt-4o-mini-transcribe".into(),
-                "mistralai/voxtral-mini-transcribe".into(),
+                "elevenlabs::scribe_v2_realtime".into(),
+                "microsoft/mai-transcribe-2".into(),
+                "grok::grok-voice-transcribe-2.0".into(),
             ],
             language: AUTO_LANGUAGE.into(),
             attempt_timeout_seconds: 30,
@@ -183,6 +185,7 @@ fn load_config_at_unlocked(path: &Path) -> Result<Config> {
     match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map(drop_retired_models)
+            .map(drop_realtime_only_fallbacks)
             .wrap_err_with(|| format!("invalid OpenRouter config at {}", path.display())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let config = Config::default();
@@ -207,6 +210,18 @@ fn drop_retired_models(mut config: Config) -> Config {
     transcription
         .model_options
         .retain(|id, _| !crate::providers::is_retired_model(id));
+    config
+}
+
+/// Realtime-only models cannot answer a finished recording, so older files
+/// that list one as a fallback lose it from the chain; its profile stays.
+fn drop_realtime_only_fallbacks(mut config: Config) -> Config {
+    let mut slot = 0;
+    config.transcription.models.retain(|id| {
+        let keep = slot == 0 || !crate::providers::is_realtime_only(id);
+        slot += 1;
+        keep
+    });
     config
 }
 
@@ -731,5 +746,43 @@ mod tests {
         assert!(!excerpt.contains('\n'));
         assert!(excerpt.starts_with("line one line two"));
         assert!(excerpt.chars().count() <= 201);
+    }
+
+    #[test]
+    fn live_only_models_leave_fallback_slots_on_load_but_keep_their_profiles() {
+        let dir = temp_dir("live-only-fallbacks");
+        let path = dir.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            br#"{"transcription":{"models":["grok::grok-voice-transcribe-2.0","elevenlabs::scribe_v2_realtime","microsoft/mai-transcribe-2","openai::gpt-live-transcribe"],
+                "model_options":{"elevenlabs::scribe_v2_realtime":{"language":"pt"}}}}"#,
+        )
+        .unwrap();
+        let config = load_config_at(&path).unwrap();
+        assert_eq!(
+            config.transcription.models,
+            [
+                "grok::grok-voice-transcribe-2.0",
+                "microsoft/mai-transcribe-2"
+            ]
+        );
+        assert_eq!(
+            config.transcription.model_options["elevenlabs::scribe_v2_realtime"].language,
+            "pt"
+        );
+        // A live-only primary stays where it is.
+        fs::write(
+            &path,
+            br#"{"transcription":{"models":["elevenlabs::scribe_v2_realtime","microsoft/mai-transcribe-2"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load_config_at(&path).unwrap().transcription.models,
+            [
+                "elevenlabs::scribe_v2_realtime",
+                "microsoft/mai-transcribe-2"
+            ]
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 }

@@ -1141,6 +1141,15 @@ fn transcribe_configured(
     sleep: &mut dyn FnMut(Duration),
 ) -> Result<Transcription> {
     let cancelled = live.as_ref().map(streaming::PendingLive::cancellation_flag);
+    // Returning without a sample (cancellation) leaves streamed audio unaccounted,
+    // so the session reports it as discarded when its last owner drops.
+    let account = live.as_ref().map(streaming::PendingLive::account);
+    let record_sample = |sample: Sample| {
+        if let Some(account) = &account {
+            account.settle();
+        }
+        record_sample(sample);
+    };
     check_cancelled(cancelled.as_deref())?;
     let recorded_ms = duration_ms(samples.len());
     let started = Instant::now();
@@ -1371,7 +1380,7 @@ fn transcribe_configured(
         cost_usd: usage.cost_usd,
         failures: progress.failures.clone(),
         telemetry: Some(progress.telemetry(true)),
-        skipped_silent: false,
+        ..Sample::default()
     });
     let mut failed = Vec::new();
     for failure in progress.failures {
@@ -1917,7 +1926,6 @@ mod tests {
         take_samples();
         let mut config = telemetry_config(&[
             "meta::muse-voice-transcribe-1.0",
-            "openai::gpt-live-transcribe",
             "openai::gpt-transcribe",
             "openai/gpt-transcribe",
         ]);
@@ -1926,13 +1934,6 @@ mod tests {
             "meta::muse-voice-transcribe-1.0".into(),
             ModelOptions {
                 language: "ru".into(),
-                ..Default::default()
-            },
-        );
-        config.transcription.model_options.insert(
-            "openai::gpt-live-transcribe".into(),
-            ModelOptions {
-                streaming: false,
                 ..Default::default()
             },
         );
@@ -1952,7 +1953,7 @@ mod tests {
                 };
                 (response, Duration::from_millis(31))
             },
-            &mut |_, _, _, _| panic!("realtime profile was not enabled"),
+            &mut |_, _, _, _| panic!("no live-only model in this chain"),
             &mut |_| panic!("no retry"),
         )
         .unwrap();
@@ -3101,29 +3102,14 @@ mod tests {
             vocabulary.settings().remote_hints,
             "shared snapshot must not be changed by retry"
         );
+        // A saved "off" cannot disable a live-only model: it has no other transport.
         config
             .transcription
             .model_options
             .get_mut("openai::gpt-live-transcribe")
             .unwrap()
             .streaming = false;
-        assert!(
-            Chain {
-                config: &config,
-                vocabulary: &vocabulary,
-                hints: &hints,
-                cancelled: None
-            }
-            .run(
-                &[0.1; 160],
-                Duration::ZERO,
-                &mut Progress::default(),
-                &mut |_, _| panic!("disabled"),
-                &mut |_, _, _, _| panic!("disabled"),
-                &mut |_| {}
-            )
-            .is_err()
-        );
+        assert!(crate::providers::options(&config, "openai::gpt-live-transcribe").streaming);
     }
 
     fn live_fixture(text: &str, sent: usize, trim: bool) -> streaming::PendingLive {
@@ -3298,8 +3284,42 @@ mod tests {
         take_samples();
         let live = live_fixture("must not be returned", 1600, false);
         live.cancellation_flag().store(true, Ordering::Release);
+        streaming::take_discarded();
         assert!(transcribe(&[0.1; 1600], &Snapshot::default(), Some(live)).is_err());
         assert!(take_samples().is_empty());
+        // The 100 ms already streamed is reported once, as discarded audio.
+        let discarded = streaming::take_discarded();
+        assert_eq!(discarded.len(), 1);
+        assert_eq!(discarded[0].sent_ms, 100);
+        let estimate = discarded[0].estimated_cost_usd.unwrap();
+        assert!((estimate - 0.017 / 600.0).abs() < 1e-12, "{estimate}");
+    }
+
+    #[test]
+    fn streamed_audio_in_a_recorded_dictation_is_never_also_discarded() {
+        streaming::take_discarded();
+        take_samples();
+        transcribe(
+            &[0.1; 1600],
+            &Snapshot::default(),
+            Some(live_fixture("hello world", 1600, false)),
+        )
+        .unwrap();
+        assert_eq!(take_samples().len(), 1);
+        assert!(streaming::take_discarded().is_empty());
+
+        // Streamed silence is already a failed dictation with its sent audio.
+        let silent = transcribe(
+            &[0.0; 16_000],
+            &Snapshot::default(),
+            Some(live_fixture("hallucination", 16_000, true)),
+        );
+        assert!(silent.is_err());
+        let samples = take_samples();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].sent_ms, 1_000);
+        assert!(samples[0].discarded.is_none());
+        assert!(streaming::take_discarded().is_empty());
     }
 
     #[test]
@@ -3320,5 +3340,46 @@ mod tests {
                 .iter()
                 .any(|failure| failure.kind == ErrorKind::InvalidResponse)
         );
+    }
+
+    #[test]
+    fn fallbacks_upload_the_finished_recording_even_when_streaming_is_saved_on() {
+        take_samples();
+        let mut config = telemetry_config(&["fixture/primary", "deepgram::nova-3"]);
+        config.transcription.model_options.insert(
+            "deepgram::nova-3".into(),
+            ModelOptions {
+                streaming: true,
+                ..ModelOptions::default()
+            },
+        );
+        let mut providers = Vec::new();
+        let result = transcribe_configured(
+            &[0.1; 1600],
+            &Snapshot::default(),
+            None,
+            &config,
+            &mut |request, _| {
+                providers.push(request.provider);
+                (
+                    Ok(match request.provider {
+                        Provider::OpenRouter => response(503, "unavailable", None),
+                        _ => response(
+                            200,
+                            r#"{"results":{"channels":[{"alternatives":[{"transcript":"done"}]}]}}"#,
+                            None,
+                        ),
+                    }),
+                    Duration::from_millis(5),
+                )
+            },
+            &mut |_, _, _, _| panic!("a fallback never opens a live session"),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(result.text, "done");
+        assert_eq!(providers, [Provider::OpenRouter, Provider::Deepgram]);
+        let samples = take_samples();
+        assert!(samples[0].telemetry.as_ref().unwrap().used_fallback);
     }
 }

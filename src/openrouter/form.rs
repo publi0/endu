@@ -143,6 +143,12 @@ pub fn set_model(base: &Config, slot: usize, model: Option<&str>) -> Result<Conf
             {
                 return Ok(config);
             }
+            if slot > 0 && crate::providers::is_realtime_only(&model) {
+                return Err(tf!(
+                    "{model} only works live while recording, so it can only be the primary model.",
+                    model = model
+                ));
+            }
             let previous = config
                 .transcription
                 .models
@@ -162,13 +168,17 @@ pub fn set_model(base: &Config, slot: usize, model: Option<&str>) -> Result<Conf
 }
 
 /// Moves the fallback at `slot` one place earlier, swapping with its
-/// predecessor (which may be the primary).
-pub fn promote_model(base: &Config, slot: usize) -> Config {
+/// predecessor (which may be the primary). A realtime-only primary cannot
+/// move down into a fallback slot.
+pub fn promote_model(base: &Config, slot: usize) -> Result<Config, String> {
     let mut config = base.clone();
     if slot > 0 && slot < config.transcription.models.len() {
+        if crate::providers::is_realtime_only(&config.transcription.models[slot - 1]) {
+            return Err(t("A model that only works live must stay the primary model.").into());
+        }
         config.transcription.models.swap(slot - 1, slot);
     }
-    config
+    Ok(config)
 }
 
 pub fn remove_migrated_key(base: &Config, stored_key: &str) -> Result<Config, String> {
@@ -328,15 +338,29 @@ mod tests {
     fn promoting_swaps_with_the_previous_model() {
         let base = with_models(&["a", "b", "c"]);
         assert_eq!(
-            promote_model(&base, 2).transcription.models,
+            promote_model(&base, 2).unwrap().transcription.models,
             ["a", "c", "b"]
         );
         assert_eq!(
-            promote_model(&base, 1).transcription.models,
+            promote_model(&base, 1).unwrap().transcription.models,
             ["b", "a", "c"]
         );
-        assert_eq!(promote_model(&base, 0), base);
-        assert_eq!(promote_model(&base, 9), base);
+        assert_eq!(promote_model(&base, 0).unwrap(), base);
+        assert_eq!(promote_model(&base, 9).unwrap(), base);
+    }
+
+    #[test]
+    fn live_only_models_stay_the_primary_model() {
+        let live_only = "elevenlabs::scribe_v2_realtime";
+        let base = with_models(&[live_only, "grok::grok-voice-transcribe-2.0"]);
+        // A fallback cannot be live-only, and the live-only primary cannot move down.
+        assert!(set_model(&base, 1, Some(live_only)).is_err());
+        assert!(set_model(&with_models(&["a"]), 1, Some(live_only)).is_err());
+        assert!(promote_model(&base, 1).is_err());
+        // It can still become the primary model.
+        let config = set_model(&with_models(&["a", "b"]), 0, Some(live_only)).unwrap();
+        assert_eq!(config.transcription.models[0], live_only);
+        assert!(crate::providers::options(&config, live_only).streaming);
     }
 
     #[test]
@@ -373,5 +397,22 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn fallbacks_can_still_be_reordered_below_a_live_only_primary() {
+        let live_only = "elevenlabs::scribe_v2_realtime";
+        let base = with_models(&[live_only, "a", "b"]);
+        assert_eq!(
+            promote_model(&base, 2).unwrap().transcription.models,
+            [live_only, "b", "a"]
+        );
+        assert!(promote_model(&base, 1).is_err());
+        // Replacing a fallback with a live-only model fails without changing anything.
+        assert!(set_model(&base, 2, Some(live_only)).is_err());
+        assert!(set_model(&base, 2, Some("openai::gpt-live-transcribe")).is_err());
+        // Swapping the live-only primary for an upload model is allowed.
+        let config = set_model(&base, 0, Some("c")).unwrap();
+        assert_eq!(config.transcription.models, ["c", "a", "b"]);
     }
 }

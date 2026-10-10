@@ -832,6 +832,76 @@ pub(crate) fn symbol_icon(
         .rendering_mode(gpui_symbols::RenderingMode::Monochrome)
 }
 
+/// The GitHub mark, from the 16-unit octicon in absolute coordinates: an
+/// end point followed by its two cubic control points.
+const GITHUB_MARK: [[(f32, f32); 3]; 24] = [
+    [(0.0, 8.0), (3.58, 0.0), (0.0, 3.58)],
+    [(5.47, 15.59), (0.0, 11.54), (2.29, 14.53)],
+    [(6.02, 15.21), (5.87, 15.66), (6.02, 15.42)],
+    [(6.01, 13.72), (6.02, 15.02), (6.01, 14.39)],
+    [(3.32, 12.78), (4.0, 14.09), (3.48, 13.23)],
+    [(2.5, 11.65), (3.23, 12.55), (2.84, 11.84)],
+    [(2.49, 11.12), (2.22, 11.5), (1.82, 11.13)],
+    [(3.72, 11.94), (3.12, 11.11), (3.57, 11.7)],
+    [(6.05, 12.6), (4.44, 13.15), (5.59, 12.81)],
+    [(6.56, 11.53), (6.12, 12.08), (6.33, 11.73)],
+    [(2.92, 7.58), (4.78, 11.33), (2.92, 10.64)],
+    [(3.74, 5.43), (2.92, 6.71), (3.23, 5.99)],
+    [(3.82, 3.31), (3.66, 5.23), (3.38, 4.41)],
+    [(6.02, 4.13), (3.82, 3.31), (4.49, 3.1)],
+    [(8.02, 3.86), (6.66, 3.95), (7.34, 3.86)],
+    [(10.02, 4.13), (8.7, 3.86), (9.38, 3.95)],
+    [(12.22, 3.31), (11.55, 3.09), (12.22, 3.31)],
+    [(12.3, 5.43), (12.66, 4.41), (12.38, 5.23)],
+    [(13.12, 7.58), (12.81, 5.99), (13.12, 6.7)],
+    [(9.47, 11.53), (13.12, 10.65), (11.25, 11.33)],
+    [(10.01, 13.01), (9.76, 11.78), (10.01, 12.26)],
+    [(10.0, 15.21), (10.01, 14.08), (10.0, 14.94)],
+    [(10.55, 15.59), (10.0, 15.42), (10.15, 15.67)],
+    // After the arc around the right side back to (16, 8).
+    [(8.0, 0.0), (16.0, 3.58), (12.42, 0.0)],
+];
+
+/// The GitHub mark in one theme color. SF Symbols has no logo for it, so it
+/// is drawn as a vector like the wordmark.
+pub(crate) fn github_mark(color: ThemeColor, size: f32) -> AnyElement {
+    canvas(
+        |_, _, _| {},
+        move |bounds, (), window, _| {
+            let scale = size / 16.0;
+            let at = |(x, y): (f32, f32)| {
+                point(
+                    bounds.origin.x + px(x * scale),
+                    bounds.origin.y + px(y * scale),
+                )
+            };
+            let mut path = PathBuilder::fill();
+            path.move_to(at((8.0, 0.0)));
+            let (body, last) = GITHUB_MARK.split_at(GITHUB_MARK.len() - 1);
+            for [to, a, b] in body {
+                path.cubic_bezier_to(at(*to), at(*a), at(*b));
+            }
+            let radius = px(8.013 * scale);
+            path.arc_to(
+                point(radius, radius),
+                px(0.0),
+                false,
+                false,
+                at((16.0, 8.0)),
+            );
+            let [to, a, b] = last[0];
+            path.cubic_bezier_to(at(to), at(a), at(b));
+            path.close();
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgb(color));
+            }
+        },
+    )
+    .size(px(size))
+    .flex_none()
+    .into_any_element()
+}
+
 /// A turning three-quarter ring for work in progress. With reduced motion it
 /// rests in place.
 pub(crate) fn spinner(id: impl Into<ElementId>, color: ThemeColor, size: f32) -> AnyElement {
@@ -879,8 +949,26 @@ pub(crate) fn icon_button_with(
     label: &'static str,
     glyph: AnyElement,
 ) -> Stateful<Div> {
-    layout_item(div())
-        .id(id)
+    icon_button_frame(layout_item(div()), id, label, glyph)
+}
+
+/// An [`icon_button_with`] for the sidebar, which sits outside every pane
+/// and so is not a pane layout probe.
+pub(crate) fn sidebar_icon_button(
+    id: impl Into<ElementId>,
+    label: &'static str,
+    glyph: AnyElement,
+) -> Stateful<Div> {
+    icon_button_frame(div(), id, label, glyph)
+}
+
+fn icon_button_frame(
+    base: Div,
+    id: impl Into<ElementId>,
+    label: &'static str,
+    glyph: AnyElement,
+) -> Stateful<Div> {
+    base.id(id)
         .flex_none()
         .size(px(28.0))
         .flex()

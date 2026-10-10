@@ -418,7 +418,8 @@ impl ModelOptions {
     }
 
     fn for_capabilities(mut self, capabilities: Capabilities) -> Self {
-        self.streaming &= capabilities.streaming;
+        // A realtime-only model has no other transport, so it always streams.
+        self.streaming = capabilities.streaming && (self.streaming || !capabilities.batch);
         self.smart_format &= capabilities.formatting;
         self.punctuate &= capabilities.punctuate;
         self.numerals &= capabilities.numerals;
@@ -426,6 +427,14 @@ impl ModelOptions {
         self
     }
 }
+/// A model without an upload transport only works live, while recording.
+/// Fallbacks answer the finished recording, so such a model can only be the
+/// primary one.
+pub fn is_realtime_only(id: &str) -> bool {
+    let capabilities = ModelRef::parse(id).capabilities();
+    capabilities.streaming && !capabilities.batch
+}
+
 pub fn options(config: &Config, id: &str) -> ModelOptions {
     config
         .transcription
@@ -647,9 +656,10 @@ mod tests {
         assert_eq!(options(&config, "deepgram::nova-3").language, "pt");
         for id in ["deepgram::nova-2", "elevenlabs::scribe_v2_realtime"] {
             let options = options(&config, id);
+            // A live-only model always streams; its other false choices survive.
+            assert_eq!(options.streaming, is_realtime_only(id));
             assert!(
-                !options.streaming
-                    && !options.smart_format
+                !options.smart_format
                     && !options.punctuate
                     && !options.numerals
                     && !options.no_verbatim
@@ -709,7 +719,8 @@ mod tests {
             Some("deepgram::nova-3"),
         );
         let target = options(&config, "elevenlabs::scribe_v2_realtime");
-        assert!(!target.streaming);
+        // Live-only models stream even when the source had streaming off.
+        assert!(target.streaming);
         assert!(target.no_verbatim);
         initialize_model(
             &mut config,
@@ -791,5 +802,58 @@ mod tests {
             .language = "en".into();
         initialize_model(&mut c, "deepgram::nova-2", Some("deepgram::nova-3"));
         assert_eq!(options(&c, "deepgram::nova-2").language, "pt");
+    }
+
+    #[test]
+    fn default_chain_is_a_live_primary_with_distinct_upload_fallbacks() {
+        let models = Config::default().transcription.models;
+        assert!(is_realtime_only(&models[0]));
+        assert!(options(&Config::default(), &models[0]).streaming);
+        for id in &models[1..] {
+            assert!(
+                !is_realtime_only(id),
+                "{id} cannot answer a finished recording"
+            );
+            assert!(ModelRef::parse(id).capabilities().batch, "{id}");
+        }
+        let unique: std::collections::BTreeSet<_> =
+            models.iter().map(|id| ModelRef::parse(id).key()).collect();
+        assert_eq!(unique.len(), models.len());
+        assert!(
+            models
+                .iter()
+                .any(|id| ModelRef::parse(id).provider == Provider::OpenRouter)
+        );
+    }
+
+    #[test]
+    fn only_models_without_uploads_are_live_only_and_others_keep_their_choice() {
+        for id in [
+            "elevenlabs::scribe_v2_realtime",
+            "openai::gpt-live-transcribe",
+            "google::gemini-3.5-transcribe-live",
+        ] {
+            assert!(is_realtime_only(id), "{id}");
+        }
+        for id in [
+            "deepgram::nova-3",
+            "grok::grok-voice-transcribe-2.0",
+            "meta::muse-voice-transcribe-1.0",
+            "microsoft/mai-transcribe-2",
+            "openai::gpt-transcribe",
+        ] {
+            assert!(!is_realtime_only(id), "{id}");
+        }
+        let mut config = Config::default();
+        for streaming in [false, true] {
+            config.transcription.model_options.insert(
+                "deepgram::nova-3".into(),
+                ModelOptions {
+                    streaming,
+                    ..ModelOptions::default()
+                },
+            );
+            assert_eq!(options(&config, "deepgram::nova-3").streaming, streaming);
+        }
     }
 }

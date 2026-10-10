@@ -157,6 +157,14 @@ A transcrição usa a internet e a sua própria chave de API.
 | **Google** | Gemini Transcribe e Transcribe Live, com a chave do AI Studio, vocabulário e Transcrição inteligente. |
 | **Meta** | Muse Voice Transcribe por upload ou streaming, com palavras-chave e idioma. |
 
+A cadeia padrão é **ElevenLabs Scribe v2 Realtime** (ao vivo), com
+**MAI-Transcribe 2** pelo OpenRouter e **Grok Voice Transcribe 2.0** como
+fallbacks; a chave de qualquer um deles já basta para começar. Só o modelo
+principal transmite durante a gravação: os fallbacks recebem o clipe
+completo depois que você termina, num único envio. Por isso modelos que só
+funcionam ao vivo, como o Scribe v2 Realtime, só podem ser o principal, e o
+streaming aparece fixo nas opções dos fallbacks.
+
 Os seletores mostram somente modelos de provedores com chave cadastrada. A
 busca combina nome, ID, provedor e capacidades: `deepgram streaming`,
 `google keywords`, `batch`. Avisos de preço, pré-requisitos e restrições
@@ -259,9 +267,13 @@ regras depois não reescreve o Histórico. Um resultado vazio nunca é colado.
 
 - **Microfone**: dispositivo, prioridade automática entre microfones, canal
   de entrada em interfaces com vários canais, níveis RMS e pico do último
-  clipe, **Cortar silêncio** e a opção de liberar o microfone enquanto ocioso.
-- **Durante o ditado**: **Silenciar**, **Abaixar** ou **Pausar** o que estiver
-  tocando, com fades curtos que respeitam ajustes manuais de volume.
+  clipe, **Cortar silêncio** (ligado) e o modo do microfone. Por padrão ele
+  só abre no atalho, então o indicador do macOS aparece apenas enquanto você
+  dita; **Manter pronto** guarda um trecho antes do atalho para não perder a
+  primeira sílaba.
+- **Durante o ditado**: por padrão o áudio do sistema **abaixa para 30%**;
+  também dá para **Silenciar**, **Pausar** ou **Manter**, sempre com fades
+  curtos que respeitam ajustes manuais de volume.
 - **Atalhos**: **Tocar ou segurar** (padrão), **Só segurar** ou **Toque
   duplo**. **Enter para colar e enviar**, desligado por padrão, termina a
   gravação travada, cola e envia um Enter ao mesmo aplicativo.
@@ -300,7 +312,10 @@ com a retenção normal: ficam até você recuperá-las ou excluí-las.
 As **Estatísticas** comparam períodos (hoje, 7 dias, 30 dias, tudo) e detalham
 as tentativas por provedor ou modelo, separando **Ao vivo** de **Gravado**:
 latência média, P95 aproximado (a partir de 20 respostas), retries, fallbacks,
-erros por tipo e custo. Só totais diários são guardados, nunca texto ou áudio.
+erros por tipo e custo. O cartão **Cancelado durante o streaming** mostra o
+áudio que já tinha ido ao vivo para o provedor quando você cancelou a gravação
+(e que normalmente é cobrado), com o custo estimado (≈) e a fatia do áudio
+enviado. Só totais diários são guardados, nunca texto ou áudio.
 
 ## Privacidade
 

@@ -421,6 +421,51 @@ pub struct Sample {
     pub cost_usd: f64,
     pub failures: Vec<Failure>,
     pub skipped_silent: bool,
+    /// A live session that sent audio but ended without any dictation, for
+    /// example cancelled while recording. It is not a dictation.
+    pub discarded: Option<DiscardedStream>,
+}
+
+/// Audio streamed to a provider that no dictation accounts for.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DiscardedStream {
+    pub sent_ms: u64,
+    /// Published-price estimate; `None` when the model has no known price.
+    pub estimated_cost_usd: Option<f64>,
+}
+
+/// Live sessions that were cancelled, discarded or interrupted after sending
+/// audio. Absent (zero) for days recorded before this existed.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct DiscardedTotals {
+    pub sessions: u64,
+    pub sent_ms: u64,
+    /// Sessions with a list-price estimate; the others have unknown cost.
+    pub estimated_sessions: u64,
+    pub estimated_cost_usd: f64,
+}
+
+impl DiscardedTotals {
+    fn add(&mut self, stream: &DiscardedStream) {
+        self.sessions = self.sessions.saturating_add(1);
+        self.sent_ms = self.sent_ms.saturating_add(stream.sent_ms);
+        if let Some(cost) = stream.estimated_cost_usd
+            && add_cost(&mut self.estimated_cost_usd, cost)
+        {
+            self.estimated_sessions = self.estimated_sessions.saturating_add(1);
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.sessions = self.sessions.saturating_add(other.sessions);
+        self.sent_ms = self.sent_ms.saturating_add(other.sent_ms);
+        if add_cost(&mut self.estimated_cost_usd, other.estimated_cost_usd) {
+            self.estimated_sessions = self
+                .estimated_sessions
+                .saturating_add(other.estimated_sessions);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -447,10 +492,15 @@ pub struct Totals {
     pub model_latency: BTreeMap<String, ModelLatency>,
     /// Failed attempts per error kind, then per model.
     pub errors: BTreeMap<String, BTreeMap<String, u64>>,
+    pub discarded: DiscardedTotals,
 }
 
 impl Totals {
     pub(crate) fn add_sample(&mut self, sample: &Sample) {
+        if let Some(stream) = &sample.discarded {
+            self.discarded.add(stream);
+            return;
+        }
         self.recorded_ms = self.recorded_ms.saturating_add(sample.recorded_ms);
         self.sent_ms = self.sent_ms.saturating_add(sample.sent_ms);
         if sample.skipped_silent {
@@ -510,6 +560,7 @@ impl Totals {
 
     pub fn merge(&mut self, other: &Self) {
         self.details.merge(&other.details);
+        self.discarded.merge(&other.discarded);
         self.dictations = self.dictations.saturating_add(other.dictations);
         self.failed_dictations = self
             .failed_dictations
@@ -1216,6 +1267,7 @@ mod tests {
             cost_usd: 0.001,
             failures,
             skipped_silent: false,
+            discarded: None,
         }
     }
 
@@ -1620,5 +1672,69 @@ mod tests {
     fn words_ignore_punctuation_only_tokens() {
         assert_eq!(word_count("Olá, mundo — tudo bem?"), 4);
         assert_eq!(word_count("   "), 0);
+    }
+
+    #[test]
+    fn discarded_streams_are_separate_from_dictations_and_keep_unknown_costs() {
+        let mut day = Totals::default();
+        day.add_sample(&Sample {
+            discarded: Some(DiscardedStream {
+                sent_ms: 4_000,
+                estimated_cost_usd: Some(0.001),
+            }),
+            ..Sample::default()
+        });
+        day.add_sample(&Sample {
+            discarded: Some(DiscardedStream {
+                sent_ms: 2_000,
+                estimated_cost_usd: None,
+            }),
+            ..Sample::default()
+        });
+        assert_eq!(
+            day.discarded,
+            DiscardedTotals {
+                sessions: 2,
+                sent_ms: 6_000,
+                estimated_sessions: 1,
+                estimated_cost_usd: 0.001,
+            }
+        );
+        assert_eq!(
+            day.dictations + day.failed_dictations + day.skipped_silent,
+            0
+        );
+        assert_eq!((day.recorded_ms, day.sent_ms), (0, 0));
+        assert_eq!((day.cost_usd, day.estimated_cost_usd), (0.0, 0.0));
+
+        let mut period = Totals::default();
+        period.merge(&day);
+        period.merge(&day);
+        assert_eq!(period.discarded.sessions, 4);
+        assert_eq!(period.discarded.estimated_sessions, 2);
+        assert!((period.discarded.estimated_cost_usd - 0.002).abs() < 1e-12);
+
+        // Days saved before this existed load as nothing discarded.
+        let old: Totals = serde_json::from_str(r#"{"dictations":3}"#).unwrap();
+        assert_eq!(old.discarded, DiscardedTotals::default());
+        let saved: Totals = serde_json::from_str(&serde_json::to_string(&period).unwrap()).unwrap();
+        assert_eq!(saved.discarded, period.discarded);
+    }
+
+    #[test]
+    fn discarded_streams_are_recorded_into_the_day_file() {
+        let path = temp_path("discarded");
+        let sample = Sample {
+            discarded: Some(DiscardedStream {
+                sent_ms: 1_500,
+                estimated_cost_usd: Some(0.0005),
+            }),
+            ..Sample::default()
+        };
+        record_at(&path, &sample, "2026-10-10").unwrap();
+        let totals = &load(&path).unwrap().days["2026-10-10"];
+        assert_eq!(totals.discarded.sessions, 1);
+        assert_eq!(totals.discarded.sent_ms, 1_500);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }

@@ -1714,9 +1714,18 @@ impl AppWindow {
                 .h(px(30.0))
                 .flex()
                 .items_center()
+                .justify_between()
                 .text_size(px(11.0))
                 .text_color(rgb(MUTED))
                 .child(format!("Endu {}", env!("CARGO_PKG_VERSION")))
+                .child(
+                    crate::desktop_ui::sidebar_icon_button(
+                        "sidebar-github",
+                        t("View on GitHub"),
+                        crate::desktop_ui::github_mark(crate::desktop_ui::ThemeColor::Muted, 14.0),
+                    )
+                    .on_click(|_, _, cx| cx.open_url(env!("CARGO_PKG_REPOSITORY"))),
+                )
                 .into_any_element();
         };
         let restarting = self.update_restarting;
@@ -2833,7 +2842,7 @@ mod tests {
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.settings.recording_audio_behavior = RecordingAudioBehavior::LowerVolume;
-                assert_eq!(view.lower_volume_input.read(cx).text(), "80");
+                assert_eq!(view.lower_volume_input.read(cx).text(), "30");
                 for percent in ["35", "0", "100"] {
                     view.lower_volume_input
                         .update(cx, |input, cx| input.set_text(percent, cx));

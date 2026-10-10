@@ -124,7 +124,14 @@ pub fn native_catalog() -> Vec<CatalogModel> {
 
 pub fn available_catalog(remote: &[CatalogModel]) -> Vec<CatalogModel> {
     let mut models = native_catalog();
+    // Default OpenRouter routes stay choosable before the remote catalog
+    // loads. Native defaults are already listed under their own provider.
     for id in Config::default().transcription.models {
+        if crate::providers::ModelRef::parse(&id).provider != crate::providers::Provider::OpenRouter
+            || models.iter().any(|model| model.id == id)
+        {
+            continue;
+        }
         let (_, name) = split_name(&id, "");
         models.push(CatalogModel {
             id,
@@ -254,15 +261,16 @@ pub fn selector_label(id: &str, catalog: &[CatalogModel]) -> String {
 }
 
 pub fn label(id: &str, catalog: &[CatalogModel]) -> String {
-    catalog
-        .iter()
+    // A native model always reads with its own name; catalogs describe routes.
+    native_catalog()
+        .into_iter()
         .find(|model| model.id == id)
-        .map(|model| model.name.clone())
+        .map(|model| model.name)
         .or_else(|| {
-            native_catalog()
-                .into_iter()
+            catalog
+                .iter()
                 .find(|model| model.id == id)
-                .map(|model| model.name)
+                .map(|model| model.name.clone())
         })
         .unwrap_or_else(|| crate::providers::ModelRef::parse(id).model.to_owned())
 }
@@ -494,7 +502,15 @@ mod tests {
                     .any(|model| crate::providers::ModelRef::parse(&model.id).provider == provider)
             );
         }
-        let id = Config::default().transcription.models[0].clone();
+        let id = Config::default()
+            .transcription
+            .models
+            .into_iter()
+            .find(|id| {
+                crate::providers::ModelRef::parse(id).provider
+                    == crate::providers::Provider::OpenRouter
+            })
+            .expect("the default chain keeps an OpenRouter route");
         let remote = CatalogModel {
             id: id.clone(),
             name: "Remote model name".into(),
@@ -509,6 +525,38 @@ mod tests {
             capability_badges("deepgram::nova-3", false)
                 .iter()
                 .any(|(_, label)| *label == "Live")
+        );
+    }
+
+    #[test]
+    fn default_chain_models_are_listed_once_under_their_own_provider() {
+        let catalog = available_catalog(&[]);
+        for id in Config::default().transcription.models {
+            let entries: Vec<_> = catalog.iter().filter(|model| model.id == id).collect();
+            assert_eq!(entries.len(), 1, "{id} must appear exactly once");
+            assert_eq!(entries[0].provider, provider_label(&id), "{id}");
+        }
+        // A catalog entry that names a native model after its id never wins.
+        let id = "elevenlabs::scribe_v2_realtime";
+        let raw = CatalogModel {
+            id: id.into(),
+            name: id.into(),
+            provider: "OpenRouter".into(),
+        };
+        assert_eq!(label(id, std::slice::from_ref(&raw)), "Scribe v2 Realtime");
+        assert_eq!(
+            selector_label(id, &[raw]),
+            "ElevenLabs · Scribe v2 Realtime"
+        );
+        // Routes still take their name from the catalog.
+        let route = CatalogModel {
+            id: "microsoft/mai-transcribe-2".into(),
+            name: "MAI-Transcribe 2".into(),
+            provider: "OpenRouter".into(),
+        };
+        assert_eq!(
+            selector_label("microsoft/mai-transcribe-2", &[route]),
+            "OpenRouter · MAI-Transcribe 2"
         );
     }
 }

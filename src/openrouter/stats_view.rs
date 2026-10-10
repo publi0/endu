@@ -1,11 +1,11 @@
 //! Aggregate Statistics: global dictation totals and scoped, measured attempts.
 use super::stats::{
-    self, AttemptSample, Dashboard, DictationTelemetry, ErrorKind, Failure, Period, RequestMode,
-    RequestTotals, Sample, Totals,
+    self, AttemptSample, Dashboard, DictationTelemetry, DiscardedTotals, ErrorKind, Failure,
+    Period, RequestMode, RequestTotals, Sample, Totals,
 };
 use super::stats_dashboard::{self, Group, Mode, Sort};
 use crate::desktop_ui::{
-    ACCENT, FAINT, LINE, MUTED, NEGATIVE, PANEL_RADIUS, POSITIVE, PickerState,
+    ACCENT, DIVIDER, FAINT, LINE, MUTED, NEGATIVE, PANEL_RADIUS, POSITIVE, PickerState,
     SETTINGS_CONTROL_WIDTH, SURFACE, SURFACE_HOVER, SURFACE_SELECTED, TEXT, TEXT_SOFT,
     compact_panel, compact_panel_header, disclosure_button, empty_message, error_message,
     header_button, pane_body, pane_content, pane_header_with_action, picker_open_key, picker_popup,
@@ -698,6 +698,11 @@ impl StatisticsView {
                     },
                 ),
                 cost_detail,
+            ))
+            .child(discarded_card(
+                &totals.discarded,
+                totals.sent_ms,
+                self.shown,
             ));
         let details = &totals.details;
         let recoveries = div()
@@ -737,6 +742,11 @@ impl StatisticsView {
             .child(note(t(
                 "Words are raw transcription output. Avg wait is transcription time, including failures; queue and paste are excluded.",
             )))
+            .when(totals.discarded.sessions > 0, |overview| {
+                overview.child(note(t(
+                    "Audio already streamed when a recording is cancelled is usually still billed by the provider.",
+                )))
+            })
             .child(
                 compact_panel()
                     .flex_none()
@@ -1214,6 +1224,78 @@ fn small_card(title: &'static str, value: String, detail: String) -> Div {
         )
         .child(note(detail))
 }
+/// Live audio that left the Mac but never became a dictation, with its share
+/// of everything sent; the share bar grows with the other overview values.
+fn discarded_card(discarded: &DiscardedTotals, sent_ms: u64, shown: u64) -> Div {
+    let (value, detail) = discarded_summary(discarded);
+    let card = small_card(t("Cancelled while streaming"), value, detail)
+        .debug_selector(|| "statistics-discarded".into());
+    if discarded.sessions == 0 {
+        return card;
+    }
+    let streamed = sent_ms.saturating_add(discarded.sent_ms);
+    let share = if streamed == 0 {
+        0.0
+    } else {
+        discarded.sent_ms as f32 / streamed as f32
+    };
+    card.child(
+        div()
+            .mt_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(4.0))
+                    .rounded(px(2.0))
+                    .bg(rgb(DIVIDER))
+                    .child(crate::desktop_ui::animate_once(
+                        div()
+                            .h_full()
+                            .rounded(px(2.0))
+                            .bg(rgb(ACCENT))
+                            .w(gpui::relative(share.max(0.02))),
+                        gpui::ElementId::NamedInteger("statistics-discarded-share".into(), shown),
+                        700,
+                        move |bar, progress| {
+                            let grown = crate::desktop_ui::ease_out(progress);
+                            bar.w(gpui::relative((share * grown).max(0.02)))
+                        },
+                    )),
+            )
+            .child(note(tf!(
+                "{share} of audio sent",
+                share = rate(discarded.sent_ms, streamed)
+            ))),
+    )
+}
+fn discarded_summary(discarded: &DiscardedTotals) -> (String, String) {
+    if discarded.sessions == 0 {
+        return ("—".into(), t("Nothing cancelled mid-stream").into());
+    }
+    let count = tf!(
+        "{count} cancelled",
+        count = format_count(discarded.sessions)
+    );
+    let cost = match discarded.estimated_sessions {
+        0 => t("cost unknown").into(),
+        known if known >= discarded.sessions => {
+            format!("≈ {}", format_cost(discarded.estimated_cost_usd))
+        }
+        known => tf!(
+            "≈ {cost} for {known} of them",
+            cost = format_cost(discarded.estimated_cost_usd),
+            known = format_count(known)
+        ),
+    };
+    (
+        format_duration(discarded.sent_ms),
+        format!("{count} · {cost}"),
+    )
+}
 fn table_row() -> Div {
     div()
         .px_4()
@@ -1645,6 +1727,17 @@ fn preview_dashboard(period: Period) -> Dashboard {
                     ..Default::default()
                 });
             }
+            if day % 4 == 1 {
+                // A live session cancelled after a few seconds; OpenRouter has no list price.
+                totals.add_sample(&Sample {
+                    discarded: Some(stats::DiscardedStream {
+                        sent_ms: 2_500 + day * 150,
+                        estimated_cost_usd: (day % 3 != 0)
+                            .then_some((2_500 + day * 150) as f64 / 60_000.0 * 0.004),
+                    }),
+                    ..Default::default()
+                });
+            }
         }
         days.push((date, totals));
     }
@@ -1675,6 +1768,36 @@ fn preview_dashboard(period: Period) -> Dashboard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discarded_summary_marks_estimates_and_keeps_unknown_costs_unknown() {
+        let mut discarded = DiscardedTotals::default();
+        assert_eq!(
+            discarded_summary(&discarded),
+            ("—".into(), "Nothing cancelled mid-stream".into())
+        );
+        discarded = DiscardedTotals {
+            sessions: 3,
+            sent_ms: 75_000,
+            estimated_sessions: 3,
+            estimated_cost_usd: 0.004,
+        };
+        assert_eq!(
+            discarded_summary(&discarded),
+            ("1 min".into(), "3 cancelled · ≈ $0.004".into())
+        );
+        discarded.estimated_sessions = 2;
+        assert_eq!(
+            discarded_summary(&discarded).1,
+            "3 cancelled · ≈ $0.004 for 2 of them"
+        );
+        discarded.estimated_sessions = 0;
+        discarded.estimated_cost_usd = 0.0;
+        assert_eq!(
+            discarded_summary(&discarded).1,
+            "3 cancelled · cost unknown"
+        );
+    }
 
     #[test]
     fn overview_reported_cost_matches_history_including_failed_attempts() {

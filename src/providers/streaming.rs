@@ -17,7 +17,7 @@ use tungstenite::{Message, WebSocket};
 
 use super::{ModelOptions, ModelRef, Provider};
 use crate::openrouter::Config;
-use crate::openrouter::stats::ErrorKind;
+use crate::openrouter::stats::{DiscardedStream, ErrorKind, RequestMode};
 use crate::vocabulary::Snapshot;
 
 const BLOCK: usize = 1_600; // 100 ms of mono 16 kHz audio.
@@ -305,17 +305,38 @@ struct SessionControl {
     sent_samples: Arc<AtomicUsize>,
     attempt_started: AtomicBool,
     sent_keyword_count: AtomicUsize,
+    /// Set only for sessions opened during capture: what to report if the
+    /// session ends without a dictation that accounts for its audio.
+    discard: Option<DiscardContext>,
+    accounted: AtomicBool,
+}
+/// The billing context of a live session, kept in memory only.
+struct DiscardContext {
+    model: String,
+    auto_language: bool,
 }
 impl SessionControl {
     fn new(permit: Option<SessionPermit>, cancellation: Option<Arc<AtomicBool>>) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new(Self::with(permit, cancellation, None))
+    }
+    fn live(permit: Option<SessionPermit>, discard: DiscardContext) -> Arc<Self> {
+        Arc::new(Self::with(permit, None, Some(discard)))
+    }
+    fn with(
+        permit: Option<SessionPermit>,
+        cancellation: Option<Arc<AtomicBool>>,
+        discard: Option<DiscardContext>,
+    ) -> Self {
+        Self {
             stopped: AtomicBool::new(false),
             cancelled: cancellation.unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
             _permit: permit,
             sent_samples: Arc::new(AtomicUsize::new(0)),
             attempt_started: AtomicBool::new(false),
             sent_keyword_count: AtomicUsize::new(0),
-        })
+            discard,
+            accounted: AtomicBool::new(false),
+        }
     }
     fn check(&self, deadline: Instant) -> Result<()> {
         if self.stopped.load(Ordering::Acquire) || self.cancelled.load(Ordering::Acquire) {
@@ -331,6 +352,77 @@ impl SessionControl {
     }
 }
 
+/// The last owner of a live session, worker or dictation, runs this once the
+/// socket is closed, so the count of sent samples is final. Audio that left
+/// the Mac but never reached a dictation (cancel, discard, interruption) is
+/// still billed by the provider; it is reported as discarded streaming audio.
+impl Drop for SessionControl {
+    fn drop(&mut self) {
+        let Some(discard) = self.discard.take() else {
+            return;
+        };
+        if *self.accounted.get_mut() {
+            return;
+        }
+        let sent_ms = self.sent_samples.load(Ordering::Acquire) as u64 * 1_000
+            / u64::from(crate::openrouter::transcribe::SAMPLE_RATE);
+        if sent_ms == 0 {
+            return;
+        }
+        let estimated_cost_usd = super::pricing::estimate(
+            ModelRef::parse(&discard.model),
+            RequestMode::Live,
+            super::pricing::Billing {
+                audio_ms: sent_ms,
+                auto_language: discard.auto_language,
+            },
+            *self.sent_keyword_count.get_mut(),
+        );
+        record_discarded(DiscardedStream {
+            sent_ms,
+            estimated_cost_usd,
+        });
+    }
+}
+
+/// Statistics I/O never runs on the capture or shortcut thread that may drop
+/// the last owner.
+#[cfg(not(test))]
+fn record_discarded(discarded: DiscardedStream) {
+    let _ = std::thread::Builder::new()
+        .name("hex-live-discard".into())
+        .spawn(move || {
+            crate::openrouter::stats::record(&crate::openrouter::stats::Sample {
+                discarded: Some(discarded),
+                ..Default::default()
+            });
+        });
+}
+#[cfg(test)]
+thread_local! {
+    static DISCARDED: std::cell::RefCell<Vec<DiscardedStream>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(test)]
+fn record_discarded(discarded: DiscardedStream) {
+    DISCARDED.with(|recorded| recorded.borrow_mut().push(discarded));
+}
+/// Discarded sessions whose last owner dropped on this test thread.
+#[cfg(test)]
+pub(crate) fn take_discarded() -> Vec<DiscardedStream> {
+    DISCARDED.with(|recorded| std::mem::take(&mut *recorded.borrow_mut()))
+}
+
+/// Marks a live session as part of a recorded dictation sample, so its audio
+/// is not also reported as discarded. Holding it keeps the session's
+/// accounting open until the dictation decides.
+pub struct LiveAccount(Arc<SessionControl>);
+impl LiveAccount {
+    pub fn settle(&self) {
+        self.0.accounted.store(true, Ordering::Release);
+    }
+}
+
 pub struct LiveCapture {
     config: Config,
     vocabulary: Snapshot,
@@ -343,6 +435,20 @@ pub struct LiveCapture {
     /// The worker already returned (for example without a key). Its own error
     /// is the result; audio is no longer sent and no other reason is invented.
     worker_ended: bool,
+}
+
+fn discard_context(config: &Config) -> DiscardContext {
+    let model = config
+        .transcription
+        .models
+        .first()
+        .cloned()
+        .unwrap_or_default();
+    let language = super::options(config, &model).language;
+    DiscardContext {
+        auto_language: language.trim().is_empty() || language == crate::openrouter::AUTO_LANGUAGE,
+        model,
+    }
 }
 
 impl LiveCapture {
@@ -367,7 +473,7 @@ impl LiveCapture {
         let (send_result, result) = mpsc::sync_channel(1);
         let permit = SessionPermit::acquire(SESSION_COUNT.clone());
         let admitted = permit.is_some();
-        let control = SessionControl::new(permit, None);
+        let control = SessionControl::live(permit, discard_context(&config));
         let worker_config = config.clone();
         let worker_vocabulary = vocabulary.clone();
         let worker_control = control.clone();
@@ -511,7 +617,8 @@ impl PendingLive {
             |_| true,
         );
         sender.send(result).expect("fixture receiver is alive");
-        let control = SessionControl::new(None, None);
+        // Shaped like a capture session, so unaccounted audio is reported.
+        let control = SessionControl::live(None, discard_context(&config));
         control.attempt_started.store(attempted, Ordering::Release);
         control.sent_samples.store(sent_samples, Ordering::Release);
         Self {
@@ -525,6 +632,9 @@ impl PendingLive {
 
     pub fn cancellation_flag(&self) -> Arc<AtomicBool> {
         self.control.cancelled.clone()
+    }
+    pub fn account(&self) -> LiveAccount {
+        LiveAccount(self.control.clone())
     }
     pub fn sent_samples(&self) -> usize {
         self.sent_samples_counter().load(Ordering::Acquire)
@@ -3165,6 +3275,75 @@ mod tests {
         assert!(SessionPermit::acquire(pool.clone()).is_some());
         drop(owners);
         assert_eq!(pool.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn unaccounted_live_audio_is_reported_once_by_its_last_owner() {
+        take_discarded();
+        let context = |model: &str| DiscardContext {
+            model: model.into(),
+            auto_language: false,
+        };
+        // The dictation side drops first; the worker still writes the last block.
+        let control = SessionControl::live(None, context("deepgram::nova-3"));
+        let worker = control.clone();
+        control.sent_samples.store(32_000, Ordering::Release);
+        drop(control);
+        assert!(take_discarded().is_empty(), "the worker still owns it");
+        worker.sent_samples.store(48_000, Ordering::Release);
+        worker.sent_keyword_count.store(2, Ordering::Release);
+        drop(worker);
+        let reported = take_discarded();
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].sent_ms, 3_000);
+        let estimate = reported[0].estimated_cost_usd.unwrap();
+        assert!(
+            (estimate - (0.0048 + 0.0013) / 20.0).abs() < 1e-12,
+            "{estimate}"
+        );
+
+        // A price Hex does not know stays unknown, never zero.
+        let unpriced = SessionControl::live(None, context("openai/gpt-4o-transcribe"));
+        unpriced.sent_samples.store(16_000, Ordering::Release);
+        drop(unpriced);
+        assert_eq!(
+            take_discarded(),
+            vec![DiscardedStream {
+                sent_ms: 1_000,
+                estimated_cost_usd: None
+            }]
+        );
+    }
+
+    #[test]
+    fn accounted_silent_or_recorded_sessions_are_not_discarded() {
+        take_discarded();
+        let accounted = SessionControl::live(
+            None,
+            DiscardContext {
+                model: "deepgram::nova-3".into(),
+                auto_language: true,
+            },
+        );
+        accounted.sent_samples.store(16_000, Ordering::Release);
+        let account = LiveAccount(accounted.clone());
+        account.settle();
+        drop((accounted, account));
+
+        let nothing_sent = SessionControl::live(
+            None,
+            DiscardContext {
+                model: "deepgram::nova-3".into(),
+                auto_language: true,
+            },
+        );
+        drop(nothing_sent);
+
+        // Completed-clip sessions belong to their dictation's request statistics.
+        let recorded = SessionControl::new(None, None);
+        recorded.sent_samples.store(16_000, Ordering::Release);
+        drop(recorded);
+        assert!(take_discarded().is_empty());
     }
 
     #[test]

@@ -15,7 +15,6 @@ pub struct ModelNotice {
 /// as provider-wide copy or next to unselected search results.
 pub fn model_notices(config: &Config, id: &str) -> Vec<ModelNotice> {
     let model = ModelRef::parse(id);
-    let capabilities = model.capabilities();
     let options = options(config, id);
     let mut notices = Vec::new();
 
@@ -37,13 +36,6 @@ pub fn model_notices(config: &Config, id: &str) -> Vec<ModelNotice> {
                 is_error: false,
             });
         }
-    }
-
-    if capabilities.streaming && !capabilities.batch && !options.streaming {
-        notices.push(ModelNotice {
-            text: t("Streaming is off. This realtime-only model will be skipped."),
-            is_error: true,
-        });
     }
 
     if model.provider == Provider::Deepgram
@@ -165,7 +157,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_off_is_an_error_only_for_known_realtime_only_models() {
+    fn live_only_models_always_stream_and_never_warn_about_being_skipped() {
         let mut config = Config::default();
         for id in [
             "openai::gpt-live-transcribe",
@@ -180,42 +172,8 @@ mod tests {
                     ..Default::default()
                 },
             );
-            assert!(
-                model_notices(&config, id)
-                    .iter()
-                    .any(|notice| notice.is_error
-                        && notice.text
-                            == "Streaming is off. This realtime-only model will be skipped.")
-            );
-            profile(
-                &mut config,
-                id,
-                ModelOptions {
-                    streaming: true,
-                    ..Default::default()
-                },
-            );
-            assert!(
-                model_notices(&config, id)
-                    .iter()
-                    .all(|notice| !notice.is_error)
-            );
-        }
-        for id in [
-            "deepgram::nova-3",
-            "grok::grok-voice-transcribe-2.0",
-            "elevenlabs::scribe_v2",
-            "openai::unknown",
-            "openai/gpt-live-transcribe",
-        ] {
-            profile(
-                &mut config,
-                id,
-                ModelOptions {
-                    streaming: false,
-                    ..Default::default()
-                },
-            );
+            assert!(crate::providers::is_realtime_only(id));
+            assert!(crate::providers::options(&config, id).streaming);
             assert!(
                 model_notices(&config, id)
                     .iter()

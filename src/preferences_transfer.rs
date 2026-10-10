@@ -358,6 +358,14 @@ impl PreferenceBundle {
                 bail!("Model identifiers must be unique and contain no whitespace.");
             }
         }
+        if transcription
+            .models
+            .iter()
+            .skip(1)
+            .any(|id| crate::providers::is_realtime_only(id))
+        {
+            bail!("Only the primary model can be one that works only live.");
+        }
         if !openrouter::LANGUAGES
             .iter()
             .any(|(code, _)| *code == transcription.language)
@@ -1067,6 +1075,13 @@ mod tests {
                 json!(["x".repeat(MAX_MODEL_CHARS + 1)]),
             ),
             ("/transcription/models", json!(["duplicate", "duplicate"])),
+            (
+                "/transcription/models",
+                json!([
+                    "grok::grok-voice-transcribe-2.0",
+                    "elevenlabs::scribe_v2_realtime"
+                ]),
+            ),
             ("/transcription/language", json!("PRIVATE_MARKER_VALUE")),
             ("/transcription/attempt_timeout_seconds", json!(601)),
             ("/transcription/total_timeout_seconds", json!(1801)),
@@ -1342,6 +1357,32 @@ mod tests {
                     assert_eq!(config, original);
                 }
             });
+        }
+    }
+
+    #[test]
+    fn audio_warnings_export_both_choices_and_legacy_imports_preserve_local_choice() {
+        for audio_notices in [false, true] {
+            let mut source = settings();
+            source.hud.audio_notices = audio_notices;
+            let bytes = export_bytes(&source, &Config::default()).unwrap();
+            let mut local = settings();
+            local.hud.audio_notices = !audio_notices;
+            let imported = decode(&bytes).unwrap();
+            assert_eq!(
+                imported.app.apply_to(&local).hud.audio_notices,
+                audio_notices
+            );
+            let mut legacy: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            legacy["app"]["hud"]
+                .as_object_mut()
+                .unwrap()
+                .remove("audio_notices");
+            let imported = decode(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+            assert_eq!(
+                imported.app.apply_to(&local).hud.audio_notices,
+                local.hud.audio_notices
+            );
         }
     }
 }

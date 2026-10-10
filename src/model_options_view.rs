@@ -440,6 +440,27 @@ impl ModelOptionsView {
             .into_any_element();
         self.row(field, title, detail, control)
     }
+    /// A toggle fixed by the model's position or transport: shown inert. A
+    /// fallback's saved choice waits for the model to become primary.
+    fn disabled_toggle_row(
+        &self,
+        field: Field,
+        title: &'static str,
+        detail: &'static str,
+        on: bool,
+    ) -> AnyElement {
+        let control = div()
+            .debug_selector(|| "model-option-toggle-disabled".into())
+            .w(px(SETTINGS_CONTROL_WIDTH))
+            .h(px(crate::desktop_ui::CONTROL_HEIGHT))
+            .flex()
+            .items_center()
+            .justify_end()
+            .opacity(0.45)
+            .child(toggle(if on { 1.0 } else { 0.0 }))
+            .into_any_element();
+        self.row(field, title, detail, control)
+    }
     fn render_model_selector(&self, cx: &mut Context<Self>) -> AnyElement {
         let label = self
             .selected
@@ -570,7 +591,28 @@ impl Render for ModelOptionsView {
                 self.render_language(cx),
             ));
             if caps.streaming {
-                panel = panel.child(self.toggle_row(Field::Streaming, 0, t("Streaming"), t("Transcribe while recording. Silence trimming applies only to recorded-audio requests."), self.saved.streaming, cx));
+                panel = panel.child(match streaming_control(&self.config, id) {
+                    StreamingControl::AlwaysLive => self.disabled_toggle_row(
+                        Field::Streaming,
+                        t("Streaming"),
+                        t("This model only works live, so it always streams and can only be the primary model."),
+                        true,
+                    ),
+                    StreamingControl::Fallback => self.disabled_toggle_row(
+                        Field::Streaming,
+                        t("Streaming"),
+                        t("Only the primary model streams while you record. As a fallback, this model receives the finished recording in a single upload."),
+                        false,
+                    ),
+                    StreamingControl::Choice => self.toggle_row(
+                        Field::Streaming,
+                        0,
+                        t("Streaming"),
+                        t("Transcribe while recording. Silence trimming applies only to recorded-audio requests."),
+                        self.saved.streaming,
+                        cx,
+                    ),
+                });
             }
             if caps.prompt {
                 panel = panel.child(
@@ -658,6 +700,34 @@ impl Render for ModelOptionsView {
             })
             .child(settings_section_label(t("Model options")))
             .child(panel)
+    }
+}
+
+/// How the Streaming option behaves for a model that can stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamingControl {
+    /// The primary model with an upload transport: streaming is a choice.
+    Choice,
+    /// A live-only model, which can only be the primary: always on.
+    AlwaysLive,
+    /// Only the primary streams while recording; fallbacks get the finished
+    /// recording in one upload, so the option does not apply.
+    Fallback,
+}
+
+fn streaming_control(config: &Config, id: &str) -> StreamingControl {
+    if providers::is_realtime_only(id) {
+        StreamingControl::AlwaysLive
+    } else if config
+        .transcription
+        .models
+        .iter()
+        .position(|model| model == id)
+        .is_some_and(|slot| slot > 0)
+    {
+        StreamingControl::Fallback
+    } else {
+        StreamingControl::Choice
     }
 }
 
@@ -799,6 +869,38 @@ mod tests {
         ] {
             assert!(cx.debug_bounds(selector).is_some());
         }
+    }
+
+    #[test]
+    fn streaming_is_fixed_for_live_only_primaries_and_for_fallbacks() {
+        let mut config = Config::default();
+        config.transcription.models = vec![
+            "elevenlabs::scribe_v2_realtime".into(),
+            "grok::grok-voice-transcribe-2.0".into(),
+        ];
+        assert_eq!(
+            streaming_control(&config, "elevenlabs::scribe_v2_realtime"),
+            StreamingControl::AlwaysLive
+        );
+        assert_eq!(
+            streaming_control(&config, "grok::grok-voice-transcribe-2.0"),
+            StreamingControl::Fallback
+        );
+        config.transcription.models = vec!["grok::grok-voice-transcribe-2.0".into()];
+        assert_eq!(
+            streaming_control(&config, "grok::grok-voice-transcribe-2.0"),
+            StreamingControl::Choice
+        );
+    }
+
+    #[gpui::test]
+    fn a_fixed_streaming_option_has_no_interactive_toggle(cx: &mut gpui::TestAppContext) {
+        let mut config = Config::default();
+        config.transcription.models = vec!["elevenlabs::scribe_v2_realtime".into()];
+        let (_view, cx) = cx.add_window_view(|_, cx| ModelOptionsView::new(config, true, cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("model-option-toggle-0").is_none());
+        assert!(cx.debug_bounds("model-option-toggle-disabled").is_some());
     }
 
     fn fixture() -> Config {

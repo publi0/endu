@@ -990,10 +990,6 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
         "Guardada en el Llavero de macOS, nunca en un archivo",
     ),
     ("Streaming", "Streaming"),
-    (
-        "Streaming is off. This realtime-only model will be skipped.",
-        "El streaming está desactivado. Este modelo, que solo funciona en tiempo real, se omitirá.",
-    ),
     ("Subtle", "Sutil"),
     ("Succeeded", "Correcto"),
     ("Success", "Éxito"),
@@ -1171,6 +1167,7 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
     ("Unsupported key", "Tecla no admitida"),
     ("Update ready", "Actualización lista"),
     ("Use another provider…", "Usar otro proveedor…"),
+    ("View on GitHub", "Ver en GitHub"),
     (
         "Use this model's non-verbatim transcription option",
         "Usa la opción de transcripción no literal de este modelo",
@@ -1428,5 +1425,40 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
     (
         "Writes “No audio” or “Low audio” in the capsule as soon as the microphone stays silent or too quiet.",
         "Escribe “Sin audio” o “Audio bajo” en la cápsula en cuanto el micrófono se queda en silencio o demasiado bajo.",
+    ),
+    (
+        "Only the primary model streams while you record. As a fallback, this model receives the finished recording in a single upload.",
+        "Solo el modelo principal transmite mientras grabas. Como fallback, este modelo recibe la grabación completa en un único envío.",
+    ),
+    (
+        "This model only works live, so it always streams and can only be the primary model.",
+        "Este modelo solo funciona en vivo, así que siempre transmite y solo puede ser el modelo principal.",
+    ),
+    (
+        "{model} only works live while recording, so it can only be the primary model.",
+        "{model} solo funciona en vivo durante la grabación, así que solo puede ser el modelo principal.",
+    ),
+    (
+        "A model that only works live must stay the primary model.",
+        "Un modelo que solo funciona en vivo debe seguir siendo el principal.",
+    ),
+    (
+        "Cancelled while streaming",
+        "Cancelado durante el streaming",
+    ),
+    (
+        "Nothing cancelled mid-stream",
+        "Nada cancelado a mitad del streaming",
+    ),
+    ("{count} cancelled", "{count} cancelados"),
+    ("cost unknown", "costo desconocido"),
+    (
+        "≈ {cost} for {known} of them",
+        "≈ {cost} en {known} de ellos",
+    ),
+    ("{share} of audio sent", "{share} del audio enviado"),
+    (
+        "Audio already streamed when a recording is cancelled is usually still billed by the provider.",
+        "El audio ya enviado por streaming cuando se cancela una grabación suele cobrarlo igualmente el proveedor.",
     ),
 ];
