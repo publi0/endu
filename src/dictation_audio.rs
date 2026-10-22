@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use color_eyre::eyre::{Result, eyre};
 
 use crate::audio::{CaptureInstant, RecoveringAudioInput, RecoveringAudioInputEvent};
-use crate::dictation::{DictationCapture, Finish};
+use crate::dictation::{DictationCapture, Finish, Release};
 use crate::microphone::DevicePreference;
 use crate::recording_environment::RecordingEnvironmentController;
 use crate::suppression::PendingInputEvents;
@@ -99,8 +99,14 @@ enum Command {
         at: CaptureInstant,
         reply: SyncSender<bool>,
     },
+    Release {
+        at: CaptureInstant,
+        tail: Duration,
+        reply: SyncSender<Release>,
+    },
     Finish {
         at: CaptureInstant,
+        keep_open: bool,
         reply: SyncSender<Finish>,
     },
     Cancel {
@@ -132,6 +138,18 @@ struct Owner {
     recognition_overflowed: bool,
     pending_input: PendingInputEvents,
     last_captured_through: Option<CaptureInstant>,
+    /// A released clip whose tail was cut short by a capture gap or a device
+    /// interruption. It is accepted work: the next Finish returns it, ending
+    /// at the release edge or its last audio, whichever is later.
+    released: Option<ReleasedClip>,
+    /// The listener sealed a tail at a new press and starts the next capture
+    /// at once; keep a released-while-idle microphone open until it does.
+    keep_open: bool,
+}
+
+struct ReleasedClip {
+    capture: DictationCapture,
+    input: Option<crate::microphone::InputDescription>,
 }
 
 #[derive(Clone, Copy)]
@@ -240,6 +258,8 @@ impl DictationAudio {
                     recognition_overflowed: false,
                     pending_input,
                     last_captured_through: None,
+                    released: None,
+                    keep_open: false,
                 }
                 .run();
             })?;
@@ -250,6 +270,28 @@ impl DictationAudio {
             state,
             worker: Some(worker),
         })
+    }
+
+    /// A running owner over a warm 48 kHz test microphone whose chunks the
+    /// caller sends; it never opens a real device.
+    #[cfg(test)]
+    pub fn for_test() -> (Self, Sender<(Vec<f32>, CaptureInstant)>) {
+        let (mut input, opened) = RecoveringAudioInput::pending_for_test();
+        let (replacement, samples) = crate::audio::AudioInput::channel_for_test();
+        opened.send((0, Ok(replacement))).unwrap();
+        assert!(matches!(
+            input.recv_timeout(Duration::ZERO, true),
+            RecoveringAudioInputEvent::Reopened
+        ));
+        let audio = Self::with_input(
+            input,
+            "Test microphone".into(),
+            RecordingEnvironmentController::for_test(),
+            PendingInputEvents::default(),
+            false,
+        )
+        .unwrap();
+        (audio, samples)
     }
 
     #[cfg(test)]
@@ -320,8 +362,28 @@ impl DictationAudio {
         self.call(|reply| Command::BecomeIntentional { at, reply })
     }
 
+    /// Applies the finishing edge without waiting for its tail; the caller
+    /// finishes at the returned instant once the timeline has reached it.
+    pub fn release(&self, at: CaptureInstant, tail: Duration) -> Result<Release> {
+        self.call(|reply| Command::Release { at, tail, reply })
+    }
+
     pub fn finish(&self, at: CaptureInstant) -> Result<Finish> {
-        self.call(|reply| Command::Finish { at, reply })
+        self.call(|reply| Command::Finish {
+            at,
+            keep_open: false,
+            reply,
+        })
+    }
+
+    /// Finishes a released clip at a new press that starts the next capture
+    /// right after, so a released-while-idle microphone stays open between.
+    pub fn finish_before_start(&self, at: CaptureInstant) -> Result<Finish> {
+        self.call(|reply| Command::Finish {
+            at,
+            keep_open: true,
+            reply,
+        })
     }
 
     pub fn cancel(&self) -> Result<()> {
@@ -438,6 +500,7 @@ impl Owner {
     fn handle(&mut self, command: Command) -> bool {
         match command {
             Command::Start { at, reply } => {
+                self.keep_open = false;
                 // Draining can discover a failure belonging to the previous capture or idle
                 // period. Validate and advance the new capture only after that drain.
                 if self.input.is_open() && !self.input.is_recovering() {
@@ -446,6 +509,17 @@ impl Owner {
                 if self.input.is_recovering() {
                     let _ = reply.send(CaptureStart::Rejected);
                     return true;
+                }
+                // Unreachable: a clip is set aside only while the listener
+                // holds its tail (Release returned Tail), and the listener
+                // seals that tail with a Finish (`finish_before_start`)
+                // before every Start; Cancel clears it too. The owner cannot
+                // hand a clip back from Start, so a leftover here would be a
+                // listener bug: fail loudly in debug builds, warn in release.
+                let leftover = self.released.take().is_some();
+                debug_assert!(!leftover, "a released clip was not sealed before Start");
+                if leftover {
+                    tracing::warn!("a released clip was still unfinished at a new capture");
                 }
                 self.state.capture_generation.fetch_add(1, Ordering::AcqRel);
                 let readiness = if self.input.is_open() {
@@ -474,22 +548,63 @@ impl Owner {
                     .publish_live_prefix(self.pending_input.oldest());
                 let _ = reply.send(became_intentional);
             }
-            Command::Finish { at, reply } => {
-                let mut finish = if self.pending_capture.take().is_some() {
+            Command::Release { at, tail, reply } => {
+                let release = if self.pending_capture.take().is_some() {
+                    // A cold open never delivered audio for this press.
+                    self.input.cancel_open();
+                    Release::Discard
+                } else {
+                    self.capture.release(at, tail)
+                };
+                if release == Release::Discard {
+                    self.state.recording.store(false, Ordering::Release);
+                } else {
+                    // Recording continues: the microphone stays open, the
+                    // environment stays active and the meter keeps moving.
+                    self.capture
+                        .publish_live_prefix(self.pending_input.oldest());
+                }
+                let _ = reply.send(release);
+            }
+            Command::Finish {
+                at,
+                keep_open,
+                reply,
+            } => {
+                let finish = if self.pending_capture.take().is_some() {
                     self.input.cancel_open();
                     Finish::Discard
                 } else {
-                    self.drain_through(at);
-                    self.capture.finish(at)
+                    // Draining may reach a gap or interruption that sets the
+                    // released clip aside; it still finishes here.
+                    if self.released.is_none() {
+                        self.drain_through(at);
+                    }
+                    match self.released.take() {
+                        Some(mut released) => {
+                            let mut finish = released.capture.finish(at);
+                            if let Finish::Transcribe(clip) = &mut finish {
+                                clip.input = released.input;
+                            }
+                            finish
+                        }
+                        None => {
+                            let mut finish = self.capture.finish(at);
+                            if let Finish::Transcribe(clip) = &mut finish {
+                                clip.input = self.input.description().cloned();
+                            }
+                            finish
+                        }
+                    }
                 };
-                if let Finish::Transcribe(clip) = &mut finish {
-                    clip.input = self.input.description().cloned();
-                }
+                self.keep_open = keep_open && self.input.is_open();
                 self.state.recording.store(false, Ordering::Release);
                 let _ = reply.send(finish);
             }
             Command::Cancel { reply } => {
                 self.pending_capture = None;
+                self.released = None;
+                self.keep_open = false;
                 if !self.input.is_open() {
                     self.input.cancel_open();
                 }
@@ -536,6 +651,7 @@ impl Owner {
 
     fn capture_idle(&self) -> bool {
         !self.capture.is_recording()
+            && !self.keep_open
             && self.pending_capture.is_none()
             && self.pending_input.oldest().is_none()
     }
@@ -563,7 +679,7 @@ impl Owner {
                     && captured_from.duration_since(previous) > Duration::from_millis(50)
                 {
                     let gap = captured_from.duration_since(previous);
-                    let was_recording = self.capture.is_recording();
+                    let was_recording = !self.set_aside_released() && self.capture.is_recording();
                     let capture_generation = self.state.capture_generation.load(Ordering::Acquire);
                     self.capture = new_capture(self.sample_rate(), &self.recording_environment);
                     self.state.recording.store(false, Ordering::Release);
@@ -593,7 +709,7 @@ impl Owner {
             RecoveringAudioInputEvent::Interrupted => {
                 self.last_captured_through = None;
                 self.next_recognition_generation();
-                let was_recording = self.capture.is_recording();
+                let was_recording = !self.set_aside_released() && self.capture.is_recording();
                 let capture_generation = self.state.capture_generation.load(Ordering::Acquire);
                 self.capture.cancel();
                 self.state.recording.store(false, Ordering::Release);
@@ -658,6 +774,22 @@ impl Owner {
                 }
             }
         }
+    }
+
+    /// A gap or interruption during a release tail ends the released clip
+    /// instead of failing it: it is set aside, with the microphone that
+    /// recorded it, for the listener's next Finish. Returns whether it was.
+    fn set_aside_released(&mut self) -> bool {
+        if !self.capture.is_released() {
+            return false;
+        }
+        let fresh = new_capture(self.sample_rate(), &self.recording_environment);
+        let capture = std::mem::replace(&mut self.capture, fresh);
+        self.released = Some(ReleasedClip {
+            capture,
+            input: self.input.description().cloned(),
+        });
+        true
     }
 
     fn forward_recognition(&mut self, samples: Vec<f32>) {
@@ -807,6 +939,8 @@ mod tests {
             recognition_overflowed: false,
             pending_input: PendingInputEvents::default(),
             last_captured_through: None,
+            released: None,
+            keep_open: false,
         };
         let input = DictationAudio {
             commands,
@@ -856,18 +990,29 @@ mod tests {
                     assert!(!input.is_recording());
                     match boundary {
                         "finish" => {
-                            control(&mut owner, |reply| Command::Finish { at, reply });
+                            control(&mut owner, |reply| Command::Finish {
+                                at,
+                                keep_open: false,
+                                reply,
+                            });
                         }
                         "cancel" => control(&mut owner, |reply| Command::Cancel { reply }),
                         "start" | "start-finish" => {
                             start(&mut owner, at);
                             if boundary == "start-finish" {
-                                control(&mut owner, |reply| Command::Finish { at, reply });
+                                control(&mut owner, |reply| Command::Finish {
+                                    at,
+                                    keep_open: false,
+                                    reply,
+                                });
                             }
                         }
                         _ => {}
                     }
-                    let event = input.try_recv_event();
+                    // The HUD meter projection may overflow first; skip it.
+                    let event = std::iter::from_fn(|| input.try_recv_event()).find(|event| {
+                        !matches!(event, DictationAudioEvent::RecognitionDiscontinuity { .. })
+                    });
                     if matches!(boundary, "current" | "finish" | "cancel") {
                         assert!(matches!(
                             event,
@@ -1016,7 +1161,11 @@ mod tests {
                 }
                 match boundary {
                     "finish" => {
-                        control(&mut owner, |reply| Command::Finish { at, reply });
+                        control(&mut owner, |reply| Command::Finish {
+                            at,
+                            keep_open: false,
+                            reply,
+                        });
                     }
                     "cancel" => control(&mut owner, |reply| Command::Cancel { reply }),
                     "start" => start(&mut owner, CaptureInstant::from_nanos(0)),
@@ -1066,6 +1215,7 @@ mod tests {
                 assert!(matches!(
                     control(&mut owner, |reply| Command::Finish {
                         at: at + Duration::from_millis(80),
+                        keep_open: false,
                         reply,
                     }),
                     Finish::Discard
@@ -1128,6 +1278,7 @@ mod tests {
             samples.send((vec![0.25; 4_800], finished_at)).unwrap();
             let finish = control(&mut owner, |reply| Command::Finish {
                 at: finished_at,
+                keep_open: false,
                 reply,
             });
             let Finish::Transcribe(clip) = finish else {
@@ -1144,12 +1295,259 @@ mod tests {
             assert!(matches!(
                 control(&mut owner, |reply| Command::Finish {
                     at: finished_at,
+                    keep_open: false,
                     reply
                 }),
                 Finish::Discard
             ));
             assert!(input.try_recv_event().is_none());
         }
+    }
+
+    /// A warm owner whose 1 s intentional hold was just released.
+    fn released_owner(
+        release_while_idle: bool,
+    ) -> (
+        Owner,
+        DictationAudio,
+        Sender<(Vec<f32>, CaptureInstant)>,
+        CaptureInstant,
+    ) {
+        let (mut owner, input, samples) = owner_for_test(true);
+        owner.release_while_idle = release_while_idle;
+        let at = capture_time();
+        // 10 ms of warm audio becomes the only pre-roll.
+        owner.handle_input(RecoveringAudioInputEvent::Chunk {
+            samples: vec![0.25; 480],
+            captured_through: at,
+        });
+        start(&mut owner, at);
+        owner.handle_input(RecoveringAudioInputEvent::Chunk {
+            samples: vec![0.25; 48_000],
+            captured_through: at + Duration::from_secs(1),
+        });
+        let released = at + Duration::from_secs(1);
+        assert!(control(&mut owner, |reply| Command::BecomeIntentional {
+            at: released,
+            reply
+        }));
+        assert_eq!(
+            control(&mut owner, |reply| Command::Release {
+                at: released,
+                tail: crate::dictation::RELEASE_TAIL,
+                reply
+            }),
+            Release::Tail {
+                until: released + crate::dictation::RELEASE_TAIL
+            }
+        );
+        (owner, input, samples, released)
+    }
+
+    #[test]
+    fn interruptions_during_the_tail_finish_the_released_clip() {
+        for interruption in ["gap", "disconnect", "gap-in-finish-drain"] {
+            let (mut owner, input, samples, released) = released_owner(true);
+            owner.handle_input(RecoveringAudioInputEvent::Chunk {
+                samples: vec![0.5; 4_800],
+                captured_through: released + Duration::from_millis(100),
+            });
+            let until = released + crate::dictation::RELEASE_TAIL;
+            let gap = (vec![0.75; 2_400], released + Duration::from_millis(260));
+            match interruption {
+                "gap" => owner.handle_input(RecoveringAudioInputEvent::Chunk {
+                    samples: gap.0,
+                    captured_through: gap.1,
+                }),
+                "disconnect" => owner.handle_input(RecoveringAudioInputEvent::Interrupted),
+                // The listener seals before the owner reads the gap: the
+                // Finish drain meets it and still returns the released clip.
+                _ => samples.send(gap).unwrap(),
+            }
+            if interruption != "gap-in-finish-drain" {
+                // Accepted work, not a failed capture: nothing to report as lost.
+                // The HUD meter projection may overflow first; skip it.
+                let event = std::iter::from_fn(|| input.try_recv_event()).find(|event| {
+                    !matches!(event, DictationAudioEvent::RecognitionDiscontinuity { .. })
+                });
+                assert!(
+                    matches!(
+                        event,
+                        Some(
+                            DictationAudioEvent::CaptureDiscontinuity {
+                                was_recording: false,
+                                ..
+                            } | DictationAudioEvent::Interrupted {
+                                was_recording: false,
+                                ..
+                            }
+                        )
+                    ),
+                    "{interruption}"
+                );
+                assert!(!input.is_recording());
+                owner.reconcile_input();
+            }
+            let finish = control(&mut owner, |reply| Command::Finish {
+                at: until,
+                keep_open: false,
+                reply,
+            });
+            let Finish::Transcribe(clip) = finish else {
+                panic!("{interruption}: a released clip is never lost");
+            };
+            // Pre-roll, hold and the tail audio received before the interruption.
+            assert_eq!(clip.duration_ms(), 1_110, "{interruption}");
+            assert!(clip.input.is_some(), "{interruption}");
+            assert!(!clip.into_transcription_samples().contains(&0.75));
+            owner.reconcile_input();
+            assert!(!input.is_recording());
+        }
+    }
+
+    #[test]
+    fn escape_after_an_interrupted_tail_still_cancels_it() {
+        let (mut owner, _input, _samples, released) = released_owner(true);
+        owner.handle_input(RecoveringAudioInputEvent::Interrupted);
+        control(&mut owner, |reply| Command::Cancel { reply });
+        assert!(matches!(
+            control(&mut owner, |reply| Command::Finish {
+                at: released + crate::dictation::RELEASE_TAIL,
+                keep_open: false,
+                reply,
+            }),
+            Finish::Discard
+        ));
+    }
+
+    #[test]
+    fn sealing_before_a_new_press_keeps_a_released_while_idle_microphone_open() {
+        let (mut owner, input, _samples, released) = released_owner(true);
+        let pressed = released + Duration::from_millis(100);
+        owner.handle_input(RecoveringAudioInputEvent::Chunk {
+            samples: vec![0.5; 4_800],
+            captured_through: pressed,
+        });
+        assert!(matches!(
+            control(&mut owner, |reply| Command::Finish {
+                at: pressed,
+                keep_open: true,
+                reply,
+            }),
+            Finish::Transcribe(_)
+        ));
+        owner.reconcile_input();
+        assert!(owner.input.is_open(), "no cold reopen between the clips");
+        assert_eq!(
+            control(&mut owner, |reply| Command::Start { at: pressed, reply }),
+            CaptureStart::Ready
+        );
+        control(&mut owner, |reply| Command::Cancel { reply });
+        owner.reconcile_input();
+        assert!(!owner.input.is_open());
+        assert!(!input.is_recording());
+    }
+
+    #[test]
+    fn release_tail_keeps_recording_and_the_released_microphone_open() {
+        let (mut owner, input, _samples, released) = released_owner(true);
+        owner.reconcile_input();
+        assert!(input.is_recording());
+        assert!(owner.input.is_open());
+        assert!(owner.capture.is_recording());
+        let until = released + crate::dictation::RELEASE_TAIL;
+        owner.handle_input(RecoveringAudioInputEvent::Chunk {
+            samples: vec![0.5; 14_400],
+            captured_through: until,
+        });
+        assert_eq!(input.captured_through(), until);
+        let Finish::Transcribe(clip) = control(&mut owner, |reply| Command::Finish {
+            at: until,
+            keep_open: false,
+            reply,
+        }) else {
+            panic!("the released clip must transcribe with its tail");
+        };
+        assert_eq!(clip.duration_ms(), 1_310);
+        // The tail's own audio, after the 10 ms pre-roll and the 1 s hold.
+        assert!((clip.into_transcription_samples()[18_500] - 0.5).abs() < 0.01);
+        owner.reconcile_input();
+        assert!(!input.is_recording());
+        assert!(!owner.input.is_open());
+    }
+
+    #[test]
+    fn escape_during_the_tail_cancels_the_clip() {
+        let (mut owner, input, _samples, released) = released_owner(true);
+        control(&mut owner, |reply| Command::Cancel { reply });
+        owner.reconcile_input();
+        assert!(!input.is_recording());
+        assert!(!owner.input.is_open());
+        assert!(matches!(
+            control(&mut owner, |reply| Command::Finish {
+                at: released + crate::dictation::RELEASE_TAIL,
+                keep_open: false,
+                reply
+            }),
+            Finish::Discard
+        ));
+    }
+
+    #[test]
+    fn a_new_press_during_the_tail_keeps_both_clips() {
+        let (mut owner, input, samples, released) = released_owner(false);
+        let pressed = released + Duration::from_millis(100);
+        samples.send((vec![0.5; 4_800], pressed)).unwrap();
+        // The listener finishes the released clip at the new press, then starts.
+        let Finish::Transcribe(first) = control(&mut owner, |reply| Command::Finish {
+            at: pressed,
+            keep_open: true,
+            reply,
+        }) else {
+            panic!("the released clip is accepted work");
+        };
+        assert_eq!(first.duration_ms(), 1_110);
+        assert_eq!(
+            control(&mut owner, |reply| Command::Start { at: pressed, reply }),
+            CaptureStart::Ready
+        );
+        assert!(input.is_recording());
+        owner.handle_input(RecoveringAudioInputEvent::Chunk {
+            samples: vec![0.75; 19_200],
+            captured_through: pressed + Duration::from_millis(400),
+        });
+        let Finish::Transcribe(second) = control(&mut owner, |reply| Command::Finish {
+            at: pressed + Duration::from_millis(400),
+            keep_open: false,
+            reply,
+        }) else {
+            panic!("the new press records its own clip");
+        };
+        // Only its own audio: the pre-roll stops at the first clip's end, so
+        // nothing already in the first clip (its tail included) repeats.
+        assert_eq!(second.duration_ms(), 400);
+        assert!((second.into_transcription_samples()[3_200] - 0.75).abs() < 0.01);
+    }
+
+    #[test]
+    fn releasing_a_pending_cold_open_discards_without_a_tail() {
+        let (mut owner, input, _samples) = owner_for_test(false);
+        owner.release_while_idle = true;
+        let (pending, _opened) = RecoveringAudioInput::pending_for_test();
+        owner.input = pending;
+        let at = capture_time();
+        start(&mut owner, at);
+        assert_eq!(
+            control(&mut owner, |reply| Command::Release {
+                at: at + Duration::from_secs(1),
+                tail: crate::dictation::RELEASE_TAIL,
+                reply
+            }),
+            Release::Discard
+        );
+        owner.reconcile_input();
+        assert!(!input.is_recording());
+        assert!(!owner.input.is_opening());
     }
 
     #[test]
@@ -1209,6 +1607,7 @@ mod tests {
                 assert!(matches!(
                     control(&mut owner, |reply| Command::Finish {
                         at: boundary,
+                        keep_open: false,
                         reply
                     }),
                     Finish::Discard
@@ -1261,14 +1660,22 @@ mod tests {
             control(&mut owner, |reply| Command::Cancel { reply });
             assert_eq!(input.capture_generation(), generation);
             let generation = input.capture_generation();
-            control(&mut owner, |reply| Command::Finish { at, reply });
+            control(&mut owner, |reply| Command::Finish {
+                at,
+                keep_open: false,
+                reply,
+            });
             assert_eq!(input.capture_generation(), generation);
         }
         let generation = input.capture_generation();
         start(&mut owner, at);
         assert_ne!(input.capture_generation(), generation);
         let generation = input.capture_generation();
-        control(&mut owner, |reply| Command::Finish { at, reply });
+        control(&mut owner, |reply| Command::Finish {
+            at,
+            keep_open: false,
+            reply,
+        });
         control(&mut owner, |reply| Command::Cancel { reply });
         assert_eq!(input.capture_generation(), generation);
     }

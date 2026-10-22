@@ -324,6 +324,32 @@ impl DictationWorker {
         }
     }
 
+    /// A worker with injected transcription and paste, for listener tests.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        wake: Arc<Doorbell>,
+        transcribe: impl FnMut(&[f32]) -> Result<crate::openrouter::transcribe::Transcription>
+        + Send
+        + 'static,
+        mut paste: impl FnMut(&str, PasteOptions) -> Result<PasteOutcome> + Send + 'static,
+    ) -> Self {
+        let mut transcribe = transcribe;
+        Self::start_with(
+            wake,
+            None,
+            move |samples, _, _, _, _| transcribe(samples),
+            move || {
+                Box::new(move |prepare_only, text, _, options, commit| {
+                    if prepare_only {
+                        return Ok(PasteOutcome::Pasted);
+                    }
+                    assert!(commit());
+                    paste(text, options)
+                })
+            },
+        )
+    }
+
     pub fn transcribe(
         &self,
         clip: DictationClip,

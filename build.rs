@@ -13,6 +13,7 @@ fn main() {
     let developer_dir = String::from_utf8(output.stdout).expect("Xcode path must be UTF-8");
     compile_indicator_shader();
     compile_permission_guide();
+    compile_opus_encoder();
     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
     for runtime in ["swift-5.5/macosx", "swift/macosx"] {
         let swift_runtime = format!(
@@ -33,6 +34,15 @@ fn compile_permission_guide() {
         .file("native/permission_guide.m")
         .flag("-fobjc-arc")
         .compile("hex_permission_guide");
+}
+
+fn compile_opus_encoder() {
+    println!("cargo:rerun-if-changed=native/opus_encoder.c");
+    println!("cargo:rustc-link-lib=framework=AudioToolbox");
+
+    cc::Build::new()
+        .file("native/opus_encoder.c")
+        .compile("endu_opus_encoder");
 }
 
 fn compile_indicator_shader() {

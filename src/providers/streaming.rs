@@ -451,6 +451,16 @@ fn discard_context(config: &Config) -> DiscardContext {
     }
 }
 
+/// The model a capture streams live: the first configured slot, as given,
+/// when its options and language allow streaming. Shared with the recorded
+/// upload warm-up so both read the same primary.
+pub(crate) fn live_primary(config: &Config) -> Option<&str> {
+    let id = config.transcription.models.first()?;
+    let options = super::options(config, id);
+    (options.streaming && ModelRef::parse(id).can_stream_language(&options.language))
+        .then_some(id.as_str())
+}
+
 impl LiveCapture {
     /// Memory-only configuration snapshots; the spawned worker resolves the key.
     pub fn start() -> Option<Self> {
@@ -459,11 +469,7 @@ impl LiveCapture {
             return None;
         }
         let config = super::runtime_config()?;
-        let id = config.transcription.models.first()?;
-        let options = super::options(&config, id);
-        if !options.streaming || !ModelRef::parse(id).can_stream_language(&options.language) {
-            return None;
-        }
+        live_primary(&config)?;
         Some(Self::spawn(config, Snapshot::current()))
     }
 
@@ -496,6 +502,7 @@ impl LiveCapture {
             let _ = send_result.try_send(Err(failure(
                 "Streaming session limit reached; using the complete recording.",
             )));
+            super::batch::prewarm_recovery();
         }
         Self {
             config,
@@ -517,12 +524,12 @@ impl LiveCapture {
             return;
         }
         if prefix.len() < self.queued {
-            self.invalidate("A delayed input boundary invalidated the live transcript.");
+            self.abandon("A delayed input boundary invalidated the live transcript.");
             return;
         }
         let remaining = &prefix[self.queued..];
         if remaining.len() > MAX_TAIL {
-            self.invalidate("Streaming audio fell behind; using the complete recording.");
+            self.abandon("Streaming audio fell behind; using the complete recording.");
             return;
         }
         // Keep sub-packet samples in Recording until a full 100 ms block exists.
@@ -534,11 +541,12 @@ impl LiveCapture {
             }) {
                 Ok(()) => self.queued += samples.len(),
                 Err(mpsc::TrySendError::Full(_)) => {
-                    self.invalidate("Streaming audio fell behind; using the complete recording.");
+                    self.abandon("Streaming audio fell behind; using the complete recording.");
                     break;
                 }
                 Err(mpsc::TrySendError::Disconnected(_)) => {
                     self.worker_ended = true;
+                    super::batch::prewarm_recovery();
                     break;
                 }
             }
@@ -548,6 +556,14 @@ impl LiveCapture {
     fn invalidate(&mut self, reason: &'static str) {
         self.invalid = Some(reason);
         self.control.stopped.store(true, Ordering::Release);
+    }
+
+    /// Invalidates the session while the user is still speaking, and warms
+    /// the recorded upload that will replace it after Finish. Only a flag swap
+    /// and a thread spawn happen here, on the audio owner.
+    fn abandon(&mut self, reason: &'static str) {
+        self.invalidate(reason);
+        super::batch::prewarm_recovery();
     }
 
     pub fn finish(mut self, samples: &[f32]) -> PendingLive {

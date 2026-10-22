@@ -506,49 +506,10 @@ impl RecoveringAudioInput {
     ) -> RecoveringAudioInputEvent {
         let now = Instant::now();
         self.maintain_routing(now, capture_idle);
-        if let Some((opened_revision, result)) = self.poll_replacement() {
-            let target_revision = self
-                .recovery
-                .target_revision
-                .unwrap_or(self.active_revision);
-            if opened_revision != target_revision {
-                self.recovery.next_attempt = Some(now);
-                return RecoveringAudioInputEvent::Timeout;
-            }
-            match result {
-                Ok(replacement) if capture_idle || self.input.is_none() => {
-                    // An available preferred device may fail to open. If the
-                    // fallback is already active, keep its stream and pre-roll.
-                    if self.recovery.reason == Some(MicrophoneRecoveryReason::AvailabilityChanged)
-                        && self.is_current_device(&DevicePreference {
-                            id: replacement.description.device_id.clone(),
-                            name: replacement.device_name.clone(),
-                        })
-                    {
-                        self.recovery.recovered();
-                        return RecoveringAudioInputEvent::Timeout;
-                    }
-                    self.input = Some(replacement);
-                    self.active_revision = opened_revision;
-                    self.recovery.recovered();
-                    tracing::info!(device = %self.device_name(), "dictation microphone reopened");
-                    return RecoveringAudioInputEvent::Reopened;
-                }
-                Ok(_) => {
-                    self.recovery.failed(now);
-                }
-                Err(error) => {
-                    if self.input.is_none() && !self.is_recovering() {
-                        self.recovery.recovered();
-                        return RecoveringAudioInputEvent::OpenFailed(error);
-                    }
-                    self.recovery.failed(now);
-                    tracing::warn!(
-                        %error,
-                        "could not reopen dictation microphone; retrying"
-                    );
-                }
-            }
+        if let Some(opened) = self.poll_replacement()
+            && let Some(event) = self.apply_replacement(opened, now, capture_idle)
+        {
+            return event;
         }
         if (capture_idle || self.input.is_none())
             && self.recovery.should_attempt(now)
@@ -557,12 +518,10 @@ impl RecoveringAudioInput {
             self.start_replacement();
         }
         if self.recovery.blocks_audio() {
-            std::thread::sleep(timeout);
-            return RecoveringAudioInputEvent::Timeout;
+            return self.wait_for_replacement(timeout, capture_idle);
         }
         let Some(input) = self.input.as_ref() else {
-            std::thread::sleep(timeout);
-            return RecoveringAudioInputEvent::Timeout;
+            return self.wait_for_replacement(timeout, capture_idle);
         };
         match input.recv_timeout(timeout) {
             AudioInputEvent::Chunk {
@@ -577,6 +536,83 @@ impl RecoveringAudioInput {
                 tracing::warn!(%error, device = %input.device_name, "microphone stream stopped; reopening it");
                 self.recovery.request_stream_recovery(Instant::now());
                 RecoveringAudioInputEvent::Interrupted
+            }
+        }
+    }
+
+    /// Applies a finished open. `None` means nothing to report this turn.
+    fn apply_replacement(
+        &mut self,
+        (opened_revision, result): InputOpenResult,
+        now: Instant,
+        capture_idle: bool,
+    ) -> Option<RecoveringAudioInputEvent> {
+        let target_revision = self
+            .recovery
+            .target_revision
+            .unwrap_or(self.active_revision);
+        if opened_revision != target_revision {
+            self.recovery.next_attempt = Some(now);
+            return Some(RecoveringAudioInputEvent::Timeout);
+        }
+        match result {
+            Ok(replacement) if capture_idle || self.input.is_none() => {
+                // An available preferred device may fail to open. If the
+                // fallback is already active, keep its stream and pre-roll.
+                if self.recovery.reason == Some(MicrophoneRecoveryReason::AvailabilityChanged)
+                    && self.is_current_device(&DevicePreference {
+                        id: replacement.description.device_id.clone(),
+                        name: replacement.device_name.clone(),
+                    })
+                {
+                    self.recovery.recovered();
+                    return Some(RecoveringAudioInputEvent::Timeout);
+                }
+                self.input = Some(replacement);
+                self.active_revision = opened_revision;
+                self.recovery.recovered();
+                tracing::info!(device = %self.device_name(), "dictation microphone reopened");
+                return Some(RecoveringAudioInputEvent::Reopened);
+            }
+            Ok(_) => {
+                self.recovery.failed(now);
+            }
+            Err(error) => {
+                if self.input.is_none() && !self.is_recovering() {
+                    self.recovery.recovered();
+                    return Some(RecoveringAudioInputEvent::OpenFailed(error));
+                }
+                self.recovery.failed(now);
+                tracing::warn!(
+                    %error,
+                    "could not reopen dictation microphone; retrying"
+                );
+            }
+        }
+        None
+    }
+
+    /// Without a stream there is nothing to read, so wait on a pending open
+    /// instead of sleeping through it: a cold open reaches the capture as
+    /// soon as the device starts, not at the end of the owner's turn.
+    fn wait_for_replacement(
+        &mut self,
+        timeout: Duration,
+        capture_idle: bool,
+    ) -> RecoveringAudioInputEvent {
+        let Some(replacement) = &self.replacement else {
+            std::thread::sleep(timeout);
+            return RecoveringAudioInputEvent::Timeout;
+        };
+        match replacement.recv_timeout(timeout) {
+            Ok(opened) => {
+                self.replacement = None;
+                self.apply_replacement(opened, Instant::now(), capture_idle)
+                    .unwrap_or(RecoveringAudioInputEvent::Timeout)
+            }
+            // A stopped worker is reported by the next poll.
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                RecoveringAudioInputEvent::Timeout
             }
         }
     }
@@ -1545,6 +1581,26 @@ mod tests {
         assert!(!input.is_opening());
         assert!(!input.is_recovering());
         assert!(input.recovery.next_attempt.is_none());
+    }
+
+    #[test]
+    fn a_cold_open_is_delivered_when_it_completes_not_after_the_turn() {
+        let (mut input, opened) = RecoveringAudioInput::pending_for_test();
+        let opener = std::thread::spawn(move || {
+            let (replacement, samples) = AudioInput::channel_for_test();
+            opened.send((0, Ok(replacement))).unwrap();
+            samples
+        });
+        let waited = Instant::now();
+        // A closed input must not sleep through the whole turn before polling.
+        assert!(matches!(
+            input.recv_timeout(Duration::from_secs(60), false),
+            RecoveringAudioInputEvent::Reopened
+        ));
+        assert!(waited.elapsed() < Duration::from_secs(30));
+        assert!(input.is_open());
+        assert!(!input.is_opening());
+        let _samples = opener.join().unwrap();
     }
 
     #[test]

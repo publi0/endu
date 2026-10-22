@@ -294,7 +294,7 @@ impl AppWindow {
                             sliding_segmented_item(side_widths[index], selected == side)
                                 .id(("hotkey-side", hotkey_kind_index(kind) * 3 + index))
                                 .when(candidate.is_none(), |item| item.opacity(0.35))
-                                .child(label)
+                                .child(crate::desktop_ui::control_label(label))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     let Some(candidate) =
                                         hotkey_side_binding(&this.settings, kind, side)

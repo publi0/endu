@@ -361,6 +361,9 @@ impl Paster {
             return Ok(PasteOutcome::Deferred);
         };
         let clipboard_restore = self.clipboard_restore.clone();
+        // Cmd+V goes to the verified process only (CGEventPostToPid). It
+        // reports no delivery result, so a silent failure in the recipient
+        // cannot be detected here and still counts as Pasted.
         let submitted = complete_paste_with_submit(
             || keyboard::post_command_to_pid('v', pid),
             move || {
@@ -417,6 +420,10 @@ impl Paster {
     }
 }
 
+/// The opt-in copy-on-paste-failure fallback. It copies the raw transcript
+/// only on a detected failure or deferred output, never on cancellation or
+/// shutdown (`commit` refuses those). Copying invalidates pending clipboard
+/// restores, never records History and never counts as a paste.
 fn fallback_after_attempt(
     outcome: Result<PasteOutcome>,
     enabled: bool,

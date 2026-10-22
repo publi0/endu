@@ -1,7 +1,7 @@
 use crate::i18n::t;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 use color_eyre::eyre::{Result, eyre};
@@ -17,6 +17,7 @@ static DICTATION_MODE: AtomicU8 = AtomicU8::new(0);
 static ENTER_TO_SUBMIT: AtomicBool = AtomicBool::new(false);
 static DOUBLE_TAP_ONLY: AtomicBool = AtomicBool::new(false);
 static RELEASE_MICROPHONE_WHILE_IDLE: AtomicBool = AtomicBool::new(true);
+static RELEASE_TAIL_MS: AtomicU16 = AtomicU16::new(ReleaseTail::DEFAULT_MILLIS);
 static HOTKEYS: OnceLock<RwLock<RuntimeHotkeys>> = OnceLock::new();
 static PASTE_LAST_BINDING: RwLock<Option<HotkeyBinding>> = RwLock::new(None);
 static DICTATION_BINDING: RwLock<Option<HotkeyBinding>> = RwLock::new(None);
@@ -430,10 +431,63 @@ impl DictationMode {
     }
 }
 
+/// `Keep recording after release`: audio kept after the finishing shortcut
+/// edge so the last syllable is not clipped. Persisted as milliseconds.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ReleaseTail {
+    Off,
+    Short,
+    #[default]
+    Normal,
+    Long,
+}
+
+impl ReleaseTail {
+    pub const ALL: [Self; 4] = [Self::Off, Self::Short, Self::Normal, Self::Long];
+    pub const DEFAULT_MILLIS: u16 = Self::Normal.millis();
+
+    pub const fn millis(self) -> u16 {
+        match self {
+            Self::Off => 0,
+            Self::Short => 150,
+            Self::Normal => 300,
+            Self::Long => 500,
+        }
+    }
+
+    pub fn duration(self) -> std::time::Duration {
+        std::time::Duration::from_millis(u64::from(self.millis()))
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => t("Off"),
+            Self::Short => "150 ms",
+            Self::Normal => "300 ms",
+            Self::Long => "500 ms",
+        }
+    }
+
+    /// The exact choice for a persisted or imported value.
+    pub fn from_millis(millis: u16) -> Option<Self> {
+        Self::ALL.into_iter().find(|tail| tail.millis() == millis)
+    }
+
+    /// The closest choice for a hand-edited value outside the allowed set,
+    /// preferring the shorter one on a tie.
+    pub fn nearest(millis: u16) -> Self {
+        Self::ALL
+            .into_iter()
+            .min_by_key(|tail| tail.millis().abs_diff(millis))
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AppSettings {
     pub release_microphone_while_idle: bool,
+    pub release_tail_ms: u16,
     pub sound_effects: bool,
     pub sound_effect_volume: f32,
     pub sound_volumes: Option<crate::interaction_settings::SoundVolumes>,
@@ -466,6 +520,7 @@ impl Default for AppSettings {
             // The microphone opens on the shortcut, so macOS shows its
             // indicator only while dictating.
             release_microphone_while_idle: true,
+            release_tail_ms: ReleaseTail::DEFAULT_MILLIS,
             sound_effects: true,
             sound_effect_volume: 0.5,
             sound_volumes: None,
@@ -548,6 +603,7 @@ impl AppSettings {
                 }
                 settings.normalize_double_tap_settings();
                 settings.lower_volume_percent = settings.lower_volume_percent.min(100);
+                settings.release_tail_ms = settings.release_tail().millis();
                 if serde_json::to_value(&settings)? != loaded
                     && let Err(error) = settings.write_to(path)
                 {
@@ -585,6 +641,11 @@ impl AppSettings {
         Ok(())
     }
 
+    /// The saved tail, or the nearest choice for an out-of-range value.
+    pub fn release_tail(&self) -> ReleaseTail {
+        ReleaseTail::nearest(self.release_tail_ms)
+    }
+
     pub fn effective_sound_volumes(&self) -> crate::interaction_settings::SoundVolumes {
         if !self.sound_effects {
             return crate::interaction_settings::SoundVolumes::from_legacy(0.0);
@@ -603,6 +664,7 @@ impl AppSettings {
         self.vocabulary.apply_runtime();
         COPY_ON_PASTE_FAILURE.store(self.copy_on_paste_failure, Ordering::Release);
         RELEASE_MICROPHONE_WHILE_IDLE.store(self.release_microphone_while_idle, Ordering::Release);
+        RELEASE_TAIL_MS.store(self.release_tail().millis(), Ordering::Release);
         crate::feedback::set_enabled(self.sound_effects);
         crate::feedback::set_volumes(self.effective_sound_volumes());
         crate::feedback::set_start_cue(self.start_cue);
@@ -718,6 +780,12 @@ pub fn copy_on_paste_failure() -> bool {
 
 pub fn release_microphone_while_idle() -> bool {
     RELEASE_MICROPHONE_WHILE_IDLE.load(Ordering::Acquire)
+}
+
+/// The `Keep recording after release` tail; the listener snapshots it at
+/// each finishing edge, so a change never alters a tail already recording.
+pub fn release_tail() -> std::time::Duration {
+    ReleaseTail::nearest(RELEASE_TAIL_MS.load(Ordering::Acquire)).duration()
 }
 
 pub fn dictation_mode() -> DictationMode {
@@ -1051,6 +1119,50 @@ mod tests {
         assert_eq!(reloaded.double_tap_only, settings.double_tap_only);
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), written);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn release_tail_defaults_keeps_choices_and_snaps_invalid_values() {
+        let missing: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.release_tail_ms, 300);
+        assert_eq!(missing.release_tail(), ReleaseTail::Normal);
+        assert_eq!(
+            ReleaseTail::ALL.map(ReleaseTail::millis),
+            [0, 150, 300, 500]
+        );
+        for tail in ReleaseTail::ALL {
+            assert_eq!(ReleaseTail::from_millis(tail.millis()), Some(tail));
+            assert_eq!(ReleaseTail::nearest(tail.millis()), tail);
+        }
+        assert_eq!(ReleaseTail::from_millis(200), None);
+        assert_eq!(ReleaseTail::nearest(225), ReleaseTail::Short);
+        assert_eq!(ReleaseTail::nearest(u16::MAX), ReleaseTail::Long);
+
+        for (saved, loaded) in [(0, 0), (500, 500), (9_000, 500), (40, 0)] {
+            let directory = std::env::temp_dir().join(format!(
+                "hex-release-tail-{}-{}",
+                std::process::id(),
+                SETTINGS_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+            ));
+            fs::create_dir(&directory).unwrap();
+            let path = directory.join("settings.json");
+            let original = serde_json::to_string(&AppSettings {
+                release_tail_ms: saved,
+                ..AppSettings::default()
+            })
+            .unwrap();
+            fs::write(&path, &original).unwrap();
+            let settings = AppSettings::load_from(&path).unwrap();
+            assert_eq!(settings.release_tail_ms, loaded, "{saved}");
+            let persisted = fs::read_to_string(&path).unwrap();
+            if saved == loaded {
+                // A valid saved choice, Off included, is never rewritten.
+                assert_eq!(persisted, original);
+            } else {
+                assert!(persisted.contains(&format!("\"release_tail_ms\": {loaded}")));
+            }
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]

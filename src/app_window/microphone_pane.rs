@@ -1,6 +1,10 @@
 //! Microphone pane: input device, channel, levels and capture options.
+//!
+//! Device and channel changes apply only between clips. The mix stays until
+//! the user picks a channel; never infer a voice channel from volume.
 
 use super::*;
+use crate::app_settings::ReleaseTail;
 use crate::i18n::t;
 
 impl AppWindow {
@@ -520,7 +524,7 @@ impl AppWindow {
                     let selected = self.settings.recording_audio_behavior == behavior;
                     sliding_segmented_item(audio_widths[index], selected)
                         .id(("recording-audio-behavior", index))
-                        .child(behavior.label())
+                        .child(crate::desktop_ui::control_label(behavior.label()))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if this.settings.recording_audio_behavior != behavior
                                 && this.update_settings(
@@ -551,7 +555,7 @@ impl AppWindow {
                     self.settings.release_microphone_while_idle == release,
                 )
                 .id(("microphone-mode", index))
-                .child(label)
+                .child(crate::desktop_ui::control_label(label))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if this.settings.release_microphone_while_idle != release
                         && this.update_settings(SettingControl::MicrophoneMode, cx, |settings| {
@@ -562,6 +566,32 @@ impl AppWindow {
                     }
                 }))
             }),
+        );
+        let saved_tail = self.settings.release_tail();
+        let release_tail = crate::desktop_ui::settings_choice(
+            "release-tail",
+            ReleaseTail::ALL.iter().position(|tail| *tail == saved_tail),
+            ReleaseTail::ALL.len(),
+        )
+        .children(
+            ReleaseTail::ALL
+                .into_iter()
+                .enumerate()
+                .map(|(index, tail)| {
+                    crate::desktop_ui::settings_segmented_item(
+                        saved_tail == tail,
+                        ReleaseTail::ALL.len(),
+                    )
+                    .id(("release-tail", index))
+                    .child(crate::desktop_ui::control_label(tail.label()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.settings.release_tail() != tail {
+                            this.update_settings(SettingControl::ReleaseTail, cx, |settings| {
+                                settings.release_tail_ms = tail.millis()
+                            });
+                        }
+                    }))
+                }),
         );
         configuration_pane(t("Microphone"), "microphone-scroll", div().children(permission_warnings)
                 .child(settings_section_label(t("Input and recording")))
@@ -603,6 +633,11 @@ impl AppWindow {
                                 t("Keeps the microphone open so a short pre-roll catches the start of speech")
                             },
                             microphone_mode,
+                        ))
+                        .child(self.setting_row(SettingControl::ReleaseTail,
+                            t("Keep recording after release"),
+                            t("Captures the end of your last word"),
+                            release_tail,
                         ))
                         .child(self.setting_row(SettingControl::Trim,
                             t("Trim silence"),

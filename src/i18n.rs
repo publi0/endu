@@ -85,7 +85,23 @@ pub fn set_language(language: Language) {
     CURRENT.store(language as u8, Ordering::Relaxed);
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_LANGUAGE: std::cell::Cell<Option<Language>> = const { std::cell::Cell::new(None) };
+}
+
+/// Renders this test thread in `language`, whatever the process-wide choice
+/// other tests set concurrently. GPUI tests render on their own thread.
+#[cfg(test)]
+pub fn set_test_language(language: Option<Language>) {
+    TEST_LANGUAGE.set(language);
+}
+
 pub fn language() -> Language {
+    #[cfg(test)]
+    if let Some(language) = TEST_LANGUAGE.get() {
+        return language;
+    }
     match CURRENT.load(Ordering::Relaxed) {
         1 => Language::Portuguese,
         2 => Language::Spanish,

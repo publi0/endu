@@ -61,6 +61,8 @@ pub(super) fn settings(
     Ok(body)
 }
 
+/// The first WebSocket frame. It is the only place the Meta credential travels:
+/// never in HTTP headers or query parameters (see `streaming::authentication`).
 pub(super) fn handshake(
     model: &str,
     options: &ModelOptions,

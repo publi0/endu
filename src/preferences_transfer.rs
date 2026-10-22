@@ -1,4 +1,8 @@
 //! A versioned preferences allowlist. Credentials and local history never travel.
+//!
+//! Never export keys, endpoints, History or its retention, audio, permissions
+//! or login registration. Imports validate every field before writing, roll
+//! back a partial save, and apply the runtime only after both files succeed.
 
 use std::collections::HashSet;
 use std::fs;
@@ -49,6 +53,10 @@ struct AppPreferences {
     recording_audio_behavior: RecordingAudioBehavior,
     #[serde(default)]
     lower_volume_percent: Option<u8>,
+    /// `Keep recording after release` in milliseconds: 0, 150, 300 or 500.
+    /// Older exports omit it and keep the local choice.
+    #[serde(default)]
+    release_tail_ms: Option<u16>,
     #[serde(default)]
     dictation_mode: Option<DictationMode>,
     #[serde(default)]
@@ -309,6 +317,12 @@ impl PreferenceBundle {
             bail!("Volume while dictating must be between 0 and 100.");
         }
         if app
+            .release_tail_ms
+            .is_some_and(|value| crate::app_settings::ReleaseTail::from_millis(value).is_none())
+        {
+            bail!("Keep recording after release must be Off, 150, 300 or 500 ms.");
+        }
+        if app
             .dictation_mode
             .is_some_and(|mode| (mode == DictationMode::DoubleTap) != app.double_tap_lock)
         {
@@ -516,6 +530,7 @@ impl AppPreferences {
             }),
             recording_audio_behavior: settings.recording_audio_behavior,
             lower_volume_percent: Some(settings.lower_volume_percent),
+            release_tail_ms: Some(settings.release_tail().millis()),
             dictation_mode: Some(settings.dictation_mode),
             enter_to_submit: Some(settings.enter_to_submit),
             copy_on_paste_failure: Some(settings.copy_on_paste_failure),
@@ -584,6 +599,9 @@ impl AppPreferences {
         settings.recording_audio_behavior = self.recording_audio_behavior;
         if let Some(value) = self.lower_volume_percent {
             settings.lower_volume_percent = value;
+        }
+        if let Some(value) = self.release_tail_ms {
+            settings.release_tail_ms = value;
         }
         settings.dictation_mode = self.effective_dictation_mode();
         if let Some(value) = self.enter_to_submit {
@@ -673,6 +691,7 @@ mod tests {
         // Construct without AppSettings::default's native keyboard lookup.
         AppSettings {
             release_microphone_while_idle: false,
+            release_tail_ms: 300,
             sound_effects: false,
             sound_effect_volume: 0.4,
             sound_volumes: None,
@@ -851,6 +870,7 @@ mod tests {
             source.dictation_mode = mode;
             source.recording_audio_behavior = RecordingAudioBehavior::LowerVolume;
             source.lower_volume_percent = 35;
+            source.release_tail_ms = 500;
             source.enter_to_submit = true;
             source.copy_on_paste_failure = true;
             source.double_tap_sensitivity = DoubleTapSensitivity::Tolerant;
@@ -882,6 +902,7 @@ mod tests {
                 RecordingAudioBehavior::LowerVolume
             );
             assert_eq!(imported.settings.lower_volume_percent, 35);
+            assert_eq!(imported.settings.release_tail_ms, 500);
             assert_eq!(
                 imported.settings.double_tap_sensitivity,
                 DoubleTapSensitivity::Tolerant
@@ -982,6 +1003,7 @@ mod tests {
             "enter_to_submit",
             "copy_on_paste_failure",
             "lower_volume_percent",
+            "release_tail_ms",
             "post_processing",
         ] {
             value["app"].as_object_mut().unwrap().remove(field);
@@ -990,6 +1012,7 @@ mod tests {
             enter_to_submit: true,
             copy_on_paste_failure: true,
             lower_volume_percent: 40,
+            release_tail_ms: 0,
             post_processing: crate::post_processing::Preferences {
                 single_line: true,
                 ..Default::default()
@@ -1008,6 +1031,7 @@ mod tests {
             assert!(applied.enter_to_submit);
             assert!(applied.copy_on_paste_failure);
             assert_eq!(applied.lower_volume_percent, 40);
+            assert_eq!(applied.release_tail_ms, 0);
             assert_eq!(applied.post_processing, current.post_processing);
         }
     }
@@ -1036,6 +1060,8 @@ mod tests {
             ("/app/sounds/start", json!(1.01)),
             ("/app/sounds/stop", json!(-0.1)),
             ("/app/lower_volume_percent", json!(101)),
+            ("/app/release_tail_ms", json!(200)),
+            ("/app/release_tail_ms", json!(-1)),
             ("/app/dictation_mode", json!("hold")),
             ("/app/hud/edge_distance", json!(161)),
             ("/app/hud/screen", json!("fixed_monitor")),

@@ -403,7 +403,7 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
     ("Export", "Exportar"),
     (
         "Fades system audio out and back in quickly; preserves detected manual volume changes",
-        "Abaixa e devolve o áudio do sistema rapidamente; preserva mudanças manuais de volume detectadas",
+        "Abaixa e devolve o áudio do sistema rapidamente e preserva mudanças manuais de volume detectadas",
     ),
     ("Failed", "Falhou"),
     ("Failed dictations per day", "Ditados com falha por dia"),
@@ -583,7 +583,7 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
     ("Lowercase text", "Texto em minúsculas"),
     (
         "Lowers system audio with a quick fade; preserves detected manual volume changes",
-        "Abaixa o áudio do sistema com um fade rápido; preserva mudanças manuais de volume detectadas",
+        "Abaixa o áudio do sistema com um fade rápido e preserva mudanças manuais de volume detectadas",
     ),
     ("Mar", "mar"),
     ("May", "mai"),
@@ -1013,7 +1013,7 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
         "System follows your Mac's light or dark mode.",
         "Sistema segue o modo claro ou escuro do seu Mac.",
     ),
-    ("Tap or hold", "Tocar ou segurar"),
+    ("Tap or hold", "Tocar/segurar"),
     (
         "Tap the shortcut to keep recording and tap again to stop, or hold and release. Endu trims silence, transcribes with your selected provider, and pastes the text once these permissions and your key are in place.",
         "Toque o atalho para gravar e toque de novo para parar, ou segure e solte. O Endu corta o silêncio, transcreve com o provedor escolhido e cola o texto assim que estas permissões e a sua chave estiverem prontas.",
@@ -1143,6 +1143,22 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
     (
         "Transcription was interrupted. The saved audio is ready to retry.",
         "A transcrição foi interrompida. O áudio salvo está pronto para tentar de novo.",
+    ),
+    (
+        "Keep recording after release",
+        "Continuar gravando após soltar",
+    ),
+    (
+        "Captures the end of your last word",
+        "Captura o fim da sua última palavra",
+    ),
+    (
+        "Endu quit before this recording was transcribed.",
+        "O Endu foi encerrado antes de transcrever esta gravação.",
+    ),
+    (
+        "Endu quit before this recording was transcribed, and its audio could not be saved to disk.",
+        "O Endu foi encerrado antes de transcrever esta gravação, e o áudio não pôde ser salvo no disco.",
     ),
     ("Trim silence", "Cortar silêncio"),
     (

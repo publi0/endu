@@ -271,10 +271,13 @@ regras depois não reescreve o Histórico. Um resultado vazio nunca é colado.
   só abre no atalho, então o indicador do macOS aparece apenas enquanto você
   dita; **Manter pronto** guarda um trecho antes do atalho para não perder a
   primeira sílaba.
+- **Continuar gravando após soltar**: mantém a gravação um instante depois
+  que você solta o atalho, para não cortar a última palavra: Desligado, 150,
+  **300** (padrão) ou 500 ms.
 - **Durante o ditado**: por padrão o áudio do sistema **abaixa para 30%**;
   também dá para **Silenciar**, **Pausar** ou **Manter**, sempre com fades
   curtos que respeitam ajustes manuais de volume.
-- **Atalhos**: **Tocar ou segurar** (padrão), **Só segurar** ou **Toque
+- **Atalhos**: **Tocar/segurar** (padrão), **Só segurar** ou **Toque
   duplo**. **Enter para colar e enviar**, desligado por padrão, termina a
   gravação travada, cola e envia um Enter ao mesmo aplicativo.
 - **Sons**: o **Som de início** padrão é o **Respiro**; também há Gota, Duas
@@ -303,6 +306,23 @@ O **Histórico** guarda os ditados colados com sucesso por sete dias (ajustável
 com o aplicativo de destino, duração, latência, modelos, fallbacks e o custo de
 cada tentativa. Quando o provedor não informa o custo, o Endu estima pelo preço
 de tabela publicado e marca o valor com **≈**.
+
+Os envios de clipes gravados vão em Opus a 24 kbit/s (cerca de um décimo do
+WAV) para Deepgram, ElevenLabs, Grok, Google, OpenAI e a rota
+`microsoft/mai-transcribe-2` do OpenRouter; as outras rotas do OpenRouter e a
+Meta continuam recebendo WAV. Se o provedor recusar o formato do áudio, a
+mesma tentativa é repetida uma vez em WAV e o Endu passa a mandar WAV para esse
+modelo até ser reaberto. Uma resposta vazia ao Opus é repetida uma vez em WAV,
+e o Opus só é desligado para o modelo se o WAV trouxer texto. Depois que um
+modelo já transcreveu um Opus, as respostas vazias dele são aceitas sem
+reenvio.
+
+Enquanto você fala, o Endu abre a conexão (sem chave nem áudio) com o
+provedor que vai receber a gravação: o modelo principal, quando ele não
+transcreve ao vivo; se a sessão ao vivo falhar, o primeiro modelo da cadeia
+que envia gravações e tem chave, que pode ser o próprio principal. O Deepgram
+não é pré-aquecido, porque fecha conexões ociosas em poucos segundos. A
+conexão fica disponível para reúso por um tempo limitado.
 
 Antes de cada envio, o clipe é salvo localmente em WAV. Se todos os modelos
 falharem, a gravação aparece no Histórico com o motivo e **Tentar e copiar**,

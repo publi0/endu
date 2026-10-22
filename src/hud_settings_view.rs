@@ -256,6 +256,8 @@ impl HudSettingsView {
             .flatten()
     }
 
+    /// The display list refreshes each time the menu opens; there is no
+    /// refresh button.
     fn refresh_monitors(&mut self) {
         self.monitors = monitor_choices(self.preview);
     }
@@ -359,7 +361,7 @@ impl HudSettingsView {
         .children(choices.iter().enumerate().map(|(index, &value)| {
             let change = change.clone();
             crate::desktop_ui::settings_segmented_item(value == selected, choices.len())
-                .child(label(value))
+                .child(crate::desktop_ui::control_label(label(value)))
                 .id((id, index))
                 .debug_selector(move || format!("{id}-{index}"))
                 .track_focus(&focus[index])
@@ -383,54 +385,58 @@ impl HudSettingsView {
         } else {
             self.preferences.transcription_color
         };
+        // Two chips per row leave room for the longest translated color names
+        // ("Verde azulado"); three did not. Selection is the soft accent with
+        // accent text, like every selected segment, so both states share one
+        // layout: swatch, then label.
+        const COLUMNS: f32 = 2.0;
+        const GAP: f32 = 8.0;
         div()
             .w(px(crate::desktop_ui::SETTINGS_CONTROL_WIDTH))
             .flex_none()
             .flex()
             .flex_wrap()
-            .gap_2()
+            .gap(px(GAP))
             .children(HudColor::ALL.into_iter().enumerate().map(|(index, color)| {
-                compact_button("")
-                    .id((id, index))
-                    .debug_selector(move || format!("{id}-{index}"))
-                    .track_focus(&self.color_focus[group][index])
-                    .focus(|style| style.border_color(rgb(ACCENT)))
-                    .border_1()
-                    .border_color(rgb(LINE))
-                    .w(px((crate::desktop_ui::SETTINGS_CONTROL_WIDTH - 16.0) / 3.0))
-                    .h(px(32.0))
-                    .gap(px(6.0))
-                    .when(color == selected, |button| {
-                        button.bg(rgb(ACCENT_SOFT)).text_color(rgb(ACCENT))
-                    })
-                    .child(
-                        div()
-                            .size(px(10.0))
-                            .flex_none()
-                            .rounded_full()
-                            .bg(rgb(color.swatch())),
-                    )
-                    .child(color.label())
-                    .when(color == selected, |button| {
-                        button.child(div().text_size(px(10.0)).child("✓"))
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let mut preferences = this.preferences;
+                compact_button(
+                    div()
+                        .size(px(10.0))
+                        .flex_none()
+                        .rounded_full()
+                        .bg(rgb(color.swatch())),
+                )
+                .id((id, index))
+                .track_focus(&self.color_focus[group][index])
+                .focus(|style| style.border_color(rgb(ACCENT)))
+                .border_1()
+                .border_color(rgb(LINE))
+                .w(px((crate::desktop_ui::SETTINGS_CONTROL_WIDTH
+                    - GAP * (COLUMNS - 1.0))
+                    / COLUMNS))
+                .flex_none()
+                .overflow_hidden()
+                .gap(px(6.0))
+                .when(color == selected, |button| {
+                    button.bg(rgb(ACCENT_SOFT)).text_color(rgb(ACCENT))
+                })
+                .child(crate::desktop_ui::control_label(color.label()))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let mut preferences = this.preferences;
+                    if recording {
+                        preferences.recording_color = color;
+                    } else {
+                        preferences.transcription_color = color;
+                    }
+                    this.change(
                         if recording {
-                            preferences.recording_color = color;
+                            Section::Recording
                         } else {
-                            preferences.transcription_color = color;
-                        }
-                        this.change(
-                            if recording {
-                                Section::Recording
-                            } else {
-                                Section::Transcription
-                            },
-                            preferences,
-                            cx,
-                        );
-                    }))
+                            Section::Transcription
+                        },
+                        preferences,
+                        cx,
+                    );
+                }))
             }))
             .into_any_element()
     }

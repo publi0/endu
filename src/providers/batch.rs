@@ -9,6 +9,7 @@ use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
 use serde_json::{Value, json};
 
+use super::http_pool::{AGENT, HttpPool, POOL_IDLE, origin};
 use super::pricing::{self, Billing};
 use super::{ModelOptions, ModelRef, Provider, keys, streaming};
 use crate::openrouter::http::Response;
@@ -28,7 +29,6 @@ const MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_REQUEST_BYTES: usize = 10 * 1024 * 1024;
 const LEGACY_PROMPT_HINT_BYTES: usize = 200;
 static BOUNDARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
 /// The provider-specific view of the shared dictionary, always retaining whole terms.
 pub fn keywords(model: ModelRef<'_>, vocabulary: &Snapshot) -> Vec<String> {
     if !vocabulary.settings().remote_hints || !model.capabilities().keywords {
@@ -103,6 +103,226 @@ struct Request {
     content_type: String,
     body: Vec<u8>,
     keyword_count: usize,
+    /// The body carries the Ogg Opus encoding rather than the WAV.
+    opus: bool,
+}
+
+/// The clip offered to a request: always the WAV, plus its Ogg Opus encoding
+/// when one exists. `request` sends Opus only where `accepts_opus` allows it.
+#[derive(Clone, Copy)]
+struct Upload<'a> {
+    wav: &'a [u8],
+    opus: Option<&'a [u8]>,
+}
+
+impl<'a> Upload<'a> {
+    fn wav(bytes: &'a [u8]) -> Self {
+        Self {
+            wav: bytes,
+            opus: None,
+        }
+    }
+
+    /// The same clip with Opus dropped for models that do not accept it.
+    fn for_model(self, model: ModelRef<'_>) -> Self {
+        Self {
+            wav: self.wav,
+            opus: self.opus.filter(|_| accepts_opus(model)),
+        }
+    }
+
+    fn bytes(self) -> &'a [u8] {
+        self.opus.unwrap_or(self.wav)
+    }
+
+    fn is_opus(self) -> bool {
+        self.opus.is_some()
+    }
+
+    fn filename(self) -> &'static str {
+        if self.is_opus() {
+            "clip.ogg"
+        } else {
+            "clip.wav"
+        }
+    }
+
+    fn mime(self) -> &'static str {
+        if self.is_opus() {
+            "audio/ogg"
+        } else {
+            "audio/wav"
+        }
+    }
+}
+
+/// Models that accepted Ogg Opus uploads in a paid comparison against WAV
+/// (docs/experiments/opus-upload-2026-10-21.md). OpenAI accepts it although
+/// its guide lists no Ogg. OpenRouter depends on the routed provider, so only
+/// the tested MAI route qualifies; Meta rejects anything but WAV.
+fn accepts_opus(model: ModelRef<'_>) -> bool {
+    match model.provider {
+        Provider::Deepgram
+        | Provider::ElevenLabs
+        | Provider::Grok
+        | Provider::Google
+        | Provider::OpenAi => true,
+        Provider::OpenRouter => model.model == "microsoft/mai-transcribe-2",
+        Provider::Meta => false,
+    }
+}
+
+/// Models that rejected an Opus upload in this process; they receive the WAV
+/// directly afterwards. Bounded: the oldest remembered model gives way to a
+/// new one, in insertion order.
+const MAX_OPUS_REJECTIONS: usize = 64;
+type OpusRejections = std::collections::VecDeque<String>;
+
+/// What this process learned about each model's Opus uploads: models that
+/// refused it, and models whose Opus upload already returned text. Each list
+/// is bounded the same way.
+struct OpusMemory {
+    rejected: OpusRejections,
+    confirmed: OpusRejections,
+}
+
+impl OpusMemory {
+    const fn new() -> Self {
+        Self {
+            rejected: OpusRejections::new(),
+            confirmed: OpusRejections::new(),
+        }
+    }
+}
+
+#[cfg(not(test))]
+static OPUS_MEMORY: std::sync::Mutex<OpusMemory> = std::sync::Mutex::new(OpusMemory::new());
+#[cfg(test)]
+thread_local! {
+    // Per test thread, so one test's outcome never changes another's uploads.
+    static OPUS_MEMORY: std::cell::RefCell<OpusMemory> =
+        const { std::cell::RefCell::new(OpusMemory::new()) };
+}
+
+fn with_opus_memory<T>(f: impl FnOnce(&mut OpusMemory) -> T) -> T {
+    #[cfg(not(test))]
+    return f(&mut OPUS_MEMORY
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()));
+    #[cfg(test)]
+    OPUS_MEMORY.with(|memory| f(&mut memory.borrow_mut()))
+}
+
+#[cfg(test)]
+fn with_opus_rejections<T>(f: impl FnOnce(&mut OpusRejections) -> T) -> T {
+    with_opus_memory(|memory| f(&mut memory.rejected))
+}
+
+fn remember_model(models: &mut OpusRejections, id: &str) {
+    if models.iter().any(|known| known == id) {
+        return;
+    }
+    if models.len() >= MAX_OPUS_REJECTIONS {
+        models.pop_front();
+    }
+    models.push_back(id.to_owned());
+}
+
+fn opus_refused(id: &str) -> bool {
+    with_opus_memory(|memory| memory.rejected.iter().any(|known| known == id))
+}
+
+fn remember_opus_rejection(id: &str) {
+    with_opus_memory(|memory| remember_model(&mut memory.rejected, id));
+}
+
+/// Whether an Opus upload to this model has already returned text, so the
+/// model is known to decode it: an empty answer is then the real outcome.
+fn opus_confirmed(id: &str) -> bool {
+    with_opus_memory(|memory| memory.confirmed.iter().any(|known| known == id))
+}
+
+fn remember_opus_confirmed(id: &str) {
+    with_opus_memory(|memory| remember_model(&mut memory.confirmed, id));
+}
+
+#[cfg(test)]
+type Encoder = fn(&[f32]) -> Option<Vec<u8>>;
+#[cfg(test)]
+thread_local! {
+    static OPUS_ENCODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FAKE_OPUS: std::cell::Cell<Option<Encoder>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The clip's Ogg Opus encoding. Tests count calls and may inject an encoder,
+/// so chain logic is covered where no system encoder exists.
+fn encode_opus(samples: &[f32]) -> Option<Vec<u8>> {
+    #[cfg(test)]
+    {
+        OPUS_ENCODES.with(|count| count.set(count.get() + 1));
+        if let Some(fake) = FAKE_OPUS.with(std::cell::Cell::get) {
+            return fake(samples);
+        }
+    }
+    super::opus::encode(samples)
+}
+
+/// Whether an error answers the Ogg Opus container rather than another
+/// field. 415 always does; 400/422 only when the body names the audio format
+/// or its decoding, so an unrelated validation error costs no second upload.
+/// The body is reduced to lowercase words and every pattern must match whole
+/// words in sequence, so `invalid_file_format` and `content-type` match while
+/// "payload decoded size" or "Base64 decoding failed" (a request-encoding
+/// error) do not. Bare "invalid audio" and "decode" are deliberately absent:
+/// they also describe content ("too short", "no speech") and JSON payload
+/// errors. The body is never logged or kept.
+fn opus_rejected(request: &Request, response: &Response) -> bool {
+    const FORMAT: &[&str] = &[
+        "ogg",
+        "opus",
+        "codec",
+        "codecs",
+        "mime",
+        "mimetype",
+        "filetype",
+        "audio format",
+        "file format",
+        "container format",
+        "unsupported format",
+        "unsupported audio",
+        "unsupported media",
+        "corrupt or unsupported data",
+        "could not decode audio",
+        "could not decode the audio",
+        "failed to decode audio",
+        "failed to decode the audio",
+        "unable to decode audio",
+        "unable to decode the audio",
+        "audio decoding",
+        "file type",
+        "content type",
+        "media type",
+        "mime type",
+    ];
+    if !request.opus {
+        return false;
+    }
+    match response.status {
+        415 => true,
+        400 | 422 => {
+            let body = String::from_utf8_lossy(&response.body).to_ascii_lowercase();
+            let words: Vec<_> = body
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|word| !word.is_empty())
+                .collect();
+            let words = format!(" {} ", words.join(" "));
+            FORMAT
+                .iter()
+                .any(|pattern| words.contains(&format!(" {pattern} ")))
+        }
+        _ => false,
+    }
 }
 
 fn language(options: &ModelOptions) -> Option<&str> {
@@ -147,7 +367,7 @@ fn request(
     config: &Config,
     model: ModelRef<'_>,
     options: &ModelOptions,
-    wav: &[u8],
+    audio: Upload<'_>,
     vocabulary: &Snapshot,
     hints: &HintPlan,
     without_hints: bool,
@@ -157,9 +377,10 @@ fn request(
     } else {
         keywords(model, vocabulary)
     };
+    let audio = audio.for_model(model);
     match model.provider {
         Provider::OpenRouter => {
-            let mut body = json!({ "model": model.model, "input_audio": {"data": encode_base64(wav), "format": "wav"} });
+            let mut body = json!({ "model": model.model, "input_audio": {"data": encode_base64(audio.bytes()), "format": if audio.is_opus() { "ogg" } else { "wav" }} });
             if let Some(language) = language(options) {
                 body["language"] = json!(language);
             }
@@ -177,6 +398,7 @@ fn request(
                 content_type: "application/json".into(),
                 body: body.to_string().into_bytes(),
                 keyword_count: count,
+                opus: audio.is_opus(),
             })
         }
         Provider::OpenAi => {
@@ -212,13 +434,14 @@ fn request(
             {
                 fields.push(("temperature", temperature.to_string()));
             }
-            let (content_type, body) = multipart(&fields, wav);
+            let (content_type, body) = multipart(&fields, audio);
             Ok(Request {
                 provider: model.provider,
                 url: "https://api.openai.com/v1/audio/transcriptions".into(),
                 content_type,
                 body,
                 keyword_count: count,
+                opus: audio.is_opus(),
             })
         }
         Provider::Deepgram => {
@@ -242,9 +465,10 @@ fn request(
             Ok(Request {
                 provider: model.provider,
                 url: url.into(),
-                content_type: "audio/wav".into(),
-                body: wav.to_vec(),
+                content_type: audio.mime().into(),
+                body: audio.bytes().to_vec(),
                 keyword_count: terms.len(),
+                opus: audio.is_opus(),
             })
         }
         Provider::ElevenLabs => {
@@ -258,13 +482,14 @@ fn request(
                 fields.push(("language_code", language.to_owned()));
             }
             fields.extend(terms.iter().cloned().map(|term| ("keyterms", term)));
-            let (content_type, body) = multipart(&fields, wav);
+            let (content_type, body) = multipart(&fields, audio);
             Ok(Request {
                 provider: model.provider,
                 url: "https://api.elevenlabs.io/v1/speech-to-text".into(),
                 content_type,
                 body,
                 keyword_count: terms.len(),
+                opus: audio.is_opus(),
             })
         }
         Provider::Grok => {
@@ -283,20 +508,21 @@ fn request(
             }
             fields.extend(terms.iter().cloned().map(|term| ("keyterm", term)));
             // xAI ignores options placed after the audio: multipart keeps file last.
-            let (content_type, body) = multipart(&fields, wav);
+            let (content_type, body) = multipart(&fields, audio);
             Ok(Request {
                 provider: model.provider,
                 url: "https://api.x.ai/v1/stt".into(),
                 content_type,
                 body,
                 keyword_count: terms.len(),
+                opus: audio.is_opus(),
             })
         }
         Provider::Meta => {
             let settings = super::meta::settings(model.model, options, "WAV", &terms)?;
             let (content_type, body) = multipart_audio_typed(
                 &[("request", settings.to_string())],
-                wav,
+                audio,
                 "audio",
                 Some("application/json"),
             );
@@ -306,10 +532,13 @@ fn request(
                 content_type,
                 body,
                 keyword_count: terms.len(),
+                opus: audio.is_opus(),
             })
         }
         Provider::Google => {
             // https://ai.google.dev/gemini-api/docs/transcribe and /api/interactions-api
+            // `store: false` keeps Google from persisting the Interaction. Audio
+            // goes inline; never upload it as a stored file.
             let mut transcription = json!({"mode": if options.smart_format {
                 json!("smart")
             } else {
@@ -327,7 +556,7 @@ fn request(
             let body = json!({
                 "model": model.model,
                 "store": false,
-                "input": [{"type":"audio", "data":encode_base64(wav), "mime_type":"audio/wav"}],
+                "input": [{"type":"audio", "data":encode_base64(audio.bytes()), "mime_type":audio.mime()}],
                 "generation_config": {"transcription_config":transcription}
             });
             Ok(Request {
@@ -336,6 +565,7 @@ fn request(
                 content_type: "application/json".into(),
                 body: body.to_string().into_bytes(),
                 keyword_count: terms.len(),
+                opus: audio.is_opus(),
             })
         }
     }
@@ -345,17 +575,21 @@ fn bool_text(value: bool) -> &'static str {
     if value { "true" } else { "false" }
 }
 
-fn multipart(fields: &[(&str, String)], wav: &[u8]) -> (String, Vec<u8>) {
-    multipart_audio(fields, wav, "file")
+fn multipart(fields: &[(&str, String)], audio: Upload<'_>) -> (String, Vec<u8>) {
+    multipart_audio(fields, audio, "file")
 }
 
-fn multipart_audio(fields: &[(&str, String)], wav: &[u8], audio_field: &str) -> (String, Vec<u8>) {
-    multipart_audio_typed(fields, wav, audio_field, None)
+fn multipart_audio(
+    fields: &[(&str, String)],
+    audio: Upload<'_>,
+    audio_field: &str,
+) -> (String, Vec<u8>) {
+    multipart_audio_typed(fields, audio, audio_field, None)
 }
 
 fn multipart_audio_typed(
     fields: &[(&str, String)],
-    wav: &[u8],
+    audio: Upload<'_>,
     audio_field: &str,
     field_type: Option<&str>,
 ) -> (String, Vec<u8>) {
@@ -366,7 +600,8 @@ fn multipart_audio_typed(
             BOUNDARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         );
         if !fields.iter().any(|(_, field)| field.contains(&value))
-            && !wav
+            && !audio
+                .bytes()
                 .windows(value.len())
                 .any(|bytes| bytes == value.as_bytes())
         {
@@ -384,8 +619,8 @@ fn multipart_audio_typed(
             .as_bytes(),
         );
     }
-    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{audio_field}\"; filename=\"clip.wav\"\r\nContent-Type: audio/wav\r\n\r\n").as_bytes());
-    body.extend_from_slice(wav);
+    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{audio_field}\"; filename=\"{}\"\r\nContent-Type: {}\r\n\r\n", audio.filename(), audio.mime()).as_bytes());
+    body.extend_from_slice(audio.bytes());
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
     (format!("multipart/form-data; boundary={boundary}"), body)
 }
@@ -470,23 +705,67 @@ fn send(request: &Request, config: &Config, timeout: Duration) -> Result<Respons
     let key = keys::api_key(request.provider, config)
         .map_err(|_| TransportFailure(ErrorKind::Auth, 0))?;
     let (header, authorization) = keys::authorization(request.provider, &key);
-    let agent = ureq::Agent::new_with_config(
-        ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .max_redirects(0)
+    post(&AGENT, request, header, &authorization, timeout)
+}
+
+/// The network half of `send`, after URL validation and key resolution; tests
+/// reach it only with loopback servers and a dummy header. A request that may
+/// have been handed a pooled socket and failed while the request was still
+/// being written (the socket was dropped by the server or a network change)
+/// is repeated once on a new connection with the same credential, within what
+/// remains of `timeout`. The server never had the whole request, so nothing it
+/// could have transcribed or billed is sent twice. A failure while waiting for
+/// the response, once the whole request may have arrived, is never repeated.
+fn post(
+    pool: &HttpPool,
+    request: &Request,
+    header: &str,
+    authorization: &str,
+    timeout: Duration,
+) -> Result<Response> {
+    let started = Instant::now();
+    let origin = origin(&request.url);
+    let checkout = pool.checkout(origin.as_deref());
+    // A request to an origin this agent never pooled opens a new connection,
+    // so a failure there is not a stale socket and is not repeated.
+    let mut may_retry = checkout.pooled;
+    let mut idle_age = POOL_IDLE;
+    let mut response = loop {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let mut body = std::io::Cursor::new(request.body.as_slice());
+        let sent = checkout
+            .agent
+            .post(&request.url)
+            .config()
             // Retain OpenRouter-compatible HTTP localhost endpoints; direct provider
             // URLs are fixed HTTPS constants and never configurable through a profile.
             .https_only(request.provider != Provider::OpenRouter)
-            .timeout_global(Some(timeout))
-            .build(),
-    );
-    let mut response = agent
-        .post(&request.url)
-        .header(header, authorization)
-        .header("Content-Type", request.content_type.as_str())
-        .header("X-Title", "Endu")
-        .send(request.body.as_slice())
-        .map_err(|error| TransportFailure(http_error_kind(&error, false), 0))?;
+            .timeout_global(Some(remaining))
+            .max_idle_age(idle_age)
+            .build()
+            .header(header, authorization)
+            .header("Content-Type", request.content_type.as_str())
+            .header("Content-Length", request.body.len())
+            .header("X-Title", "Endu")
+            .send(ureq::SendBody::from_reader(&mut body));
+        // ureq reads the body only to write it, so an unread remainder proves
+        // the request was cut off while it was being sent.
+        let unsent = body.position() < request.body.len() as u64;
+        match sent {
+            Ok(response) => break response,
+            Err(error)
+                if may_retry
+                    && dropped_while_sending(&error, unsent)
+                    && started.elapsed() < timeout =>
+            {
+                may_retry = false;
+                // Zero discards this origin's pooled sockets (ureq drops each
+                // one it skips) and forces a new connection.
+                idle_age = Duration::ZERO;
+            }
+            Err(error) => return Err(TransportFailure(http_error_kind(&error, false), 0).into()),
+        }
+    };
     let status = response.status().as_u16();
     let retry_after = response
         .headers()
@@ -501,10 +780,192 @@ fn send(request: &Request, config: &Config, timeout: Duration) -> Result<Respons
         .limit(MAX_RESPONSE_BYTES)
         .read_to_vec()
         .map_err(|error| http_body_failure(&error, request.keyword_count))?;
+    pool.used(&checkout, origin.as_deref());
     Ok(Response {
         status,
         retry_after,
         body,
+    })
+}
+
+/// A socket that failed under the request before the server could have read
+/// all of it: the signature of a kept-alive connection the server or a network
+/// change dropped. Write-side errors qualify on their own. A reset qualifies
+/// only while part of the body was still unsent (`unsent`), since a reset or
+/// EOF while awaiting the response may follow a request the server fully
+/// received; so does EINVAL, which macOS returns when ureq updates the write
+/// timeout of a socket that was reset mid-body. Timeouts are not included:
+/// the global attempt budget is already spent.
+fn dropped_while_sending(error: &ureq::Error, unsent: bool) -> bool {
+    let ureq::Error::Io(error) = error else {
+        return false;
+    };
+    match error.kind() {
+        std::io::ErrorKind::BrokenPipe
+        | std::io::ErrorKind::NotConnected
+        | std::io::ErrorKind::ConnectionAborted => true,
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::InvalidInput => unsent,
+        _ => false,
+    }
+}
+
+/// Bounds the TLS warm-up; a slow host simply stays cold.
+const PREWARM_TIMEOUT: Duration = Duration::from_secs(5);
+/// A HEAD answer has no body; anything larger is not drained into the pool.
+const PREWARM_BODY_LIMIT: u64 = 64 * 1024;
+static PREWARMING: AtomicBool = AtomicBool::new(false);
+
+/// Opens the connection for the recorded upload while the user speaks, so the
+/// request after Finish skips TCP and TLS (ureq still resolves DNS for every
+/// request). It sends a bare HEAD to the provider's origin: no credentials,
+/// audio or vocabulary. A primary that streams live already opens its own
+/// socket and needs no warm-up. The caller (the audio owner) only claims the
+/// single flight and spawns; configuration, key status and the request run on
+/// the warm-up thread.
+pub fn prewarm() {
+    spawn_prewarm(upload_origin_unless_live);
+}
+
+/// Warms the first recorded upload after a live session failed or was
+/// invalidated during capture, so the recovery request after Finish skips
+/// TCP and TLS. Same single flight and thread as `prewarm`.
+pub fn prewarm_recovery() {
+    spawn_prewarm(recorded_upload_origin);
+}
+
+type OriginSelector = fn(&Config, &dyn Fn(Provider) -> bool) -> Option<PrewarmOrigin>;
+
+fn spawn_prewarm(select: OriginSelector) {
+    if cfg!(test) {
+        return;
+    }
+    let Some(flight) = PrewarmFlight::acquire() else {
+        return;
+    };
+    // A failed spawn drops the closure and, with it, the flight.
+    let _ = std::thread::Builder::new()
+        .name("endu-prewarm".into())
+        .spawn(move || {
+            let _flight = flight;
+            let Some(config) = super::runtime_config() else {
+                return;
+            };
+            // Cached state or Keychain attributes only, as the selectors use;
+            // a warm-up never resolves or decrypts a key.
+            let has_key = |provider| {
+                !matches!(
+                    keys::key_status(provider, &config),
+                    crate::openrouter::KeyStatus::Missing
+                )
+            };
+            if let Some(origin) = select(&config, &has_key) {
+                warm(&AGENT, &origin);
+            }
+        });
+}
+
+fn warm(pool: &HttpPool, target: &PrewarmOrigin) {
+    let origin = origin(&target.url);
+    let checkout = pool.checkout(origin.as_deref());
+    let response = checkout
+        .agent
+        .head(&target.url)
+        .config()
+        .https_only(target.https_only)
+        .timeout_global(Some(PREWARM_TIMEOUT))
+        .build()
+        .call();
+    // Draining the empty body returns the connection to the pool.
+    if let Ok(mut response) = response
+        && response
+            .body_mut()
+            .with_config()
+            .limit(PREWARM_BODY_LIMIT)
+            .read_to_vec()
+            .is_ok()
+    {
+        pool.used(&checkout, origin.as_deref());
+    }
+}
+
+/// Owns `PREWARMING` for one warm-up; released on drop, including a panic.
+struct PrewarmFlight(());
+
+impl PrewarmFlight {
+    fn acquire() -> Option<Self> {
+        (!PREWARMING.swap(true, Ordering::AcqRel)).then_some(Self(()))
+    }
+}
+
+impl Drop for PrewarmFlight {
+    fn drop(&mut self) {
+        PREWARMING.store(false, Ordering::Release);
+    }
+}
+
+/// Providers that drop an idle kept-alive socket within seconds. Deepgram
+/// closes it after ~5 s, so a socket warmed while the user speaks is usually
+/// gone by Finish; warming it would only add a request per dictation.
+fn closes_idle_quickly(provider: Provider) -> bool {
+    provider == Provider::Deepgram
+}
+
+#[derive(Debug, PartialEq)]
+struct PrewarmOrigin {
+    url: String,
+    https_only: bool,
+}
+
+/// The origin of the first recorded upload when no live session opens. The
+/// primary is read exactly as `LiveCapture::start` reads it.
+fn upload_origin_unless_live(
+    config: &Config,
+    has_key: &dyn Fn(Provider) -> bool,
+) -> Option<PrewarmOrigin> {
+    if streaming::live_primary(config).is_some() {
+        return None;
+    }
+    recorded_upload_origin(config, has_key)
+}
+
+/// The origin of the first HTTP upload the chain makes for a completed clip,
+/// in chain order, skipping slots it would skip or answer without HTTP: blank,
+/// invalid options, live-only (a completed WebSocket) and missing keys. The
+/// URL comes from the same request builder the chain uses.
+fn recorded_upload_origin(
+    config: &Config,
+    has_key: &dyn Fn(Provider) -> bool,
+) -> Option<PrewarmOrigin> {
+    let (id, options) = config
+        .transcription
+        .models
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .map(|id| (id, super::options(config, id)))
+        .find(|(id, options)| {
+            let model = ModelRef::parse(id);
+            model.capabilities().batch && options.validate().is_ok() && has_key(model.provider)
+        })?;
+    let model = ModelRef::parse(id);
+    if closes_idle_quickly(model.provider) {
+        return None;
+    }
+    let request = request(
+        config,
+        model,
+        &options,
+        Upload::wav(&[]),
+        &Snapshot::default(),
+        &HintPlan::default(),
+        true,
+    )
+    .ok()?;
+    crate::openrouter::http::validate_url(&request.url).ok()?;
+    let url = url::Url::parse(&request.url).ok()?;
+    Some(PrewarmOrigin {
+        url: format!("{}/", url.origin().ascii_serialization()),
+        https_only: model.provider != Provider::OpenRouter,
     })
 }
 
@@ -727,6 +1188,14 @@ struct Chain<'a> {
 }
 
 impl Chain<'_> {
+    /// What remains of the chain deadline: `spent` adds measured request,
+    /// encode and wait time to `initial_spent`; wall time covers the rest.
+    fn remaining(&self, started: Instant, initial_spent: Duration, spent: Duration) -> Duration {
+        self.config
+            .total_timeout()
+            .saturating_sub(initial_spent.saturating_add(started.elapsed()).max(spent))
+    }
+
     fn run(
         &self,
         samples: &[f32],
@@ -740,6 +1209,8 @@ impl Chain<'_> {
         let mut spent = initial_spent;
         let wav =
             encode_wav(samples).map_err(|_| eyre!("Could not encode transcription audio."))?;
+        // These samples' Opus encoding, made on the first model that takes it.
+        let opus = std::cell::OnceCell::new();
         for (model_index, id) in self
             .config
             .transcription
@@ -767,15 +1238,20 @@ impl Chain<'_> {
             }
             let mut rate_retried = false;
             let mut without_hints = false;
+            // Set once this model's Opus upload was answered: every later
+            // request in this loop sends the WAV, whatever the shared set says.
+            let mut opus_retried = false;
+            // A 2xx Opus answer without text: remember the model as refusing
+            // Opus only if the WAV resend then transcribes.
+            let mut opus_unconfirmed = false;
             loop {
                 check_cancelled(self.cancelled)?;
-                let elapsed = initial_spent.saturating_add(started.elapsed()).max(spent);
-                let remaining = self.config.total_timeout().saturating_sub(elapsed);
+                let remaining = self.remaining(started, initial_spent, spent);
                 if remaining.is_zero() {
                     progress.fail(id, ErrorKind::Timeout, "not tried, chain deadline reached");
                     break;
                 }
-                let timeout = self.config.attempt_timeout().min(remaining);
+                let mut timeout = self.config.attempt_timeout().min(remaining);
                 if !capability.batch {
                     let at = Instant::now();
                     let mut without_remote = self.vocabulary.settings().clone();
@@ -859,9 +1335,7 @@ impl Chain<'_> {
                                 without_hints = true;
                                 continue;
                             }
-                            let available = self.config.total_timeout().saturating_sub(
-                                initial_spent.saturating_add(started.elapsed()).max(spent),
-                            );
+                            let available = self.remaining(started, initial_spent, spent);
                             if status == Some(429)
                                 && !rate_retried
                                 && available > Duration::from_secs(1)
@@ -886,15 +1360,45 @@ impl Chain<'_> {
                         }
                     }
                 }
-                let request = match request(
-                    self.config,
-                    model,
-                    &options,
-                    &wav,
-                    self.vocabulary,
-                    self.hints,
-                    without_hints,
-                ) {
+                let build = |audio| {
+                    request(
+                        self.config,
+                        model,
+                        &options,
+                        audio,
+                        self.vocabulary,
+                        self.hints,
+                        without_hints,
+                    )
+                };
+                // Validate the request without audio first, so an invalid
+                // endpoint or option never costs an encode.
+                let valid = build(Upload::wav(&[]));
+                let mut audio = Upload::wav(&wav);
+                if valid.is_ok() && accepts_opus(model) && !opus_retried && !opus_refused(id) {
+                    // The encode counts against this attempt's deadline as
+                    // well as the chain's.
+                    let at = Instant::now();
+                    audio.opus = opus.get_or_init(|| encode_opus(samples)).as_deref();
+                    let encoding = at.elapsed();
+                    spent = spent.saturating_add(encoding);
+                    check_cancelled(self.cancelled)?;
+                    let remaining = self.remaining(started, initial_spent, spent);
+                    timeout = self
+                        .config
+                        .attempt_timeout()
+                        .saturating_sub(encoding)
+                        .min(remaining);
+                    if timeout.is_zero() {
+                        progress.fail(
+                            id,
+                            ErrorKind::Timeout,
+                            "not tried, deadline reached while encoding audio",
+                        );
+                        break;
+                    }
+                }
+                let request = match valid.and_then(|_| build(audio)) {
                     Ok(request) => request,
                     Err(_) => {
                         progress.execution(model, false, 0, false, None);
@@ -920,10 +1424,15 @@ impl Chain<'_> {
                                     request.keyword_count,
                                     Ok(latency.as_millis() as u64),
                                     cost,
-                                    rate_retried || without_hints,
+                                    rate_retried || without_hints || opus_retried,
                                 );
                                 progress.telemetry.used_fallback |= model_index > 0;
                                 progress.execution(model, false, request.keyword_count, true, cost);
+                                if opus_unconfirmed {
+                                    remember_opus_rejection(id);
+                                } else if request.opus {
+                                    remember_opus_confirmed(id);
+                                }
                                 return Ok(Success {
                                     text,
                                     model: id.into(),
@@ -939,7 +1448,7 @@ impl Chain<'_> {
                                     request.keyword_count,
                                     Err(ErrorKind::InvalidResponse),
                                     cost,
-                                    rate_retried || without_hints,
+                                    rate_retried || without_hints || opus_retried,
                                 );
                                 progress.execution(
                                     model,
@@ -953,6 +1462,18 @@ impl Chain<'_> {
                                     ErrorKind::InvalidResponse,
                                     "invalid transcription response",
                                 );
+                                // Any 2xx the parser rejects (empty text,
+                                // malformed body) for an Opus clip may be a
+                                // mis-decode: resend the WAV once on the same
+                                // model. A model whose Opus upload already
+                                // returned text decodes it, so its empty
+                                // answer is the real outcome and is not
+                                // billed twice.
+                                if request.opus && !opus_retried && !opus_confirmed(id) {
+                                    opus_retried = true;
+                                    opus_unconfirmed = true;
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -964,7 +1485,7 @@ impl Chain<'_> {
                             request.keyword_count,
                             Err(ErrorKind::from_status(response.status)),
                             cost,
-                            rate_retried || without_hints,
+                            rate_retried || without_hints || opus_retried,
                         );
                         progress.execution(model, false, request.keyword_count, false, cost);
                         if response.status == 401 {
@@ -984,10 +1505,18 @@ impl Chain<'_> {
                             without_hints = true;
                             continue;
                         }
+                        if opus_rejected(&request, &response) {
+                            progress.fail(
+                                id,
+                                ErrorKind::from_status(response.status),
+                                &format!("HTTP {}: compressed audio rejected", response.status),
+                            );
+                            remember_opus_rejection(id);
+                            opus_retried = true;
+                            continue;
+                        }
                         let wait = response.retry_after.unwrap_or(Duration::from_secs(1));
-                        let available = self.config.total_timeout().saturating_sub(
-                            initial_spent.saturating_add(started.elapsed()).max(spent),
-                        );
+                        let available = self.remaining(started, initial_spent, spent);
                         if response.status == 429
                             && !rate_retried
                             && self.config.transcription.rate_limit_retry_max_wait_ms > 0
@@ -1024,7 +1553,7 @@ impl Chain<'_> {
                                 keyword_count,
                                 Err(kind),
                                 None,
-                                rate_retried || without_hints,
+                                rate_retried || without_hints || opus_retried,
                             );
                         }
                         progress.execution(model, false, keyword_count, false, None);
@@ -1408,6 +1937,7 @@ fn transcribe_configured(
 mod tests {
     use super::*;
     use crate::vocabulary::Vocabulary;
+    use std::time::SystemTime;
 
     #[test]
     fn meta_upload_uses_typed_request_part_named_language_and_authoritative_wav() {
@@ -1424,7 +1954,7 @@ mod tests {
                     language: "pt".into(),
                     ..Default::default()
                 },
-                &wav,
+                Upload::wav(&wav),
                 &words,
                 &HintPlan::default(),
                 without_hints,
@@ -1529,6 +2059,1410 @@ mod tests {
                 .iter()
                 .all(|failure| !failure.detail.contains("PRIVATE_MARKER"))
         );
+    }
+
+    #[test]
+    fn prewarm_targets_the_first_recorded_upload_origin_only() {
+        let mut grok = config(&["grok::grok-voice-transcribe-2.0", "deepgram::nova-3"]);
+        grok.transcription.model_options.insert(
+            ModelRef::parse("grok::grok-voice-transcribe-2.0").key(),
+            ModelOptions {
+                language: "pt".into(),
+                streaming: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            upload_origin_unless_live(&grok, &|_| true),
+            Some(PrewarmOrigin {
+                url: "https://api.x.ai/".into(),
+                https_only: true,
+            })
+        );
+
+        // A live primary opens its own socket; the fallback is not warmed.
+        grok.transcription.model_options.insert(
+            ModelRef::parse("grok::grok-voice-transcribe-2.0").key(),
+            ModelOptions {
+                language: "pt".into(),
+                streaming: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(upload_origin_unless_live(&grok, &|_| true), None);
+        assert_eq!(
+            upload_origin_unless_live(&config(&["elevenlabs::scribe_v2_realtime"]), &|_| true),
+            None
+        );
+        assert_eq!(
+            upload_origin_unless_live(&config(&[" ", ""]), &|_| true),
+            None
+        );
+
+        // The OpenRouter origin follows the configured, validated base URL.
+        let mut routed = config(&["microsoft/mai-transcribe-2"]);
+        assert_eq!(
+            upload_origin_unless_live(&routed, &|_| true).map(|origin| origin.url),
+            Some("https://openrouter.ai/".into())
+        );
+        routed.base_url = "http://127.0.0.1:8080/api/v1".into();
+        assert_eq!(
+            upload_origin_unless_live(&routed, &|_| true),
+            Some(PrewarmOrigin {
+                url: "http://127.0.0.1:8080/".into(),
+                https_only: false,
+            })
+        );
+        routed.base_url = "http://localhost.evil/api/v1".into();
+        assert_eq!(upload_origin_unless_live(&routed, &|_| true), None);
+    }
+
+    #[test]
+    fn prewarm_and_live_capture_read_the_same_primary() {
+        let cases = [
+            config(&[" ", "grok::grok-voice-transcribe-2.0"]),
+            config(&["grok::grok-voice-transcribe-2.0", "openai::whisper-1"]),
+            config(&[
+                "elevenlabs::scribe_v2_realtime",
+                "microsoft/mai-transcribe-2",
+            ]),
+            config(&["microsoft/mai-transcribe-2"]),
+            config(&["deepgram::nova-2", "openai::whisper-1"]),
+        ];
+        for case in &cases {
+            // Never both a live socket and a warmed upload for one capture.
+            assert!(
+                streaming::live_primary(case).is_none()
+                    || upload_origin_unless_live(case, &|_| true).is_none()
+            );
+        }
+        // A blank first slot never streams live, so the recorded upload is
+        // warmed even though the next slot could stream.
+        assert_eq!(streaming::live_primary(&cases[0]), None);
+        assert_eq!(
+            upload_origin_unless_live(&cases[0], &|_| true).map(|origin| origin.url),
+            Some("https://api.x.ai/".into())
+        );
+        assert_eq!(
+            streaming::live_primary(&cases[1]),
+            Some("grok::grok-voice-transcribe-2.0")
+        );
+        assert_eq!(
+            upload_origin_unless_live(&cases[3], &|_| true).map(|origin| origin.url),
+            Some("https://openrouter.ai/".into())
+        );
+        // Nova-2 with Auto uploads to Deepgram, which drops idle sockets in ~5 s.
+        assert_eq!(streaming::live_primary(&cases[4]), None);
+        assert_eq!(upload_origin_unless_live(&cases[4], &|_| true), None);
+    }
+
+    #[test]
+    fn recovery_warms_the_first_recorded_http_upload_with_a_key() {
+        let chain = config(&[
+            "elevenlabs::scribe_v2_realtime",
+            "microsoft/mai-transcribe-2",
+            "grok::grok-voice-transcribe-2.0",
+        ]);
+        let all = |_: Provider| true;
+        // The live-only primary answers a completed clip over a WebSocket.
+        assert_eq!(upload_origin_unless_live(&chain, &all), None);
+        assert_eq!(
+            recorded_upload_origin(&chain, &all),
+            Some(PrewarmOrigin {
+                url: "https://openrouter.ai/".into(),
+                https_only: false,
+            })
+        );
+        assert_eq!(
+            recorded_upload_origin(&chain, &|provider| provider != Provider::OpenRouter)
+                .map(|origin| origin.url),
+            Some("https://api.x.ai/".into())
+        );
+        assert_eq!(recorded_upload_origin(&chain, &|_| false), None);
+
+        // A streaming primary that can upload retries itself with the recording.
+        let grok = config(&[
+            "grok::grok-voice-transcribe-2.0",
+            "microsoft/mai-transcribe-2",
+        ]);
+        assert_eq!(
+            recorded_upload_origin(&grok, &all).map(|origin| origin.url),
+            Some("https://api.x.ai/".into())
+        );
+        // Deepgram would take the upload but closes idle sockets within seconds.
+        let deepgram = config(&[
+            "elevenlabs::scribe_v2_realtime",
+            "deepgram::nova-3",
+            "openai::whisper-1",
+        ]);
+        assert_eq!(recorded_upload_origin(&deepgram, &all), None);
+    }
+
+    #[test]
+    fn prewarm_flight_is_released_when_the_warm_up_panics() {
+        let flight = PrewarmFlight::acquire().expect("no other warm-up in tests");
+        assert!(PrewarmFlight::acquire().is_none());
+        let joined = std::thread::spawn(move || {
+            let _flight = flight;
+            panic!("warm-up failed");
+        })
+        .join();
+        assert!(joined.is_err());
+        assert!(PrewarmFlight::acquire().is_some());
+        assert!(!PREWARMING.load(Ordering::Acquire));
+    }
+
+    /// One HTTP/1.1 request (headers plus Content-Length body); `None` at EOF.
+    fn read_http_request(stream: &mut std::net::TcpStream) -> Option<Vec<u8>> {
+        use std::io::Read;
+        let mut data = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            if let Some(end) = data.windows(4).position(|window| window == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if data.len() >= end + 4 + length {
+                    return Some(data);
+                }
+            }
+            let read = stream.read(&mut buffer).ok()?;
+            if read == 0 {
+                return None;
+            }
+            data.extend_from_slice(&buffer[..read]);
+        }
+    }
+
+    fn loopback(provider: Provider, listener: &std::net::TcpListener) -> Request {
+        Request {
+            provider,
+            url: format!("http://{}/api/v1/audio", listener.local_addr().unwrap()),
+            content_type: "audio/wav".into(),
+            body: b"RIFF".to_vec(),
+            keyword_count: 0,
+            opus: false,
+        }
+    }
+
+    /// Whether anything connected to `listener` since it was last accepted.
+    fn connected(listener: &std::net::TcpListener) -> bool {
+        listener.set_nonblocking(true).unwrap();
+        listener.accept().is_ok()
+    }
+
+    /// Reads one request's head only, leaving any body unread in the socket.
+    fn read_http_head(stream: &mut std::net::TcpStream) {
+        use std::io::Read;
+        let mut data = Vec::new();
+        let mut byte = [0];
+        while !data.ends_with(b"\r\n\r\n") {
+            assert_eq!(stream.read(&mut byte).unwrap(), 1);
+            data.push(byte[0]);
+        }
+    }
+
+    /// `post` with a dummy bearer credential, as the loopback tests send it.
+    fn post_bearer(pool: &HttpPool, request: &Request, timeout: Duration) -> Result<Response> {
+        post(pool, request, "Authorization", "Bearer test", timeout)
+    }
+
+    const OK_EMPTY: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+    const OK_TEXT: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n{\"text\":\"ok\"}";
+
+    /// Larger than loopback socket buffers, so the client is still writing
+    /// when the server drops the connection.
+    fn large_upload(listener: &std::net::TcpListener) -> Request {
+        Request {
+            body: vec![0; 32 << 20],
+            ..loopback(Provider::OpenRouter, listener)
+        }
+    }
+
+    #[test]
+    fn a_pooled_socket_dropped_while_sending_is_retried_once_on_a_fresh_connection() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let warm = loopback(Provider::OpenRouter, &listener);
+        let upload = large_upload(&listener);
+        let server = std::thread::spawn(move || {
+            let (mut kept, _) = listener.accept().unwrap();
+            read_http_request(&mut kept).unwrap();
+            kept.write_all(OK_EMPTY).unwrap();
+            // The next request reuses the kept-alive socket, which closes with
+            // the body still arriving, as a server idle close racing the
+            // request would. Unread data makes the close a reset.
+            read_http_head(&mut kept);
+            drop(kept);
+            let (mut fresh, _) = listener.accept().unwrap();
+            let received = read_http_request(&mut fresh).unwrap();
+            fresh.write_all(OK_TEXT).unwrap();
+            (listener, received.len())
+        });
+        let pool = HttpPool::new();
+        let timeout = Duration::from_secs(20);
+        let first = post_bearer(&pool, &warm, timeout).unwrap();
+        assert_eq!(first.status, 200);
+        let second = post_bearer(&pool, &upload, timeout).unwrap();
+        assert_eq!(
+            (second.status, second.body.as_slice()),
+            (200, &br#"{"text":"ok"}"#[..])
+        );
+        let (listener, received) = server.join().unwrap();
+        assert!(
+            received > upload.body.len(),
+            "the retry sent the whole body"
+        );
+        assert!(!connected(&listener), "exactly one retry");
+    }
+
+    #[test]
+    fn a_pooled_socket_closed_after_the_whole_request_is_not_retried() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let request = loopback(Provider::OpenRouter, &listener);
+        let server = std::thread::spawn(move || {
+            let (mut kept, _) = listener.accept().unwrap();
+            read_http_request(&mut kept).unwrap();
+            kept.write_all(OK_EMPTY).unwrap();
+            // The server has the whole request and may have processed (and
+            // billed) it; resending would upload the audio twice.
+            read_http_request(&mut kept).unwrap();
+            drop(kept);
+            listener
+        });
+        let pool = HttpPool::new();
+        let timeout = Duration::from_secs(10);
+        post_bearer(&pool, &request, timeout).unwrap();
+        let error = post_bearer(&pool, &request, timeout).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<TransportFailure>()
+                .map(|failure| failure.0),
+            Some(ErrorKind::Network)
+        );
+        let listener = server.join().unwrap();
+        assert!(!connected(&listener));
+    }
+
+    #[test]
+    fn a_new_connection_dropped_while_sending_is_not_retried() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let upload = large_upload(&listener);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_http_head(&mut stream);
+            drop(stream);
+            listener
+        });
+        let error = post_bearer(&HttpPool::new(), &upload, Duration::from_secs(20)).unwrap_err();
+        assert!(error.downcast_ref::<TransportFailure>().is_some());
+        let listener = server.join().unwrap();
+        assert!(!connected(&listener), "no pooled socket, no retry");
+    }
+
+    #[test]
+    fn a_suspect_pool_discards_sockets_to_every_host() {
+        use std::io::{Read, Write};
+        let host_a = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host_b = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let to_a = loopback(Provider::OpenRouter, &host_a);
+        let to_b = loopback(Provider::OpenRouter, &host_b);
+        let (served, slept) = std::sync::mpsc::channel();
+        let server_a = std::thread::spawn(move || {
+            let (mut kept, _) = host_a.accept().unwrap();
+            read_http_request(&mut kept).unwrap();
+            kept.write_all(OK_EMPTY).unwrap();
+            // After the sleep the request arrives on a new connection, and the
+            // kept-alive socket was closed with the discarded pool.
+            let (mut fresh, _) = host_a.accept().unwrap();
+            read_http_request(&mut fresh).unwrap();
+            fresh.write_all(OK_TEXT).unwrap();
+            kept.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            assert_eq!(kept.read(&mut [0; 16]).unwrap(), 0);
+            host_a
+        });
+        let server_b = std::thread::spawn(move || {
+            let (mut kept, _) = host_b.accept().unwrap();
+            read_http_request(&mut kept).unwrap();
+            kept.write_all(OK_EMPTY).unwrap();
+            served.send(()).unwrap();
+            let (mut fresh, _) = host_b.accept().unwrap();
+            read_http_request(&mut fresh).unwrap();
+            fresh.write_all(OK_EMPTY).unwrap();
+            host_b
+        });
+        let pool = HttpPool::new();
+        let timeout = Duration::from_secs(10);
+        post_bearer(&pool, &to_a, timeout).unwrap();
+        post_bearer(&pool, &to_b, timeout).unwrap();
+        slept.recv().unwrap();
+        let (key_a, key_b) = (origin(&to_a.url), origin(&to_b.url));
+        assert!(pool.checkout(key_a.as_deref()).pooled);
+        // The Mac slept ten minutes while `Instant` stood still.
+        let wall = SystemTime::now() + Duration::from_secs(600);
+        let after_sleep = pool.checkout_at(key_b.as_deref(), wall, Instant::now());
+        assert!(!after_sleep.pooled);
+        drop(after_sleep);
+        post_bearer(&pool, &to_b, timeout).unwrap();
+        // Host B's fresh request must not have vouched for host A's socket.
+        assert!(!pool.checkout(key_a.as_deref()).pooled);
+        let response = post_bearer(&pool, &to_a, timeout).unwrap();
+        assert_eq!(response.body.as_slice(), &br#"{"text":"ok"}"#[..]);
+        let (host_a, host_b) = (server_a.join().unwrap(), server_b.join().unwrap());
+        assert!(!connected(&host_a) && !connected(&host_b));
+    }
+
+    #[test]
+    fn a_failure_after_the_response_began_is_not_retried() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let request = loopback(Provider::OpenRouter, &listener);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_http_request(&mut stream).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\n{}")
+                .unwrap();
+            drop(stream);
+            listener
+        });
+        let error = post_bearer(&HttpPool::new(), &request, Duration::from_secs(10)).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<TransportFailure>()
+                .map(|failure| failure.0),
+            Some(ErrorKind::InvalidResponse)
+        );
+        let listener = server.join().unwrap();
+        assert!(!connected(&listener));
+    }
+
+    #[test]
+    fn request_config_keeps_the_shared_agent_redirect_and_https_rules() {
+        use std::io::Write;
+        let elsewhere = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = format!("http://{}/stolen", elsewhere.local_addr().unwrap());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let request = loopback(Provider::OpenRouter, &listener);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_http_request(&mut stream).unwrap();
+            let reply =
+                format!("HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\n\r\n");
+            stream.write_all(reply.as_bytes()).unwrap();
+            listener
+        });
+        let timeout = Duration::from_secs(10);
+        let response = post_bearer(&AGENT, &request, timeout).unwrap();
+        // The redirect is a plain response; the credential never follows it.
+        assert_eq!(response.status, 302);
+        let listener = server.join().unwrap();
+        assert!(!connected(&elsewhere));
+
+        // Direct providers require HTTPS even on loopback.
+        listener.set_nonblocking(false).unwrap();
+        let direct = loopback(Provider::Deepgram, &listener);
+        let error = post(&AGENT, &direct, "Authorization", "Token test", timeout).unwrap_err();
+        assert!(error.downcast_ref::<TransportFailure>().is_some());
+        assert!(!connected(&listener));
+    }
+
+    const DEEPGRAM_DONE: &str =
+        r#"{"results":{"channels":[{"alternatives":[{"transcript":"done"}]}]}}"#;
+
+    fn run_chain(
+        config: &Config,
+        vocabulary: &Snapshot,
+        cancelled: Option<&AtomicBool>,
+        progress: &mut Progress,
+        send: &mut RequestSender<'_>,
+    ) -> Result<Success> {
+        Chain {
+            config,
+            vocabulary,
+            hints: &HintPlan::default(),
+            cancelled,
+        }
+        .run(
+            &[0.1; 16_000],
+            Duration::ZERO,
+            progress,
+            send,
+            &mut |_, _, _, _| panic!("no completed websocket"),
+            &mut |_| panic!("no sleep"),
+        )
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    #[test]
+    fn opus_goes_only_to_providers_that_accept_it() {
+        use_encoder(false);
+        let ids = [
+            "openai/gpt-transcribe",
+            "meta::muse-voice-transcribe-1.0",
+            "microsoft/mai-transcribe-2",
+            "openai::gpt-transcribe",
+            "grok::grok-voice-transcribe-2.0",
+        ];
+        let config = config(&ids);
+        let mut uploads = Vec::new();
+        let success = run_chain(
+            &config,
+            &vocabulary(&[]),
+            None,
+            &mut Progress::default(),
+            &mut |request, _| {
+                let body = String::from_utf8_lossy(&request.body).into_owned();
+                uploads.push((request.provider, request.opus, body));
+                let status = if request.provider == Provider::Grok {
+                    200
+                } else {
+                    503
+                };
+                (
+                    Ok(response(status, r#"{"text":"done"}"#, None)),
+                    Duration::from_millis(10),
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(success.model, ids[4]);
+        let [routed, meta, mai, openai, grok] = &uploads[..] else {
+            panic!("one attempt per model");
+        };
+        // Other OpenRouter routes and Meta keep the WAV clip.
+        assert!(!routed.1 && routed.2.contains(r#""format":"wav""#));
+        assert!(
+            !meta.1
+                && meta
+                    .2
+                    .contains("filename=\"clip.wav\"\r\nContent-Type: audio/wav")
+        );
+        // Other platforms have no system encoder and keep the WAV clip.
+        let encoded = cfg!(target_os = "macos");
+        assert_eq!(mai.1, encoded);
+        assert_eq!(
+            mai.2.contains(r#""format":"ogg""#),
+            encoded,
+            "the MAI route names the Ogg container"
+        );
+        for (_, opus, body) in [openai, grok] {
+            assert_eq!(*opus, encoded);
+            if *opus {
+                assert!(body.contains("filename=\"clip.ogg\"\r\nContent-Type: audio/ogg"));
+                assert!(body.contains("OggS") && !body.contains("RIFF"));
+            }
+        }
+    }
+
+    #[test]
+    fn request_sends_opus_only_where_documented_and_names_the_ogg_container() {
+        let config = config(&[]);
+        let upload = Upload {
+            wav: b"RIFF_FIXTURE",
+            opus: Some(b"OggS_FIXTURE"),
+        };
+        let build = |id: &str| {
+            request(
+                &config,
+                ModelRef::parse(id),
+                &ModelOptions::default(),
+                upload,
+                &Snapshot::default(),
+                &HintPlan::default(),
+                false,
+            )
+            .unwrap()
+        };
+        let deepgram = build("deepgram::nova-3");
+        assert!(deepgram.opus);
+        assert_eq!(deepgram.content_type, "audio/ogg");
+        assert_eq!(deepgram.body, b"OggS_FIXTURE");
+        for id in ["elevenlabs::scribe_v2", "grok::grok-voice-transcribe-2.0"] {
+            let request = build(id);
+            let body = String::from_utf8_lossy(&request.body);
+            assert!(request.opus);
+            assert!(body.contains(
+                "filename=\"clip.ogg\"\r\nContent-Type: audio/ogg\r\n\r\nOggS_FIXTURE\r\n"
+            ));
+            assert!(!body.contains("RIFF"));
+        }
+        let openai = build("openai::gpt-transcribe");
+        let body = String::from_utf8_lossy(&openai.body);
+        assert!(openai.opus);
+        assert!(
+            body.contains(
+                "filename=\"clip.ogg\"\r\nContent-Type: audio/ogg\r\n\r\nOggS_FIXTURE\r\n"
+            )
+        );
+        assert!(!body.contains("RIFF"));
+        let mai = build("microsoft/mai-transcribe-2");
+        let routed: Value = serde_json::from_slice(&mai.body).unwrap();
+        assert!(mai.opus);
+        assert_eq!(routed["input_audio"]["format"], "ogg");
+        assert_eq!(
+            routed["input_audio"]["data"],
+            encode_base64(b"OggS_FIXTURE")
+        );
+        let google = build("google::gemini-3.5-transcribe");
+        let body: Value = serde_json::from_slice(&google.body).unwrap();
+        assert!(google.opus);
+        assert_eq!(body["input"][0]["mime_type"], "audio/ogg");
+        assert_eq!(body["input"][0]["data"], encode_base64(b"OggS_FIXTURE"));
+
+        // Handing Opus to a WAV-only model still sends the WAV, including any
+        // OpenRouter route other than the tested MAI one.
+        for id in ["openai/gpt-transcribe", "meta::muse-voice-transcribe-1.0"] {
+            let request = build(id);
+            assert!(!request.opus);
+            assert!(!contains(&request.body, b"OggS"));
+        }
+        let routed: Value = serde_json::from_slice(&build("openai/gpt-transcribe").body).unwrap();
+        assert_eq!(routed["input_audio"]["format"], "wav");
+        assert_eq!(
+            routed["input_audio"]["data"],
+            encode_base64(b"RIFF_FIXTURE")
+        );
+        assert!(contains(
+            &build("meta::muse-voice-transcribe-1.0").body,
+            b"filename=\"clip.wav\"\r\nContent-Type: audio/wav\r\n\r\nRIFF_FIXTURE"
+        ));
+    }
+
+    fn fake_opus(_: &[f32]) -> Option<Vec<u8>> {
+        Some(format!("OggS_FAKE_{}", OPUS_ENCODES.with(std::cell::Cell::get)).into_bytes())
+    }
+
+    /// Installs the numbered fake encoder (or the system one) on this test
+    /// thread, and clears the encode count and remembered rejections.
+    fn use_encoder(fake: bool) {
+        let encoder: Encoder = fake_opus;
+        FAKE_OPUS.with(|cell| cell.set(fake.then_some(encoder)));
+        OPUS_ENCODES.with(|count| count.set(0));
+        with_opus_memory(|memory| {
+            memory.rejected.clear();
+            memory.confirmed.clear();
+        });
+    }
+
+    fn opus_encodes() -> usize {
+        OPUS_ENCODES.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn only_format_errors_count_as_an_opus_rejection() {
+        let request = |opus| Request {
+            provider: Provider::Deepgram,
+            url: String::new(),
+            content_type: String::new(),
+            body: Vec::new(),
+            keyword_count: 0,
+            opus,
+        };
+        let rejected =
+            |opus, status, body: &str| opus_rejected(&request(opus), &response(status, body, None));
+        assert!(rejected(true, 415, "{}"));
+        assert!(!rejected(false, 415, "{}"));
+        let cases = [
+            // Deepgram's documented wording for an undecodable upload.
+            (
+                r#"{"err_code":"Bad Request","err_msg":"Bad Request: failed to process audio: corrupt or unsupported data"}"#,
+                true,
+            ),
+            (
+                r#"{"detail":{"status":"invalid_file_format","message":"The uploaded file has an invalid format."}}"#,
+                true,
+            ),
+            (r#"{"error":"Unsupported audio format"}"#, true),
+            (r#"{"error":"Invalid audio format: expected wav"}"#, true),
+            (r#"{"error":"audio/ogg is not supported"}"#, true),
+            (
+                r#"{"error":{"message":"Could not decode the audio file"}}"#,
+                true,
+            ),
+            (r#"{"error":"failed to decode audio"}"#, true),
+            (r#"{"detail":"Invalid file type"}"#, true),
+            (r#"{"error":"codec not supported: opus"}"#, true),
+            (
+                r#"{"error":{"code":400,"message":"Unsupported MIME type: audio/ogg","status":"INVALID_ARGUMENT"}}"#,
+                true,
+            ),
+            (r#"{"error":"Content-Type not supported"}"#, true),
+            ("{}", false),
+            (
+                r#"{"error":{"code":400,"message":"Request contains an invalid argument.","status":"INVALID_ARGUMENT"}}"#,
+                false,
+            ),
+            (
+                r#"{"error":{"code":400,"message":"Invalid value at 'input[0].data' (TYPE_BYTES), Base64 decoding failed for \"abc\"","status":"INVALID_ARGUMENT"}}"#,
+                false,
+            ),
+            (
+                r#"{"error":"payload decoded size exceeds the limit"}"#,
+                false,
+            ),
+            (
+                r#"{"error":"Text formatting requires a supported language"}"#,
+                false,
+            ),
+            (r#"{"error":"invalid audio: too short"}"#, false),
+            (r#"{"error":"Invalid audio: no speech detected"}"#, false),
+            (r#"{"detail":"Audio file is too short"}"#, false),
+            (r#"{"err_msg":"Bad Request: invalid language 'xx'"}"#, false),
+            (r#"{"error":"invalid response_format"}"#, false),
+            (r#"{"error":"invalid option: toggle_logging"}"#, false),
+            (r#"{"error":"temperature must be between 0 and 1"}"#, false),
+            (r#"{"error":"corrupted request id"}"#, false),
+        ];
+        for (body, expected) in cases {
+            for status in [400, 422] {
+                assert_eq!(rejected(true, status, body), expected, "{status} {body}");
+                assert!(!rejected(false, status, body), "{status} {body}");
+            }
+            assert!(!rejected(true, 500, body), "{body}");
+        }
+    }
+
+    #[test]
+    fn remembered_rejections_evict_the_oldest_model_first() {
+        use_encoder(true);
+        remember_opus_rejection("model-b");
+        remember_opus_rejection("model-a");
+        for index in 0..MAX_OPUS_REJECTIONS - 2 {
+            remember_opus_rejection(&format!("fill-{index:02}"));
+        }
+        // Remembering a known model neither duplicates nor evicts it.
+        remember_opus_rejection("model-a");
+        assert_eq!(
+            with_opus_rejections(|known| known.len()),
+            MAX_OPUS_REJECTIONS
+        );
+        remember_opus_rejection("model-new");
+        assert_eq!(
+            with_opus_rejections(|known| known.len()),
+            MAX_OPUS_REJECTIONS
+        );
+        assert!(!opus_refused("model-b"));
+        for id in ["model-a", "fill-00", "model-new"] {
+            assert!(opus_refused(id), "{id}");
+        }
+        remember_opus_rejection("model-newer");
+        assert!(!opus_refused("model-a") && opus_refused("fill-00"));
+    }
+
+    #[test]
+    fn one_encode_per_chain_across_retries_and_fallbacks() {
+        use_encoder(true);
+        let config = config(&[
+            "openai::gpt-transcribe",
+            "deepgram::nova-3",
+            "elevenlabs::scribe_v2",
+            "grok::grok-voice-transcribe-2.0",
+        ]);
+        let mut sent = Vec::<(Provider, Vec<u8>)>::new();
+        let success = run_chain(
+            &config,
+            &vocabulary(&[]),
+            None,
+            &mut Progress::default(),
+            &mut |request, _| {
+                sent.push((request.provider, request.body.clone()));
+                let status = match sent.len() {
+                    2 => 415,
+                    5 => 200,
+                    _ => 503,
+                };
+                (
+                    Ok(response(status, r#"{"text":"done"}"#, None)),
+                    Duration::from_millis(10),
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(success.model, "grok::grok-voice-transcribe-2.0");
+        assert_eq!(opus_encodes(), 1);
+        let providers: Vec<_> = sent.iter().map(|(provider, _)| *provider).collect();
+        assert_eq!(
+            providers,
+            [
+                Provider::OpenAi,
+                Provider::Deepgram,
+                Provider::Deepgram,
+                Provider::ElevenLabs,
+                Provider::Grok,
+            ]
+        );
+        assert_eq!(sent[1].1, b"OggS_FAKE_1");
+        assert!(sent[2].1.starts_with(b"RIFF"));
+        for (_, body) in &sent[3..] {
+            assert!(contains(body, b"OggS_FAKE_1") && !contains(body, b"RIFF"));
+        }
+    }
+
+    #[test]
+    fn no_encode_without_an_opus_provider_a_deadline_or_after_cancellation() {
+        use_encoder(true);
+        // The WAV-only primary answers before any Opus provider is reached.
+        let config = config(&["openai/gpt-transcribe", "deepgram::nova-3"]);
+        run_chain(
+            &config,
+            &vocabulary(&[]),
+            None,
+            &mut Progress::default(),
+            &mut |request, _| {
+                assert!(!request.opus);
+                (
+                    Ok(response(200, r#"{"text":"done"}"#, None)),
+                    Duration::from_millis(10),
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(opus_encodes(), 0);
+
+        // An exhausted chain deadline sends and encodes nothing.
+        let mut progress = Progress::default();
+        let failure = Chain {
+            config: &config,
+            vocabulary: &vocabulary(&[]),
+            hints: &HintPlan::default(),
+            cancelled: None,
+        }
+        .run(
+            &[0.1; 16_000],
+            config.total_timeout(),
+            &mut progress,
+            &mut |_, _| panic!("no request after the deadline"),
+            &mut |_, _, _, _| panic!("no completed websocket"),
+            &mut |_| panic!("no sleep"),
+        );
+        assert!(failure.is_err());
+        assert_eq!(progress.failures.len(), 2);
+        assert_eq!(opus_encodes(), 0);
+
+        // A cancelled chain neither encodes nor sends.
+        let cancelled = AtomicBool::new(true);
+        let error = run_chain(
+            &config,
+            &vocabulary(&[]),
+            Some(&cancelled),
+            &mut Progress::default(),
+            &mut |_, _| panic!("no request after cancellation"),
+        )
+        .err()
+        .expect("cancelled chain");
+        assert_eq!(error.to_string(), "Transcription was cancelled.");
+        assert_eq!(opus_encodes(), 0);
+    }
+
+    #[test]
+    fn encoding_time_counts_against_the_attempt_deadline() {
+        fn slow_opus(samples: &[f32]) -> Option<Vec<u8>> {
+            std::thread::sleep(Duration::from_millis(60));
+            fake_opus(samples)
+        }
+        use_encoder(true);
+        FAKE_OPUS.with(|cell| cell.set(Some(slow_opus)));
+        let mut config = config(&["deepgram::nova-3", "grok::grok-voice-transcribe-2.0"]);
+        config.transcription.attempt_timeout_seconds = 5;
+        config.transcription.total_timeout_seconds = 60;
+        let attempt = config.attempt_timeout();
+        let mut timeouts = Vec::new();
+        run_chain(
+            &config,
+            &vocabulary(&[]),
+            None,
+            &mut Progress::default(),
+            &mut |request, timeout| {
+                timeouts.push((request.provider, request.opus, timeout));
+                let status = if request.provider == Provider::Grok {
+                    200
+                } else {
+                    503
+                };
+                (
+                    Ok(response(status, r#"{"text":"done"}"#, None)),
+                    Duration::from_millis(10),
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(opus_encodes(), 1);
+        let [
+            (Provider::Deepgram, true, first),
+            (Provider::Grok, true, second),
+        ] = timeouts[..]
+        else {
+            panic!("one Opus attempt per model: {timeouts:?}");
+        };
+        // The encoding attempt loses the encode time; the fallback reuses the
+        // clip and keeps its full attempt budget.
+        assert!(first <= attempt - Duration::from_millis(60), "{first:?}");
+        assert!(second > attempt - Duration::from_millis(30), "{second:?}");
+    }
+
+    #[test]
+    fn wav_only_providers_never_retry_a_format_error() {
+        let config = config(&["meta::muse-voice-transcribe-1.0", "openai/gpt-transcribe"]);
+        let mut sent = Vec::new();
+        let failure = run_chain(
+            &config,
+            &vocabulary(&[]),
+            None,
+            &mut Progress::default(),
+            &mut |request, _| {
+                sent.push((request.provider, request.opus));
+                (
+                    Ok(response(
+                        400,
+                        r#"{"error":"unsupported audio format"}"#,
+                        None,
+                    )),
+                    Duration::from_millis(10),
+                )
+            },
+        );
+        assert!(failure.is_err());
+        assert_eq!(
+            sent,
+            [(Provider::Meta, false), (Provider::OpenRouter, false)]
+        );
+    }
+
+    #[test]
+    fn rejected_opus_upload_retries_once_with_the_wav_clip_and_is_remembered() {
+        use_encoder(true);
+        let config = config(&["deepgram::nova-3"]);
+        let mut progress = Progress::default();
+        let mut sent = Vec::new();
+        let success = run_chain(
+            &config,
+            &vocabulary(&[]),
+            None,
+            &mut progress,
+            &mut |request, _| {
+                sent.push((request.opus, request.content_type.clone()));
+                let status = if request.opus { 415 } else { 200 };
+                (
+                    Ok(response(status, DEEPGRAM_DONE, None)),
+                    Duration::from_millis(10),
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(success.text, "done");
+        assert_eq!(
+            sent,
+            [(true, "audio/ogg".into()), (false, "audio/wav".into())]
+        );
+        assert_eq!(
+            progress.failures[0].detail,
+            "deepgram::nova-3: HTTP 415: compressed audio rejected"
+        );
+        assert!(progress.telemetry(true).retried);
+        assert!(opus_refused("deepgram::nova-3"));
+
+        // The next dictation sends the WAV first and is not a retry.
+        let mut progress = Progress::default();
+        let mut sent = Vec::new();
+        run_chain(
+            &config,
+            &vocabulary(&[]),
+            None,
+            &mut progress,
+            &mut |request, _| {
+                sent.push(request.opus);
+                (
+                    Ok(response(200, DEEPGRAM_DONE, None)),
+                    Duration::from_millis(10),
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(sent, [false]);
+        assert!(!progress.telemetry(true).retried);
+
+        // A WAV rejection is final: no further request to the model.
+        let mut attempts = 0;
+        let failure = run_chain(
+            &config,
+            &vocabulary(&[]),
+            None,
+            &mut Progress::default(),
+            &mut |_, _| {
+                attempts += 1;
+                (Ok(response(415, "{}", None)), Duration::from_millis(10))
+            },
+        );
+        assert!(failure.is_err());
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn unrelated_errors_on_an_opus_upload_do_not_resend_the_wav() {
+        use_encoder(true);
+        let config = config(&["deepgram::nova-3", "grok::grok-voice-transcribe-2.0"]);
+        let mut progress = Progress::default();
+        let mut sent = Vec::new();
+        let failure = run_chain(
+            &config,
+            &vocabulary(&[]),
+            None,
+            &mut progress,
+            &mut |request, _| {
+                sent.push((request.provider, request.opus));
+                let body = if request.provider == Provider::Deepgram {
+                    r#"{"err_msg":"Bad Request: invalid language 'xx'"}"#
+                } else {
+                    r#"{"error":"Text formatting requires a supported language"}"#
+                };
+                (Ok(response(400, body, None)), Duration::from_millis(10))
+            },
+        );
+        assert!(failure.is_err());
+        assert_eq!(sent, [(Provider::Deepgram, true), (Provider::Grok, true)]);
+        assert!(progress.failures.iter().all(|failure| {
+            failure
+                .detail
+                .ends_with("HTTP 400: transcription request failed")
+        }));
+        assert!(!opus_refused("deepgram::nova-3"));
+        assert!(!opus_refused("grok::grok-voice-transcribe-2.0"));
+    }
+
+    #[test]
+    fn hint_then_opus_rejection_resend_in_order_within_the_deadline() {
+        use_encoder(true);
+        let config = config(&["deepgram::nova-3"]);
+        let mut progress = Progress::default();
+        let mut sent = Vec::new();
+        let mut elapsed = Duration::ZERO;
+        let success = run_chain(
+            &config,
+            &vocabulary(&["Zephyr Files"]),
+            None,
+            &mut progress,
+            &mut |request, timeout| {
+                assert!(timeout <= config.attempt_timeout());
+                assert!(elapsed + timeout <= config.total_timeout());
+                sent.push((request.keyword_count > 0, request.opus));
+                let (status, body) = match sent.len() {
+                    1 => (400, r#"{"err_msg":"invalid keyterm"}"#),
+                    2 => (415, "{}"),
+                    _ => (200, DEEPGRAM_DONE),
+                };
+                elapsed += Duration::from_millis(10);
+                (Ok(response(status, body, None)), Duration::from_millis(10))
+            },
+        )
+        .unwrap();
+        assert_eq!(success.text, "done");
+        assert_eq!(sent, [(true, true), (false, true), (false, false)]);
+        let details: Vec<_> = progress
+            .failures
+            .iter()
+            .map(|f| f.detail.as_str())
+            .collect();
+        assert_eq!(
+            details,
+            [
+                "deepgram::nova-3: HTTP 400: vocabulary parameter rejected",
+                "deepgram::nova-3: HTTP 415: compressed audio rejected",
+            ]
+        );
+    }
+
+    #[test]
+    fn rate_limited_opus_upload_retries_with_opus() {
+        use_encoder(true);
+        let config = config(&["deepgram::nova-3"]);
+        let mut sent = Vec::new();
+        let mut slept = Vec::new();
+        let success = Chain {
+            config: &config,
+            vocabulary: &vocabulary(&[]),
+            hints: &HintPlan::default(),
+            cancelled: None,
+        }
+        .run(
+            &[0.1; 16_000],
+            Duration::ZERO,
+            &mut Progress::default(),
+            &mut |request, _| {
+                sent.push(request.opus);
+                let status = if sent.len() == 1 { 429 } else { 200 };
+                (
+                    Ok(response(
+                        status,
+                        DEEPGRAM_DONE,
+                        Some(Duration::from_secs(1)),
+                    )),
+                    Duration::from_millis(10),
+                )
+            },
+            &mut |_, _, _, _| panic!("no completed websocket"),
+            &mut |wait| slept.push(wait),
+        )
+        .unwrap();
+        assert_eq!(success.text, "done");
+        assert_eq!(sent, [true, true]);
+        assert_eq!(slept, [Duration::from_secs(1)]);
+        assert!(!opus_refused("deepgram::nova-3"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn opus_rejected_by_one_model_still_reaches_the_next_provider() {
+        use_encoder(false);
+        let config = config(&["deepgram::nova-3", "elevenlabs::scribe_v2"]);
+        let mut sent = Vec::<(Provider, bool, Vec<u8>)>::new();
+        let success = run_chain(
+            &config,
+            &vocabulary(&[]),
+            None,
+            &mut Progress::default(),
+            &mut |request, _| {
+                sent.push((request.provider, request.opus, request.body.clone()));
+                let status = match sent.len() {
+                    1 => 415,
+                    2 => 503,
+                    _ => 200,
+                };
+                (
+                    Ok(response(status, r#"{"text":"done"}"#, None)),
+                    Duration::from_millis(10),
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(success.model, "elevenlabs::scribe_v2");
+        let [
+            (_, true, opus),
+            (_, false, wav),
+            (Provider::ElevenLabs, true, multipart),
+        ] = &sent[..]
+        else {
+            panic!("opus, wav, then opus to the fallback");
+        };
+        assert!(opus.starts_with(b"OggS") && wav.starts_with(b"RIFF"));
+        // The fallback reuses the clip's single encoding.
+        assert!(contains(multipart, opus));
+        assert!(opus_refused("deepgram::nova-3"));
+        assert!(!opus_refused("elevenlabs::scribe_v2"));
+        assert_eq!(opus_encodes(), 1);
+    }
+
+    #[test]
+    fn chunked_recording_encodes_each_chunk_and_keeps_the_rejection() {
+        use_encoder(true);
+        take_samples();
+        let config = telemetry_config(&["deepgram::nova-3", "grok::grok-voice-transcribe-2.0"]);
+        let mut sent = Vec::<(Provider, bool, Vec<u8>)>::new();
+        let result = transcribe_configured(
+            &[0.1; 15 * 16_000],
+            &Snapshot::default(),
+            None,
+            &config,
+            &mut |request, _| {
+                sent.push((request.provider, request.opus, request.body.clone()));
+                let (status, body) = match sent.len() {
+                    1 => (415, "{}"),
+                    2 => (
+                        200,
+                        r#"{"results":{"channels":[{"alternatives":[{"transcript":"one"}]}]}}"#,
+                    ),
+                    3 => (503, "{}"),
+                    _ => (200, r#"{"text":"two"}"#),
+                };
+                (Ok(response(status, body, None)), Duration::from_millis(10))
+            },
+            &mut |_, _, _, _| panic!("no websocket"),
+            &mut |_| panic!("no retry"),
+        )
+        .unwrap();
+        assert_eq!(result.text, "one two");
+        let summary: Vec<_> = sent
+            .iter()
+            .map(|(provider, opus, _)| (*provider, *opus))
+            .collect();
+        // Chunk two goes to Deepgram as WAV at once; its fallback still gets Opus.
+        assert_eq!(
+            summary,
+            [
+                (Provider::Deepgram, true),
+                (Provider::Deepgram, false),
+                (Provider::Deepgram, false),
+                (Provider::Grok, true),
+            ]
+        );
+        // One encode per chunk, whatever the chunks' lengths.
+        assert_eq!(opus_encodes(), 2);
+        assert_eq!(sent[0].2, b"OggS_FAKE_1");
+        assert!(sent[1].2.starts_with(b"RIFF") && sent[2].2.starts_with(b"RIFF"));
+        assert!(contains(&sent[3].2, b"OggS_FAKE_2") && !contains(&sent[3].2, b"RIFF"));
+        let samples = take_samples();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].failures.len(), 2);
+    }
+
+    #[test]
+    fn cancellation_during_the_wav_resend_stops_the_chain() {
+        use_encoder(true);
+        let config = config(&["deepgram::nova-3", "grok::grok-voice-transcribe-2.0"]);
+        let cancelled = AtomicBool::new(false);
+        let mut sent = Vec::new();
+        let error = run_chain(
+            &config,
+            &vocabulary(&[]),
+            Some(&cancelled),
+            &mut Progress::default(),
+            &mut |request, _| {
+                sent.push((request.provider, request.opus));
+                if !request.opus {
+                    cancelled.store(true, Ordering::Release);
+                }
+                let status = if request.opus { 415 } else { 200 };
+                (
+                    Ok(response(status, DEEPGRAM_DONE, None)),
+                    Duration::from_millis(10),
+                )
+            },
+        )
+        .err()
+        .expect("cancelled chain");
+        assert_eq!(error.to_string(), "Transcription was cancelled.");
+        assert_eq!(
+            sent,
+            [(Provider::Deepgram, true), (Provider::Deepgram, false)]
+        );
+    }
+
+    #[test]
+    fn empty_opus_transcript_resends_the_wav_once_and_remembers_only_on_success() {
+        const EMPTY: &str = r#"{"results":{"channels":[{"alternatives":[{"transcript":" "}]}]}}"#;
+        // Opus heard as nothing, the WAV transcribes: a silent mis-decode.
+        use_encoder(true);
+        let config = config(&["deepgram::nova-3", "grok::grok-voice-transcribe-2.0"]);
+        let mut progress = Progress::default();
+        let mut sent = Vec::new();
+        let success = run_chain(
+            &config,
+            &vocabulary(&[]),
+            None,
+            &mut progress,
+            &mut |request, _| {
+                sent.push((request.provider, request.opus));
+                let body = if request.opus { EMPTY } else { DEEPGRAM_DONE };
+                (Ok(response(200, body, None)), Duration::from_millis(10))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (success.model.as_str(), success.text.as_str()),
+            ("deepgram::nova-3", "done")
+        );
+        assert_eq!(
+            sent,
+            [(Provider::Deepgram, true), (Provider::Deepgram, false)]
+        );
+        assert_eq!(
+            progress.failures[0].detail,
+            "deepgram::nova-3: invalid transcription response"
+        );
+        let telemetry = progress.telemetry(true);
+        assert!(telemetry.retried && !telemetry.used_fallback);
+        assert_eq!(telemetry.attempts.len(), 2);
+        assert_eq!(
+            telemetry.attempts[0].error,
+            Some(ErrorKind::InvalidResponse)
+        );
+        assert_eq!(progress.executions.len(), 2);
+        assert!(opus_refused("deepgram::nova-3"));
+
+        // Both empty, or the WAV resend failing: the clip may be silent, so
+        // nothing is remembered and the chain falls through as before.
+        for wav_status in [200, 503] {
+            use_encoder(true);
+            let mut sent = Vec::new();
+            let success = run_chain(
+                &config,
+                &vocabulary(&[]),
+                None,
+                &mut Progress::default(),
+                &mut |request, _| {
+                    sent.push((request.provider, request.opus));
+                    let (status, body) = match (request.provider, request.opus) {
+                        (Provider::Grok, _) => (200, r#"{"text":"two"}"#),
+                        (_, true) => (200, EMPTY),
+                        (_, false) => (wav_status, EMPTY),
+                    };
+                    (Ok(response(status, body, None)), Duration::from_millis(10))
+                },
+            )
+            .unwrap();
+            assert_eq!(success.model, "grok::grok-voice-transcribe-2.0");
+            assert_eq!(
+                sent,
+                [
+                    (Provider::Deepgram, true),
+                    (Provider::Deepgram, false),
+                    (Provider::Grok, true),
+                ]
+            );
+            assert!(!opus_refused("deepgram::nova-3"));
+            assert_eq!(opus_encodes(), 1);
+        }
+
+        // An empty WAV answer never triggers an Opus resend.
+        use_encoder(true);
+        let wav_only = self::config(&["openai/gpt-transcribe"]);
+        let mut sent = 0;
+        let failure = run_chain(
+            &wav_only,
+            &vocabulary(&[]),
+            None,
+            &mut Progress::default(),
+            &mut |_, _| {
+                sent += 1;
+                (
+                    Ok(response(200, r#"{"text":""}"#, None)),
+                    Duration::from_millis(10),
+                )
+            },
+        );
+        assert!(failure.is_err());
+        assert_eq!(sent, 1);
+    }
+
+    #[test]
+    fn a_model_confirmed_on_opus_accepts_its_empty_answer_without_a_wav_resend() {
+        const EMPTY: &str = r#"{"results":{"channels":[{"alternatives":[{"transcript":" "}]}]}}"#;
+        use_encoder(true);
+        let config = config(&["deepgram::nova-3", "grok::grok-voice-transcribe-2.0"]);
+        // Unconfirmed: an empty Opus answer resends the WAV once, as before.
+        assert!(!opus_confirmed("deepgram::nova-3"));
+        let mut sent = Vec::new();
+        let _ = run_chain(
+            &config,
+            &vocabulary(&[]),
+            None,
+            &mut Progress::default(),
+            &mut |request, _| {
+                sent.push((request.provider, request.opus));
+                let body = match (request.provider, request.opus) {
+                    (Provider::Grok, _) => r#"{"text":"two"}"#,
+                    _ => EMPTY,
+                };
+                (Ok(response(200, body, None)), Duration::from_millis(10))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            sent,
+            [
+                (Provider::Deepgram, true),
+                (Provider::Deepgram, false),
+                (Provider::Grok, true),
+            ]
+        );
+        assert!(!opus_confirmed("deepgram::nova-3"));
+        assert!(opus_confirmed("grok::grok-voice-transcribe-2.0"));
+
+        // An Opus upload that returns text confirms the model.
+        let mut sent = Vec::new();
+        let success = run_chain(
+            &config,
+            &vocabulary(&[]),
+            None,
+            &mut Progress::default(),
+            &mut |request, _| {
+                sent.push((request.provider, request.opus));
+                (
+                    Ok(response(200, DEEPGRAM_DONE, None)),
+                    Duration::from_millis(10),
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(success.text, "done");
+        assert_eq!(sent, [(Provider::Deepgram, true)]);
+        assert!(opus_confirmed("deepgram::nova-3"));
+        assert!(!opus_refused("deepgram::nova-3"));
+
+        // Confirmed: a noisy clip heard as nothing is the real outcome. The
+        // chain falls through without billing the same clip as WAV.
+        let mut sent = Vec::new();
+        let success = run_chain(
+            &config,
+            &vocabulary(&[]),
+            None,
+            &mut Progress::default(),
+            &mut |request, _| {
+                sent.push((request.provider, request.opus));
+                let body = match request.provider {
+                    Provider::Grok => r#"{"text":"two"}"#,
+                    _ => EMPTY,
+                };
+                (Ok(response(200, body, None)), Duration::from_millis(10))
+            },
+        )
+        .unwrap();
+        assert_eq!(success.model, "grok::grok-voice-transcribe-2.0");
+        assert_eq!(sent, [(Provider::Deepgram, true), (Provider::Grok, true)]);
+        assert!(!opus_refused("deepgram::nova-3"));
+    }
+
+    #[test]
+    fn a_cleared_rejection_never_sends_opus_twice_in_one_attempt_loop() {
+        use_encoder(true);
+        let config = config(&["deepgram::nova-3"]);
+        let mut sent = Vec::new();
+        let mut slept = Vec::new();
+        let success = Chain {
+            config: &config,
+            vocabulary: &vocabulary(&[]),
+            hints: &HintPlan::default(),
+            cancelled: None,
+        }
+        .run(
+            &[0.1; 16_000],
+            Duration::ZERO,
+            &mut Progress::default(),
+            &mut |request, _| {
+                sent.push(request.opus);
+                // Another dictation evicted the shared entry meanwhile.
+                with_opus_rejections(OpusRejections::clear);
+                let status = match sent.len() {
+                    1 => 415,
+                    2 => 429,
+                    _ => 200,
+                };
+                (
+                    Ok(response(
+                        status,
+                        DEEPGRAM_DONE,
+                        Some(Duration::from_secs(1)),
+                    )),
+                    Duration::from_millis(10),
+                )
+            },
+            &mut |_, _, _, _| panic!("no completed websocket"),
+            &mut |wait| slept.push(wait),
+        )
+        .unwrap();
+        assert_eq!(success.text, "done");
+        assert_eq!(sent, [true, false, false]);
+        assert_eq!(slept, [Duration::from_secs(1)]);
+        assert_eq!(opus_encodes(), 1);
     }
 
     #[test]
@@ -2055,7 +3989,7 @@ mod tests {
         take_samples();
         let config = telemetry_config(&[
             "fixture/primary",
-            "openai::gpt-transcribe",
+            "meta::muse-voice-transcribe-1.0",
             "deepgram::nova-3",
         ]);
         let audio = vec![0.1; 160_160];
@@ -2068,7 +4002,7 @@ mod tests {
                 (Ok(match calls {
                     1 => response(429, r#"{"usage":{"cost":0.0001}}"#, Some(Duration::ZERO)),
                     2 => response(503, r#"{"error":"PRIVATE_BODY","usage":{"cost":0.0002}}"#, None),
-                    3 => response(200, r#"{"text":" ","usage":{"cost":0.0003}}"#, None),
+                    3 => response(200, r#"{"transcript":" ","usage":{"cost":0.0003}}"#, None),
                     4 => response(200, r#"{"results":{"channels":[{"alternatives":[{"transcript":"first"}]}]}}"#, None),
                     5 => response(200, r#"{"text":"second","usage":{"cost":0.004}}"#, None),
                     _ => panic!("unexpected request"),
@@ -2095,7 +4029,7 @@ mod tests {
             [
                 ("openrouter", "fixture/primary", "failed", Some(0.0001)),
                 ("openrouter", "fixture/primary", "failed", Some(0.0002)),
-                ("openai", "gpt-transcribe", "failed", Some(0.0003)),
+                ("meta", "muse-voice-transcribe-1.0", "failed", Some(0.0003)),
                 ("deepgram", "nova-3", "success", None),
                 ("openrouter", "fixture/primary", "success", Some(0.004)),
             ]
@@ -2287,7 +4221,7 @@ mod tests {
             &config,
             ModelRef::parse("grok::grok-voice-transcribe-2.0"),
             &options,
-            b"WAV_FIXTURE",
+            Upload::wav(b"WAV_FIXTURE"),
             &vocabulary,
             &hints,
             false,
@@ -2312,7 +4246,7 @@ mod tests {
             &config,
             ModelRef::parse("google::gemini-3.5-transcribe"),
             &options,
-            b"WAV_FIXTURE",
+            Upload::wav(b"WAV_FIXTURE"),
             &vocabulary,
             &hints,
             false,
@@ -2366,7 +4300,7 @@ mod tests {
                 &config,
                 ModelRef::parse(id),
                 &options,
-                b"WAV",
+                Upload::wav(b"WAV"),
                 &vocabulary,
                 &hints,
                 true,
@@ -2400,7 +4334,7 @@ mod tests {
                 &config,
                 ModelRef::parse("grok::grok-voice-transcribe-2.0"),
                 &options,
-                b"WAV",
+                Upload::wav(b"WAV"),
                 &vocabulary,
                 &hints,
                 false,
@@ -2545,7 +4479,7 @@ mod tests {
                 &config,
                 model,
                 &ModelOptions::default(),
-                b"WAV",
+                Upload::wav(b"WAV"),
                 &vocabulary,
                 &hints,
                 false,
@@ -2555,7 +4489,7 @@ mod tests {
                 &config,
                 model,
                 &ModelOptions::default(),
-                b"WAV",
+                Upload::wav(b"WAV"),
                 &vocabulary,
                 &hints,
                 true,
@@ -2600,6 +4534,7 @@ mod tests {
                 content_type: "application/json".into(),
                 body: b"{}".to_vec(),
                 keyword_count: 0,
+                opus: false,
             };
             let error = send(&request, &config, Duration::from_secs(1)).unwrap_err();
             assert_eq!(
@@ -2622,6 +4557,7 @@ mod tests {
                 content_type: "application/json".into(),
                 body: b"{}".to_vec(),
                 keyword_count: 0,
+                opus: false,
             };
             let error = send(&request, &config, Duration::from_secs(1)).unwrap_err();
             assert_eq!(
@@ -2651,7 +4587,7 @@ mod tests {
             &config,
             ModelRef::parse("openai::gpt-transcribe"),
             &options,
-            &wav,
+            Upload::wav(&wav),
             &vocabulary,
             &hints,
             false,
@@ -2677,7 +4613,7 @@ mod tests {
                 &config,
                 ModelRef::parse(model),
                 &options,
-                &wav,
+                Upload::wav(&wav),
                 &vocabulary,
                 &hints,
                 false,
@@ -2696,7 +4632,7 @@ mod tests {
             &config,
             ModelRef::parse("deepgram::nova-3"),
             &options,
-            &wav,
+            Upload::wav(&wav),
             &vocabulary,
             &hints,
             false,
@@ -2717,7 +4653,7 @@ mod tests {
             &config,
             ModelRef::parse("deepgram::nova-2"),
             &ModelOptions::default(),
-            &wav,
+            Upload::wav(&wav),
             &vocabulary,
             &hints,
             false,
@@ -2729,7 +4665,7 @@ mod tests {
             &config,
             ModelRef::parse("elevenlabs::scribe_v2"),
             &options,
-            &wav,
+            Upload::wav(&wav),
             &vocabulary,
             &hints,
             false,
@@ -2783,7 +4719,7 @@ mod tests {
             &config,
             ModelRef::parse(id),
             &ModelOptions::default(),
-            b"fixture-wave",
+            Upload::wav(b"fixture-wave"),
             &vocabulary(&["Zephyr Files"]),
             &hints,
             false,
@@ -2804,7 +4740,7 @@ mod tests {
     fn mixed_provider_failures_fall_back_and_never_echo_remote_payloads() {
         let config = config(&[
             "openai/vendor-model",
-            "openai::gpt-transcribe",
+            "meta::muse-voice-transcribe-1.0",
             "deepgram::nova-3",
             "elevenlabs::scribe_v2",
         ]);
@@ -2813,14 +4749,14 @@ mod tests {
         let mut progress = Progress::default();
         let mut calls = Vec::new();
         let success=Chain { config:&config,vocabulary:&vocabulary,hints:&hints,cancelled:None }.run(&[0.1;160],Duration::ZERO,&mut progress,
-            &mut |request,_| { calls.push(request.provider); (Ok(match request.provider { Provider::OpenRouter=>response(503,"PRIVATE_PROVIDER_PAYLOAD",None), Provider::OpenAi=>response(200,r#"{"text":"   "}"#,None), _=>response(200,r#"{"results":{"channels":[{"alternatives":[{"transcript":"done"}]}]}}"#,None) }),Duration::from_millis(17)) },
+            &mut |request,_| { calls.push(request.provider); (Ok(match request.provider { Provider::OpenRouter=>response(503,"PRIVATE_PROVIDER_PAYLOAD",None), Provider::Meta=>response(200,r#"{"transcript":"   "}"#,None), _=>response(200,r#"{"results":{"channels":[{"alternatives":[{"transcript":"done"}]}]}}"#,None) }),Duration::from_millis(17)) },
             &mut |_,_,_,_| panic!("batch-capable models must not use completed WebSockets"), &mut |_| panic!("no wait")).unwrap();
         assert_eq!(success.model, "deepgram::nova-3");
         assert_eq!(success.text, "done");
         assert_eq!(success.latency_ms, 17);
         assert_eq!(
             calls,
-            [Provider::OpenRouter, Provider::OpenAi, Provider::Deepgram]
+            [Provider::OpenRouter, Provider::Meta, Provider::Deepgram]
         );
         assert_eq!(progress.failures.len(), 2);
         assert!(
@@ -2843,12 +4779,13 @@ mod tests {
     fn empty_responses_fall_back_after_rate_limit_retry_and_fail_when_all_are_empty() {
         let config = config(&[
             "openai/vendor-model",
-            "openai::gpt-transcribe",
+            "meta::muse-voice-transcribe-1.0",
             "deepgram::nova-3",
         ]);
         let vocabulary = Snapshot::default();
         let hints = HintPlan::default();
         for final_succeeds in [true, false] {
+            use_encoder(true);
             let mut progress = Progress::default();
             let mut calls = Vec::new();
             let mut waits = Vec::new();
@@ -2878,6 +4815,7 @@ mod tests {
                             },
                             None,
                         ),
+                        Provider::Meta => response(200, r#"{"transcript":" \n\t "}"#, None),
                         _ => response(200, r#"{"text":" \n\t "}"#, None),
                     };
                     (Ok(response), Duration::ZERO)
@@ -2894,7 +4832,7 @@ mod tests {
                     [
                         Provider::OpenRouter,
                         Provider::OpenRouter,
-                        Provider::OpenAi,
+                        Provider::Meta,
                         Provider::Deepgram
                     ]
                 );
@@ -2907,7 +4845,8 @@ mod tests {
                     panic!("empty responses must fail the chain")
                 };
                 let failure = error.downcast_ref::<ChainFailure>().unwrap();
-                assert_eq!(failure.failures.len(), 3);
+                // Deepgram's empty Opus answer is resent once as the WAV.
+                assert_eq!(failure.failures.len(), 4);
                 assert!(
                     failure
                         .failures
@@ -2916,9 +4855,15 @@ mod tests {
                 );
                 assert_eq!(
                     calls,
-                    [Provider::OpenRouter, Provider::OpenAi, Provider::Deepgram]
+                    [
+                        Provider::OpenRouter,
+                        Provider::Meta,
+                        Provider::Deepgram,
+                        Provider::Deepgram
+                    ]
                 );
                 assert!(waits.is_empty());
+                assert!(!opus_refused("deepgram::nova-3"));
                 assert!(
                     progress
                         .executions

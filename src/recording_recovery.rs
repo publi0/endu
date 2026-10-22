@@ -352,15 +352,20 @@ impl RecordingRecovery {
         entry
     }
 
-    fn finish_failure(&self, mut entry: RecoveryEntry, message: &str) {
-        entry.status = RecoveryStatus::Failed;
-        entry.message = Some(if entry.volatile {
+    fn finish_failure(&self, entry: RecoveryEntry, message: &str) {
+        let message = if entry.volatile {
             format!(
                 "{message} Audio could not be saved to disk and is only in memory. Keep Endu open until recovery."
             )
         } else {
             message.to_owned()
-        });
+        };
+        self.record_failure(entry, message);
+    }
+
+    fn record_failure(&self, mut entry: RecoveryEntry, message: String) {
+        entry.status = RecoveryStatus::Failed;
+        entry.message = Some(message);
         if !entry.volatile
             && let Err(error) = self.save_metadata(&entry)
         {
@@ -437,6 +442,29 @@ impl RecordingRecovery {
             }
         }
         result
+    }
+
+    /// Keeps accepted audio that can no longer be transcribed, such as a
+    /// released clip still recording its tail when Endu quits, as a failed
+    /// entry for a manual Retry.
+    pub fn save_untranscribed(&self, samples: &[f32], application: Option<&str>) {
+        let entry = self.begin(samples, application);
+        let _active = ActiveAttempt {
+            store: self.clone(),
+            id: entry.id.clone(),
+            retry: false,
+        };
+        if entry.volatile {
+            // Quitting ends the process that holds the in-memory copy, so
+            // "keep Endu open" cannot apply: say the audio is lost instead.
+            tracing::warn!("audio sealed at quit could not be saved for recovery");
+            let message = t(
+                "Endu quit before this recording was transcribed, and its audio could not be saved to disk.",
+            );
+            self.record_failure(entry, message.to_owned());
+            return;
+        }
+        self.finish_failure(entry, t("Endu quit before this recording was transcribed."));
     }
 
     pub fn retry(&self, id: &str) -> io::Result<()> {

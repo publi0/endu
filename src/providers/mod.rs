@@ -6,9 +6,11 @@ use std::collections::BTreeMap;
 use std::sync::{LazyLock, RwLock};
 
 pub mod batch;
+mod http_pool;
 pub mod keys;
 mod meta;
 mod model_notices;
+mod opus;
 pub mod pricing;
 pub use model_notices::model_notices;
 pub mod streaming;

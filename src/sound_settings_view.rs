@@ -363,7 +363,7 @@ impl SoundSettingsView {
                 .border_color(gpui::transparent_black())
                 .focus(|style| style.border_color(rgb(ACCENT)))
                 .cursor_pointer()
-                .child(LABELS[index])
+                .child(crate::desktop_ui::control_label(LABELS[index]))
                 .on_click(cx.listener(move |this, event, window, cx| {
                     if matches!(event, gpui::ClickEvent::Mouse(_)) {
                         this.focus[row][index].focus(window);

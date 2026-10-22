@@ -527,6 +527,7 @@ enum SettingControl {
     Microphone,
     Channel,
     MicrophoneMode,
+    ReleaseTail,
     AudioBehavior,
     LowerVolume,
     Dock,
@@ -1934,7 +1935,7 @@ impl AppWindow {
                     .border_1()
                     .border_color(gpui::transparent_black())
                     .focus(|style| style.border_color(rgb(ACCENT)))
-                    .child(mode.label())
+                    .child(crate::desktop_ui::control_label(mode.label()))
                     .on_click(cx.listener(move |this, _, _, cx| this.set_dictation_mode(mode, cx)))
                 },
             ));
@@ -1978,7 +1979,7 @@ impl AppWindow {
                     .border_1()
                     .border_color(gpui::transparent_black())
                     .focus(|style| style.border_color(rgb(ACCENT)))
-                    .child(sensitivity.label())
+                    .child(crate::desktop_ui::control_label(sensitivity.label()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.update_settings(
                             SettingControl::DoubleTapSensitivity,
@@ -2009,7 +2010,7 @@ impl AppWindow {
                     .border_1()
                     .border_color(gpui::transparent_black())
                     .focus(|style| style.border_color(rgb(ACCENT)))
-                    .child(appearance.label())
+                    .child(crate::desktop_ui::control_label(appearance.label()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.update_settings(SettingControl::Appearance, cx, |settings| {
                             settings.appearance = appearance
@@ -2040,7 +2041,7 @@ impl AppWindow {
                     .border_1()
                     .border_color(gpui::transparent_black())
                     .focus(|style| style.border_color(rgb(ACCENT)))
-                    .child(language.label())
+                    .child(crate::desktop_ui::control_label(language.label()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.update_settings(SettingControl::Language, cx, |settings| {
                             settings.language = language
@@ -3155,7 +3156,38 @@ mod tests {
         let within = |inner: &Bounds<gpui::Pixels>, outer: &Bounds<gpui::Pixels>| {
             inner.left() >= outer.left() - tolerance && inner.right() <= outer.right() + tolerance
         };
+        // A label slot is the room its control leaves; the text inside takes
+        // its system-font width, so a translation that would need truncating,
+        // or would touch the slot's edge, fails here. Report them all at once.
+        let crowded: Vec<String> = probes
+            .iter()
+            .filter(|(_, probe, _)| *probe == LayoutProbe::Label)
+            .filter_map(|(name, _, slot)| {
+                let text_name: &'static str = Box::leak(format!("{name}-text").into_boxed_str());
+                let text = cx
+                    .debug_bounds(text_name)
+                    .expect("label text renders with its slot");
+                let fits = text.left() >= slot.left() + px(2.0) - tolerance
+                    && text.right() <= slot.right() - px(2.0) + tolerance;
+                (!fits).then(|| {
+                    format!(
+                        "{:?} needs {:?} in a slot {:?} wide",
+                        layout_probes::label_text(name).unwrap_or_default(),
+                        text.size.width,
+                        slot.size.width - px(4.0),
+                    )
+                })
+            })
+            .collect();
+        assert!(
+            crowded.is_empty(),
+            "{scene}: labels do not fit their controls:\n{}",
+            crowded.join("\n")
+        );
         for (name, probe, bounds) in &probes {
+            if *probe == LayoutProbe::Label {
+                continue;
+            }
             assert!(
                 bounds.left() >= px(SIDEBAR_WIDTH) - tolerance
                     && bounds.right() <= px(WINDOW_WIDTH) + tolerance,
@@ -3229,6 +3261,31 @@ mod tests {
             assert_layout_probes_fit(cx, &format!("History entry {id}"));
         }
         std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    /// Fixed-width chips and segments must fit every translation of their
+    /// label. `control_label` measures the text with the macOS system font
+    /// while probes record, since GPUI's test text system does not.
+    #[gpui::test]
+    fn controls_fit_their_labels_in_every_language(cx: &mut gpui::TestAppContext) {
+        use crate::i18n::{Language, set_test_language};
+        let (view, cx) = cx.add_window_view(preview_fixture);
+        cx.simulate_resize(size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)));
+        for language in [Language::English, Language::Portuguese, Language::Spanish] {
+            set_test_language(Some(language));
+            for pane in Pane::ALL {
+                crate::desktop_ui::layout_probes::record();
+                cx.update(|_, cx| {
+                    view.update(cx, |view, cx| {
+                        view.select_pane(pane, cx);
+                        cx.notify();
+                    })
+                });
+                cx.run_until_parked();
+                assert_layout_probes_fit(cx, &format!("{pane:?} in {language:?}"));
+            }
+        }
+        set_test_language(None);
     }
 
     #[gpui::test]

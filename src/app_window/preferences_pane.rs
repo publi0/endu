@@ -52,6 +52,8 @@ impl AppWindow {
         .detach();
     }
 
+    /// Imports wait for this: a key operation's callback reloads its editor
+    /// and would overwrite the state the import just applied.
     pub(super) fn key_operation_pending(&self, cx: &App) -> bool {
         self.openrouter_settings.read(cx).has_key_operation()
             || self.openrouter_setup.read(cx).has_key_operation()

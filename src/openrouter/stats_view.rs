@@ -337,7 +337,8 @@ impl StatisticsView {
                             .debug_selector(move || {
                                 format!("statistics-label-{}-{index}", segment.index())
                             })
-                            .child(label),
+                            .min_w_0()
+                            .child(crate::desktop_ui::control_label(label)),
                     )
                     .on_click(cx.listener(move |this, event, window, cx| {
                         if matches!(event, gpui::ClickEvent::Mouse(_)) {
@@ -618,7 +619,7 @@ impl StatisticsView {
             .flex()
             .items_center()
             .gap_3()
-            .child(self.segments(Segment::Period, 262.0, cx))
+            .child(self.segments(Segment::Period, SETTINGS_CONTROL_WIDTH, cx))
             .child(reset)
             .into_any_element()
     }

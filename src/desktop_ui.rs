@@ -22,6 +22,10 @@ pub(crate) fn layout_container<E: InteractiveElement>(element: E) -> E {
 pub(crate) enum LayoutProbe {
     Item,
     Container,
+    /// The slot a control leaves for its text; the text itself is probed
+    /// as `<name>-text`.
+    #[cfg(test)]
+    Label,
 }
 
 #[cfg(test)]
@@ -50,6 +54,21 @@ pub(crate) mod layout_probes {
         static RECORDING: Cell<bool> = const { Cell::new(false) };
         static NEXT: Cell<usize> = const { Cell::new(0) };
         static PROBES: RefCell<Vec<(String, LayoutProbe)>> = const { RefCell::new(Vec::new()) };
+        static LABELS: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn note_label(name: &str, text: &str) {
+        LABELS.with_borrow_mut(|labels| labels.push((name.to_owned(), text.to_owned())));
+    }
+
+    /// The text a [`super::control_label`] probe was recorded with.
+    pub(crate) fn label_text(name: &str) -> Option<String> {
+        LABELS.with_borrow(|labels| {
+            labels
+                .iter()
+                .find(|(probe, _)| probe == name)
+                .map(|(_, text)| text.clone())
+        })
     }
 
     pub(super) fn register(kind: LayoutProbe) -> Option<String> {
@@ -63,6 +82,7 @@ pub(crate) mod layout_probes {
     pub(crate) fn record() {
         RECORDING.set(true);
         PROBES.take();
+        LABELS.take();
     }
 
     pub(crate) fn take() -> Vec<(String, LayoutProbe)> {
@@ -1207,6 +1227,61 @@ pub(crate) fn compact_button(label: impl IntoElement) -> Div {
         .text_color(rgb(TEXT_SOFT))
         .hover(|button| button.bg(rgb(SURFACE_HOVER)))
         .child(label)
+}
+
+/// The single-line text of a fixed-width chip or segment, at the control
+/// text size. It shrinks to the room the control leaves and truncates there
+/// rather than run into the border or the next chip. While the layout test
+/// records, the text instead takes its width in the macOS system font inside
+/// a slot with 2 points of room on each side, so the test fails, in every
+/// interface language, when a label would truncate or touch an edge.
+pub(crate) fn control_label(label: impl Into<SharedString>) -> Div {
+    let label = label.into();
+    let (slot, text) = label_probes(&label);
+    slot.flex_shrink().min_w_0().flex().child(text.child(label))
+}
+
+#[cfg(test)]
+fn label_probes(label: &str) -> (Div, Div) {
+    match layout_probes::register(LayoutProbe::Label) {
+        Some(name) => {
+            layout_probes::note_label(&name, label);
+            let text = format!("{name}-text");
+            (
+                div().debug_selector(|| name).px(px(2.0)),
+                div()
+                    .debug_selector(|| text)
+                    .w(px(system_text_width(label, CONTROL_TEXT_SIZE)))
+                    .flex_none()
+                    .whitespace_nowrap(),
+            )
+        }
+        None => (div(), div().min_w_0().truncate()),
+    }
+}
+
+#[cfg(not(test))]
+fn label_probes(_: &str) -> (Div, Div) {
+    (div(), div().min_w_0().truncate())
+}
+
+/// GPUI's test text system gives every character 0.6 em, so the layout test
+/// measures labels with AppKit's system font, the one GPUI renders with.
+#[cfg(test)]
+pub(crate) fn system_text_width(text: &str, size: f32) -> f32 {
+    use objc2::runtime::AnyObject;
+    use objc2_app_kit::{NSFont, NSFontAttributeName, NSStringDrawing};
+    use objc2_foundation::{NSDictionary, NSString};
+    let font = NSFont::systemFontOfSize(f64::from(size));
+    // SAFETY: the key is AppKit's font attribute and its value an NSFont.
+    unsafe {
+        let attributes: objc2::rc::Retained<NSDictionary<_, AnyObject>> =
+            NSDictionary::from_slices(&[NSFontAttributeName], &[font.as_ref()]);
+        NSString::from_str(text)
+            .sizeWithAttributes(Some(&attributes))
+            .width
+            .ceil() as f32
+    }
 }
 
 pub(crate) fn compact_panel() -> Div {
