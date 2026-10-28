@@ -127,10 +127,7 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
         "At most 128 saved model profiles.",
         "No máximo 128 perfis de modelo salvos.",
     ),
-    (
-        "At most {max_fallbacks} fallback models.",
-        "No máximo {max_fallbacks} modelos de fallback.",
-    ),
+    ("Only one fallback model.", "Só um modelo de fallback."),
     ("Attempt timeout", "Timeout por tentativa"),
     ("Attempt timeout (s)", "Timeout por tentativa (s)"),
     ("Attempts", "Tentativas"),
@@ -196,8 +193,8 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
         "Escolha um local de exportação fora dos dados do Endu.",
     ),
     (
-        "Choose models and fallbacks in Models.",
-        "Escolha modelos e fallbacks em Modelos.",
+        "Choose the primary and fallback models in Models.",
+        "Escolha o modelo principal e o fallback em Modelos.",
     ),
     ("Chunk length", "Tamanho dos chunks"),
     ("Chunk length (s)", "Tamanho dos chunks (s)"),
@@ -410,10 +407,12 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
     ("Failure reason", "Motivo da falha"),
     ("Failures", "Falhas"),
     ("Fallback", "Fallback"),
-    ("Fallback 1", "Fallback 1"),
-    ("Fallback 2", "Fallback 2"),
+    ("Fallback model", "Modelo de fallback"),
+    (
+        "Gets the recorded file, so it must accept audio files.",
+        "Recebe o arquivo gravado; precisa aceitar arquivos de áudio.",
+    ),
     ("Fallback removed.", "Fallback removido."),
-    ("Fallback {slot}", "Fallback {slot}"),
     ("Feb", "fev"),
     ("File", "Arquivo"),
     (
@@ -585,6 +584,7 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
         "Lowers system audio with a quick fade; preserves detected manual volume changes",
         "Abaixa o áudio do sistema com um fade rápido e preserva mudanças manuais de volume detectadas",
     ),
+    ("Make primary", "Tornar principal"),
     ("Mar", "mar"),
     ("May", "mai"),
     (
@@ -622,13 +622,11 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
     ),
     ("Mon", "seg"),
     ("Mono input", "Entrada mono"),
-    ("Move down", "Mover para baixo"),
     (
         "Move the recording lines with your microphone level.",
         "Movimenta as linhas da gravação com o nível do microfone.",
     ),
     ("Move to Keychain", "Mover para as Chaves"),
-    ("Move up", "Mover para cima"),
     ("Moving key", "Movendo chave"),
     (
         "Muse Voice does not support this language hint. Choose Auto or a supported language.",
@@ -797,7 +795,6 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
         "Preview: no network request was made.",
         "Prévia: nenhuma requisição de rede foi feita.",
     ),
-    ("Primary", "Principal"),
     ("Primary model", "Modelo principal"),
     ("Provider", "Provedor"),
     (
@@ -1186,8 +1183,15 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
         "Usa a opção de transcrição não literal deste modelo",
     ),
     ("Use “{id}”", "Usar “{id}”"),
-    ("Used by {only}", "Usado por {only}"),
-    ("Used by {rest} and {last}", "Usado por {rest} e {last}"),
+    (
+        "Used by the fallback model",
+        "Usado pelo modelo de fallback",
+    ),
+    (
+        "Used by the primary and fallback models",
+        "Usado pelos modelos principal e de fallback",
+    ),
+    ("Used by the primary model", "Usado pelo modelo principal"),
     (
         "Used only by models routed through OpenRouter",
         "Usado só por modelos roteados pelo OpenRouter",
@@ -1293,20 +1297,12 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
         "{error}. Corrija o arquivo antes de salvar os ajustes.",
     ),
     (
-        "{extra} more fallback model from openrouter.json is tried after these.",
-        "Mais {extra} modelo de fallback do openrouter.json é tentado depois destes.",
-    ),
-    (
-        "{extra} more fallback models from openrouter.json are tried after these.",
-        "Mais {extra} modelos de fallback do openrouter.json são tentados depois destes.",
-    ),
-    (
         "{failed} failed · {silent} silent",
         "{failed} com falha · {silent} silenciosos",
     ),
     (
-        "{fallbacks} of {max_fallbacks} fallbacks. Any error — rate limit, timeout, server error — moves on to the next model.",
-        "{fallbacks} de {max_fallbacks} fallbacks. Qualquer erro — rate limit, timeout, erro do servidor — passa para o próximo modelo.",
+        "No fallback. When the primary fails — rate limit, timeout, server error — a fallback gets the recorded file, so it must accept audio files.",
+        "Sem fallback. Quando o principal falha — rate limit, timeout, erro do servidor — o fallback recebe o arquivo gravado, por isso precisa aceitar arquivos de áudio.",
     ),
     (
         "{field} must be a whole number from {min} to {max}.",
@@ -1331,16 +1327,16 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
     ),
     ("{minutes}m ago", "há {minutes} min"),
     (
-        "{model} is already fallback {existing}.",
-        "{model} já é o fallback {existing}.",
+        "{model} is already the fallback model.",
+        "{model} já é o modelo de fallback.",
     ),
     (
         "{model} is already the primary model.",
         "{model} já é o modelo principal.",
     ),
     (
-        "{model} is fallback {slot}.",
-        "{model} é o fallback {slot}.",
+        "{model} is now the fallback model.",
+        "{model} agora é o modelo de fallback.",
     ),
     (
         "{model} is now the primary model.",

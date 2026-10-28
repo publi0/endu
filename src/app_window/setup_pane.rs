@@ -275,7 +275,7 @@ impl AppWindow {
                                     .border_color(rgb(crate::desktop_ui::DIVIDER))
                                     .child(setup_row(
                                         t("Provider ready"),
-                                        t("Choose models and fallbacks in Models."),
+                                        t("Choose the primary and fallback models in Models."),
                                         setup_ready_badge(),
                                     ))
                                     .into_any_element()

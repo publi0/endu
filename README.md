@@ -32,9 +32,10 @@ desliga no outro, e se importa com a grafia de cada nome próprio. Quase tudo
 pode ser ajustado, mas cada ajuste tem um padrão sensato. Dá para instalar,
 cadastrar uma chave e começar a ditar sem abrir nenhuma outra tela.
 
-- **Cadeia de modelos com fallback.** Escolha um modelo principal e até duas
-  reservas. Se o principal falhar, o próximo assume com o mesmo áudio; o texto
-  só é colado uma vez, na ordem em que você ditou.
+- **Cadeia de modelos com fallback.** Escolha um modelo principal e um
+  fallback. Se o principal falhar, o fallback recebe o arquivo gravado, por isso
+  precisa aceitar arquivos de áudio; o texto só é colado uma vez, na ordem em
+  que você ditou.
 - **As capacidades de cada modelo.** Idioma, streaming, palavras-chave,
   formatação inteligente, pontuação, números e remoção de hesitações aparecem
   somente quando o modelo e o transporte escolhidos realmente oferecem. Cada
@@ -157,13 +158,14 @@ A transcrição usa a internet e a sua própria chave de API.
 | **Google** | Gemini Transcribe e Transcribe Live, com a chave do AI Studio, vocabulário e Transcrição inteligente. |
 | **Meta** | Muse Voice Transcribe por upload ou streaming, com palavras-chave e idioma. |
 
-A cadeia padrão é **ElevenLabs Scribe v2 Realtime** (ao vivo), com
-**MAI-Transcribe 2** pelo OpenRouter e **Grok Voice Transcribe 2.0** como
-fallbacks; a chave de qualquer um deles já basta para começar. Só o modelo
-principal transmite durante a gravação: os fallbacks recebem o clipe
-completo depois que você termina, num único envio. Por isso modelos que só
+A cadeia tem um modelo principal e, opcionalmente, um fallback. A padrão é
+**ElevenLabs Scribe v2 Realtime** (ao vivo), com **MAI-Transcribe 2** pelo
+OpenRouter como fallback; a chave de qualquer um deles já basta para começar.
+Só o modelo principal transmite durante a gravação: se ele falhar, o fallback
+recebe o arquivo gravado depois que você termina, num único envio. Por isso o
+fallback precisa ser um modelo que aceita arquivos de áudio; modelos que só
 funcionam ao vivo, como o Scribe v2 Realtime, só podem ser o principal, e o
-streaming aparece fixo nas opções dos fallbacks.
+streaming aparece fixo nas opções do fallback.
 
 Os seletores mostram somente modelos de provedores com chave cadastrada. A
 busca combina nome, ID, provedor e capacidades: `deepgram streaming`,
@@ -190,7 +192,7 @@ Uma pausa na fala não encerra o ditado. O streaming não compacta pausas como
 o **Cortar silêncio** dos clipes gravados, então o silêncio também pode ser
 transmitido e cobrado.
 
-Qualquer erro passa para a próxima reserva. Um HTTP 429 que peça uma espera
+Qualquer erro do principal passa para o fallback. Um HTTP 429 que peça uma espera
 dentro do limite configurado ganha uma nova tentativa no mesmo modelo. Clipes
 longos enviados depois da gravação são divididos em trechos. Os limites de
 tempo e a URL do OpenRouter ficam em **Provedores → Avançado**; a URL exige

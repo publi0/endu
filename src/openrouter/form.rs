@@ -4,8 +4,8 @@
 use super::Config;
 use crate::i18n::t;
 
-/// The primary model plus at most this many fallbacks are editable in Settings.
-pub const MAX_FALLBACKS: usize = 2;
+/// The chain's slots: the primary model and one fallback.
+pub const MODEL_SLOTS: usize = 2;
 
 /// The text fields under "Advanced".
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -95,15 +95,11 @@ impl AdvancedForm {
     }
 }
 
-/// Sets the model at `slot` (0 is the primary, then fallbacks in order).
-/// `None` removes a fallback; the primary cannot be removed. Models beyond
-/// the editable slots (added by hand to the file) are kept.
+/// Sets the model at `slot` (0 is the primary, 1 the fallback).
+/// `None` removes the fallback; the primary cannot be removed.
 pub fn set_model(base: &Config, slot: usize, model: Option<&str>) -> Result<Config, String> {
-    if slot > MAX_FALLBACKS {
-        return Err(tf!(
-            "At most {max_fallbacks} fallback models.",
-            max_fallbacks = MAX_FALLBACKS
-        ));
+    if slot >= MODEL_SLOTS {
+        return Err(t("Only one fallback model.").into());
     }
     let mut config = base.clone();
     match model.map(str::trim) {
@@ -128,11 +124,7 @@ pub fn set_model(base: &Config, slot: usize, model: Option<&str>) -> Result<Conf
                 return Err(if existing == 0 {
                     tf!("{model} is already the primary model.", model = model)
                 } else {
-                    tf!(
-                        "{model} is already fallback {existing}.",
-                        model = model,
-                        existing = existing
-                    )
+                    tf!("{model} is already the fallback model.", model = model)
                 });
             }
             if config
@@ -167,16 +159,16 @@ pub fn set_model(base: &Config, slot: usize, model: Option<&str>) -> Result<Conf
     Ok(config)
 }
 
-/// Moves the fallback at `slot` one place earlier, swapping with its
-/// predecessor (which may be the primary). A realtime-only primary cannot
-/// move down into a fallback slot.
-pub fn promote_model(base: &Config, slot: usize) -> Result<Config, String> {
+/// Swaps the primary and the fallback. A live-only primary cannot become the
+/// fallback.
+pub fn swap_models(base: &Config) -> Result<Config, String> {
     let mut config = base.clone();
-    if slot > 0 && slot < config.transcription.models.len() {
-        if crate::providers::is_realtime_only(&config.transcription.models[slot - 1]) {
+    let models = &mut config.transcription.models;
+    if models.len() > 1 {
+        if crate::providers::is_realtime_only(&models[0]) {
             return Err(t("A model that only works live must stay the primary model.").into());
         }
-        config.transcription.models.swap(slot - 1, slot);
+        models.swap(0, 1);
     }
     Ok(config)
 }
@@ -301,14 +293,14 @@ mod tests {
         let base = with_models(&["a/one"]);
         let config = set_model(&base, 1, Some(" b/two ")).unwrap();
         assert_eq!(config.transcription.models, ["a/one", "b/two"]);
-        let config = set_model(&config, 2, Some("c/three")).unwrap();
-        assert_eq!(config.transcription.models, ["a/one", "b/two", "c/three"]);
         let config = set_model(&config, 0, Some("z/zero")).unwrap();
-        assert_eq!(config.transcription.models, ["z/zero", "b/two", "c/three"]);
-        let config = set_model(&config, 1, None).unwrap();
+        assert_eq!(config.transcription.models, ["z/zero", "b/two"]);
+        let config = set_model(&config, 1, Some("c/three")).unwrap();
         assert_eq!(config.transcription.models, ["z/zero", "c/three"]);
+        let config = set_model(&config, 1, None).unwrap();
+        assert_eq!(config.transcription.models, ["z/zero"]);
         // Removing an empty slot is a no-op.
-        assert_eq!(set_model(&config, 2, None).unwrap(), config);
+        assert_eq!(set_model(&config, 1, None).unwrap(), config);
     }
 
     #[test]
@@ -321,32 +313,24 @@ mod tests {
                 .unwrap_err()
                 .contains("primary")
         );
-        assert!(set_model(&base, 3, Some("c/three")).is_err());
+        assert!(
+            set_model(&base, 0, Some("b/two"))
+                .unwrap_err()
+                .contains("fallback")
+        );
+        // There is only one fallback slot.
+        assert!(set_model(&base, 2, Some("c/three")).is_err());
         assert!(set_model(&base, 1, Some("has space")).is_err());
         // Re-choosing the same model in place is fine.
         assert_eq!(set_model(&base, 1, Some("b/two")).unwrap(), base);
     }
 
     #[test]
-    fn hand_added_models_beyond_the_slots_survive() {
-        let base = with_models(&["a", "b", "c", "d"]);
-        let config = set_model(&base, 2, Some("x")).unwrap();
-        assert_eq!(config.transcription.models, ["a", "b", "x", "d"]);
-    }
-
-    #[test]
-    fn promoting_swaps_with_the_previous_model() {
-        let base = with_models(&["a", "b", "c"]);
-        assert_eq!(
-            promote_model(&base, 2).unwrap().transcription.models,
-            ["a", "c", "b"]
-        );
-        assert_eq!(
-            promote_model(&base, 1).unwrap().transcription.models,
-            ["b", "a", "c"]
-        );
-        assert_eq!(promote_model(&base, 0).unwrap(), base);
-        assert_eq!(promote_model(&base, 9).unwrap(), base);
+    fn swapping_exchanges_the_primary_and_the_fallback() {
+        let base = with_models(&["a", "b"]);
+        assert_eq!(swap_models(&base).unwrap().transcription.models, ["b", "a"]);
+        let alone = with_models(&["a"]);
+        assert_eq!(swap_models(&alone).unwrap(), alone);
     }
 
     #[test]
@@ -356,7 +340,7 @@ mod tests {
         // A fallback cannot be live-only, and the live-only primary cannot move down.
         assert!(set_model(&base, 1, Some(live_only)).is_err());
         assert!(set_model(&with_models(&["a"]), 1, Some(live_only)).is_err());
-        assert!(promote_model(&base, 1).is_err());
+        assert!(swap_models(&base).is_err());
         // It can still become the primary model.
         let config = set_model(&with_models(&["a", "b"]), 0, Some(live_only)).unwrap();
         assert_eq!(config.transcription.models[0], live_only);
@@ -400,19 +384,15 @@ mod tests {
     }
 
     #[test]
-    fn fallbacks_can_still_be_reordered_below_a_live_only_primary() {
+    fn the_fallback_below_a_live_only_primary_accepts_only_uploads() {
         let live_only = "elevenlabs::scribe_v2_realtime";
-        let base = with_models(&[live_only, "a", "b"]);
-        assert_eq!(
-            promote_model(&base, 2).unwrap().transcription.models,
-            [live_only, "b", "a"]
-        );
-        assert!(promote_model(&base, 1).is_err());
-        // Replacing a fallback with a live-only model fails without changing anything.
-        assert!(set_model(&base, 2, Some(live_only)).is_err());
-        assert!(set_model(&base, 2, Some("openai::gpt-live-transcribe")).is_err());
+        let base = with_models(&[live_only, "a"]);
+        assert!(swap_models(&base).is_err());
+        // Replacing the fallback with a live-only model fails without changing anything.
+        assert!(set_model(&base, 1, Some(live_only)).is_err());
+        assert!(set_model(&base, 1, Some("openai::gpt-live-transcribe")).is_err());
         // Swapping the live-only primary for an upload model is allowed.
         let config = set_model(&base, 0, Some("c")).unwrap();
-        assert_eq!(config.transcription.models, ["c", "a", "b"]);
+        assert_eq!(config.transcription.models, ["c", "a"]);
     }
 }

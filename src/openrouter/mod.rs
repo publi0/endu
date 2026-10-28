@@ -128,12 +128,11 @@ impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
             model_options: Default::default(),
-            // Live ElevenLabs first; an OpenRouter route and native Grok
-            // answer when it fails. Any one of their keys makes Endu ready.
+            // Live ElevenLabs first; an OpenRouter route answers when it
+            // fails. Either key makes Endu ready.
             models: vec![
                 "elevenlabs::scribe_v2_realtime".into(),
                 "microsoft/mai-transcribe-2".into(),
-                "grok::grok-voice-transcribe-2.0".into(),
             ],
             language: AUTO_LANGUAGE.into(),
             attempt_timeout_seconds: 30,
@@ -186,6 +185,7 @@ fn load_config_at_unlocked(path: &Path) -> Result<Config> {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map(drop_retired_models)
             .map(drop_realtime_only_fallbacks)
+            .map(keep_one_fallback)
             .wrap_err_with(|| format!("invalid OpenRouter config at {}", path.display())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let config = Config::default();
@@ -222,6 +222,13 @@ fn drop_realtime_only_fallbacks(mut config: Config) -> Config {
         slot += 1;
         keep
     });
+    config
+}
+
+/// Older files may list several fallbacks. The chain keeps the primary and
+/// the first fallback; the others' profiles stay.
+fn keep_one_fallback(mut config: Config) -> Config {
+    config.transcription.models.truncate(form::MODEL_SLOTS);
     config
 }
 
@@ -782,6 +789,28 @@ mod tests {
                 "elevenlabs::scribe_v2_realtime",
                 "microsoft/mai-transcribe-2"
             ]
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn older_chains_keep_only_the_primary_and_first_fallback_on_load() {
+        let dir = temp_dir("one-fallback");
+        let path = dir.join(CONFIG_FILE);
+        fs::write(
+            &path,
+            br#"{"transcription":{"models":["deepgram::nova-3","microsoft/mai-transcribe-2","grok::grok-voice-transcribe-2.0"],
+                "model_options":{"grok::grok-voice-transcribe-2.0":{"language":"pt"}}}}"#,
+        )
+        .unwrap();
+        let config = load_config_at(&path).unwrap();
+        assert_eq!(
+            config.transcription.models,
+            ["deepgram::nova-3", "microsoft/mai-transcribe-2"]
+        );
+        assert_eq!(
+            config.transcription.model_options["grok::grok-voice-transcribe-2.0"].language,
+            "pt"
         );
         let _ = fs::remove_dir_all(dir);
     }

@@ -11,7 +11,7 @@ use gpui::{
 };
 
 use super::catalog::{self, CatalogModel};
-use super::form::{self, AdvancedForm, MAX_FALLBACKS};
+use super::form::{self, AdvancedForm, MODEL_SLOTS};
 use super::{Config, KeyStatus};
 use crate::desktop_ui::{
     ACCENT, FAINT, LINE, MUTED, NEGATIVE, SURFACE, SURFACE_HOVER, SURFACE_SELECTED, TEXT,
@@ -155,7 +155,7 @@ pub struct OpenRouterSettings {
     catalog: CatalogState,
     catalog_revision: u64,
     picker: Option<ModelPicker>,
-    model_focus: [FocusHandle; MAX_FALLBACKS + 1],
+    model_focus: [FocusHandle; MODEL_SLOTS],
     advanced_open: bool,
     advanced_focus: FocusHandle,
     advanced: AdvancedInputs,
@@ -167,7 +167,7 @@ pub struct OpenRouterSettings {
     message_count: u64,
     /// The upper slot of the last reorder and its count, so the two swapped
     /// models glide into place.
-    chain_moved: Option<(usize, u64)>,
+    chain_swaps: Option<u64>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -296,7 +296,7 @@ impl OpenRouterSettings {
             key_operation: None,
             message,
             message_count: 0,
-            chain_moved: None,
+            chain_swaps: None,
             _subscriptions: subscriptions,
         };
         if preview {
@@ -895,7 +895,7 @@ impl OpenRouterSettings {
         let success = match (&model, slot) {
             (None, _) => t("Fallback removed.").to_owned(),
             (Some(model), 0) => tf!("{model} is now the primary model.", model = model),
-            (Some(model), slot) => tf!("{model} is fallback {slot}.", model = model, slot = slot),
+            (Some(model), _) => tf!("{model} is now the fallback model.", model = model),
         };
         let saved = self.commit(
             cx,
@@ -910,21 +910,14 @@ impl OpenRouterSettings {
         saved
     }
 
-    fn promote_model(&mut self, slot: usize, cx: &mut Context<Self>) {
-        if self.commit(
-            cx,
-            Scope::Model(slot),
-            |config| form::promote_model(config, slot),
-            t("Order updated."),
-        ) && slot > 0
-        {
-            let count = self.chain_moved.map_or(0, |(_, count)| count) + 1;
-            self.chain_moved = Some((slot - 1, count));
+    fn swap_models(&mut self, cx: &mut Context<Self>) {
+        if self.commit(cx, Scope::Model(1), form::swap_models, t("Order updated.")) {
+            self.chain_swaps = Some(self.chain_swaps.map_or(1, |count| count + 1));
         }
         cx.notify();
     }
 
-    /// The model selector of `slot`, gliding in from the slot it swapped with.
+    /// The model selector of `slot`, gliding in from the other slot after a swap.
     fn chain_button(
         &mut self,
         slot: usize,
@@ -932,14 +925,10 @@ impl OpenRouterSettings {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let button = self.render_model_button(slot, model, cx);
-        let Some((upper, count)) = self.chain_moved else {
+        let Some(count) = self.chain_swaps else {
             return button;
         };
-        let from = match slot {
-            slot if slot == upper => 14.0,
-            slot if slot == upper + 1 => -14.0,
-            _ => return button,
-        };
+        let from = if slot == 0 { 14.0 } else { -14.0 };
         crate::desktop_ui::animate_once(
             div().relative().child(button),
             gpui::ElementId::NamedInteger(format!("chain-move-{slot}").into(), count),
@@ -1699,78 +1688,13 @@ impl OpenRouterSettings {
             .into_any_element()
     }
 
-    /// Up, down and remove share fixed columns in every chain row, with
-    /// empty slots where a move is impossible, so the buttons line up.
-    fn render_order_controls(
-        &self,
-        slot: usize,
-        chain_len: usize,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let placeholder = || {
-            div()
-                .size(px(crate::desktop_ui::CONTROL_HEIGHT))
-                .flex_none()
-        };
-        let busy = self.busy();
-        // A live-only primary can never move into a fallback slot.
-        let primary_locked = self
-            .config
-            .transcription
-            .models
-            .first()
-            .is_some_and(|id| crate::providers::is_realtime_only(id));
-        div()
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap_1()
-            .child(if slot > 0 && !(slot == 1 && primary_locked) {
-                icon_button("↑", t("Move up"))
-                    .id(("openrouter-promote", slot))
-                    .when(busy, |button| button.opacity(0.5))
-                    .on_click(cx.listener(move |this, _, _, cx| this.promote_model(slot, cx)))
-                    .into_any_element()
-            } else {
-                placeholder().into_any_element()
-            })
-            .child(if slot + 1 < chain_len && !(slot == 0 && primary_locked) {
-                icon_button("↓", t("Move down"))
-                    .id(("openrouter-demote", slot))
-                    .when(busy, |button| button.opacity(0.5))
-                    .on_click(cx.listener(move |this, _, _, cx| this.promote_model(slot + 1, cx)))
-                    .into_any_element()
-            } else {
-                placeholder().into_any_element()
-            })
-            .child(if slot > 0 {
-                icon_button("✕", t("Remove"))
-                    .id(("openrouter-remove-model", slot))
-                    .when(busy, |button| button.opacity(0.5))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.choose_model(slot, None, cx);
-                    }))
-                    .into_any_element()
-            } else {
-                placeholder().into_any_element()
-            })
-    }
-
     fn render_models_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let models = self.config.transcription.models.clone();
-        let mut panel = settings_panel();
-        let chain_len = models.len().min(MAX_FALLBACKS + 1);
-        let primary = div()
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap_1()
-            .child(self.render_order_controls(0, chain_len, cx))
-            .child(self.chain_button(0, models.first().map(String::as_str), cx));
+        let primary = self.chain_button(0, models.first().map(String::as_str), cx);
         let primary_notices = models
             .first()
             .and_then(|id| self.render_model_notices(0, id));
-        panel = panel.child(
+        let mut panel = settings_panel().child(
             self.row_message(
                 settings_row(t("Primary model"), "", primary)
                     .when(primary_notices.is_some(), |row| row.pb_1())
@@ -1781,41 +1705,51 @@ impl OpenRouterSettings {
             .debug_selector(|| "model-slot-0".into())
             .children(primary_notices),
         );
-        let fallbacks = models.len().saturating_sub(1).min(MAX_FALLBACKS);
-        for (slot, model) in models.iter().enumerate().skip(1).take(fallbacks) {
-            let button = self.chain_button(slot, Some(model.as_str()), cx);
-            let notices = self.render_model_notices(slot, model);
+        if let Some(model) = models.get(1) {
+            let busy = self.busy();
+            // A live-only primary can never become the fallback.
+            let primary_locked = crate::providers::is_realtime_only(&models[0]);
+            let button = self.chain_button(1, Some(model.as_str()), cx);
+            let notices = self.render_model_notices(1, model);
             let control = div()
                 .flex_none()
                 .flex()
                 .items_center()
                 .gap_1()
-                .child(self.render_order_controls(slot, chain_len, cx))
+                .when(!primary_locked, |control| {
+                    control.child(
+                        icon_button("↑", t("Make primary"))
+                            .id("openrouter-swap-models")
+                            .when(busy, |button| button.opacity(0.5))
+                            .on_click(cx.listener(|this, _, _, cx| this.swap_models(cx))),
+                    )
+                })
+                .child(
+                    icon_button("✕", t("Remove"))
+                        .id("openrouter-remove-fallback")
+                        .when(busy, |button| button.opacity(0.5))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.choose_model(1, None, cx);
+                        })),
+                )
                 .child(button);
             panel = panel.child(
                 self.row_message(
                     settings_row(
-                        if slot == 1 {
-                            t("Fallback 1")
-                        } else {
-                            t("Fallback 2")
-                        },
-                        "",
+                        t("Fallback model"),
+                        t("Gets the recorded file, so it must accept audio files."),
                         control,
                     )
                     .when(notices.is_some(), |row| row.pb_1())
-                    .debug_selector(move || format!("model-row-{slot}")),
-                    Scope::Model(slot),
-                    self.picker
-                        .as_ref()
-                        .is_none_or(|picker| picker.slot != slot),
+                    .debug_selector(|| "model-row-1".into()),
+                    Scope::Model(1),
+                    self.picker.as_ref().is_none_or(|picker| picker.slot != 1),
                 )
-                .debug_selector(move || format!("model-slot-{slot}"))
+                .debug_selector(|| "model-slot-1".into())
                 .children(notices),
             );
-        }
-        if fallbacks < MAX_FALLBACKS && !models.is_empty() {
-            let slot = models.len().min(MAX_FALLBACKS);
+        } else if !models.is_empty() {
+            let slot = 1;
             let open = self
                 .picker
                 .as_ref()
@@ -1836,7 +1770,7 @@ impl OpenRouterSettings {
                             .min_w_0()
                             .text_size(px(11.0))
                             .text_color(rgb(MUTED))
-                            .child(tf!("{fallbacks} of {max_fallbacks} fallbacks. Any error — rate limit, timeout, server error — moves on to the next model.", fallbacks = fallbacks, max_fallbacks = MAX_FALLBACKS)),
+                            .child(t("No fallback. When the primary fails — rate limit, timeout, server error — a fallback gets the recorded file, so it must accept audio files.")),
                     )
                     .child(
                         div()
@@ -1865,27 +1799,6 @@ impl OpenRouterSettings {
                 Scope::Model(slot),
                 !open,
             ));
-        }
-        let extra = models.len().saturating_sub(MAX_FALLBACKS + 1);
-        if extra > 0 {
-            panel = panel.child(
-                div()
-                    .px_4()
-                    .py_3()
-                    .text_size(px(11.0))
-                    .text_color(rgb(MUTED))
-                    .child(if extra == 1 {
-                        tf!(
-                            "{extra} more fallback model from openrouter.json is tried after these.",
-                            extra = extra
-                        )
-                    } else {
-                        tf!(
-                            "{extra} more fallback models from openrouter.json are tried after these.",
-                            extra = extra
-                        )
-                    }),
-            );
         }
         div()
             .child(settings_section_label(t("Models")))
@@ -2014,31 +1927,21 @@ impl OpenRouterSettings {
     }
 }
 
-/// Which primary/fallback slots a provider's key serves, so the Providers
-/// list shows what each key is for without repeating the model names.
+/// Which chain models a provider's key serves, so the Providers list shows
+/// what each key is for without repeating the model names.
 fn key_usage(models: &[String], provider: crate::providers::Provider) -> String {
-    let slots: Vec<String> = models
-        .iter()
-        .take(MAX_FALLBACKS + 1)
-        .enumerate()
-        .filter(|(_, id)| crate::providers::ModelRef::parse(id).provider == provider)
-        .map(|(slot, _)| {
-            if slot == 0 {
-                t("Primary").to_owned()
-            } else {
-                tf!("Fallback {slot}", slot = slot)
-            }
-        })
-        .collect();
-    match slots.as_slice() {
-        [] => t("Not used by your models").into(),
-        [only] => tf!("Used by {only}", only = only),
-        [rest @ .., last] => tf!(
-            "Used by {rest} and {last}",
-            rest = rest.join(", "),
-            last = last
-        ),
+    let serves = |slot: usize| {
+        models
+            .get(slot)
+            .is_some_and(|id| crate::providers::ModelRef::parse(id).provider == provider)
+    };
+    match (serves(0), serves(1)) {
+        (true, true) => t("Used by the primary and fallback models"),
+        (true, false) => t("Used by the primary model"),
+        (false, true) => t("Used by the fallback model"),
+        (false, false) => t("Not used by your models"),
     }
+    .into()
 }
 
 /// Catalog models matching `query`, then a custom-id choice when the query
@@ -2148,7 +2051,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|_, cx| OpenRouterSettings::new(false, true, cx));
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
-                for slot in 0..=MAX_FALLBACKS {
+                for slot in 0..MODEL_SLOTS {
                     view.set_available_providers(vec![Provider::Deepgram], cx);
                     view.open_picker(slot, window, cx);
                     let search = view.picker.as_ref().unwrap().search.clone();
@@ -2192,18 +2095,16 @@ mod tests {
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 view.config.transcription.models = vec![
-                    "elevenlabs::scribe_v2".into(),
-                    "deepgram::nova-3".into(),
                     "elevenlabs::scribe_v2_realtime".into(),
+                    "elevenlabs::scribe_v2".into(),
                 ];
                 cx.notify();
             })
         });
         cx.run_until_parked();
-        assert!(cx.debug_bounds("model-notices-1").is_none());
         for (picker, note, row) in [
             ("model-control-0", "model-notice-copy-0", "model-slot-0"),
-            ("model-control-2", "model-notice-copy-2", "model-slot-2"),
+            ("model-control-1", "model-notice-copy-1", "model-slot-1"),
         ] {
             let picker = cx.debug_bounds(picker).unwrap();
             let note = cx.debug_bounds(note).unwrap();
@@ -2213,18 +2114,18 @@ mod tests {
             assert!(note.top() >= picker.bottom());
             assert!(note.bottom() <= row.bottom());
         }
-        let before = cx.debug_bounds("model-slot-2").unwrap().size.height;
+        let before = cx.debug_bounds("model-slot-1").unwrap().size.height;
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
-                assert!(view.choose_model(2, Some("google::gemini-3.5-transcribe".into()), cx));
+                assert!(view.choose_model(1, Some("google::gemini-3.5-transcribe".into()), cx));
                 assert!(
-                    view.render_model_notices(2, &view.config.transcription.models[2])
+                    view.render_model_notices(1, &view.config.transcription.models[1])
                         .is_none()
                 );
             })
         });
         cx.run_until_parked();
-        assert!(cx.debug_bounds("model-slot-2").unwrap().size.height < before);
+        assert!(cx.debug_bounds("model-slot-1").unwrap().size.height < before);
     }
 
     #[gpui::test]
@@ -2275,11 +2176,8 @@ mod tests {
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 // Nova-3 exercises the densest current feature line: four badges.
-                view.config.transcription.models = vec![
-                    "deepgram::nova-3".into(),
-                    "openai::gpt-transcribe".into(),
-                    "elevenlabs::scribe_v2".into(),
-                ];
+                view.config.transcription.models =
+                    vec!["deepgram::nova-3".into(), "openai::gpt-transcribe".into()];
                 cx.notify();
             })
         });
@@ -2292,7 +2190,6 @@ mod tests {
             for (row, control, badge) in [
                 ("model-row-0", "model-control-0", "model-capabilities-0"),
                 ("model-row-1", "model-control-1", "model-capabilities-1"),
-                ("model-row-2", "model-control-2", "model-capabilities-2"),
             ] {
                 let row = cx.debug_bounds(row).unwrap();
                 let control = cx.debug_bounds(control).unwrap();
@@ -2708,8 +2605,8 @@ mod tests {
             view.update(cx, |view, cx| {
                 view.set_available_providers(Provider::ALL.to_vec(), cx);
                 let chain = view.config.transcription.models.clone();
-                assert!(chain.len() >= 2, "the preview chain has fallbacks");
-                for slot in 0..=chain.len().min(MAX_FALLBACKS) {
+                assert_eq!(chain.len(), MODEL_SLOTS, "the preview chain has a fallback");
+                for slot in 0..MODEL_SLOTS {
                     view.open_picker(slot, window, cx);
                     let offered: Vec<String> = view
                         .picker_choices(cx)

@@ -118,9 +118,11 @@ Only modules whose name does not say enough:
   and transport; unsupported fields never enter a request. Never invent a
   language for Auto. Saved `microsoft::` IDs are dropped on load and never
   routed to OpenRouter.
-- `openrouter.json` is re-read on every dictation; any model error falls back
-  to the next slot. Only the primary opens a live session; fallbacks receive
-  the finished recording, so live-only models are primary-only.
+- `openrouter.json` is re-read on every dictation; the chain is the primary
+  and at most one fallback (`openrouter::form::MODEL_SLOTS`), and any primary
+  error falls back. Only the primary opens a live session; the fallback
+  receives the finished recording as a file, so live-only models are
+  primary-only.
 - A live transcript completes only on the provider's explicit terminal
   acknowledgement after Finish. Never promote an interim segment, a segment
   commit or a socket close to a result, and never paste partial text. Live PCM
