@@ -24,10 +24,12 @@ pub fn model_notices(config: &Config, id: &str) -> Vec<ModelNotice> {
     // https://elevenlabs.io/docs/api-reference/speech-to-text/v-1-speech-to-text-realtime
     if model.provider == Provider::ElevenLabs {
         let text = match model.model {
-            "scribe_v2" => Some(t(
+            "scribe_v3" | "scribe_v2" => Some(t(
                 "Using keyterms adds 20% to the price. Over 100 terms also means a 20-second minimum charge per request.",
             )),
-            "scribe_v2_realtime" => Some(t("Using keyterms adds 20% to the price.")),
+            "scribe_v3_live" | "scribe_v2_realtime" => {
+                Some(t("Using keyterms adds 20% to the price."))
+            }
             _ => None,
         };
         if let Some(text) = text {
@@ -119,30 +121,39 @@ mod tests {
     #[test]
     fn elevenlabs_prices_are_conditional_and_specific_to_the_known_direct_model() {
         let config = Config::default();
-        let batch = model_notices(&config, "elevenlabs::scribe_v2");
-        assert_eq!(
-            batch,
-            [ModelNotice {
-                text: "Using keyterms adds 20% to the price. Over 100 terms also means a 20-second minimum charge per request.",
-                is_error: false,
-            }]
-        );
-        let realtime = model_notices(&config, "elevenlabs::scribe_v2_realtime");
-        assert_eq!(
-            realtime,
-            [ModelNotice {
-                text: "Using keyterms adds 20% to the price.",
-                is_error: false,
-            }]
-        );
-        assert!(
-            realtime
-                .iter()
-                .all(|notice| !notice.text.contains("minimum") && !notice.text.contains("100"))
-        );
+        for id in ["elevenlabs::scribe_v3", "elevenlabs::scribe_v2"] {
+            let batch = model_notices(&config, id);
+            assert_eq!(
+                batch,
+                [ModelNotice {
+                    text: "Using keyterms adds 20% to the price. Over 100 terms also means a 20-second minimum charge per request.",
+                    is_error: false,
+                }]
+            );
+        }
+        for id in [
+            "elevenlabs::scribe_v3_live",
+            "elevenlabs::scribe_v2_realtime",
+        ] {
+            let realtime = model_notices(&config, id);
+            assert_eq!(
+                realtime,
+                [ModelNotice {
+                    text: "Using keyterms adds 20% to the price.",
+                    is_error: false,
+                }]
+            );
+            assert!(
+                realtime
+                    .iter()
+                    .all(|notice| !notice.text.contains("minimum") && !notice.text.contains("100"))
+            );
+        }
         for id in [
             "elevenlabs::scribe_v1",
             "elevenlabs::unknown",
+            "elevenlabs/scribe_v3",
+            "elevenlabs/scribe_v3_live",
             "elevenlabs/scribe_v2",
             "elevenlabs/scribe_v2_realtime",
             "openrouter::elevenlabs/scribe_v2",
@@ -161,6 +172,7 @@ mod tests {
         let mut config = Config::default();
         for id in [
             "openai::gpt-live-transcribe",
+            "elevenlabs::scribe_v3_live",
             "elevenlabs::scribe_v2_realtime",
             "google::gemini-3.5-transcribe-live",
         ] {

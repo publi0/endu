@@ -41,7 +41,13 @@ pub fn keywords(model: ModelRef<'_>, vocabulary: &Snapshot) -> Vec<String> {
         Provider::OpenAi => (50, 400, usize::MAX, usize::MAX),
         // A UTF-8 byte budget is conservative for Deepgram's 500-token limit.
         Provider::Deepgram => (100, 400, usize::MAX, usize::MAX),
-        Provider::ElevenLabs if model.model.ends_with("_realtime") => (50, 4_000, 20, 5),
+        Provider::ElevenLabs
+            if model.capabilities().streaming
+                || model.model.ends_with("_realtime")
+                || model.model.ends_with("_live") =>
+        {
+            (50, 4_000, 20, 5)
+        }
         Provider::ElevenLabs => (1_000, 128_000, 49, 5),
         Provider::Grok => (100, 128_000, 50, usize::MAX),
         Provider::Google => (1_000, 128_000, usize::MAX, usize::MAX),
@@ -4693,17 +4699,18 @@ mod tests {
         let accepted = "B".repeat(49);
         let vocabulary =
             vocabulary(&[&long, &accepted, "One-Two-Three-Four-Five-Six", "Neo Brand"]);
-        assert_eq!(
-            keywords(ModelRef::parse("elevenlabs::scribe_v2"), &vocabulary),
-            [accepted, "Neo Brand".into()]
-        );
-        assert_eq!(
-            keywords(
-                ModelRef::parse("elevenlabs::scribe_v2_realtime"),
-                &vocabulary
-            ),
-            ["Neo Brand"]
-        );
+        for id in ["elevenlabs::scribe_v3", "elevenlabs::scribe_v2"] {
+            assert_eq!(
+                keywords(ModelRef::parse(id), &vocabulary),
+                [accepted.clone(), "Neo Brand".into()]
+            );
+        }
+        for id in [
+            "elevenlabs::scribe_v3_live",
+            "elevenlabs::scribe_v2_realtime",
+        ] {
+            assert_eq!(keywords(ModelRef::parse(id), &vocabulary), ["Neo Brand"]);
+        }
         assert_eq!(pcm16(&[f32::NAN, 2.0, -2.0]), [0, 0, 255, 127, 1, 128]);
     }
 

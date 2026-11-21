@@ -289,6 +289,14 @@ mod tests {
     #[test]
     fn selectors_label_models_by_display_name() {
         assert_eq!(
+            selector_label("elevenlabs::scribe_v3", &[]),
+            "ElevenLabs · Scribe v3"
+        );
+        assert_eq!(
+            selector_label("elevenlabs::scribe_v3_live", &[]),
+            "ElevenLabs · Scribe v3 Live"
+        );
+        assert_eq!(
             selector_label("elevenlabs::scribe_v2_realtime", &[]),
             "ElevenLabs · Scribe v2 Realtime"
         );

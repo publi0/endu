@@ -153,7 +153,7 @@ A transcrição usa a internet e a sua própria chave de API.
 | **OpenRouter** | Catálogo de modelos de transcrição, com vocabulário nas rotas verificadas. Recebe clipes gravados. |
 | **OpenAI** | GPT Transcribe, GPT-4o e Whisper por upload; GPT Live Transcribe por WebSocket. |
 | **Deepgram** | Nova-3 e Nova-2, por upload ou streaming, com keyterms, formatação, pontuação e números. |
-| **ElevenLabs** | Scribe v2 por upload e Scribe v2 Realtime por WebSocket, com keyterms e remoção de hesitações. |
+| **ElevenLabs** | Scribe v3 e v2 por upload; Scribe v3 Live e Scribe v2 Realtime por WebSocket, com keyterms e remoção de hesitações. |
 | **Grok (xAI)** | Grok Voice Transcribe por upload ou streaming, com keyterms, formatação e hesitações. |
 | **Google** | Gemini Transcribe e Transcribe Live, com a chave do AI Studio, vocabulário e Transcrição inteligente. |
 | **Meta** | Muse Voice Transcribe por upload ou streaming, com palavras-chave e idioma. |

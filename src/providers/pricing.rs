@@ -7,7 +7,8 @@
 //! - OpenAI: https://developers.openai.com/api/docs/pricing (per-minute estimates).
 //! - Deepgram: https://deepgram.com/pricing (Pay As You Go; streaming uses the
 //!   current promotional rate; keyterm prompting is a separate add-on).
-//! - ElevenLabs: https://elevenlabs.io/pricing/api (per hour; keyterm add-on).
+//! - ElevenLabs: https://elevenlabs.io/pricing/api (per hour; keyterm add-on;
+//!   checked on 2026-11-20).
 //! - xAI: https://docs.x.ai/developers/models ($0.10/h REST, $0.20/h streaming).
 //! - Google: https://ai.google.dev/gemini-api/docs/pricing (Google's blended
 //!   per-minute estimates for audio input plus text output).
@@ -51,8 +52,10 @@ fn price_per_minute(
             },
             0.0013,
         ),
-        (Provider::ElevenLabs, "scribe_v2") => (0.22 * PER_HOUR, 0.05 * PER_HOUR),
-        (Provider::ElevenLabs, "scribe_v2_realtime") => (0.39 * PER_HOUR, 0.08 * PER_HOUR),
+        (Provider::ElevenLabs, "scribe_v3" | "scribe_v2") => (0.20 * PER_HOUR, 0.05 * PER_HOUR),
+        (Provider::ElevenLabs, "scribe_v3_live" | "scribe_v2_realtime") => {
+            (0.22 * PER_HOUR, 0.08 * PER_HOUR)
+        }
         (Provider::Grok, "grok-voice-transcribe-2.0") => {
             (if live { 0.20 } else { 0.10 } * PER_HOUR, 0.0)
         }
@@ -122,6 +125,24 @@ mod tests {
         close(
             estimate(meta, RequestMode::Live, billing(30_000), 0),
             0.0015,
+        );
+        let scribe_v3 = ModelRef::parse("elevenlabs::scribe_v3");
+        close(
+            estimate(scribe_v3, RequestMode::Recorded, billing(3_600_000), 0),
+            0.20,
+        );
+        close(
+            estimate(scribe_v3, RequestMode::Recorded, billing(3_600_000), 3),
+            0.25,
+        );
+        let scribe_v3_live = ModelRef::parse("elevenlabs::scribe_v3_live");
+        close(
+            estimate(scribe_v3_live, RequestMode::Live, billing(3_600_000), 0),
+            0.22,
+        );
+        close(
+            estimate(scribe_v3_live, RequestMode::Live, billing(3_600_000), 3),
+            0.30,
         );
     }
 

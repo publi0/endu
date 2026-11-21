@@ -278,6 +278,22 @@ fn build_native_models() -> Vec<NativeModel> {
         },
         NativeModel {
             provider: Provider::ElevenLabs,
+            id: "scribe_v3",
+            name: "Scribe v3",
+            capabilities: scribe,
+        },
+        NativeModel {
+            provider: Provider::ElevenLabs,
+            id: "scribe_v3_live",
+            name: "Scribe v3 Live",
+            capabilities: Capabilities {
+                batch: false,
+                streaming: true,
+                ..scribe
+            },
+        },
+        NativeModel {
+            provider: Provider::ElevenLabs,
             id: "scribe_v2",
             name: "Scribe v2",
             capabilities: scribe,
@@ -543,6 +559,20 @@ mod tests {
                 true,
                 true,
             ),
+            (
+                "elevenlabs::scribe_v3",
+                Provider::ElevenLabs,
+                true,
+                false,
+                true,
+            ),
+            (
+                "elevenlabs::scribe_v3_live",
+                Provider::ElevenLabs,
+                false,
+                true,
+                true,
+            ),
         ];
         for (id, provider, batch, streaming, keywords) in cases {
             let model = ModelRef::parse(id);
@@ -596,6 +626,7 @@ mod tests {
         for id in [
             "deepgram::nova-3",
             "openai::gpt-live-transcribe",
+            "elevenlabs::scribe_v3_live",
             "elevenlabs::scribe_v2_realtime",
         ] {
             assert!(ModelRef::parse(id).can_stream_language("auto"));
@@ -604,6 +635,7 @@ mod tests {
         for id in [
             "deepgram/nova-2",
             "openai::gpt-transcribe",
+            "elevenlabs::scribe_v3",
             "elevenlabs::scribe_v2",
             "deepgram::unknown",
         ] {
