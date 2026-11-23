@@ -280,8 +280,21 @@ impl RuntimeHotkey {
     }
 
     pub fn exact_modifiers(self, flags: u64) -> bool {
+        let flags = self.without_implied_function(flags);
         modifiers_from_flags(flags).matches_exactly(self.modifiers)
             && self.required_modifiers_down(flags)
+    }
+
+    /// macOS marks every press of a function, arrow or navigation key with
+    /// SecondaryFn whether or not Fn is held, so a recorded ⌘F14 never
+    /// matched. Only for a binding on one of those keys that does not ask
+    /// for Fn is the flag ignored; Fn stays significant everywhere else.
+    fn without_implied_function(self, flags: u64) -> u64 {
+        if !self.modifiers.function && self.key_code.is_some_and(key_reports_function_flag) {
+            flags & !FUNCTION_KEY_MASK
+        } else {
+            flags
+        }
     }
 
     pub fn required_modifiers_down(self, flags: u64) -> bool {
@@ -305,6 +318,16 @@ impl RuntimeHotkey {
     pub fn matches_key_press(self, code: u16, flags: u64) -> bool {
         self.key_code == Some(code) && self.exact_modifiers(flags)
     }
+}
+
+/// macOS virtual key codes whose events always carry SecondaryFn: F1–F20,
+/// the arrows, Home, End, Page Up, Page Down, Forward Delete and Help.
+pub fn key_reports_function_flag(code: u16) -> bool {
+    const CODES: [u16; 30] = [
+        122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111, 105, 107, 113, 106, 64, 79, 80, 90,
+        123, 124, 125, 126, 115, 119, 116, 121, 117, 114,
+    ];
+    CODES.contains(&code)
 }
 
 impl HotkeyModifiers {
@@ -1382,6 +1405,41 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn navigation_keys_match_despite_the_fn_flag_macos_adds() {
+        const F14: u16 = 107;
+        const LEFT_ARROW: u16 = 123;
+        for code in [F14, LEFT_ARROW] {
+            let bare = RuntimeHotkey {
+                modifiers: HotkeyModifiers::default(),
+                key_code: Some(code),
+            };
+            let command = RuntimeHotkey {
+                modifiers: modifiers_from_flags(COMMAND_KEY_MASK),
+                key_code: Some(code),
+            };
+            for (binding, held) in [(bare, 0), (command, COMMAND_KEY_MASK)] {
+                assert!(binding.matches_key_press(code, held | FUNCTION_KEY_MASK));
+                assert!(binding.matches_key_press(code, held));
+                assert!(!binding.matches_key_press(code, held | SHIFT_KEY_MASK));
+            }
+            // A binding that asks for Fn still needs it.
+            let function = RuntimeHotkey {
+                modifiers: modifiers_from_flags(FUNCTION_KEY_MASK),
+                key_code: Some(code),
+            };
+            assert!(function.matches_key_press(code, FUNCTION_KEY_MASK));
+            assert!(!function.matches_key_press(code, 0));
+        }
+        // Fn stays significant for keys macOS does not mark with it.
+        let space = RuntimeHotkey {
+            modifiers: modifiers_from_flags(COMMAND_KEY_MASK),
+            key_code: Some(49),
+        };
+        assert!(!space.matches_key_press(49, COMMAND_KEY_MASK | FUNCTION_KEY_MASK));
+        assert!(!key_reports_function_flag(49));
     }
 
     #[test]

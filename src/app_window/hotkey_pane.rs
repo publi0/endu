@@ -421,7 +421,6 @@ impl AppWindow {
             self.cancel_hotkey_capture(cx);
             return;
         }
-        let modifiers = hotkey_modifiers(event.keystroke.modifiers).without_side_constraints();
         let key = match hotkey_key(&event.keystroke.key) {
             Ok(key) => key,
             Err(message) => {
@@ -429,6 +428,10 @@ impl AppWindow {
                 return;
             }
         };
+        let modifiers = recorded_key_modifiers(
+            hotkey_modifiers(event.keystroke.modifiers).without_side_constraints(),
+            key.code,
+        );
         if modifiers.is_empty() && !is_function_key(&key.label) {
             self.set_hotkey_capture_message(t("Add a modifier"), cx);
             return;
@@ -696,6 +699,16 @@ pub(super) fn hotkey_modifiers_with_flags(modifiers: GpuiModifiers, flags: u64) 
         command: modifiers.platform.then_some(Default::default()),
         function: modifiers.function,
     }
+}
+
+/// macOS reports Fn on every function, arrow and navigation key press, held
+/// or not, so it is never part of a recorded press of one of those keys.
+/// Matching ignores the implied flag for such a binding.
+pub(super) fn recorded_key_modifiers(mut modifiers: HotkeyModifiers, code: u16) -> HotkeyModifiers {
+    if crate::app_settings::key_reports_function_flag(code) {
+        modifiers.function = false;
+    }
+    modifiers
 }
 
 pub(super) fn hotkey_key(key: &str) -> Result<HotkeyKey, &'static str> {
