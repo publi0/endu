@@ -140,6 +140,7 @@ pub struct RecoveringAudioInput {
     replacement: Option<Receiver<InputOpenResult>>,
     routing_probe: Option<Receiver<Result<DevicePreference, String>>>,
     next_routing_probe: Instant,
+    lid_generation: u64,
 }
 
 pub enum RecoveringAudioInputEvent {
@@ -249,6 +250,7 @@ impl AudioInput {
                     channel: None,
                     requested_channel: None,
                     fallback_from: None,
+                    fallback_lid_closed: false,
                 },
             },
             sender,
@@ -401,6 +403,7 @@ impl RecoveringAudioInput {
             replacement: None,
             routing_probe: None,
             next_routing_probe: Instant::now() + ROUTING_PROBE_INTERVAL,
+            lid_generation: crate::clamshell::generation(),
         }
     }
 
@@ -686,6 +689,14 @@ impl RecoveringAudioInput {
         {
             return;
         }
+        // Opening or closing the lid turns the internal microphone on or
+        // off without changing the device list: resolve again now.
+        let lid_generation = crate::clamshell::generation();
+        if lid_generation != self.lid_generation {
+            self.lid_generation = lid_generation;
+            self.routing_probe = None;
+            self.next_routing_probe = now;
+        }
         if let Some(probe) = &self.routing_probe {
             match probe.try_recv() {
                 Ok(Ok(preferred)) => {
@@ -745,13 +756,22 @@ fn open_configured_input(
     preferences: &[DevicePreference],
     fallback_from_selected: bool,
 ) -> Result<AudioInput> {
+    let lid_closed =
+        device_override.is_none() && selected_device.is_some_and(selected_off_with_lid_closed);
     let (mut input, fallback_from) = open_with_selection(
         device_override,
         selected_device,
-        fallback_from_selected,
-        AudioInput::open_named,
+        // A switched-off microphone is a known state, not a failed edit.
+        fallback_from_selected || lid_closed,
+        |name| {
+            if lid_closed {
+                return Err(eyre!(crate::clamshell::LID_CLOSED_ERROR));
+            }
+            AudioInput::open_named(name)
+        },
         || AudioInput::open_automatic(preferences),
     )?;
+    input.description.fallback_lid_closed = lid_closed && fallback_from.is_some();
     input.description.fallback_from = fallback_from;
     Ok(input)
 }
@@ -845,6 +865,7 @@ fn describe_device(device: &Device, channels: u16) -> InputDescription {
         channel: resolve_channel(requested_channel, channels),
         requested_channel,
         fallback_from: None,
+        fallback_lid_closed: false,
     }
 }
 
@@ -860,11 +881,15 @@ pub fn input_description(
         }
         Ok(describe_device(&device, channels))
     };
+    let lid_closed = selected_device.is_some_and(selected_off_with_lid_closed);
     let (mut description, fallback_from) = open_with_selection(
         None,
         selected_device,
         true,
         |name| {
+            if lid_closed {
+                return Err(eyre!(crate::clamshell::LID_CLOSED_ERROR));
+            }
             let device = cpal::default_host()
                 .input_devices()?
                 .find(|device| device.to_string() == name)
@@ -873,6 +898,7 @@ pub fn input_description(
         },
         || try_input_candidates(automatic_devices(preferences)?, describe),
     )?;
+    description.fallback_lid_closed = lid_closed && fallback_from.is_some();
     description.fallback_from = fallback_from;
     Ok(description)
 }
@@ -912,8 +938,7 @@ fn automatic_devices(preferences: &[DevicePreference]) -> Result<Vec<Device>> {
         .input_devices()
         .wrap_err("could not enumerate input devices")?
         .collect();
-    let fallback = host.default_input_device().map(|default| {
-        let default = avoid_bluetooth_input(default, &devices);
+    let default = host.default_input_device().map(|default| {
         let identity = device_identity(&default);
         devices
             .iter()
@@ -923,53 +948,97 @@ fn automatic_devices(preferences: &[DevicePreference]) -> Result<Vec<Device>> {
                 devices.len() - 1
             })
     });
+    let transports = devices.iter().map(input_transport).collect::<Vec<_>>();
     let identities = devices.iter().map(device_identity).collect::<Vec<_>>();
-    Ok(automatic_device_indices(&identities, preferences, fallback)
-        .into_iter()
-        .map(|index| devices[index].clone())
-        .collect())
+    let lid_closed = crate::clamshell::closed();
+    Ok(
+        automatic_input_order(&identities, &transports, default, preferences, lid_closed)
+            .map_err(|error| eyre!(error))?
+            .into_iter()
+            .map(|index| devices[index].clone())
+            .collect(),
+    )
 }
 
-#[cfg(target_os = "macos")]
+/// The automatic candidates in order: the priority list, then the system
+/// default. A Bluetooth default stands aside for the internal microphone,
+/// and with the lid closed the internal microphone, listed but switched off,
+/// is passed over everywhere; with nothing else listed, say why instead of
+/// recording silence.
+fn automatic_input_order(
+    identities: &[DevicePreference],
+    transports: &[InputTransport],
+    default: Option<usize>,
+    preferences: &[DevicePreference],
+    lid_closed: bool,
+) -> std::result::Result<Vec<usize>, &'static str> {
+    let off = |index: usize| lid_closed && transports.get(index) == Some(&InputTransport::BuiltIn);
+    let fallback = default.map(|default| {
+        let index = automatic_input_index(default, transports, lid_closed);
+        if index != default {
+            tracing::info!(
+                default = %identities[default].name,
+                selected = %identities[index].name,
+                lid_closed,
+                "automatic microphone selection passed over the system default"
+            );
+        }
+        index
+    });
+    let indices = automatic_device_indices(identities, preferences, fallback)
+        .into_iter()
+        .filter(|&index| !off(index))
+        .collect::<Vec<_>>();
+    if indices.is_empty() && (0..identities.len()).any(off) {
+        return Err(crate::clamshell::LID_CLOSED_ERROR);
+    }
+    Ok(indices)
+}
+
+/// Whether the saved microphone is the internal one while the lid is closed.
+fn selected_off_with_lid_closed(name: &str) -> bool {
+    if !crate::clamshell::closed() {
+        return false;
+    }
+    cpal::default_host()
+        .input_devices()
+        .map(|mut devices| {
+            devices.any(|device| {
+                device.to_string() == name && input_transport(&device) == InputTransport::BuiltIn
+            })
+        })
+        .unwrap_or(false)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InputTransport {
+    /// The internal microphone, switched off while a MacBook's lid is
+    /// closed. A built-in headphone-jack input is `Other`.
     BuiltIn,
     Bluetooth,
+    /// A virtual or aggregate device, which may carry no microphone at all.
+    Virtual,
     Other,
 }
 
 /// Opening a Bluetooth headset's microphone switches it into a low-quality
-/// call profile for all audio, so automatic selection prefers a built-in mic.
-#[cfg(target_os = "macos")]
-fn automatic_input_index(default: usize, transports: &[InputTransport]) -> usize {
-    if transports.get(default) != Some(&InputTransport::Bluetooth) {
-        return default;
+/// call profile for all audio, so automatic selection prefers the internal
+/// mic over a Bluetooth default. With the lid closed the internal mic is
+/// off: a Bluetooth default stays, and an internal default gives way to the
+/// first other input, preferring a physical one over Bluetooth, and
+/// Bluetooth over a virtual device.
+fn automatic_input_index(default: usize, transports: &[InputTransport], lid_closed: bool) -> usize {
+    let first = |transport| transports.iter().position(|kind| *kind == transport);
+    match transports.get(default) {
+        Some(InputTransport::Bluetooth) if !lid_closed => {
+            first(InputTransport::BuiltIn).unwrap_or(default)
+        }
+        Some(InputTransport::BuiltIn) if lid_closed => first(InputTransport::Other)
+            .or_else(|| first(InputTransport::Bluetooth))
+            .or_else(|| first(InputTransport::Virtual))
+            .unwrap_or(default),
+        _ => default,
     }
-    transports
-        .iter()
-        .position(|transport| *transport == InputTransport::BuiltIn)
-        .unwrap_or(default)
-}
-
-#[cfg(target_os = "macos")]
-fn avoid_bluetooth_input(default: Device, devices: &[Device]) -> Device {
-    let identity = device_identity(&default);
-    let Some(default_index) = devices
-        .iter()
-        .position(|device| identity.matches(&device_identity(device)))
-    else {
-        return default;
-    };
-    let transports = devices.iter().map(input_transport).collect::<Vec<_>>();
-    let index = automatic_input_index(default_index, &transports);
-    if index != default_index {
-        tracing::info!(
-            bluetooth = %devices[default_index],
-            selected = %devices[index],
-            "automatic microphone selection skipped a Bluetooth headset"
-        );
-    }
-    devices[index].clone()
 }
 
 #[cfg(target_os = "macos")]
@@ -980,21 +1049,27 @@ fn input_transport(device: &Device) -> InputTransport {
     use objc2_core_audio::{
         AudioObjectGetPropertyData, AudioObjectID, AudioObjectPropertyAddress,
         AudioObjectPropertySelector, kAudioDevicePropertyTransportType,
-        kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE,
-        kAudioDeviceTransportTypeBuiltIn, kAudioHardwarePropertyTranslateUIDToDevice,
+        kAudioDeviceTransportTypeAggregate, kAudioDeviceTransportTypeBluetooth,
+        kAudioDeviceTransportTypeBluetoothLE, kAudioDeviceTransportTypeBuiltIn,
+        kAudioDeviceTransportTypeVirtual, kAudioHardwarePropertyTranslateUIDToDevice,
         kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject,
     };
     use objc2_core_foundation::CFString;
 
+    /// `kAudioDevicePropertyDataSource` and `kAudioObjectPropertyScopeInput`.
+    const DATA_SOURCE_SELECTOR: u32 = u32::from_be_bytes(*b"ssrc");
+    const INPUT_SCOPE: u32 = u32::from_be_bytes(*b"inpt");
+
     fn read_u32(
         object: AudioObjectID,
         selector: AudioObjectPropertySelector,
+        scope: u32,
         qualifier: Option<NonNull<c_void>>,
         qualifier_size: u32,
     ) -> Option<u32> {
         let mut address = AudioObjectPropertyAddress {
             mSelector: selector,
-            mScope: kAudioObjectPropertyScopeGlobal,
+            mScope: scope,
             mElement: kAudioObjectPropertyElementMain,
         };
         let mut value = 0_u32;
@@ -1020,19 +1095,41 @@ fn input_transport(device: &Device) -> InputTransport {
     let Some(device_id) = read_u32(
         kAudioObjectSystemObject as AudioObjectID,
         kAudioHardwarePropertyTranslateUIDToDevice,
+        kAudioObjectPropertyScopeGlobal,
         Some(NonNull::from(&uid_ref).cast()),
         std::mem::size_of::<*const CFString>() as u32,
     )
     .filter(|device_id| *device_id != 0) else {
         return InputTransport::Other;
     };
-    match read_u32(device_id, kAudioDevicePropertyTransportType, None, 0) {
-        Some(transport) if transport == kAudioDeviceTransportTypeBuiltIn => InputTransport::BuiltIn,
+    match read_u32(
+        device_id,
+        kAudioDevicePropertyTransportType,
+        kAudioObjectPropertyScopeGlobal,
+        None,
+        0,
+    ) {
+        Some(transport) if transport == kAudioDeviceTransportTypeBuiltIn => {
+            let data_source = read_u32(device_id, DATA_SOURCE_SELECTOR, INPUT_SCOPE, None, 0);
+            // A headphone-jack microphone is built in but stays on with the
+            // lid closed.
+            if crate::clamshell::is_lid_switched_microphone(id.id(), data_source) {
+                InputTransport::BuiltIn
+            } else {
+                InputTransport::Other
+            }
+        }
         Some(transport)
             if transport == kAudioDeviceTransportTypeBluetooth
                 || transport == kAudioDeviceTransportTypeBluetoothLE =>
         {
             InputTransport::Bluetooth
+        }
+        Some(transport)
+            if transport == kAudioDeviceTransportTypeVirtual
+                || transport == kAudioDeviceTransportTypeAggregate =>
+        {
+            InputTransport::Virtual
         }
         _ => InputTransport::Other,
     }
@@ -1442,17 +1539,99 @@ mod tests {
         assert!(mono(&samples, 0, Some(1), |sample| *sample).is_empty());
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn automatic_input_prefers_built_in_over_a_bluetooth_default() {
         use InputTransport::{Bluetooth, BuiltIn, Other};
 
-        assert_eq!(automatic_input_index(1, &[BuiltIn, Bluetooth]), 0);
-        assert_eq!(automatic_input_index(0, &[Bluetooth, Other, BuiltIn]), 2);
+        assert_eq!(automatic_input_index(1, &[BuiltIn, Bluetooth], false), 0);
+        assert_eq!(
+            automatic_input_index(0, &[Bluetooth, Other, BuiltIn], false),
+            2
+        );
         // Non-Bluetooth defaults, such as USB microphones, are kept.
-        assert_eq!(automatic_input_index(1, &[BuiltIn, Other]), 1);
+        assert_eq!(automatic_input_index(1, &[BuiltIn, Other], false), 1);
         // Without a built-in microphone the Bluetooth default is still used.
-        assert_eq!(automatic_input_index(0, &[Bluetooth, Other]), 0);
+        assert_eq!(automatic_input_index(0, &[Bluetooth, Other], false), 0);
+    }
+
+    #[test]
+    fn a_closed_lid_never_trades_a_bluetooth_default_for_the_switched_off_microphone() {
+        use InputTransport::{Bluetooth, BuiltIn, Other, Virtual};
+
+        // Clamshell with AirPods: the headset stays, never the silent mic.
+        assert_eq!(automatic_input_index(1, &[BuiltIn, Bluetooth], true), 1);
+        // An internal default gives way to a physical input first, then
+        // Bluetooth, then a virtual device.
+        assert_eq!(
+            automatic_input_index(0, &[BuiltIn, Virtual, Bluetooth, Other], true),
+            3
+        );
+        assert_eq!(
+            automatic_input_index(0, &[BuiltIn, Virtual, Bluetooth], true),
+            2
+        );
+        assert_eq!(automatic_input_index(0, &[BuiltIn, Virtual], true), 1);
+        // Other defaults are followed as before.
+        assert_eq!(automatic_input_index(1, &[BuiltIn, Other], true), 1);
+        // With nothing else listed the index is unchanged; the order rejects it.
+        assert_eq!(automatic_input_index(0, &[BuiltIn], true), 0);
+    }
+
+    #[test]
+    fn a_closed_lid_passes_over_the_built_in_microphone() {
+        use InputTransport::{Bluetooth, BuiltIn, Other};
+
+        let built_in = preference("built-in", "MacBook Pro Microphone");
+        let airpods = preference("airpods", "AirPods Pro");
+        let display = preference("usb", "USB Microphone");
+        let devices = [built_in.clone(), airpods.clone(), display.clone()];
+        let transports = [BuiltIn, Bluetooth, Other];
+        let order = |default, preferences: &[DevicePreference], lid_closed| {
+            automatic_input_order(&devices, &transports, default, preferences, lid_closed)
+        };
+
+        // Lid open: the built-in default and priority entries are used.
+        assert_eq!(order(Some(0), &[], false), Ok(vec![0]));
+        assert_eq!(
+            order(Some(1), std::slice::from_ref(&built_in), false),
+            Ok(vec![0])
+        );
+        // Lid closed: a built-in default stands aside for another input.
+        assert_eq!(order(Some(0), &[], true), Ok(vec![2]));
+        // A Bluetooth default is followed instead of the switched-off mic.
+        assert_eq!(order(Some(1), &[], true), Ok(vec![1]));
+        // A priority entry for the built-in microphone is skipped, keeping
+        // the rest of the order and the system fallback.
+        assert_eq!(
+            order(Some(1), &[built_in.clone(), display.clone()], true),
+            Ok(vec![2, 1])
+        );
+        // The headphone jack reads as Other, so it stays usable.
+        assert_eq!(
+            automatic_input_order(
+                &[built_in.clone(), preference("jack", "External Microphone")],
+                &[BuiltIn, Other],
+                Some(1),
+                &[],
+                true
+            ),
+            Ok(vec![1])
+        );
+        // With nothing else listed, say why rather than record silence.
+        assert_eq!(
+            automatic_input_order(
+                std::slice::from_ref(&built_in),
+                &[BuiltIn],
+                Some(0),
+                std::slice::from_ref(&built_in),
+                true
+            ),
+            Err(crate::clamshell::LID_CLOSED_ERROR)
+        );
+        assert_eq!(
+            automatic_input_order(&[], &[], None, &[], true),
+            Ok(Vec::new())
+        );
     }
 
     #[cfg(target_os = "macos")]

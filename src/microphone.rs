@@ -66,6 +66,9 @@ pub struct InputDescription {
     pub channel: Option<u16>,
     pub requested_channel: Option<u16>,
     pub fallback_from: Option<String>,
+    /// `fallback_from` is the internal microphone, off while the lid is
+    /// closed.
+    pub fallback_lid_closed: bool,
 }
 
 impl InputDescription {
@@ -96,6 +99,7 @@ impl InputDescription {
             channel: resolve_channel(requested_channel, 2),
             requested_channel,
             fallback_from: None,
+            fallback_lid_closed: false,
         }
     }
 }

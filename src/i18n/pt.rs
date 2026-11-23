@@ -1218,6 +1218,18 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
         "Usando {microphone} porque {previous} não está disponível",
     ),
     (
+        "Using {microphone} because {previous} is off while the lid is closed",
+        "Usando {microphone} porque {previous} fica desligado com a tampa fechada",
+    ),
+    (
+        "{previous} is off while the lid is closed. Current: {microphone} — {channel}",
+        "{previous} fica desligado com a tampa fechada. Atual: {microphone} — {channel}",
+    ),
+    (
+        "The built-in microphone is off while the lid is closed. Connect another microphone or open the lid.",
+        "O microfone integrado fica desligado com a tampa fechada. Conecte outro microfone ou abra a tampa.",
+    ),
+    (
         "Using {names} when connected, then the system default.",
         "Usando {names} quando conectados, depois o padrão do sistema.",
     ),

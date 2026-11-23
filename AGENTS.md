@@ -96,6 +96,11 @@ Only modules whose name does not say enough:
   the device UID, apply device and channel changes only between clips, and
   fall back to the mix with a visible warning. Never infer a voice channel
   from volume.
+- With a MacBook's lid closed (`clamshell`) the internal microphone is off
+  but still listed: automatic selection and the priority list pass over it,
+  a saved one falls back with a visible warning without changing the
+  setting, and a headphone-jack input stays usable. Lid changes arrive by
+  IOKit notification and re-resolve between clips.
 - Diagnostics and the HUD meter never modify or retain audio. No normalization,
   AGC, high-pass, VoiceProcessing or denoising by default without a separate
   user decision.
