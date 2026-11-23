@@ -615,7 +615,11 @@ fn multipart_audio_typed(
             break value;
         }
     };
-    let mut body = Vec::new();
+    let estimated_fields: usize = fields
+        .iter()
+        .map(|(name, value)| name.len() + value.len() + boundary.len() + 96)
+        .sum();
+    let mut body = Vec::with_capacity(audio.bytes().len() + estimated_fields + 256);
     for (name, value) in fields {
         let content_type =
             field_type.map_or(String::new(), |kind| format!("Content-Type: {kind}\r\n"));
@@ -874,6 +878,9 @@ fn spawn_prewarm(select: OriginSelector) {
 fn warm(pool: &HttpPool, target: &PrewarmOrigin) {
     let origin = origin(&target.url);
     let checkout = pool.checkout(origin.as_deref());
+    if checkout.pooled {
+        return;
+    }
     let response = checkout
         .agent
         .head(&target.url)
@@ -1347,13 +1354,20 @@ impl Chain<'_> {
                                 continue;
                             }
                             let available = self.remaining(started, initial_spent, spent);
+                            let retry_wait = live_error
+                                .and_then(|error| error.retry_after)
+                                .unwrap_or(Duration::from_secs(1))
+                                .max(Duration::from_millis(250));
+                            let max_wait = Duration::from_millis(
+                                self.config.transcription.rate_limit_retry_max_wait_ms,
+                            );
                             if status == Some(429)
                                 && !rate_retried
-                                && available > Duration::from_secs(1)
-                                && self.config.transcription.rate_limit_retry_max_wait_ms >= 1_000
+                                && retry_wait <= max_wait
+                                && available > retry_wait
                             {
-                                sleep(Duration::from_secs(1));
-                                spent = spent.saturating_add(Duration::from_secs(1));
+                                sleep(retry_wait);
+                                spent = spent.saturating_add(retry_wait);
                                 rate_retried = true;
                                 continue;
                             }
@@ -1632,6 +1646,7 @@ fn record_sample(sample: Sample) {
     TEST_SAMPLES.with(|samples| samples.borrow_mut().push(sample));
 }
 
+#[cfg(test)]
 pub fn transcribe(
     samples: &[f32],
     vocabulary: &Snapshot,
@@ -1646,6 +1661,26 @@ pub fn transcribe_cancellable(
     live: Option<streaming::PendingLive>,
     cancel_flag: Option<Arc<AtomicBool>>,
 ) -> Result<Transcription> {
+    transcribe_with_options(samples, vocabulary, live, cancel_flag, None)
+}
+
+/// Transcribes a recorded clip with an optional one-off model override (used by
+/// Recording Recovery's alternate-model retry without mutating `openrouter.json`).
+pub fn transcribe_with_model_override(
+    samples: &[f32],
+    vocabulary: &Snapshot,
+    model_override: Option<&str>,
+) -> Result<Transcription> {
+    transcribe_with_options(samples, vocabulary, None, None, model_override)
+}
+
+fn transcribe_with_options(
+    samples: &[f32],
+    vocabulary: &Snapshot,
+    live: Option<streaming::PendingLive>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+    model_override: Option<&str>,
+) -> Result<Transcription> {
     if samples.is_empty() {
         return Ok(Transcription {
             text: String::new(),
@@ -1655,10 +1690,16 @@ pub fn transcribe_cancellable(
     if cfg!(test) && live.is_none() {
         bail!("Use an injected chain or live fixture for unit transcription tests.");
     }
-    let config = match &live {
+    let mut config = match &live {
         Some(live) => live.config.clone(),
         None => crate::openrouter::load_config()?,
     };
+    if let Some(model) = model_override.map(str::trim).filter(|id| !id.is_empty()) {
+        if super::is_realtime_only(model) {
+            bail!("Only recorded-audio models can retry a saved recording.");
+        }
+        config.transcription.models = vec![model.to_owned()];
+    }
     let vocabulary = live
         .as_ref()
         .map_or_else(|| vocabulary.clone(), |live| live.vocabulary.clone());

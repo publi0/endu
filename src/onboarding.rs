@@ -180,13 +180,20 @@ pub fn open_permission_settings(permission: &str) {
         "accessibility" => "Privacy_Accessibility",
         _ => "Privacy",
     };
-    if let Err(error) = Command::new("/usr/bin/open")
+    match Command::new("/usr/bin/open")
         .arg(format!(
             "x-apple.systempreferences:com.apple.preference.security?{pane}"
         ))
         .spawn()
     {
-        tracing::error!(%error, "could not open Privacy & Security settings");
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(error) => {
+            tracing::error!(%error, "could not open Privacy & Security settings");
+        }
     }
 }
 

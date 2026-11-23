@@ -76,23 +76,39 @@ const EVENT_WRITER_CAPACITY: usize = 1_024;
 /// is enough for post-mortem diagnostics.
 const EVENT_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
+fn open_private_append(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+    }
+    Ok(file)
+}
+
 /// Truncates the log to a fresh file once it crosses the size cap, keeping the
 /// previous generation alongside it. Called from the writer thread between
 /// events, so no partial line is ever rotated.
-fn rotate_if_large(path: &Path, writer: &mut BufWriter<File>) -> io::Result<()> {
-    writer.flush()?;
-    let size = match fs::metadata(path) {
-        Ok(metadata) => metadata.len(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    if size < EVENT_LOG_MAX_BYTES {
+fn rotate_if_large(
+    path: &Path,
+    writer: &mut BufWriter<File>,
+    written_bytes: &mut u64,
+) -> io::Result<()> {
+    if *written_bytes < EVENT_LOG_MAX_BYTES {
         return Ok(());
     }
     let rotated = path.with_extension("ndjson.1");
     let _ = fs::remove_file(&rotated);
     fs::rename(path, &rotated)?;
-    *writer = BufWriter::new(OpenOptions::new().create(true).append(true).open(path)?);
+    *writer = BufWriter::new(open_private_append(path)?);
+    *written_bytes = 0;
     Ok(())
 }
 
@@ -101,7 +117,8 @@ impl EventLog {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let file = open_private_append(path)?;
+        let initial_bytes = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
         let (sender, receiver) = mpsc::sync_channel(EVENT_WRITER_CAPACITY);
         let error = Arc::new(Mutex::new(None));
         let worker_error = error.clone();
@@ -109,7 +126,13 @@ impl EventLog {
         let worker = thread::Builder::new()
             .name("event-writer".into())
             .spawn(move || {
-                run_event_writer(&writer_path, BufWriter::new(file), receiver, worker_error)
+                run_event_writer(
+                    &writer_path,
+                    BufWriter::new(file),
+                    initial_bytes,
+                    receiver,
+                    worker_error,
+                )
             })?;
         Ok(Self {
             inner: Arc::new(EventLogInner {
@@ -213,37 +236,52 @@ impl Drop for EventLogInner {
 fn run_event_writer(
     path: &Path,
     mut writer: BufWriter<File>,
+    mut written_bytes: u64,
     receiver: mpsc::Receiver<WriterMessage>,
     error: Arc<Mutex<Option<(io::ErrorKind, String)>>>,
 ) {
     while let Ok(message) = receiver.recv() {
         match message {
             WriterMessage::Event(event) => {
-                let result = serde_json::to_writer(&mut writer, &event)
+                let result = serde_json::to_vec(&event)
                     .map_err(io::Error::other)
-                    .and_then(|()| writer.write_all(b"\n"))
-                    .and_then(|()| writer.flush())
-                    .and_then(|()| rotate_if_large(path, &mut writer));
-                if let Err(write_error) = result {
-                    *error.lock().unwrap_or_else(|error| error.into_inner()) =
-                        Some((write_error.kind(), write_error.to_string()));
-                    break;
+                    .and_then(|mut line| {
+                        line.push(b'\n');
+                        writer.write_all(&line)?;
+                        writer.flush()?;
+                        written_bytes = written_bytes.saturating_add(line.len() as u64);
+                        rotate_if_large(path, &mut writer, &mut written_bytes)
+                    });
+                match result {
+                    Ok(()) => {
+                        *error.lock().unwrap_or_else(|error| error.into_inner()) = None;
+                    }
+                    Err(write_error) => {
+                        *error.lock().unwrap_or_else(|error| error.into_inner()) =
+                            Some((write_error.kind(), write_error.to_string()));
+                        // Best-effort reopen so a transient error or replaced file recovers.
+                        if let Ok(reopened) = open_private_append(path) {
+                            written_bytes = reopened
+                                .metadata()
+                                .map(|metadata| metadata.len())
+                                .unwrap_or(0);
+                            writer = BufWriter::new(reopened);
+                        }
+                    }
                 }
             }
             WriterMessage::Flush(reply) => {
                 let failure = writer
                     .flush()
                     .err()
-                    .map(|write_error| (write_error.kind(), write_error.to_string()));
-                if let Some(failure) = &failure {
-                    *error.lock().unwrap_or_else(|error| error.into_inner()) =
-                        Some(failure.clone());
-                }
-                let failed = failure.is_some();
+                    .map(|write_error| (write_error.kind(), write_error.to_string()))
+                    .or_else(|| {
+                        error
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .clone()
+                    });
                 let _ = reply.send(failure);
-                if failed {
-                    break;
-                }
             }
         }
     }

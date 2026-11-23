@@ -216,7 +216,9 @@ impl ModelOptionsView {
         cx.notify();
     }
     pub fn finish_editing(&mut self, cx: &mut Context<Self>) -> bool {
-        self.save_text(0, cx) && self.save_text(1, cx)
+        let context_saved = self.save_text(0, cx);
+        let temperature_saved = self.save_text(1, cx);
+        context_saved && temperature_saved
     }
     fn load_fields(&mut self, cx: &mut Context<Self>) {
         if !self.dirty[0] {
@@ -432,9 +434,12 @@ impl ModelOptionsView {
             .items_center()
             .justify_end()
             .rounded_sm()
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(SURFACE_HOVER)))
             .focus(|style| style.bg(rgb(SURFACE_HOVER)))
             .child(toggle(if enabled { 1.0 } else { 0.0 }))
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.toggles[index].focus(window);
                 this.commit(field, Edit::Toggle(field, !enabled), cx);
             }))
             .into_any_element();

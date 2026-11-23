@@ -38,7 +38,9 @@ pub struct ComparisonRow {
 
 /// Requests recorded for the removed native Microsoft provider keep their own
 /// row; parsing their IDs today would wrongly attribute them to OpenRouter.
-const RETIRED_PROVIDER: &str = "Microsoft (removed)";
+fn retired_provider_label() -> &'static str {
+    crate::i18n::t("Microsoft (removed)")
+}
 
 fn retired(id: &str) -> bool {
     crate::providers::is_retired_model(id)
@@ -100,12 +102,13 @@ pub fn comparison_rows(
             continue;
         }
         if is_retired {
+            let retired_label = retired_provider_label();
             let (key, label) = match group {
-                Group::Provider => ("microsoft".to_owned(), RETIRED_PROVIDER.to_owned()),
+                Group::Provider => ("microsoft".to_owned(), retired_label.to_owned()),
                 Group::Model => (
                     id.clone(),
                     format!(
-                        "{RETIRED_PROVIDER} · {}",
+                        "{retired_label} · {}",
                         id.strip_prefix("microsoft::").unwrap_or(id)
                     ),
                 ),

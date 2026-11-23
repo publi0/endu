@@ -340,6 +340,7 @@ pub fn key_status(config: &Config) -> KeyStatus {
     if let Some(CachedKey::Found(key)) = KEYCHAIN_KEY
         .lock()
         .unwrap_or_else(|error| error.into_inner())
+        .key
         .as_ref()
     {
         return KeyStatus::Keychain(crate::providers::keys::key_suffix(key));
@@ -379,9 +380,13 @@ pub fn store_keychain_key(key: &str) -> Result<()> {
     if !matches!(keychain_key(), KeychainRead::Found(saved) if saved == key) {
         bail!("The Keychain did not retain the key.");
     }
-    *KEYCHAIN_KEY
-        .lock()
-        .unwrap_or_else(|error| error.into_inner()) = Some(CachedKey::Found(key.to_owned()));
+    {
+        let mut cached = KEYCHAIN_KEY
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        cached.generation = cached.generation.wrapping_add(1);
+        cached.key = Some(CachedKey::Found(key.to_owned()));
+    }
     Ok(())
 }
 
@@ -420,8 +425,9 @@ pub fn check_key(config: &Config) -> Result<String> {
         let mut cached = KEYCHAIN_KEY
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if matches!(cached.as_ref(), Some(CachedKey::Unavailable)) {
-            *cached = None;
+        if matches!(cached.key.as_ref(), Some(CachedKey::Unavailable)) {
+            cached.generation = cached.generation.wrapping_add(1);
+            cached.key = None;
         }
     }
     let key = api_key(config)?;
@@ -477,7 +483,15 @@ enum CachedKey {
 
 use crate::providers::keys::KeychainRead;
 
-static KEYCHAIN_KEY: Mutex<Option<CachedKey>> = Mutex::new(None);
+struct KeychainCache {
+    generation: u64,
+    key: Option<CachedKey>,
+}
+
+static KEYCHAIN_KEY: Mutex<KeychainCache> = Mutex::new(KeychainCache {
+    generation: 0,
+    key: None,
+});
 static KEYCHAIN_READ_LOCK: Mutex<()> = Mutex::new(());
 const MISSING_KEY_RECHECK: Duration = Duration::from_secs(5);
 
@@ -500,11 +514,11 @@ pub fn api_key(config: &Config) -> Result<String> {
     if cfg!(test) {
         bail!("OpenRouter Keychain credentials are disabled in unit tests.");
     }
-    let check_cache = || -> Option<Result<String>> {
+    let check_cache = || -> (u64, Option<Result<String>>) {
         let cached = KEYCHAIN_KEY
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        match cached.as_ref() {
+        let result = match cached.key.as_ref() {
             Some(CachedKey::Found(key)) => Some(Ok(key.clone())),
             Some(CachedKey::Missing(at)) if at.elapsed() < MISSING_KEY_RECHECK => Some(Err(eyre!(
                 "OpenRouter API key not found. Run: security add-generic-password -s {KEYCHAIN_SERVICE} -a {KEYCHAIN_ACCOUNT} -w"
@@ -513,9 +527,10 @@ pub fn api_key(config: &Config) -> Result<String> {
                 crate::providers::keys::unavailable_message("OpenRouter")
             ))),
             _ => None,
-        }
+        };
+        (cached.generation, result)
     };
-    if let Some(result) = check_cache() {
+    if let (_, Some(result)) = check_cache() {
         return result;
     }
     // Keep KEYCHAIN_KEY unlocked across `/usr/bin/security` so status checks
@@ -523,7 +538,8 @@ pub fn api_key(config: &Config) -> Result<String> {
     let _read_guard = KEYCHAIN_READ_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if let Some(result) = check_cache() {
+    let (generation, cached) = check_cache();
+    if let Some(result) = cached {
         return result;
     }
     let read = match keychain_key() {
@@ -536,19 +552,26 @@ pub fn api_key(config: &Config) -> Result<String> {
     let mut cached = KEYCHAIN_KEY
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    let still_current = cached.generation == generation;
     match read {
         KeychainRead::Found(key) => {
-            *cached = Some(CachedKey::Found(key.clone()));
+            if still_current {
+                cached.key = Some(CachedKey::Found(key.clone()));
+            }
             Ok(key)
         }
         KeychainRead::Missing => {
-            *cached = Some(CachedKey::Missing(Instant::now()));
+            if still_current {
+                cached.key = Some(CachedKey::Missing(Instant::now()));
+            }
             bail!(
                 "OpenRouter API key not found. Run: security add-generic-password -s {KEYCHAIN_SERVICE} -a {KEYCHAIN_ACCOUNT} -w"
             )
         }
         KeychainRead::Unavailable => {
-            *cached = Some(CachedKey::Unavailable);
+            if still_current {
+                cached.key = Some(CachedKey::Unavailable);
+            }
             bail!(crate::providers::keys::unavailable_message("OpenRouter"))
         }
     }
@@ -556,9 +579,11 @@ pub fn api_key(config: &Config) -> Result<String> {
 
 /// Drop the cached Keychain key so a rotated key is picked up after a 401.
 pub(crate) fn forget_cached_key() {
-    *KEYCHAIN_KEY
+    let mut cached = KEYCHAIN_KEY
         .lock()
-        .unwrap_or_else(|error| error.into_inner()) = None;
+        .unwrap_or_else(|error| error.into_inner());
+    cached.generation = cached.generation.wrapping_add(1);
+    cached.key = None;
 }
 
 /// Reads through `/usr/bin/security`, shared with every provider key.

@@ -97,14 +97,6 @@ pub(crate) struct Usage {
     pub cost_reported: bool,
 }
 
-/// Shared entrypoint for recovery and CLI callers without a live capture session.
-pub fn transcribe_with_vocabulary(
-    samples: &[f32],
-    vocabulary: &crate::vocabulary::Snapshot,
-) -> Result<Transcription> {
-    crate::providers::batch::transcribe(samples, vocabulary, None)
-}
-
 #[cfg(test)]
 fn models(config: &Config) -> impl Iterator<Item = &str> {
     config

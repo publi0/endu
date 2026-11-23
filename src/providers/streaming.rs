@@ -146,6 +146,7 @@ pub struct LiveResult {
 #[derive(Debug)]
 pub struct LiveError {
     pub status: Option<u16>,
+    pub retry_after: Option<Duration>,
     pub keyword_count: usize,
     pub keywords_rejected: bool,
     pub attempted: bool,
@@ -168,6 +169,7 @@ fn failure(message: &'static str) -> color_eyre::Report {
 fn failure_kind(message: &'static str, error_kind: ErrorKind) -> color_eyre::Report {
     LiveError {
         status: None,
+        retry_after: None,
         keyword_count: 0,
         keywords_rejected: false,
         attempted: false,
@@ -181,6 +183,7 @@ fn failure_kind(message: &'static str, error_kind: ErrorKind) -> color_eyre::Rep
 pub(crate) fn fixture_error(status: Option<u16>, keywords_rejected: bool) -> color_eyre::Report {
     LiveError {
         status,
+        retry_after: None,
         keyword_count: 0,
         keywords_rejected,
         attempted: true,
@@ -216,6 +219,7 @@ pub(crate) fn fixture_grok_live_result(
     }
     Err(LiveError {
         status: None,
+        retry_after: None,
         keyword_count: 2,
         keywords_rejected: false,
         attempted: true,
@@ -272,9 +276,15 @@ fn handshake_failure<S: Read + Write>(
     error: tungstenite::HandshakeError<tungstenite::handshake::client::ClientHandshake<S>>,
     query_keyword_count: usize,
 ) -> color_eyre::Report {
-    let (status, keywords_rejected, keyword_count, error_kind) = match &error {
+    let (status, retry_after, keywords_rejected, keyword_count, error_kind) = match &error {
         tungstenite::HandshakeError::Failure(tungstenite::Error::Http(response)) => {
             let status = response.status().as_u16();
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(Duration::from_secs);
             let rejected = (status == 414 && query_keyword_count > 0)
                 || (matches!(status, 400 | 422)
                     && response
@@ -286,19 +296,21 @@ fn handshake_failure<S: Read + Write>(
             // DNS/TCP/TLS and local credential failures do not prove delivery.
             (
                 Some(status),
+                retry_after,
                 rejected,
                 query_keyword_count,
                 ErrorKind::from_status(status),
             )
         }
         tungstenite::HandshakeError::Failure(error) => {
-            (None, false, 0, websocket_error_kind(error))
+            (None, None, false, 0, websocket_error_kind(error))
         }
         // Our socket is blocking; Interrupted here is its bounded I/O wait.
-        tungstenite::HandshakeError::Interrupted(_) => (None, false, 0, ErrorKind::Timeout),
+        tungstenite::HandshakeError::Interrupted(_) => (None, None, false, 0, ErrorKind::Timeout),
     };
     LiveError {
         status,
+        retry_after,
         keyword_count,
         keywords_rejected,
         attempted: true,
@@ -1359,6 +1371,7 @@ impl Protocol {
                 });
             return Err(LiveError {
                 status,
+                retry_after: None,
                 keyword_count: 0,
                 keywords_rejected: (self.provider != Provider::Meta
                     || status.is_none_or(|status| matches!(status, 400 | 422)))

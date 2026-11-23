@@ -204,8 +204,8 @@ impl OverlayVisibility {
             self.state.missing_since = None;
         }
         if wanted
+            && self.state.ordered
             && (space_changed
-                || !self.state.ordered
                 || self
                     .last_observation
                     .is_none_or(|last| now.duration_since(last) >= RETRY_INTERVAL))

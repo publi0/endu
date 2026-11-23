@@ -95,29 +95,63 @@ impl AppWindow {
                 _ => Err(t("Could not open the import dialog.").to_owned()),
             };
             let _ = this.update(cx, |this, cx| {
-                this.preference_transfer_busy = false;
                 match result {
                     Ok(Some(bundle)) => {
-                        let imported = if this.key_operation_pending(cx) {
-                            Err(color_eyre::eyre::eyre!(t(
-                                "Wait for the key operation to finish before importing preferences."
-                            )))
+                        if this.key_operation_pending(cx) {
+                            this.preference_transfer_busy = false;
+                            this.preference_transfer_error = Some(
+                                t("Wait for the key operation to finish before importing preferences.")
+                                    .to_owned(),
+                            );
                         } else if this.preview {
-                            crate::preferences_transfer::preview_bundle(
+                            this.preference_transfer_busy = false;
+                            match crate::preferences_transfer::preview_bundle(
                                 bundle,
                                 &this.settings,
                                 &this.openrouter_settings.read(cx).config_snapshot(),
-                            )
+                            ) {
+                                Ok(imported) => this.accept_imported_preferences(imported, cx),
+                                Err(error) => {
+                                    this.preference_transfer_error = Some(error.to_string())
+                                }
+                            }
                         } else {
-                            crate::preferences_transfer::import_bundle(bundle, &this.settings)
-                        };
-                        match imported {
-                            Ok(imported) => this.accept_imported_preferences(imported, cx),
-                            Err(error) => this.preference_transfer_error = Some(error.to_string()),
+                            let current_settings = this.settings.clone();
+                            cx.spawn(async move |this, cx| {
+                                let imported = cx
+                                    .background_executor()
+                                    .spawn(async move {
+                                        crate::preferences_transfer::import_bundle(
+                                            bundle,
+                                            &current_settings,
+                                        )
+                                        .map_err(|error| error.to_string())
+                                    })
+                                    .await;
+                                let _ = this.update(cx, |this, cx| {
+                                    this.preference_transfer_busy = false;
+                                    match imported {
+                                        Ok(imported) => {
+                                            this.accept_imported_preferences(imported, cx)
+                                        }
+                                        Err(error) => {
+                                            this.preference_transfer_error = Some(error)
+                                        }
+                                    }
+                                    cx.notify();
+                                });
+                            })
+                            .detach();
+                            return;
                         }
                     }
-                    Ok(None) => {}
-                    Err(error) => this.preference_transfer_error = Some(error),
+                    Ok(None) => {
+                        this.preference_transfer_busy = false;
+                    }
+                    Err(error) => {
+                        this.preference_transfer_busy = false;
+                        this.preference_transfer_error = Some(error);
+                    }
                 }
                 cx.notify();
             });

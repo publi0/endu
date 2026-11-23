@@ -720,6 +720,9 @@ impl RecoveringAudioInput {
         if self.input.is_some() || self.replacement.is_some() || !self.recovery.blocks_audio() {
             return None;
         }
+        if crate::clamshell::generation() != self.lid_generation {
+            return Some(Duration::ZERO);
+        }
         self.recovery
             .next_attempt
             .map(|next| next.saturating_duration_since(now))

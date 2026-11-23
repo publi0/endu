@@ -1,6 +1,7 @@
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <IOKit/hidsystem/IOHIDLib.h>
 #import <QuartzCore/QuartzCore.h>
 
 typedef NS_ENUM(NSInteger, HexPermission) {
@@ -11,6 +12,7 @@ typedef NS_ENUM(NSInteger, HexPermission) {
 static NSPanel *guidePanel;
 static NSTimer *guideTimer;
 static BOOL sawSettingsWindow;
+static CFAbsoluteTime guideStartedAt;
 static HexPermission activePermission;
 
 @interface HexDragView : NSView <NSDraggingSource>
@@ -60,7 +62,7 @@ static HexPermission activePermission;
         NSFontAttributeName: [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],
         NSForegroundColorAttributeName: [NSColor colorWithWhite:(dark ? 0.94 : 0.12) alpha:1],
     };
-    [@"Hex" drawAtPoint:NSMakePoint(52, 14) withAttributes:attributes];
+    [@"Endu" drawAtPoint:NSMakePoint(52, 14) withAttributes:attributes];
 }
 
 - (void)mouseDown:(NSEvent *)event {
@@ -100,6 +102,15 @@ static HexPermission activePermission;
 @end
 
 static CGRect currentSettingsFrame(void) {
+    NSArray<NSRunningApplication *> *settingsApps =
+        [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.systempreferences"];
+    if (settingsApps.count == 0) {
+        return CGRectNull;
+    }
+    NSMutableSet<NSNumber *> *settingsPids = [NSMutableSet setWithCapacity:settingsApps.count];
+    for (NSRunningApplication *app in settingsApps) {
+        [settingsPids addObject:@(app.processIdentifier)];
+    }
     CFArrayRef windowInfo = CGWindowListCopyWindowInfo(
         kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
         kCGNullWindowID
@@ -107,9 +118,8 @@ static CGRect currentSettingsFrame(void) {
     NSArray *windows = CFBridgingRelease(windowInfo);
     CGRect best = CGRectNull;
     for (NSDictionary *window in windows) {
-        NSString *owner = window[(id)kCGWindowOwnerName];
-        if (![owner isEqualToString:@"System Settings"] &&
-            ![owner isEqualToString:@"System Preferences"]) {
+        NSNumber *ownerPid = window[(id)kCGWindowOwnerPID];
+        if (ownerPid == nil || ![settingsPids containsObject:ownerPid]) {
             continue;
         }
         if ([window[(id)kCGWindowLayer] integerValue] != 0) {
@@ -147,9 +157,10 @@ static NSRect appKitFrame(CGRect frame) {
 static BOOL permissionGranted(void) {
     switch (activePermission) {
         case HexPermissionInputMonitoring:
-            return CGPreflightListenEventAccess();
+            return IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted ||
+                   CGPreflightListenEventAccess();
         case HexPermissionAccessibility:
-            return CGPreflightPostEventAccess();
+            return AXIsProcessTrusted() || CGPreflightPostEventAccess();
     }
 }
 
@@ -159,6 +170,7 @@ static void closeGuide(void) {
     [guidePanel orderOut:nil];
     guidePanel = nil;
     sawSettingsWindow = NO;
+    guideStartedAt = 0;
 }
 
 static void updateGuidePosition(void) {
@@ -168,7 +180,7 @@ static void updateGuidePosition(void) {
     }
     CGRect quartzFrame = currentSettingsFrame();
     if (CGRectIsNull(quartzFrame)) {
-        if (sawSettingsWindow) {
+        if (sawSettingsWindow || (guideStartedAt > 0 && CFAbsoluteTimeGetCurrent() - guideStartedAt > 20.0)) {
             closeGuide();
         }
         return;
@@ -190,22 +202,33 @@ static void updateGuidePosition(void) {
     [guidePanel orderFrontRegardless];
 }
 
-void hex_show_permission_guide(int permission) {
+void hex_show_permission_guide(int permission, const char *instructionUTF8) {
     NSCAssert(NSThread.isMainThread, @"permission guide must run on the main thread");
     closeGuide();
     activePermission = (HexPermission)permission;
 
-    NSURL *bundleURL = NSBundle.mainBundle.bundleURL.standardizedURL;
-    if (![bundleURL.pathExtension.lowercaseString isEqualToString:@"app"]) {
-        return;
-    }
-
-    NSString *permissionName = activePermission == HexPermissionInputMonitoring
-        ? @"Input Monitoring"
-        : @"Accessibility";
     NSString *pane = activePermission == HexPermissionInputMonitoring
         ? @"Privacy_ListenEvent"
         : @"Privacy_Accessibility";
+    NSURL *settingsURL = [NSURL URLWithString:[NSString stringWithFormat:
+        @"x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?%@", pane]];
+
+    NSURL *bundleURL = NSBundle.mainBundle.bundleURL.standardizedURL;
+    if (![bundleURL.pathExtension.lowercaseString isEqualToString:@"app"]) {
+        [[NSWorkspace sharedWorkspace] openURL:settingsURL];
+        return;
+    }
+
+    NSString *instructionText = instructionUTF8 != NULL
+        ? [NSString stringWithUTF8String:instructionUTF8]
+        : nil;
+    if (instructionText == nil || instructionText.length == 0) {
+        NSString *permissionName = activePermission == HexPermissionInputMonitoring
+            ? @"Input Monitoring"
+            : @"Accessibility";
+        instructionText = [NSString stringWithFormat:
+            @"↑  Drag Endu into the %@ list above", permissionName];
+    }
 
     NSSize panelSize = NSMakeSize(480, 116);
     guidePanel = [[NSPanel alloc]
@@ -232,8 +255,7 @@ void hex_show_permission_guide(int permission) {
     content.layer.borderWidth = 1;
     content.layer.borderColor = [NSColor colorWithWhite:0 alpha:0.10].CGColor;
 
-    NSTextField *instruction = [NSTextField labelWithString:[NSString stringWithFormat:
-        @"↑  Drag Hex into the %@ list above", permissionName]];
+    NSTextField *instruction = [NSTextField labelWithString:instructionText];
     instruction.frame = NSMakeRect(18, 73, panelSize.width - 36, 24);
     instruction.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
     instruction.textColor = NSColor.labelColor;
@@ -245,8 +267,7 @@ void hex_show_permission_guide(int permission) {
     [content addSubview:dragView];
     guidePanel.contentView = content;
 
-    NSURL *settingsURL = [NSURL URLWithString:[NSString stringWithFormat:
-        @"x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?%@", pane]];
+    guideStartedAt = CFAbsoluteTimeGetCurrent();
     [[NSWorkspace sharedWorkspace] openURL:settingsURL];
     guideTimer = [NSTimer scheduledTimerWithTimeInterval:0.12
                                                  repeats:YES

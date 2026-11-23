@@ -122,6 +122,32 @@ impl PendingResolution {
         self.run();
     }
 
+    /// Preserves an accepted recording during shutdown instead of deleting it
+    /// when output could not be dispatched. If `text` is already available,
+    /// saves it as `Recovered` before removing audio; otherwise keeps the WAV
+    /// intact for later retry.
+    pub fn preserve_for_shutdown(mut self, text: Option<String>) {
+        let Some(mut entry) = self.entry.take() else {
+            return;
+        };
+        if let Some(text) = text.filter(|value| !value.trim().is_empty()) {
+            entry.status = RecoveryStatus::Recovered;
+            entry.message = None;
+            entry.text = Some(text);
+            if !entry.volatile && self.store.save_metadata(&entry).is_ok() {
+                let _ = remove_recording_files(&self.store.directory, &entry.id);
+                let mut state = self.store.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.entries.insert(entry.id.clone(), entry);
+                state.revision += 1;
+                return;
+            }
+        }
+        self.store.finish_failure(
+            entry,
+            t("Endu closed before transcription finished. Audio was kept for retry."),
+        );
+    }
+
     fn run(&mut self) {
         if let Some(entry) = self.entry.take() {
             self.store.resolve_entry(entry);
@@ -132,6 +158,119 @@ impl PendingResolution {
 impl Drop for PendingResolution {
     fn drop(&mut self) {
         self.run();
+    }
+}
+
+static ACTIVE_PLAYBACK_STOP: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>> = Mutex::new(None);
+
+/// Stops any local Recording Recovery playback currently in progress (for
+/// example when a new dictation begins or the History pane closes).
+pub fn stop_active_playback() {
+    if let Some(flag) = ACTIVE_PLAYBACK_STOP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        flag.store(true, Ordering::Release);
+    }
+}
+
+/// Handle to one local playback of a failed recording. Stopping or dropping
+/// the handle immediately releases the audio output device.
+pub struct RecoveryPlayback {
+    id: String,
+    duration: std::time::Duration,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    finished: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RecoveryPlayback {
+    fn start(id: String, samples: Arc<Vec<f32>>) -> io::Result<Self> {
+        stop_active_playback();
+        let duration =
+            std::time::Duration::from_secs_f64(samples.len() as f64 / f64::from(SAMPLE_RATE));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *ACTIVE_PLAYBACK_STOP
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(stop.clone());
+
+        if !cfg!(test) {
+            let worker_stop = stop.clone();
+            let worker_finished = finished.clone();
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<io::Result<()>>(1);
+            thread::Builder::new()
+                .name("recovery-playback".into())
+                .spawn(move || {
+                    use rodio::{DeviceSinkBuilder, buffer::SamplesBuffer};
+                    let sink = match DeviceSinkBuilder::open_default_sink() {
+                        Ok(sink) => {
+                            let _ = ready_tx.send(Ok(()));
+                            sink
+                        }
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(io::Error::other(format!(
+                                "{}: {error}",
+                                t("Audio output is unavailable.")
+                            ))));
+                            worker_finished.store(true, Ordering::Release);
+                            return;
+                        }
+                    };
+                    let buffer = SamplesBuffer::new(
+                        std::num::NonZero::new(1).expect("mono channel count is non-zero"),
+                        std::num::NonZero::new(SAMPLE_RATE).expect("sample rate is non-zero"),
+                        (*samples).clone(),
+                    );
+                    sink.mixer().add(buffer);
+                    let end =
+                        std::time::Instant::now() + duration + std::time::Duration::from_millis(80);
+                    while !worker_stop.load(Ordering::Acquire) && std::time::Instant::now() < end {
+                        let remaining = end.saturating_duration_since(std::time::Instant::now());
+                        thread::sleep(remaining.min(std::time::Duration::from_millis(40)));
+                    }
+                    drop(sink);
+                    worker_finished.store(true, Ordering::Release);
+                })?;
+            match ready_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    stop.store(true, Ordering::Release);
+                    return Err(error);
+                }
+                Err(_) => {
+                    stop.store(true, Ordering::Release);
+                    return Err(io::Error::other(t("Audio output is unavailable.")));
+                }
+            }
+        }
+
+        Ok(Self {
+            id,
+            duration,
+            stop,
+            finished,
+        })
+    }
+
+    pub fn is_playing(&self, id: &str) -> bool {
+        self.id == id
+            && !self.stop.load(Ordering::Acquire)
+            && !self.finished.load(Ordering::Acquire)
+    }
+
+    pub fn duration(&self) -> std::time::Duration {
+        self.duration
+    }
+
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for RecoveryPlayback {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -552,7 +691,20 @@ impl RecordingRecovery {
         self.finish_failure(entry, t("Endu quit before this recording was transcribed."));
     }
 
-    pub fn retry(&self, id: &str) -> io::Result<()> {
+    /// Retries a failed recording using either the current Models chain (`None`)
+    /// or a one-off batch-capable model override (`Some(model_id)`) without
+    /// modifying `openrouter.json`.
+    pub fn retry_with_model(&self, id: &str, model_override: Option<String>) -> io::Result<()> {
+        let model_override = model_override
+            .map(|model| model.trim().to_owned())
+            .filter(|model| !model.is_empty());
+        if let Some(model) = model_override.as_deref()
+            && crate::providers::is_realtime_only(model)
+        {
+            return Err(io::Error::other(t(
+                "Only recorded-audio models can retry a saved recording.",
+            )));
+        }
         let vocabulary = crate::vocabulary::Snapshot::current();
         let remote = vocabulary.clone();
         self.retry_with_processing(
@@ -560,9 +712,23 @@ impl RecordingRecovery {
             crate::post_processing::Preferences::current(),
             vocabulary,
             move |samples| {
-                crate::openrouter::transcribe::transcribe_with_vocabulary(samples, &remote)
+                crate::providers::batch::transcribe_with_model_override(
+                    samples,
+                    &remote,
+                    model_override.as_deref(),
+                )
             },
         )
+    }
+
+    /// Plays back a saved or volatile recovery recording locally over the
+    /// default audio output. Stops any previously playing recovery clip first.
+    pub fn play(&self, id: &str) -> io::Result<RecoveryPlayback> {
+        let samples = self.read_audio(id)?;
+        if samples.is_empty() {
+            return Err(io::Error::other(t("This recording has no audio to play.")));
+        }
+        RecoveryPlayback::start(id.to_owned(), samples)
     }
 
     #[cfg(test)]
@@ -1635,5 +1801,22 @@ mod tests {
         assert!(store.entries("").is_empty());
         assert!(store.state.lock().unwrap().volatile.is_empty());
         let _ = fs::remove_file(&fixture.0);
+    }
+
+    #[test]
+    fn alternate_model_retry_rejects_realtime_only_models_and_playback_stops_cleanly() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let id = failed(&store);
+        let error = store
+            .retry_with_model(&id, Some("elevenlabs::scribe_v2_realtime".into()))
+            .unwrap_err();
+        assert!(error.to_string().contains("recorded-audio"));
+        assert!(!store.retry_in_progress());
+
+        let playback = store.play(&id).unwrap();
+        assert!(playback.is_playing(&id));
+        stop_active_playback();
+        assert!(!playback.is_playing(&id));
     }
 }

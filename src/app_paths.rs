@@ -122,7 +122,10 @@ pub fn init_process_logging(shutdown: &'static AtomicBool) -> Result<PathBuf> {
                 })),
         )
         .init();
-    ctrlc::set_handler(|| shutdown.store(true, Ordering::Relaxed))?;
+    ctrlc::set_handler(|| {
+        shutdown.store(true, Ordering::Relaxed);
+        crate::desktop::wake_ui();
+    })?;
     Ok(log_dir)
 }
 

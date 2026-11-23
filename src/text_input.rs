@@ -753,8 +753,11 @@ impl TextInput {
     fn previous_word_boundary(&self, offset: usize) -> usize {
         let mut boundary = offset;
         let mut seen_word = false;
-        for (index, character) in self.content[..offset].char_indices().rev() {
-            if character.is_alphanumeric() || character == '_' {
+        for (index, grapheme) in self.content[..offset].grapheme_indices(true).rev() {
+            let is_word = grapheme
+                .chars()
+                .any(|character| character.is_alphanumeric() || character == '_');
+            if is_word {
                 boundary = index;
                 seen_word = true;
             } else if seen_word {
@@ -769,14 +772,17 @@ impl TextInput {
     fn next_word_boundary(&self, offset: usize) -> usize {
         let mut boundary = self.content.len();
         let mut seen_word = false;
-        for (relative, character) in self.content[offset..].char_indices() {
+        for (relative, grapheme) in self.content[offset..].grapheme_indices(true) {
             let index = offset + relative;
-            if character.is_alphanumeric() || character == '_' {
+            let is_word = grapheme
+                .chars()
+                .any(|character| character.is_alphanumeric() || character == '_');
+            if is_word {
                 seen_word = true;
             } else if seen_word {
                 return index;
             }
-            boundary = index + character.len_utf8();
+            boundary = index + grapheme.len();
         }
         boundary
     }
@@ -1275,8 +1281,12 @@ impl Element for TextElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
-        for selection in prepaint.selections.drain(..) {
-            window.paint_quad(selection);
+        if focus_handle.is_focused(window) {
+            for selection in prepaint.selections.drain(..) {
+                window.paint_quad(selection);
+            }
+        } else {
+            prepaint.selections.clear();
         }
         if let Some(layout) = prepaint.multiline_layout.take() {
             let mut origin = point(bounds.origin.x, bounds.origin.y - prepaint.scroll_y);

@@ -79,7 +79,17 @@ pub fn estimate(
     }
     let (base, vocabulary) = price_per_minute(model, mode, billing.auto_language)?;
     let rate = base + if keyword_count > 0 { vocabulary } else { 0.0 };
-    Some(rate * billing.audio_ms as f64 / 60_000.0)
+    // ElevenLabs batch models apply a 20-second minimum billable duration when
+    // more than 100 keyterms are supplied.
+    let billed_ms = if model.provider == Provider::ElevenLabs
+        && matches!(model.model, "scribe_v3" | "scribe_v2")
+        && keyword_count > 100
+    {
+        billing.audio_ms.max(20_000)
+    } else {
+        billing.audio_ms
+    };
+    Some(rate * billed_ms as f64 / 60_000.0)
 }
 
 #[cfg(test)]
@@ -134,6 +144,11 @@ mod tests {
         close(
             estimate(scribe_v3, RequestMode::Recorded, billing(3_600_000), 3),
             0.25,
+        );
+        // Over 100 keyterms on ElevenLabs batch applies a 20-second minimum charge.
+        close(
+            estimate(scribe_v3, RequestMode::Recorded, billing(5_000), 101),
+            0.25 * (20_000.0 / 3_600_000.0),
         );
         let scribe_v3_live = ModelRef::parse("elevenlabs::scribe_v3_live");
         close(

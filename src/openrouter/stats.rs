@@ -138,15 +138,16 @@ impl ErrorKind {
     }
 
     pub fn label_for_key(key: &str) -> &'static str {
+        use crate::i18n::t;
         match key {
-            "rate_limited" => "Rate limited (HTTP 429)",
-            "timeout" => "Timed out",
-            "server" => "Provider error (HTTP 5xx)",
-            "rejected" => "Request rejected (HTTP 4xx)",
-            "auth" => "Key rejected (HTTP 401/403)",
-            "network" => "Network error",
-            "invalid_response" => "Invalid or empty response",
-            _ => "Other",
+            "rate_limited" => t("Rate limited (HTTP 429)"),
+            "timeout" => t("Timed out"),
+            "server" => t("Provider error (HTTP 5xx)"),
+            "rejected" => t("Request rejected (HTTP 4xx)"),
+            "auth" => t("Key rejected (HTTP 401/403)"),
+            "network" => t("Network error"),
+            "invalid_response" => t("Invalid or empty response"),
+            _ => t("Other"),
         }
     }
 

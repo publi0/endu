@@ -202,6 +202,18 @@ impl PendingInputEvents {
             pending.pop_front();
         }
     }
+
+    /// Removes an entry whose event was never delivered to the listener
+    /// (e.g. bounded channel full or disconnected), preventing a permanently
+    /// wedged front entry.
+    fn cancel(&self, sequence: u64) {
+        let mut pending = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if pending.back().is_some_and(|(last, _)| *last == sequence) {
+            pending.pop_back();
+        } else if let Some(index) = pending.iter().position(|(seq, _)| *seq == sequence) {
+            pending.remove(index);
+        }
+    }
 }
 
 /// Bounds the event-tap-to-listener queue so a stalled listener cannot grow
@@ -1209,11 +1221,11 @@ fn send_input_with_submit(
     }) {
         Ok(()) => true,
         Err(mpsc::TrySendError::Full(_)) => {
-            context.pending.acknowledge(sequence);
+            context.pending.cancel(sequence);
             false
         }
         Err(mpsc::TrySendError::Disconnected(_)) => {
-            context.pending.acknowledge(sequence);
+            context.pending.cancel(sequence);
             // SAFETY: The callback runs on the event-tap thread's run loop.
             unsafe { CFRunLoopStop(CFRunLoopGetCurrent()) };
             false
@@ -5820,5 +5832,23 @@ mod tests {
         activity.invalidate();
 
         assert_ne!(activity.revision(), revision);
+    }
+
+    #[test]
+    fn cancelling_dropped_back_sequence_never_wedges_pending_input_events() {
+        let pending = PendingInputEvents::default();
+        let t0 = CaptureInstant::from_nanos(1_000);
+        let t1 = CaptureInstant::from_nanos(2_000);
+        let t2 = CaptureInstant::from_nanos(3_000);
+        pending.push(1, t0);
+        pending.push(2, t1);
+        pending.push(3, t2);
+        // Sequence 3 was dropped when the bounded queue was full.
+        pending.cancel(3);
+        assert_eq!(pending.oldest(), Some(t0));
+        pending.acknowledge(1);
+        assert_eq!(pending.oldest(), Some(t1));
+        pending.acknowledge(2);
+        assert_eq!(pending.oldest(), None);
     }
 }

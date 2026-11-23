@@ -18,18 +18,18 @@ pub fn bundle_path() -> Option<PathBuf> {
 }
 
 /// Walks up from the executable to the enclosing .app bundle. The binary must
-/// sit in the bundle's Contents directory; a directory that merely sits next
-/// to an .app does not count.
+/// sit directly inside `<Name>.app/Contents/<subdir>/<exe>`; a directory that
+/// merely sits under an unrelated `.app` ancestor does not count.
 fn bundle_from_executable(executable: &Path) -> Option<PathBuf> {
-    let bundle = executable.ancestors().find(|path| {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(".app"))
-    })?;
-    executable
-        .ancestors()
-        .nth(2)
-        .is_some_and(|contents| contents.file_name().is_some_and(|name| name == "Contents"))
+    let contents = executable.ancestors().nth(2)?;
+    if contents.file_name().is_none_or(|name| name != "Contents") {
+        return None;
+    }
+    let bundle = executable.ancestors().nth(3)?;
+    bundle
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".app"))
         .then(|| bundle.to_path_buf())
 }
 
@@ -53,14 +53,40 @@ pub fn pending_update() -> Option<String> {
     (version_newer(&version, env!("CARGO_PKG_VERSION"))).then_some(version)
 }
 
-fn version_newer(candidate: &str, current: &str) -> bool {
-    let parse = |value: &str| -> Vec<u64> {
-        value
-            .split('.')
-            .map(|part| part.parse().unwrap_or(0))
-            .collect()
+fn parse_semver(value: &str) -> Option<(Vec<u64>, Option<&str>)> {
+    let without_build = value.trim().split('+').next()?;
+    let (core, pre) = match without_build.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (without_build, None),
     };
-    parse(candidate) > parse(current)
+    let mut parts: Vec<u64> = core
+        .split('.')
+        .map(|part| part.parse::<u64>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if parts.is_empty() {
+        return None;
+    }
+    while parts.len() > 1 && parts.last() == Some(&0) {
+        parts.pop();
+    }
+    Some((parts, pre))
+}
+
+fn version_newer(candidate: &str, current: &str) -> bool {
+    let (Some((cand_core, cand_pre)), Some((curr_core, curr_pre))) =
+        (parse_semver(candidate), parse_semver(current))
+    else {
+        return false;
+    };
+    match cand_core.cmp(&curr_core) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => match (cand_pre, curr_pre) {
+            (None, Some(_)) => true,
+            (Some(_), None) | (None, None) => false,
+            (Some(a), Some(b)) => a > b,
+        },
+    }
 }
 
 /// Seconds the helper waits for this process to exit before reopening anyway.
@@ -151,6 +177,11 @@ mod tests {
         assert!(!version_newer("3.1.2", "3.1.3"));
         assert!(!version_newer("2.9.9", "3.1.3"));
         assert!(version_newer("4.0", "3.1.3"));
+        assert!(!version_newer("4.0.0", "4.0"));
+        assert!(!version_newer("4.0", "4.0.0"));
+        assert!(version_newer("4.0.0", "4.0.0-rc.1"));
+        assert!(!version_newer("4.0.0-rc.1", "4.0.0"));
+        assert!(version_newer("4.0.1-rc.1", "4.0.0"));
     }
 
     #[test]
@@ -174,6 +205,11 @@ mod tests {
         // A directory named like a bundle next to the executable is not enough.
         assert_eq!(
             bundle_from_executable(Path::new("/tmp/Endu.app/other/endu")),
+            None
+        );
+        // An unrelated `.app` higher in the path must not match a nested Contents.
+        assert_eq!(
+            bundle_from_executable(Path::new("/tmp/Endu.app/sub/Contents/MacOS/endu")),
             None
         );
     }

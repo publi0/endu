@@ -422,7 +422,19 @@ impl Render for MicrophonePriorityView {
                                     .min_w_0()
                                     .text_size(px(12.0))
                                     .text_color(rgb(TEXT))
-                                    .child(div().truncate().child(preference.name.clone()))
+                                    .child(
+                                        div().truncate().child(
+                                            self.catalog
+                                                .as_deref()
+                                                .unwrap_or_default()
+                                                .iter()
+                                                .find(|device| device.id == preference.id)
+                                                .map_or_else(
+                                                    || preference.name.clone(),
+                                                    |device| device.name.clone(),
+                                                ),
+                                        ),
+                                    )
                                     .when(unavailable, |row| {
                                         row.child(
                                             div()

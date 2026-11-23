@@ -1535,4 +1535,74 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
         "The file no longer contains an API key.",
         "O arquivo não contém mais uma chave de API.",
     ),
+    (
+        "1 failed recording to recover…",
+        "1 gravação com falha para recuperar…",
+    ),
+    (
+        "{count} failed recordings to recover…",
+        "{count} gravações com falha para recuperar…",
+    ),
+    (
+        "Audio is saved on this Mac until recovery or deletion. Retry & copy uses your chosen model or current Models settings, saves the text here and copies it, without automatic paste.",
+        "O áudio fica salvo neste Mac até ser recuperado ou apagado. Tentar e copiar usa o modelo escolhido ou os ajustes atuais de Modelos, salva o texto aqui e o copia, sem colagem automática.",
+    ),
+    (
+        "Audio output is unavailable.",
+        "A saída de áudio está indisponível.",
+    ),
+    ("Confirm delete", "Confirmar exclusão"),
+    (
+        "Could not restart automatically. Quit and open Endu again.",
+        "Não foi possível reiniciar automaticamente. Encerre e abra o Endu novamente.",
+    ),
+    ("Current models", "Modelos atuais"),
+    (
+        "Endu closed before transcription finished. Audio was kept for retry.",
+        "O Endu foi fechado antes de concluir a transcrição. O áudio foi mantido para nova tentativa.",
+    ),
+    ("Error/cancel sound", "Som de erro/cancelamento"),
+    ("Invalid or empty response", "Resposta inválida ou vazia"),
+    (
+        "Key rejected (HTTP 401/403)",
+        "Chave rejeitada (HTTP 401/403)",
+    ),
+    ("Microsoft (removed)", "Microsoft (removido)"),
+    (
+        "Name {index} must be a short name or phrase, without control characters, URLs or paths.",
+        "O nome {index} deve ser um nome curto ou frase, sem caracteres de controle, URLs ou caminhos.",
+    ),
+    (
+        "Names {first} and {second} have the same normalized spelling.",
+        "Os nomes {first} e {second} têm a mesma grafia normalizada.",
+    ),
+    ("Network error", "Erro de rede"),
+    ("No matching dictations.", "Nenhum ditado correspondente."),
+    (
+        "Only recorded-audio models can retry a saved recording.",
+        "Apenas modelos de áudio gravado podem tentar novamente uma gravação salva.",
+    ),
+    ("Other", "Outro"),
+    ("Provider error (HTTP 5xx)", "Erro do provedor (HTTP 5xx)"),
+    (
+        "Rate limited (HTTP 429)",
+        "Limite de requisições (HTTP 429)",
+    ),
+    ("Recent Dictations", "Ditados recentes"),
+    (
+        "Request rejected (HTTP 4xx)",
+        "Requisição rejeitada (HTTP 4xx)",
+    ),
+    ("Retry with", "Tentar novamente com"),
+    ("Stop", "Parar"),
+    (
+        "This recording has no audio to play.",
+        "Esta gravação não tem áudio para reproduzir.",
+    ),
+    ("Timed out", "Tempo esgotado"),
+    ("Use at most {max} names.", "Use no máximo {max} nomes."),
+    (
+        "↑  Drag Endu into the {permission} list above",
+        "↑  Arraste o Endu para a lista de {permission} acima",
+    ),
 ];

@@ -15,7 +15,7 @@ use crate::interaction_settings::SoundVolumes;
 use crate::start_cue::StartCue;
 
 const LEVELS: [f32; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
-const LABELS: [&str; 5] = ["Off", "25%", "50%", "75%", "100%"];
+const LABELS: [&str; 5] = ["0%", "25%", "50%", "75%", "100%"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SoundEvent {
@@ -39,7 +39,7 @@ impl SoundEvent {
         match self {
             Self::Start => t("Start sound"),
             Self::Stop => t("Stop sound"),
-            Self::ErrorCancel => "Error/cancel sound",
+            Self::ErrorCancel => t("Error/cancel sound"),
         }
     }
 

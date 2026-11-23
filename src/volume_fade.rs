@@ -98,9 +98,14 @@ impl<D: VolumeDevice> VolumeFade<D> {
             return;
         }
         self.active = active;
+        let to = if active { self.lowered } else { self.original };
+        if (to - self.last.volume).abs() <= f32::EPSILON {
+            self.ramp = None;
+            return;
+        }
         self.ramp = Some(Ramp {
             from: self.last.volume,
-            to: if active { self.lowered } else { self.original },
+            to,
             started: now,
         });
     }
@@ -135,6 +140,13 @@ impl<D: VolumeDevice> VolumeFade<D> {
                 self.ramp = None;
                 return;
             };
+            // A manual mute between `still_owned` and `read` transfers ownership
+            // back to the user so subsequent ticks never overwrite or restore.
+            if actual.muted != self.last.muted {
+                self.owns_volume = false;
+                self.ramp = None;
+                return;
+            }
             self.last = actual;
         }
         if progress >= 1.0 {
@@ -417,5 +429,16 @@ mod tests {
                 assert_eq!(device.borrow().volume, 0.3);
             }
         }
+    }
+
+    #[test]
+    fn deactivating_before_any_volume_change_skips_noop_ramp() {
+        let device = fake();
+        let now = Instant::now();
+        let mut fade = VolumeFade::new(Fake(device.clone()), now).unwrap();
+        assert!(fade.is_animating());
+        // Before the first tick writes anything, volume is still at `original`.
+        fade.set_active(false, now);
+        assert!(!fade.is_animating());
     }
 }

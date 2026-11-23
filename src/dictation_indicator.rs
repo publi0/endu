@@ -469,10 +469,16 @@ struct MetalGpu {
     command_queue: CommandQueue,
     layer: MetalLayer,
     pipeline: RenderPipelineState,
+    viewport: Option<(f32, f32)>,
 }
 
 impl MetalGpu {
-    fn set_viewport(&self, scale: f32, size_factor: f32) {
+    fn set_viewport(&mut self, scale: f32, size_factor: f32) {
+        let next = (scale, size_factor);
+        if self.viewport == Some(next) {
+            return;
+        }
+        self.viewport = Some(next);
         self.layer.set_contents_scale(f64::from(scale));
         self.layer.set_drawable_size(CGSize::new(
             f64::from(WINDOW_WIDTH * scale * size_factor),
@@ -565,6 +571,7 @@ impl SharedRenderer {
     fn handle(&self, event: DictationIndicatorEvent) {
         let mut renderer = self.renderer.lock().unwrap();
         renderer.handle(event);
+        renderer.state_generation = renderer.state_generation.wrapping_add(1);
         self.publish_notice(&renderer);
         let has_work = renderer.capture_phase.is_some() || !renderer.jobs.is_empty();
         self.live_work.store(has_work, Ordering::Release);
@@ -580,7 +587,7 @@ impl SharedRenderer {
         if let Ok(mut renderer) = self.renderer.try_lock() {
             renderer.set_viewport(scale, size_factor);
         }
-        if let Ok(gpu) = self.gpu.try_lock() {
+        if let Ok(mut gpu) = self.gpu.try_lock() {
             gpu.set_viewport(scale, size_factor);
         }
     }
@@ -589,17 +596,20 @@ impl SharedRenderer {
         if !self.active.load(Ordering::Acquire) {
             return;
         }
-        let (uniforms, keep_rendering) = {
+        let ((uniforms, keep_rendering), generation) = {
             let mut renderer = self.renderer.lock().unwrap();
             let step = renderer.step_frame(Instant::now());
             self.publish_notice(&renderer);
-            step
+            (step, renderer.state_generation)
         };
         if let Ok(gpu) = self.gpu.lock() {
             gpu.draw_with(&uniforms, |layer| layer.next_drawable());
         }
         if !keep_rendering {
-            self.active.store(false, Ordering::Release);
+            let renderer = self.renderer.lock().unwrap();
+            if renderer.state_generation == generation && !renderer.should_be_active() {
+                self.active.store(false, Ordering::Release);
+            }
         }
     }
 
@@ -750,6 +760,7 @@ fn recording_width(average: f32) -> f32 {
 
 struct MetalRenderer {
     gpu: Option<MetalGpu>,
+    state_generation: u64,
     phase: Phase,
     capture_phase: Option<CapturePhase>,
     preparing: f32,
@@ -839,7 +850,9 @@ impl MetalRenderer {
                 command_queue: device.new_command_queue(),
                 layer,
                 pipeline,
+                viewport: None,
             }),
+            state_generation: 0,
             phase: Phase::Hidden,
             capture_phase: None,
             preparing: 0.0,
@@ -1124,7 +1137,7 @@ impl MetalRenderer {
         }
         self.scale = scale;
         self.size_factor = size_factor;
-        if let Some(gpu) = &self.gpu {
+        if let Some(gpu) = &mut self.gpu {
             gpu.set_viewport(scale, size_factor);
         }
     }

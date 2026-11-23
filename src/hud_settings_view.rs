@@ -508,9 +508,8 @@ impl HudSettingsView {
                 .shadow_lg()
                 .occlude()
                 .on_key_down(cx.listener(Self::monitor_keys))
-                .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                     this.monitor_open = false;
-                    this.monitor_picker.trigger.focus(window);
                     cx.notify();
                 }))
                 .child(

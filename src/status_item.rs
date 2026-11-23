@@ -295,7 +295,7 @@ impl IconImages {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatusItemAction {
     OpenSettings,
     OpenMicrophone,
@@ -306,6 +306,9 @@ pub enum StatusItemAction {
     OpenHistory,
     OpenStatistics,
     PasteLast,
+    SetLanguage(String),
+    SetMicrophone(Option<String>),
+    CopyRecentHistory(u64),
     RestartToUpdate,
     Quit,
 }
@@ -369,6 +372,62 @@ objc2::define_class!(
             send_action(&self.ivars().actions, StatusItemAction::PasteLast);
         }
 
+        #[unsafe(method(selectLanguage:))]
+        fn select_language(&self, sender: &AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            if let Ok(index) = usize::try_from(tag)
+                && let Some((code, _)) = crate::openrouter::LANGUAGES.get(index)
+            {
+                send_action(
+                    &self.ivars().actions,
+                    StatusItemAction::SetLanguage((*code).to_owned()),
+                );
+            }
+        }
+
+        #[unsafe(method(selectMicrophone:))]
+        fn select_microphone(&self, sender: &AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            let device = if tag < 0 {
+                Some(None)
+            } else {
+                usize::try_from(tag).ok().and_then(|index| {
+                    STATUS_ITEM.with(|controller| {
+                        controller
+                            .borrow()
+                            .as_ref()
+                            .and_then(|controller| controller.microphone_names.get(index).cloned())
+                            .map(Some)
+                    })
+                })
+            };
+            if let Some(device) = device {
+                send_action(
+                    &self.ivars().actions,
+                    StatusItemAction::SetMicrophone(device),
+                );
+            }
+        }
+
+        #[unsafe(method(copyRecentHistory:))]
+        fn copy_recent_history(&self, sender: &AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            let id = usize::try_from(tag).ok().and_then(|index| {
+                STATUS_ITEM.with(|controller| {
+                    controller
+                        .borrow()
+                        .as_ref()
+                        .and_then(|controller| controller.recent_ids.get(index).copied())
+                })
+            });
+            if let Some(id) = id {
+                send_action(
+                    &self.ivars().actions,
+                    StatusItemAction::CopyRecentHistory(id),
+                );
+            }
+        }
+
         #[unsafe(method(restartToUpdate:))]
         fn restart_to_update(&self, _sender: &AnyObject) {
             send_action(&self.ivars().actions, StatusItemAction::RestartToUpdate);
@@ -399,10 +458,19 @@ struct StatusItemController {
     item: Retained<NSStatusItem>,
     status_line: Retained<NSMenuItem>,
     permission_item: Retained<NSMenuItem>,
+    recovery_item: Retained<NSMenuItem>,
     paste_item: Retained<NSMenuItem>,
+    recent_item: Retained<NSMenuItem>,
+    recent_menu: Retained<NSMenu>,
+    language_menu: Retained<NSMenu>,
+    microphone_menu: Retained<NSMenu>,
     update_item: Retained<NSMenuItem>,
     /// Fixed rows and their English keys, retitled before the menu opens.
     localized: Vec<(Retained<NSMenuItem>, &'static str)>,
+    history: Option<crate::history::History>,
+    recovery: Option<crate::recording_recovery::RecordingRecovery>,
+    recent_ids: Vec<u64>,
+    microphone_names: Vec<String>,
     images: IconImages,
     activity: IconActivity,
     phase: IconPhase,
@@ -413,7 +481,7 @@ struct StatusItemController {
     ready_to_paste: bool,
     update_version: Option<String>,
     _menu: Retained<NSMenu>,
-    _target: Retained<StatusItemTarget>,
+    target: Retained<StatusItemTarget>,
 }
 
 impl StatusItemController {
@@ -484,7 +552,7 @@ thread_local! {
 pub fn install() -> Result<Receiver<StatusItemAction>> {
     let mtm =
         MainThreadMarker::new().ok_or_else(|| eyre!("status item requires the main thread"))?;
-    let (actions, receiver) = sync_channel(8);
+    let (actions, receiver) = sync_channel(16);
     let images = IconImages::new()?;
     let target = StatusItemTarget::new(actions, mtm);
     let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Endu"));
@@ -505,6 +573,14 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
     );
     permission_item.setHidden(true);
     localized.push((permission_item.clone(), "Grant Permissions…"));
+    let recovery_item = add_item(
+        &menu,
+        &target,
+        "1 failed recording to recover…",
+        sel!(openHistory:),
+        mtm,
+    );
+    recovery_item.setHidden(true);
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     let paste_item = add_item(
         &menu,
@@ -513,6 +589,28 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
         sel!(pasteLast:),
         mtm,
     );
+    let recent_menu = NSMenu::initWithTitle(
+        NSMenu::alloc(mtm),
+        &NSString::from_str(t("Recent Dictations")),
+    );
+    let recent_item = add_item(&menu, &target, "Recent Dictations", sel!(openHistory:), mtm);
+    unsafe { recent_item.setAction(None) };
+    recent_item.setSubmenu(Some(&recent_menu));
+    recent_item.setHidden(true);
+    localized.push((recent_item.clone(), "Recent Dictations"));
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    let language_menu =
+        NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str(t("Language")));
+    let language_item = add_item(&menu, &target, "Language", sel!(openModels:), mtm);
+    unsafe { language_item.setAction(None) };
+    language_item.setSubmenu(Some(&language_menu));
+    localized.push((language_item, "Language"));
+    let microphone_menu =
+        NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str(t("Microphone")));
+    let microphone_item = add_item(&menu, &target, "Microphone", sel!(openMicrophone:), mtm);
+    unsafe { microphone_item.setAction(None) };
+    microphone_item.setSubmenu(Some(&microphone_menu));
+    localized.push((microphone_item, "Microphone"));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     for (title, action) in [
         ("History", sel!(openHistory:)),
@@ -565,9 +663,18 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
             item,
             status_line,
             permission_item,
+            recovery_item,
             paste_item,
+            recent_item,
+            recent_menu,
+            language_menu,
+            microphone_menu,
             update_item,
             localized,
+            history: None,
+            recovery: None,
+            recent_ids: Vec::new(),
+            microphone_names: Vec::new(),
             images,
             activity: IconActivity::default(),
             phase: IconPhase::Idle,
@@ -578,10 +685,24 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
             ready_to_paste: false,
             update_version: None,
             _menu: menu,
-            _target: target,
+            target,
         });
     });
     Ok(receiver)
+}
+
+/// Attaches the live History and RecordingRecovery stores so the menu bar can
+/// lazily surface recent dictations and pending recoveries when opened.
+pub fn set_stores(
+    history: Option<crate::history::History>,
+    recovery: Option<crate::recording_recovery::RecordingRecovery>,
+) {
+    STATUS_ITEM.with(|controller| {
+        if let Some(controller) = controller.borrow_mut().as_mut() {
+            controller.history = history;
+            controller.recovery = recovery;
+        }
+    });
 }
 
 fn add_item(
@@ -672,15 +793,76 @@ pub fn set_ready_to_paste(ready: bool) {
 /// Status menus do not handle key equivalents globally, so the shortcut only
 /// labels its item; the listener still owns the shortcut itself. Permission
 /// checks are preflight queries and never resolve provider keys.
+fn add_dynamic_item(
+    menu: &NSMenu,
+    target: &StatusItemTarget,
+    title: &str,
+    action: Sel,
+    tag: isize,
+    checked: bool,
+    mtm: MainThreadMarker,
+) -> Retained<NSMenuItem> {
+    let item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str(title),
+            Some(action),
+            &NSString::new(),
+        )
+    };
+    unsafe { item.setTarget(Some(target)) };
+    item.setTag(tag);
+    item.setState(if checked { 1 } else { 0 });
+    menu.addItem(&item);
+    item
+}
+
+fn recovery_menu_label(count: usize) -> String {
+    if count == 1 {
+        t("1 failed recording to recover…").to_owned()
+    } else {
+        tf!("{count} failed recordings to recover…", count = count)
+    }
+}
+
+fn recent_menu_label(text: &str, application: Option<&str>) -> String {
+    const MAX_PREVIEW_CHARS: usize = 44;
+    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview: String = collapsed.chars().take(MAX_PREVIEW_CHARS).collect();
+    if collapsed.chars().count() > MAX_PREVIEW_CHARS {
+        preview.push('…');
+    }
+    match application.map(str::trim).filter(|app| !app.is_empty()) {
+        Some(app) => format!("{preview} · {app}"),
+        None => preview,
+    }
+}
+
 fn refresh_menu() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
     let permissions_missing =
         !crate::onboarding::permission_warnings(crate::onboarding::status_with_api_key(true))
             .is_empty();
     let dictation = crate::app_settings::dictation_binding()
         .filter(|binding| !binding.is_empty())
         .map(|binding| binding.keycaps().concat());
+    let active_language = crate::openrouter::load_config()
+        .ok()
+        .map(|config| {
+            config.transcription.models.first().map_or_else(
+                || config.transcription.language.clone(),
+                |primary| crate::providers::options(&config, primary).language,
+            )
+        })
+        .unwrap_or_else(|| crate::openrouter::AUTO_LANGUAGE.to_owned());
+    let saved_microphone = crate::app_settings::AppSettings::load()
+        .ok()
+        .and_then(|settings| settings.microphone);
+    let microphones = crate::audio::input_device_names().unwrap_or_default();
     STATUS_ITEM.with(|controller| {
-        if let Some(controller) = controller.borrow().as_ref() {
+        if let Some(controller) = controller.borrow_mut().as_mut() {
             controller
                 .status_line
                 .setTitle(&NSString::from_str(&status_headline(
@@ -701,6 +883,90 @@ fn refresh_menu() {
                     t("Paste Last Dictation")
                 }));
             controller.permission_item.setHidden(!permissions_missing);
+
+            // Pending Recording Recovery alert row.
+            let pending_recovery = controller.recovery.as_ref().map_or(0, |store| {
+                store
+                    .entries("")
+                    .into_iter()
+                    .filter(|entry| {
+                        entry.status != crate::recording_recovery::RecoveryStatus::Recovered
+                    })
+                    .count()
+            });
+            controller.recovery_item.setHidden(pending_recovery == 0);
+            if pending_recovery > 0 {
+                controller
+                    .recovery_item
+                    .setTitle(&NSString::from_str(&recovery_menu_label(pending_recovery)));
+            }
+
+            // Recent dictations submenu (copy-only, up to 5 newest entries).
+            controller.recent_menu.removeAllItems();
+            controller.recent_ids.clear();
+            let recent_entries: Vec<_> = controller
+                .history
+                .as_ref()
+                .map(|history| history.search("").into_iter().take(5).collect())
+                .unwrap_or_default();
+            controller.recent_item.setHidden(recent_entries.is_empty());
+            for (index, entry) in recent_entries.into_iter().enumerate() {
+                let label = recent_menu_label(&entry.text, entry.application.as_deref());
+                controller.recent_ids.push(entry.id);
+                add_dynamic_item(
+                    &controller.recent_menu,
+                    &controller.target,
+                    &label,
+                    sel!(copyRecentHistory:),
+                    index as isize,
+                    false,
+                    mtm,
+                );
+            }
+
+            // Spoken language quick-switcher submenu.
+            controller.language_menu.removeAllItems();
+            for (index, (code, label)) in crate::openrouter::LANGUAGES.iter().enumerate() {
+                add_dynamic_item(
+                    &controller.language_menu,
+                    &controller.target,
+                    t(label),
+                    sel!(selectLanguage:),
+                    index as isize,
+                    *code == active_language,
+                    mtm,
+                );
+            }
+
+            // Microphone quick-switcher submenu (applied between clips).
+            controller.microphone_menu.removeAllItems();
+            controller.microphone_names = microphones;
+            add_dynamic_item(
+                &controller.microphone_menu,
+                &controller.target,
+                t("Automatic"),
+                sel!(selectMicrophone:),
+                -1,
+                saved_microphone.is_none(),
+                mtm,
+            );
+            if !controller.microphone_names.is_empty() {
+                controller
+                    .microphone_menu
+                    .addItem(&NSMenuItem::separatorItem(mtm));
+            }
+            for (index, name) in controller.microphone_names.iter().enumerate() {
+                add_dynamic_item(
+                    &controller.microphone_menu,
+                    &controller.target,
+                    name,
+                    sel!(selectMicrophone:),
+                    index as isize,
+                    saved_microphone.as_deref() == Some(name.as_str()),
+                    mtm,
+                );
+            }
+
             let (key, modifiers) =
                 paste_last_key_equivalent(crate::app_settings::paste_last_binding().as_ref())
                     .unwrap_or_else(|| (String::new(), NSEventModifierFlags::empty()));
@@ -1024,5 +1290,19 @@ mod tests {
                 "{differing} pixels differ"
             );
         });
+    }
+
+    #[test]
+    fn menu_labels_format_recovery_counts_and_truncate_recent_dictations() {
+        assert_eq!(recovery_menu_label(1), "1 failed recording to recover…");
+        assert_eq!(recovery_menu_label(3), "3 failed recordings to recover…");
+        assert_eq!(
+            recent_menu_label("hello\n  world", Some("Notes")),
+            "hello world · Notes"
+        );
+        let long = "a".repeat(60);
+        let formatted = recent_menu_label(&long, None);
+        assert!(formatted.ends_with('…'));
+        assert_eq!(formatted.chars().count(), 45);
     }
 }

@@ -68,26 +68,6 @@ impl VocabularyView {
             .iter()
             .map(|term| (term.clone(), cx.focus_handle().tab_stop(true)))
             .collect();
-        if !preview {
-            cx.spawn(async move |weak, cx| {
-                loop {
-                    gpui::Timer::after(Duration::from_secs(1)).await;
-                    let rows = crate::openrouter::vocabulary_support::status();
-                    if weak
-                        .update(cx, |this, cx| {
-                            if this.support != rows {
-                                this.support = rows;
-                                cx.notify();
-                            }
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            })
-            .detach();
-        }
         Self {
             remote: false,
             models: Vec::new(),
@@ -110,11 +90,44 @@ impl VocabularyView {
     pub fn for_models(preferences: Vocabulary, preview: bool, cx: &mut Context<Self>) -> Self {
         let mut view = Self::new(preferences, preview, cx);
         view.remote = true;
+        if !preview {
+            view.support = crate::openrouter::vocabulary_support::status();
+            view.poll_support_while_running(cx);
+        }
         view
+    }
+
+    fn poll_support_while_running(&self, cx: &mut Context<Self>) {
+        if self.preview || !self.remote || !crate::openrouter::vocabulary_support::is_running() {
+            return;
+        }
+        cx.spawn(async move |weak, cx| {
+            loop {
+                gpui::Timer::after(Duration::from_millis(500)).await;
+                let rows = crate::openrouter::vocabulary_support::status();
+                let running = crate::openrouter::vocabulary_support::is_running();
+                let alive = weak
+                    .update(cx, |this, cx| {
+                        if this.support != rows {
+                            this.support = rows;
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                if !alive || !running {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     pub fn set_models(&mut self, config: &crate::openrouter::Config, cx: &mut Context<Self>) {
         self.models.clone_from(&config.transcription.models);
+        if self.remote && !self.preview {
+            self.support = crate::openrouter::vocabulary_support::status();
+            self.poll_support_while_running(cx);
+        }
         cx.notify();
     }
 
@@ -232,15 +245,14 @@ impl VocabularyView {
         if error.is_none() && (accepted_draft || submitted.is_none()) {
             self.names.update(cx, |input, cx| input.set_text("", cx));
         }
+        let mut existing: std::collections::HashMap<String, FocusHandle> =
+            self.chips.drain(..).collect();
         self.chips = preferences
             .terms
             .iter()
             .map(|term| {
-                let focus = self
-                    .chips
-                    .iter()
-                    .find(|(old, _)| old == term)
-                    .map(|(_, focus)| focus.clone())
+                let focus = existing
+                    .remove(term)
                     .unwrap_or_else(|| cx.focus_handle().tab_stop(true));
                 (term.clone(), focus)
             })
@@ -547,6 +559,7 @@ impl VocabularyView {
         } else {
             crate::openrouter::vocabulary_support::schedule(true);
             self.support = crate::openrouter::vocabulary_support::status();
+            self.poll_support_while_running(cx);
         }
         cx.notify();
     }
@@ -637,7 +650,7 @@ impl Render for VocabularyView {
                 .children(
                     self.support
                         .iter()
-                        .filter(|(model, _)| self.models.contains(model))
+                        .filter(|(model, _)| self.preview || self.models.contains(model))
                         .map(|(model, status)| {
                             div()
                                 .mt_2()

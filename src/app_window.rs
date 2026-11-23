@@ -62,7 +62,6 @@ const WINDOW_HEIGHT: f32 = 640.0;
 /// exported settings file. Its size is fixed.
 const WINDOW_FRAME_KEY: &str = "HexMainWindowFrame";
 const HOTKEY_MIN_WIDTH: f32 = 148.0;
-const HOTKEY_SIDE_SELECTOR_WIDTH: f32 = 150.0;
 const PERMISSION_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How often the sidebar footer re-reads the installed bundle version.
@@ -634,7 +633,11 @@ pub struct AppWindow {
     recovery_error: Option<(String, String)>,
     /// A Retry that copies its recovered text once the worker finishes.
     recovery_copy_pending: Option<String>,
-    recovery_action_focus: [FocusHandle; 3],
+    recovery_playback: Option<crate::recording_recovery::RecoveryPlayback>,
+    recovery_retry_model: Option<String>,
+    recovery_model_picker_open: bool,
+    recovery_model_picker: PickerState,
+    recovery_action_focus: [FocusHandle; 4],
     selected_history: Option<u64>,
     /// The entry last opened, highlighted in the list after going back.
     history_last_opened: Option<HistoryItem>,
@@ -676,7 +679,8 @@ impl AppWindow {
                     let changed = window.poll_setup(false)
                         | window.poll_login_item()
                         | window.poll_history(cx)
-                        | window.poll_microphone();
+                        | window.poll_microphone()
+                        | window.poll_update();
                     if changed {
                         cx.notify();
                     }
@@ -1202,6 +1206,10 @@ impl AppWindow {
             recovery_delete_armed: false,
             recovery_error: None,
             recovery_copy_pending: None,
+            recovery_playback: None,
+            recovery_retry_model: None,
+            recovery_model_picker_open: false,
+            recovery_model_picker: PickerState::new(cx),
             recovery_action_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             selected_history: None,
             history_last_opened: None,
@@ -1265,6 +1273,11 @@ impl AppWindow {
         if pane != Pane::History {
             // Copying long after leaving History would surprise; Copy remains.
             self.recovery_copy_pending = None;
+            self.stop_recovery_playback();
+            self.recovery_model_picker_open = false;
+            self.history_clear_armed = false;
+            self.history_row_delete_armed = None;
+            self.recovery_delete_armed = false;
         }
         if self.pane != pane {
             crate::desktop_ui::note_navigation();
@@ -1298,6 +1311,47 @@ impl AppWindow {
 
     pub(crate) fn show_settings(&mut self, cx: &mut Context<Self>) {
         self.select_pane(Pane::Settings, cx);
+    }
+
+    pub(crate) fn show_update_error(&mut self, error: String, cx: &mut Context<Self>) {
+        self.update_error = Some(error);
+        self.update_restarting = false;
+        self.select_pane(Pane::Settings, cx);
+    }
+
+    pub(crate) fn sync_external_microphone(
+        &mut self,
+        device: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.microphone = device;
+        self.refresh_microphone_description();
+        cx.notify();
+    }
+
+    pub(crate) fn sync_external_openrouter_config(
+        &mut self,
+        config: crate::openrouter::Config,
+        cx: &mut Context<Self>,
+    ) {
+        self.openrouter_settings.update(cx, |view, cx| {
+            view.apply_imported_config(config.clone(), cx)
+        });
+        self.model_options
+            .update(cx, |view, cx| view.apply_imported_config(config, cx));
+        cx.notify();
+    }
+
+    fn poll_update(&mut self) -> bool {
+        if self.preview || self.update_check_at.is_some_and(|at| Instant::now() < at) {
+            return false;
+        }
+        let pending = crate::update_check::pending_update();
+        crate::status_item::set_pending_update(pending.clone());
+        let changed = self.pending_update != pending;
+        self.pending_update = pending;
+        self.update_check_at = Some(Instant::now() + UPDATE_CHECK_INTERVAL);
+        changed
     }
 
     pub(crate) fn show_microphone(&mut self, cx: &mut Context<Self>) {
@@ -1725,14 +1779,6 @@ impl AppWindow {
     /// The sidebar footer shows the running version, or a restart action when
     /// Homebrew has placed a newer bundle on disk.
     fn render_update_footer(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        // Reading the bundle plist is cheap but not free; re-check on a slow
-        // cadence instead of every render frame.
-        if self.update_check_at.is_none_or(|at| Instant::now() >= at) {
-            let pending = crate::update_check::pending_update();
-            crate::status_item::set_pending_update(pending.clone());
-            self.pending_update = pending;
-            self.update_check_at = Some(Instant::now() + UPDATE_CHECK_INTERVAL);
-        }
         let Some(version) = self.pending_update.clone() else {
             return div()
                 .flex_none()

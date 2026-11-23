@@ -168,19 +168,8 @@ fn save() {
         .entries
         .clone();
     let persist = || -> color_eyre::Result<()> {
-        use std::io::Write;
-        #[cfg(unix)]
-        use std::os::unix::fs::OpenOptionsExt;
         let path = cache_path()?;
-        fs::create_dir_all(path.parent().expect("support directory"))?;
-        let temporary = path.with_extension("tmp");
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options.open(&temporary)?;
-        file.write_all(&serde_json::to_vec(&entries)?)?;
-        fs::rename(temporary, path)?;
+        crate::app_paths::write_private_file_atomic(&path, &serde_json::to_vec(&entries)?)?;
         Ok(())
     };
     if persist().is_err() {
@@ -190,6 +179,10 @@ fn save() {
 
 pub fn status() -> Vec<(String, String)> {
     STATE.lock().unwrap_or_else(|e| e.into_inner()).rows.clone()
+}
+
+pub fn is_running() -> bool {
+    STATE.lock().unwrap_or_else(|e| e.into_inner()).running
 }
 
 static VALIDATE_LOCK: Mutex<()> = Mutex::new(());

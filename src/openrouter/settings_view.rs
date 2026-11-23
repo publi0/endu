@@ -189,6 +189,11 @@ impl OpenRouterSettings {
         self.catalog.models()
     }
 
+    /// Cached providers that currently have a configured key (no Keychain I/O).
+    pub fn available_providers_snapshot(&self) -> Vec<Provider> {
+        self.available_providers.clone()
+    }
+
     #[cfg(test)]
     fn new(key_only: bool, preview: bool, cx: &mut Context<Self>) -> Self {
         Self::with_mode(

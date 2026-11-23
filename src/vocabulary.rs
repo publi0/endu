@@ -35,7 +35,7 @@ impl Default for Vocabulary {
 impl Vocabulary {
     pub fn validate(&self) -> Result<(), String> {
         if self.terms.len() > MAX_TERMS {
-            return Err(format!("Use at most {MAX_TERMS} names."));
+            return Err(tf!("Use at most {max} names.", max = MAX_TERMS));
         }
         let mut seen = BTreeMap::new();
         for (index, term) in self.terms.iter().enumerate() {
@@ -48,16 +48,16 @@ impl Vocabulary {
                 || normalize(term).is_empty()
                 || tokens(term).len() > MAX_WORDS
             {
-                return Err(format!(
-                    "Name {} must be a short name or phrase, without control characters, URLs or paths.",
-                    index + 1
+                return Err(tf!(
+                    "Name {index} must be a short name or phrase, without control characters, URLs or paths.",
+                    index = index + 1
                 ));
             }
             if let Some(previous) = seen.insert(normalize(term), index) {
-                return Err(format!(
-                    "Names {} and {} have the same normalized spelling.",
-                    previous + 1,
-                    index + 1
+                return Err(tf!(
+                    "Names {first} and {second} have the same normalized spelling.",
+                    first = previous + 1,
+                    second = index + 1
                 ));
             }
         }
@@ -188,6 +188,7 @@ impl Snapshot {
                 {
                     for (term, candidate) in self.0.normalized.iter().enumerate() {
                         if candidate.len() >= 7
+                            && candidate.len().abs_diff(chars.len()) <= 1
                             && chars
                                 .iter()
                                 .filter(|c| c.is_numeric())
@@ -197,6 +198,7 @@ impl Snapshot {
                             let matched = (end_index, end, term);
                             if fuzzy.is_some_and(|previous| previous != matched) {
                                 ambiguous = true;
+                                break;
                             }
                             fuzzy = Some(matched);
                         }
@@ -264,7 +266,11 @@ fn protected_ranges(text: &str) -> Vec<Range<usize>> {
     let mut result = Vec::new();
     let mut offset = 0;
     for piece in text.split_inclusive(char::is_whitespace) {
-        if piece.contains(['/', '\\', '@', ':']) {
+        let trimmed = piece.trim_end_matches(char::is_whitespace);
+        let has_internal_colon = trimmed
+            .match_indices(':')
+            .any(|(pos, _)| pos + 1 < trimmed.len());
+        if trimmed.contains(['/', '\\', '@']) || has_internal_colon {
             result.push(offset..offset + piece.len());
         }
         offset += piece.len();
@@ -417,6 +423,23 @@ mod tests {
         source.terms[0] = "OtherProject".into();
         assert_eq!(saved.restore("nimbusfiles").text, "nimbus-files");
         assert_eq!(Snapshot::default().restore(" A\nB ").text, " A\nB ");
+    }
+
+    #[test]
+    fn trailing_colon_does_not_suppress_name_restoration_while_urls_stay_protected() {
+        let vocab = snapshot(&["OpenRouter", "Claude Code"], false);
+        assert_eq!(
+            vocab
+                .restore("openrouter: works and claude code: ready")
+                .text,
+            "OpenRouter: works and Claude Code: ready"
+        );
+        assert_eq!(
+            vocab
+                .restore("visit https://openrouter.ai and key:openrouter")
+                .text,
+            "visit https://openrouter.ai and key:openrouter"
+        );
     }
     #[test]
     fn validation_bounds_names_and_rejects_ambiguous_canonical_forms() {

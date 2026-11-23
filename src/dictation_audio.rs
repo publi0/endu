@@ -728,7 +728,11 @@ impl Owner {
                 self.release_while_idle = release;
             }
             Command::RetryMicrophone => self.input.retry_now(),
-            Command::LidChanged => {}
+            Command::LidChanged => {
+                if self.input.is_recovering() {
+                    self.input.retry_now();
+                }
+            }
             Command::InvalidateRecognition { reply } => {
                 let _ = reply.send(self.next_recognition_generation());
             }

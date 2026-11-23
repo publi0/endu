@@ -1,7 +1,7 @@
 //! The shared HTTP agent for recorded uploads and their warm-up. Pooled
 //! sockets that may have crossed a sleep or a long idle are never reused.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -29,8 +29,9 @@ struct PoolState {
     /// Wall and monotonic time of the last request that returned a socket.
     last_use: Option<(SystemTime, Instant)>,
     /// Origins (scheme and authority) that returned a socket to this agent's
-    /// pool. A request to any other origin necessarily opens a new connection.
-    pooled: HashSet<String>,
+    /// pool and when each origin last did so, so per-origin idle expiry stays
+    /// accurate when alternating between providers.
+    pooled: HashMap<String, (SystemTime, Instant)>,
 }
 
 /// The agent one request uses, and whether it may be handed a pooled socket.
@@ -84,10 +85,21 @@ impl HttpPool {
             state.last_use = None;
             state.pooled.clear();
         }
+        let pooled = origin.is_some_and(|origin| {
+            let fresh = state
+                .pooled
+                .get(origin)
+                .copied()
+                .is_some_and(|last| !pool_suspect(Some(last), wall, now));
+            if !fresh {
+                state.pooled.remove(origin);
+            }
+            fresh
+        });
         Checkout {
             agent: state.agent.clone(),
             generation: state.generation,
-            pooled: origin.is_some_and(|origin| state.pooled.contains(origin)),
+            pooled,
         }
     }
 
@@ -97,9 +109,10 @@ impl HttpPool {
         if state.generation != checkout.generation {
             return;
         }
-        state.last_use = Some((SystemTime::now(), Instant::now()));
+        let stamp = (SystemTime::now(), Instant::now());
+        state.last_use = Some(stamp);
         if let Some(origin) = origin {
-            state.pooled.insert(origin.to_owned());
+            state.pooled.insert(origin.to_owned(), stamp);
         }
     }
 }

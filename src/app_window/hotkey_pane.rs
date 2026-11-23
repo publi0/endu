@@ -277,54 +277,59 @@ impl AppWindow {
         side_animation.set_enabled(side.is_some());
         let side_position = side_animation.render_position(window).clamp(0.0, 1.0);
         let selected = side.unwrap_or(ModifierSide::Either);
-        let side_widths = [44.0, 56.0, 46.0];
+        let side_labels = [
+            (t("Left"), ModifierSide::Left),
+            (t("Either"), ModifierSide::Either),
+            (t("Right"), ModifierSide::Right),
+        ];
+        let side_widths = [
+            (control_text_width(window, side_labels[0].0) + 16.0).max(44.0),
+            (control_text_width(window, side_labels[1].0) + 16.0).max(56.0),
+            (control_text_width(window, side_labels[2].0) + 16.0).max(46.0),
+        ];
+        let side_total_width: f32 = side_widths.iter().sum::<f32>() + 4.0;
         let side_selection_spring =
             &mut self.hotkey_side_selection_springs[hotkey_kind_index(kind)];
         side_selection_spring.set_target(hotkey_side_index(selected) as f32);
         let selection_position = side_selection_spring.render_position(window);
-        let side_selector = div()
-            .w(px(HOTKEY_SIDE_SELECTOR_WIDTH * side_position))
-            .mr(px(8.0 * side_position))
-            .flex_none()
-            .overflow_hidden()
-            .opacity(side_position)
-            .child(
-                sliding_segmented_control(selection_position, &side_widths)
-                    .w(px(HOTKEY_SIDE_SELECTOR_WIDTH))
-                    .children(
-                        [
-                            (t("Left"), ModifierSide::Left),
-                            (t("Either"), ModifierSide::Either),
-                            (t("Right"), ModifierSide::Right),
-                        ]
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, (label, side))| {
-                            let candidate = hotkey_side_binding(&self.settings, kind, side);
-                            sliding_segmented_item(side_widths[index], selected == side)
-                                .id(("hotkey-side", hotkey_kind_index(kind) * 3 + index))
-                                .when(candidate.is_none(), |item| item.opacity(0.35))
-                                .child(crate::desktop_ui::control_label(label))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    let Some(candidate) =
-                                        hotkey_side_binding(&this.settings, kind, side)
-                                    else {
-                                        return;
-                                    };
-                                    if this.update_settings(
-                                        hotkey_feedback_scope(kind),
-                                        cx,
-                                        |settings| {
-                                            set_hotkey_binding(settings, kind, candidate);
-                                        },
-                                    ) {
-                                        this.hotkey_side_selection_springs[hotkey_kind_index(kind)]
+        let side_selector =
+            div()
+                .w(px(side_total_width * side_position))
+                .mr(px(8.0 * side_position))
+                .flex_none()
+                .overflow_hidden()
+                .opacity(side_position)
+                .child(
+                    sliding_segmented_control(selection_position, &side_widths)
+                        .w(px(side_total_width))
+                        .children(side_labels.into_iter().enumerate().map(
+                            |(index, (label, side))| {
+                                let candidate = hotkey_side_binding(&self.settings, kind, side);
+                                sliding_segmented_item(side_widths[index], selected == side)
+                                    .id(("hotkey-side", hotkey_kind_index(kind) * 3 + index))
+                                    .when(candidate.is_none(), |item| item.opacity(0.35))
+                                    .child(crate::desktop_ui::control_label(label))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let Some(candidate) =
+                                            hotkey_side_binding(&this.settings, kind, side)
+                                        else {
+                                            return;
+                                        };
+                                        if this.update_settings(
+                                            hotkey_feedback_scope(kind),
+                                            cx,
+                                            |settings| {
+                                                set_hotkey_binding(settings, kind, candidate);
+                                            },
+                                        ) {
+                                            this.hotkey_side_selection_springs
+                                                [hotkey_kind_index(kind)]
                                             .set_target(index as f32);
-                                    }
-                                }))
-                        }),
-                    ),
-            );
+                                        }
+                                    }))
+                            },
+                        )),
+                );
         div()
             .flex()
             .items_center()
@@ -349,6 +354,15 @@ impl AppWindow {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if can_reset {
                             this.reset_hotkey_binding(kind, cx);
+                        }
+                    }))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if can_reset
+                            && matches!(event.keystroke.key.as_str(), "enter" | "space")
+                            && !event.is_held
+                        {
+                            this.reset_hotkey_binding(kind, cx);
+                            cx.stop_propagation();
                         }
                     })),
             )

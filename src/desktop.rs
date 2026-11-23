@@ -35,9 +35,8 @@ static UI_WAKE: Doorbell = Doorbell::new();
 const ACTIVE_UI_TURN: Duration = Duration::from_millis(16);
 
 /// At rest, the UI loop sleeps until an indicator event, a menu action, a
-/// quit request or this fallback, which bounds a Control-C shutdown and the
-/// once-a-minute update check.
-const IDLE_UI_TURN: Duration = Duration::from_secs(1);
+/// quit request, Ctrl-C, or the once-a-minute update check.
+const IDLE_UI_TURN: Duration = UPDATE_CHECK_INTERVAL;
 
 /// Asks the desktop loop to quit on its next tick. Safe from any thread;
 /// used by the update relaunch so `open` can hand off to the new bundle.
@@ -250,6 +249,7 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
         if let Some(appearance) = appearance {
             appearance.apply_to_application();
         }
+        let menu_recovery = recovery.clone();
         if let Some(recovery) = recovery {
             cx.set_global(recovery);
         }
@@ -262,6 +262,9 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
         } else {
             None
         };
+        if preview.is_none() && status_actions.is_some() {
+            crate::status_item::set_stores(history.clone(), menu_recovery);
+        }
         crate::app_settings::set_dock_icon_visible(crate::app_settings::dock_icon_visible(
             show_dock_icon,
             status_actions.is_some(),
@@ -507,6 +510,7 @@ async fn drive_ui(
                         }
                     }
                     DictationIndicatorEvent::Preparing | DictationIndicatorEvent::Started => {
+                        crate::recording_recovery::stop_active_playback();
                         if let Some(notice) = &mut paste_notice {
                             notice.hide();
                         }
@@ -573,6 +577,15 @@ async fn drive_ui(
                 StatusItemAction::PasteLast => {
                     let _ = ui.listener_controls.try_send(ListenerControl::PasteLast);
                 }
+                StatusItemAction::SetLanguage(code) => apply_menu_language(&ui, code, cx),
+                StatusItemAction::SetMicrophone(device) => apply_menu_microphone(&ui, device, cx),
+                StatusItemAction::CopyRecentHistory(id) => {
+                    if let Some(history) = &ui.history
+                        && let Some(entry) = history.search("").into_iter().find(|e| e.id == id)
+                    {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(entry.text));
+                    }
+                }
                 StatusItemAction::RestartToUpdate => restart_to_update(&ui, cx),
                 StatusItemAction::Quit => cx.quit(),
             });
@@ -593,6 +606,59 @@ async fn drive_ui(
 
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Updates the active primary model's spoken language from the menu bar and
+/// syncs the open preferences window if visible.
+fn apply_menu_language(ui: &Ui, code: String, cx: &mut App) {
+    if ui.preview.is_some() {
+        return;
+    }
+    match crate::openrouter::update_config(|config| {
+        let mut next = config.clone();
+        next.transcription.language = code.clone();
+        if let Some(primary) = next.transcription.models.first().cloned() {
+            crate::providers::initialize_model(&mut next, &primary, None);
+            let key = crate::providers::ModelRef::parse(&primary).key();
+            if let Some(options) = next.transcription.model_options.get_mut(&key) {
+                options.language = code.clone();
+            }
+        }
+        Ok(next)
+    }) {
+        Ok(config) => {
+            if let Some(window) = *ui.app_window.borrow() {
+                let _ = window.update(cx, |view, _, cx| {
+                    view.sync_external_openrouter_config(config, cx);
+                });
+            }
+        }
+        Err(error) => tracing::warn!(%error, "could not update spoken language from menu bar"),
+    }
+}
+
+/// Updates the saved microphone selection from the menu bar (applied between
+/// clips) and syncs the open preferences window if visible.
+fn apply_menu_microphone(ui: &Ui, device: Option<String>, cx: &mut App) {
+    if ui.preview.is_some() {
+        return;
+    }
+    let result = crate::app_settings::AppSettings::load().and_then(|mut settings| {
+        settings.microphone = device.clone();
+        settings.save()?;
+        settings.apply_runtime();
+        Ok(())
+    });
+    match result {
+        Ok(()) => {
+            if let Some(window) = *ui.app_window.borrow() {
+                let _ = window.update(cx, |view, _, cx| {
+                    view.sync_external_microphone(device, cx);
+                });
+            }
+        }
+        Err(error) => tracing::warn!(%error, "could not update microphone from menu bar"),
+    }
+}
+
 /// Commits any field being edited, then hands off to the installed bundle.
 /// When that cannot start, the window's update notice explains why.
 fn restart_to_update(ui: &Ui, cx: &mut App) {
@@ -603,7 +669,12 @@ fn restart_to_update(ui: &Ui, cx: &mut App) {
     let restarted = crate::update_check::bundle_path()
         .is_some_and(|bundle| crate::update_check::relaunch_and_quit(&bundle));
     if !restarted {
-        ui.open_pane(cx, |window, cx| window.show_settings(cx));
+        ui.open_pane(cx, |window, cx| {
+            window.show_update_error(
+                crate::i18n::t("Could not restart automatically. Quit and open Endu again.").into(),
+                cx,
+            );
+        });
     }
 }
 

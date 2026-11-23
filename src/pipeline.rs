@@ -439,8 +439,9 @@ impl DictationWorker {
             let jobs = transcription_jobs.clone();
             let output = output_jobs.clone();
             let state = state.clone();
+            let recovery = recovery.clone();
             move || {
-                run_transcription_queue(jobs, &output, &event_sender, &state, transcribe);
+                run_transcription_queue(jobs, &output, &event_sender, &state, recovery, transcribe);
             }
         });
 
@@ -645,6 +646,7 @@ fn run_transcription_worker(
         output,
         events,
         state,
+        None,
         move |samples, context, vocabulary, live, preferences, _control| {
             (
                 transcribe(samples, context, vocabulary, live, preferences),
@@ -659,6 +661,7 @@ fn run_transcription_queue(
     output: &SyncSender<OutputJob>,
     events: &WorkerEvents,
     state: &Mutex<WorkerState>,
+    recovery: Option<crate::recording_recovery::RecordingRecovery>,
     mut transcribe: impl FnMut(
         &[f32],
         &ContextSnapshot,
@@ -674,9 +677,15 @@ fn run_transcription_queue(
     prioritize_transcription_thread();
     while let Some(mut job) = jobs.pop() {
         if is_shutting_down(state) {
+            if !job.control.is_user_cancelled()
+                && let Some(recovery) = &recovery
+            {
+                let samples = job.clip.into_transcription_samples();
+                recovery.save_untranscribed(&samples, job.context.application.as_deref());
+            }
             break;
         }
-        if job.control.is_cancelled() {
+        if job.control.is_user_cancelled() {
             let _ = output.send(OutputJob::Cancelled { job_id: job.job_id });
             continue;
         }
@@ -700,7 +709,16 @@ fn run_transcription_queue(
         );
         if is_shutting_down(state) {
             if let Some(pending) = pending_cleanup {
-                pending.finish();
+                if job.control.is_user_cancelled() {
+                    pending.finish();
+                } else {
+                    let recovered_text = result.ok().and_then(|transcription| {
+                        let restored = job.vocabulary.restore(transcription.text.trim());
+                        let text = restored.text.trim().to_owned();
+                        (!text.is_empty()).then_some(text)
+                    });
+                    pending.preserve_for_shutdown(recovered_text);
+                }
             }
             break;
         }

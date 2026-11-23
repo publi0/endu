@@ -155,18 +155,32 @@ fn page(out: &mut Vec<u8>, flags: u8, granule: u64, sequence: u32, packets: &[&[
     out[start + 22..start + 26].copy_from_slice(&checksum.to_le_bytes());
 }
 
-/// The Ogg CRC-32: polynomial 0x04C11DB7, unreflected, zero initial value.
-fn crc(bytes: &[u8]) -> u32 {
-    let mut crc = 0u32;
-    for &byte in bytes {
-        crc ^= u32::from(byte) << 24;
-        for _ in 0..8 {
+/// Precomputed Ogg CRC-32 lookup table (polynomial 0x04C11DB7, unreflected).
+const OGG_CRC_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = (i as u32) << 24;
+        let mut bit = 0;
+        while bit < 8 {
             crc = if crc & 0x8000_0000 == 0 {
                 crc << 1
             } else {
                 (crc << 1) ^ 0x04C1_1DB7
             };
+            bit += 1;
         }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+/// The Ogg CRC-32: polynomial 0x04C11DB7, unreflected, zero initial value.
+fn crc(bytes: &[u8]) -> u32 {
+    let mut crc = 0u32;
+    for &byte in bytes {
+        crc = (crc << 8) ^ OGG_CRC_TABLE[((crc >> 24) as usize) ^ usize::from(byte)];
     }
     crc
 }

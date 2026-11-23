@@ -45,6 +45,8 @@ impl AppWindow {
     }
 
     pub(super) fn show_history_item(&mut self, item: HistoryItem, cx: &mut Context<Self>) {
+        self.stop_recovery_playback();
+        self.recovery_model_picker_open = false;
         (self.selected_recovery, self.selected_history) = match item {
             HistoryItem::Recovery(id) => (Some(id), None),
             HistoryItem::Dictation(id) => (None, Some(id)),
@@ -54,6 +56,117 @@ impl AppWindow {
         self.history_copied = None;
         self.history_clear_armed = false;
         self.history_row_delete_armed = None;
+        cx.notify();
+    }
+
+    pub(super) fn stop_recovery_playback(&mut self) {
+        if let Some(playback) = self.recovery_playback.take() {
+            playback.stop();
+        }
+        crate::recording_recovery::stop_active_playback();
+    }
+
+    pub(super) fn toggle_recovery_playback(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self
+            .recovery_playback
+            .as_ref()
+            .is_some_and(|playback| playback.is_playing(id))
+        {
+            self.stop_recovery_playback();
+            cx.notify();
+            return;
+        }
+        self.stop_recovery_playback();
+        let Some(store) = &self.recovery else {
+            return;
+        };
+        match store.play(id) {
+            Ok(playback) => {
+                let wait = playback.duration() + Duration::from_millis(120);
+                let playing_id = id.to_owned();
+                self.recovery_playback = Some(playback);
+                self.recovery_error = None;
+                cx.spawn(async move |this, cx| {
+                    gpui::Timer::after(wait).await;
+                    let _ = this.update(cx, |this, cx| {
+                        if this
+                            .recovery_playback
+                            .as_ref()
+                            .is_some_and(|playback| !playback.is_playing(&playing_id))
+                        {
+                            this.recovery_playback = None;
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            }
+            Err(error) => {
+                self.recovery_error = Some((id.to_owned(), error.to_string()));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Batch-capable models from currently connected providers, prefixed by
+    /// `None` ("Current models"). Uses cached key availability only.
+    pub(super) fn recovery_retry_model_choices(&self, cx: &App) -> Vec<Option<String>> {
+        let settings = self.openrouter_settings.read(cx);
+        let available = settings.available_providers_snapshot();
+        let catalog = crate::openrouter::catalog::available_catalog(settings.catalog_models());
+        let mut choices: Vec<Option<String>> = vec![None];
+        for model in catalog {
+            let parsed = crate::providers::ModelRef::parse(&model.id);
+            if available.contains(&parsed.provider)
+                && !crate::providers::is_realtime_only(&model.id)
+            {
+                choices.push(Some(model.id));
+            }
+        }
+        choices
+    }
+
+    fn toggle_recovery_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.recovery_model_picker_open {
+            self.recovery_model_picker_open = false;
+            self.recovery_model_picker.trigger.focus(window);
+        } else {
+            let choices = self.recovery_retry_model_choices(cx);
+            self.recovery_model_picker.highlight = choices
+                .iter()
+                .position(|choice| choice == &self.recovery_retry_model)
+                .unwrap_or(0);
+            self.recovery_model_picker
+                .scroll
+                .scroll_to_item(self.recovery_model_picker.highlight);
+            self.recovery_model_picker_open = true;
+            self.recovery_model_picker.menu.focus(window);
+        }
+        cx.notify();
+    }
+
+    fn recovery_model_picker_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let choices = self.recovery_retry_model_choices(cx);
+        let key = event.keystroke.key.as_str();
+        if self.recovery_model_picker.navigate(key, choices.len()) {
+        } else if matches!(key, "enter" | "space") {
+            if let Some(choice) = choices.get(self.recovery_model_picker.highlight).cloned() {
+                self.recovery_retry_model = choice;
+                self.recovery_model_picker_open = false;
+                self.recovery_model_picker.trigger.focus(window);
+            }
+        } else if matches!(key, "escape" | "tab") {
+            self.recovery_model_picker_open = false;
+            self.recovery_model_picker.close(event, window);
+        } else {
+            return;
+        }
+        cx.stop_propagation();
         cx.notify();
     }
 
@@ -174,6 +287,8 @@ impl AppWindow {
 
     /// Returns to the list, keeping its search and scroll position.
     pub(super) fn close_history_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stop_recovery_playback();
+        self.recovery_model_picker_open = false;
         if let Some(item) = self.open_history_item() {
             self.history_last_opened = Some(item);
         }
@@ -198,6 +313,7 @@ impl AppWindow {
             return false;
         };
         if self.history_retention_open
+            || self.recovery_model_picker_open
             || modifiers.control
             || modifiers.alt
             || modifiers.platform
@@ -454,15 +570,9 @@ impl AppWindow {
         let Some(entry) = self.history_entries.iter().find(|entry| entry.id == id) else {
             return;
         };
-        match arboard::Clipboard::new()
-            .and_then(|mut clipboard| clipboard.set_text(entry.text.clone()))
-        {
-            Ok(()) => {
-                self.mark_copied(HistoryItem::Dictation(id), cx);
-                self.history_error = None;
-            }
-            Err(error) => self.history_error = Some(error.to_string()),
-        }
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(entry.text.clone()));
+        self.mark_copied(HistoryItem::Dictation(id), cx);
+        self.history_error = None;
         cx.notify();
     }
 
@@ -540,9 +650,12 @@ impl AppWindow {
     }
 
     pub(super) fn retry_recovery(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.stop_recovery_playback();
+        self.recovery_model_picker_open = false;
         self.history_row_delete_armed = None;
         self.history_copied = None;
         self.recovery_copy_pending = Some(id.to_owned());
+        let model_override = self.recovery_retry_model.clone();
         if let Some(store) = &self.recovery {
             self.recovery_error = (if self.preview {
                 store.retry_with_processing(
@@ -557,7 +670,7 @@ impl AppWindow {
                     },
                 )
             } else {
-                store.retry(id)
+                store.retry_with_model(id, model_override)
             })
             .err()
             .map(|error| (id.to_owned(), error.to_string()));
@@ -690,12 +803,17 @@ impl AppWindow {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = entry.id.clone();
+        let play_id = id.clone();
         let delete_id = id.clone();
         let recovered = entry.status == RecoveryStatus::Recovered;
         let can_retry = self.can_retry_recovery(entry);
+        let playing = self
+            .recovery_playback
+            .as_ref()
+            .is_some_and(|playback| playback.is_playing(&id));
         let copied = self.history_copied.as_ref() == Some(&HistoryItem::Recovery(id.clone()));
         let copy_id = id.clone();
-        let mut actions = div().flex().flex_wrap().gap_2();
+        let mut actions = div().flex().flex_wrap().items_center().gap_2();
         if entry.text.is_some() {
             actions = actions.child(
                 header_button(if copied { t("Copied") } else { t("Copy text") })
@@ -708,6 +826,15 @@ impl AppWindow {
             );
         }
         if !recovered {
+            actions = actions.child(
+                header_button(if playing { t("Stop") } else { t("Play") })
+                    .id("recovery-play")
+                    .track_focus(&self.recovery_action_focus[3])
+                    .focus(|style| style.border_color(rgb(ACCENT)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_recovery_playback(&play_id, cx);
+                    })),
+            );
             actions = actions.child(
                 header_button(if entry.busy {
                     t("Transcribing")
@@ -742,6 +869,7 @@ impl AppWindow {
                         cx.notify();
                         return;
                     }
+                    this.stop_recovery_playback();
                     if let Some(store) = &this.recovery {
                         this.recovery_error = store
                             .delete(&delete_id)
@@ -754,6 +882,78 @@ impl AppWindow {
                 }))
             }),
         );
+        let retry_model_row = (!recovered).then(|| {
+            let choices = self.recovery_retry_model_choices(cx);
+            let catalog = self.openrouter_settings.read(cx).catalog_models().to_vec();
+            let active_label = self.recovery_retry_model.as_deref().map_or_else(
+                || t("Current models").to_owned(),
+                |model| crate::openrouter::catalog::selector_label(model, &catalog),
+            );
+            let picker_menu = self.recovery_model_picker_open.then(|| {
+                let catalog_for_labels = catalog.clone();
+                selection_picker_menu(
+                    "recovery-model-picker",
+                    &self.recovery_model_picker,
+                    choices,
+                    self.recovery_retry_model.clone(),
+                    move |choice| match choice {
+                        None => t("Current models").to_owned(),
+                        Some(model) => {
+                            crate::openrouter::catalog::selector_label(model, &catalog_for_labels)
+                        }
+                    },
+                    None,
+                    (
+                        cx.listener(|this, choice: &Option<String>, window, cx| {
+                            this.recovery_retry_model = choice.clone();
+                            this.recovery_model_picker_open = false;
+                            this.recovery_model_picker.trigger.focus(window);
+                            cx.notify();
+                        }),
+                        cx.listener(|this, _, _, cx| {
+                            this.recovery_model_picker_open = false;
+                            cx.notify();
+                        }),
+                        cx.listener(Self::recovery_model_picker_key),
+                    ),
+                )
+            });
+            div()
+                .mt_4()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(TEXT_SOFT))
+                        .child(t("Retry with")),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .flex_none()
+                        .child(
+                            disclosure_button(active_label)
+                                .id("recovery-model-trigger")
+                                .track_focus(&self.recovery_model_picker.trigger)
+                                .focus(|style| style.border_color(rgb(ACCENT)))
+                                .on_click(cx.listener(|this, event, window, cx| {
+                                    if matches!(event, gpui::ClickEvent::Mouse(_)) {
+                                        this.toggle_recovery_model_picker(window, cx);
+                                    }
+                                }))
+                                .on_key_down(cx.listener(|this, event, window, cx| {
+                                    if picker_open_key(event) {
+                                        this.toggle_recovery_model_picker(window, cx);
+                                        cx.stop_propagation();
+                                    }
+                                })),
+                        )
+                        .children(picker_menu.map(picker_popup)),
+                )
+        });
         div().id("recovery-detail").flex_1().min_h_0().overflow_y_scroll().px_6().pt_4().pb_6()
             .child(div().text_size(px(18.0)).font_weight(FontWeight::SEMIBOLD).child(entry.title()))
             .child(div().mt_2().text_size(px(11.0)).text_color(rgb(MUTED))
@@ -764,13 +964,14 @@ impl AppWindow {
                 .child(section_label(t("Failure reason")))
                 .child(div().pt_2().text_size(px(12.0)).line_height(px(18.0)).text_color(rgb(NEGATIVE)).child(message))))
             .children(entry.text.clone().map(|text| div().mt_5().text_size(px(13.0)).line_height(px(20.0)).child(text)))
+            .children(retry_model_row)
             .child(div().mt_5().child(actions))
             .children(self.recovery_error_for(&entry.id).map(|error| div().mt_3()
                 .text_size(px(12.0)).text_color(rgb(NEGATIVE)).child(error)))
             .child(div().mt_5().pt_4().border_t_1().border_color(rgb(LINE)).text_size(px(12.0)).text_color(rgb(TEXT_SOFT))
                 .child(if entry.volatile { t("This recording is only in memory. Keep Endu open until it is recovered.") }
                     else if recovered { t("Recovered text is saved locally until you delete it. The temporary audio has been removed.") }
-                    else { t("Audio is saved on this Mac until recovery or deletion. Retry & copy uses your current Models settings, saves the text here and copies it, without automatic paste.") }))
+                    else { t("Audio is saved on this Mac until recovery or deletion. Retry & copy uses your chosen model or current Models settings, saves the text here and copies it, without automatic paste.") }))
             .into_any_element()
     }
 
@@ -1000,7 +1201,11 @@ impl AppWindow {
                     && self.recovery_entries.is_empty()
                     && self.history_error.is_none()
                 {
-                    Some(t("No dictations retained yet."))
+                    Some(if self.history_search.read(cx).text().trim().is_empty() {
+                        t("No dictations retained yet.")
+                    } else {
+                        t("No matching dictations.")
+                    })
                 } else {
                     None
                 },
@@ -1122,11 +1327,37 @@ impl AppWindow {
                                             }),
                                         ),
                                     )
-                                    .child(action_button(t("Delete"), "delete").on_click(
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.delete_history_entry(id, cx)
-                                        }),
-                                    )),
+                                    .child({
+                                        let delete_armed = self.history_row_delete_armed
+                                            == Some(HistoryItem::Dictation(id));
+                                        action_button(
+                                            if delete_armed {
+                                                t("Confirm delete")
+                                            } else {
+                                                t("Delete")
+                                            },
+                                            "delete",
+                                        )
+                                        .when(delete_armed, |button| {
+                                            button
+                                                .text_color(rgb(NEGATIVE))
+                                                .border_color(rgb(NEGATIVE))
+                                        })
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                if this.history_row_delete_armed
+                                                    == Some(HistoryItem::Dictation(id))
+                                                {
+                                                    this.history_row_delete_armed = None;
+                                                    this.delete_history_entry(id, cx);
+                                                } else {
+                                                    this.history_row_delete_armed =
+                                                        Some(HistoryItem::Dictation(id));
+                                                    cx.notify();
+                                                }
+                                            }),
+                                        )
+                                    }),
                             ),
                     )
                     .child(
@@ -1255,13 +1486,9 @@ impl AppWindow {
 /// A real saved WAV and failure entry, entirely synthetic and isolated from
 /// app services. The preview Retry handler also uses a local fixture.
 pub(super) fn preview_recording_recovery() -> Option<RecordingRecovery> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT_PREVIEW: AtomicU64 = AtomicU64::new(0);
-    let directory = std::env::temp_dir().join(format!(
-        "hex-recovery-preview-{}-{}",
-        std::process::id(),
-        NEXT_PREVIEW.fetch_add(1, Ordering::Relaxed),
-    ));
+    let directory =
+        std::env::temp_dir().join(format!("hex-recovery-preview-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
     let store = RecordingRecovery::open(directory).ok()?;
     let samples: Vec<f32> = (0..294_400)
         .map(|index| (index as f32 * std::f32::consts::TAU * 220.0 / 16_000.0).sin() * 0.08)

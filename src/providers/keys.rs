@@ -27,7 +27,12 @@ pub(crate) enum KeychainRead {
     Unavailable,
 }
 
-static CACHE: LazyLock<Mutex<BTreeMap<Provider, CachedKey>>> =
+struct CacheSlot {
+    generation: u64,
+    key: Option<CachedKey>,
+}
+
+static CACHE: LazyLock<Mutex<BTreeMap<Provider, CacheSlot>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 static IN_FLIGHT: LazyLock<Mutex<BTreeMap<Provider, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
@@ -73,9 +78,12 @@ pub fn api_key(provider: Provider, config: &Config) -> Result<String> {
     {
         return validate_key(provider, &key).map(str::to_owned);
     }
-    let check_cache = || -> Option<Result<String>> {
+    let check_cache = || -> (u64, Option<Result<String>>) {
         let cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
-        match cache.get(&provider) {
+        let (generation, entry) = cache
+            .get(&provider)
+            .map_or((0, None), |slot| (slot.generation, slot.key.as_ref()));
+        let result = match entry {
             Some(CachedKey::Found(key)) => Some(Ok(key.clone())),
             Some(CachedKey::Missing(at)) if at.elapsed() < RECHECK_MISSING => Some(Err(eyre!(
                 "{} API key not found. Add it in Providers.",
@@ -83,34 +91,47 @@ pub fn api_key(provider: Provider, config: &Config) -> Result<String> {
             ))),
             Some(CachedKey::Unavailable) => Some(Err(eyre!(unavailable_message(provider.label())))),
             _ => None,
-        }
+        };
+        (generation, result)
     };
-    if let Some(result) = check_cache() {
+    if let (_, Some(result)) = check_cache() {
         return result;
     }
     // Serialize Keychain reads per provider while leaving CACHE unlocked so
     // an interactive macOS prompt never blocks other providers or status checks.
     let flight = provider_read_lock(provider);
     let _flight_guard = flight.lock().unwrap_or_else(|error| error.into_inner());
-    if let Some(result) = check_cache() {
+    let (generation, cached) = check_cache();
+    if let Some(result) = cached {
         return result;
     }
     let read = read_keychain(provider);
     let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
+    let slot = cache.entry(provider).or_insert(CacheSlot {
+        generation: 0,
+        key: None,
+    });
+    let still_current = slot.generation == generation;
     match read {
         KeychainRead::Found(key) => {
-            cache.insert(provider, CachedKey::Found(key.clone()));
+            if still_current {
+                slot.key = Some(CachedKey::Found(key.clone()));
+            }
             Ok(key)
         }
         KeychainRead::Missing => {
-            cache.insert(provider, CachedKey::Missing(Instant::now()));
+            if still_current {
+                slot.key = Some(CachedKey::Missing(Instant::now()));
+            }
             bail!(
                 "{} API key not found. Add it in Providers.",
                 provider.label()
             )
         }
         KeychainRead::Unavailable => {
-            cache.insert(provider, CachedKey::Unavailable);
+            if still_current {
+                slot.key = Some(CachedKey::Unavailable);
+            }
             bail!(unavailable_message(provider.label()))
         }
     }
@@ -144,6 +165,7 @@ pub fn key_status(provider: Provider, config: &Config) -> KeyStatus {
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .get(&provider)
+        .and_then(|slot| slot.key.as_ref())
     {
         return KeyStatus::Keychain(key_suffix(key));
     }
@@ -157,8 +179,11 @@ pub fn key_status(provider: Provider, config: &Config) -> KeyStatus {
 /// Forget a refused read so the next explicit user action may ask macOS again.
 fn retry_unavailable(provider: Provider) {
     let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
-    if matches!(cache.get(&provider), Some(CachedKey::Unavailable)) {
-        cache.remove(&provider);
+    if let Some(slot) = cache.get_mut(&provider)
+        && matches!(slot.key, Some(CachedKey::Unavailable))
+    {
+        slot.generation = slot.generation.wrapping_add(1);
+        slot.key = None;
     }
 }
 
@@ -166,10 +191,13 @@ pub(crate) fn invalidate(provider: Provider) {
     if provider == Provider::OpenRouter {
         openrouter::forget_cached_key();
     } else {
-        CACHE
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&provider);
+        let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
+        let slot = cache.entry(provider).or_insert(CacheSlot {
+            generation: 0,
+            key: None,
+        });
+        slot.generation = slot.generation.wrapping_add(1);
+        slot.key = None;
     }
 }
 
@@ -189,10 +217,13 @@ pub fn store_keychain_key(provider: Provider, key: &str) -> Result<()> {
             provider.label()
         );
     }
-    CACHE
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(provider, CachedKey::Found(key.to_owned()));
+    let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
+    let slot = cache.entry(provider).or_insert(CacheSlot {
+        generation: 0,
+        key: None,
+    });
+    slot.generation = slot.generation.wrapping_add(1);
+    slot.key = Some(CachedKey::Found(key.to_owned()));
     Ok(())
 }
 
@@ -517,25 +548,46 @@ mod tests {
     #[test]
     fn a_refused_keychain_read_waits_for_an_explicit_retry() {
         let provider = Provider::ElevenLabs;
-        CACHE
-            .lock()
-            .unwrap()
-            .insert(provider, CachedKey::Unavailable);
+        CACHE.lock().unwrap().insert(
+            provider,
+            CacheSlot {
+                generation: 0,
+                key: Some(CachedKey::Unavailable),
+            },
+        );
         // Status refreshes never clear a refusal; only an explicit retry does.
         assert!(matches!(
-            CACHE.lock().unwrap().get(&provider),
+            CACHE
+                .lock()
+                .unwrap()
+                .get(&provider)
+                .and_then(|slot| slot.key.as_ref()),
             Some(CachedKey::Unavailable)
         ));
         retry_unavailable(provider);
-        assert!(CACHE.lock().unwrap().get(&provider).is_none());
+        assert!(
+            CACHE
+                .lock()
+                .unwrap()
+                .get(&provider)
+                .and_then(|slot| slot.key.as_ref())
+                .is_none()
+        );
         // A found key is never discarded by a retry.
-        CACHE
-            .lock()
-            .unwrap()
-            .insert(provider, CachedKey::Found("fixture-key-0000".into()));
+        CACHE.lock().unwrap().insert(
+            provider,
+            CacheSlot {
+                generation: 1,
+                key: Some(CachedKey::Found("fixture-key-0000".into())),
+            },
+        );
         retry_unavailable(provider);
         assert!(matches!(
-            CACHE.lock().unwrap().get(&provider),
+            CACHE
+                .lock()
+                .unwrap()
+                .get(&provider)
+                .and_then(|slot| slot.key.as_ref()),
             Some(CachedKey::Found(_))
         ));
         CACHE.lock().unwrap().remove(&provider);
