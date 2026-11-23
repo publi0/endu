@@ -1378,6 +1378,14 @@ impl AppWindow {
         self.select_pane(Pane::History, cx);
     }
 
+    /// Opens one saved recording, falling back to the list once it is gone.
+    pub(crate) fn show_recovery(&mut self, id: String, cx: &mut Context<Self>) {
+        self.select_pane(Pane::History, cx);
+        if self.recovery_entries.iter().any(|entry| entry.id == id) {
+            self.show_history_item(HistoryItem::Recovery(id), cx);
+        }
+    }
+
     pub(crate) fn show_statistics(&mut self, cx: &mut Context<Self>) {
         self.select_pane(Pane::Statistics, cx);
     }
@@ -3061,6 +3069,45 @@ mod tests {
                 }));
             });
         });
+    }
+
+    #[gpui::test]
+    fn menu_recovery_row_opens_that_recording(cx: &mut gpui::TestAppContext) {
+        let folder = std::env::temp_dir().join(format!(
+            "hex-recovery-open-{}-{}",
+            std::process::id(),
+            crate::history::now_ms()
+        ));
+        let store = RecordingRecovery::open(folder.clone()).unwrap();
+        assert!(
+            store
+                .transcribe_original(
+                    &[0.1; 1600],
+                    Some("Notes"),
+                    crate::post_processing::Preferences::default(),
+                    |_| Err(color_eyre::eyre::eyre!("offline fixture"))
+                )
+                .is_err()
+        );
+        let id = store.entries("")[0].id.clone();
+        let (view, cx) = cx.add_window_view(preview_fixture);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.recovery = Some(store.clone());
+                view.show_settings(cx);
+                view.show_recovery(id.clone(), cx);
+                assert_eq!(view.pane, Pane::History);
+                assert_eq!(view.selected_recovery.as_deref(), Some(id.as_str()));
+                view.selected_recovery = None;
+                view.show_recovery("f".repeat(32), cx);
+                assert_eq!(view.pane, Pane::History);
+                assert!(
+                    view.selected_recovery.is_none(),
+                    "a gone recording shows the list"
+                );
+            })
+        });
+        std::fs::remove_dir_all(folder).unwrap();
     }
 
     #[gpui::test]

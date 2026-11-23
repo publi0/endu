@@ -573,6 +573,9 @@ async fn drive_ui(
                 StatusItemAction::OpenHistory => {
                     ui.open_pane(cx, |window, cx| window.show_history(cx))
                 }
+                StatusItemAction::OpenRecovery(id) => {
+                    ui.open_pane(cx, |window, cx| window.show_recovery(id, cx))
+                }
                 StatusItemAction::OpenStatistics => {
                     ui.open_pane(cx, |window, cx| window.show_statistics(cx))
                 }

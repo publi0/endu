@@ -304,6 +304,8 @@ pub enum StatusItemAction {
     OpenModels,
     OpenHud,
     OpenHistory,
+    /// Opens one failed recording in History.
+    OpenRecovery(String),
     OpenStatistics,
     PasteLast,
     SetLanguage(String),
@@ -360,6 +362,20 @@ objc2::define_class!(
         #[unsafe(method(openHistory:))]
         fn open_history(&self, _sender: &AnyObject) {
             send_action(&self.ivars().actions, StatusItemAction::OpenHistory);
+        }
+
+        #[unsafe(method(openRecovery:))]
+        fn open_recovery(&self, _sender: &AnyObject) {
+            let id = STATUS_ITEM.with(|controller| {
+                controller
+                    .borrow()
+                    .as_ref()
+                    .and_then(|controller| controller.recovery_target.clone())
+            });
+            send_action(
+                &self.ivars().actions,
+                id.map_or(StatusItemAction::OpenHistory, StatusItemAction::OpenRecovery),
+            );
         }
 
         #[unsafe(method(openStatistics:))]
@@ -469,6 +485,8 @@ struct StatusItemController {
     localized: Vec<(Retained<NSMenuItem>, &'static str)>,
     history: Option<crate::history::History>,
     recovery: Option<crate::recording_recovery::RecordingRecovery>,
+    /// The newest recent failure, opened by the recovery row.
+    recovery_target: Option<String>,
     recent_ids: Vec<u64>,
     microphone_names: Vec<String>,
     images: IconImages,
@@ -577,7 +595,7 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
         &menu,
         &target,
         "1 failed recording to recover…",
-        sel!(openHistory:),
+        sel!(openRecovery:),
         mtm,
     );
     recovery_item.setHidden(true);
@@ -673,6 +691,7 @@ pub fn install() -> Result<Receiver<StatusItemAction>> {
             localized,
             history: None,
             recovery: None,
+            recovery_target: None,
             recent_ids: Vec::new(),
             microphone_names: Vec::new(),
             images,
@@ -817,6 +836,27 @@ fn add_dynamic_item(
     item
 }
 
+/// A failed recording is worth a menu row only shortly after it failed; older
+/// ones wait in History.
+const RECENT_FAILURE_WINDOW_MS: u64 = 15 * 60 * 1000;
+
+/// Ids of unrecovered, idle recordings that failed within the window, in the
+/// given (newest-first) order.
+fn recent_failures(
+    entries: &[crate::recording_recovery::RecoveryEntry],
+    now_ms: u64,
+) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|entry| {
+            entry.status != crate::recording_recovery::RecoveryStatus::Recovered
+                && !entry.busy
+                && now_ms.saturating_sub(entry.timestamp_ms) <= RECENT_FAILURE_WINDOW_MS
+        })
+        .map(|entry| entry.id.clone())
+        .collect()
+}
+
 fn recovery_menu_label(count: usize) -> String {
     if count == 1 {
         t("1 failed recording to recover…").to_owned()
@@ -884,16 +924,12 @@ fn refresh_menu() {
                 }));
             controller.permission_item.setHidden(!permissions_missing);
 
-            // Pending Recording Recovery alert row.
-            let pending_recovery = controller.recovery.as_ref().map_or(0, |store| {
-                store
-                    .entries("")
-                    .into_iter()
-                    .filter(|entry| {
-                        entry.status != crate::recording_recovery::RecoveryStatus::Recovered
-                    })
-                    .count()
+            // Recent Recording Recovery alert row.
+            let failures = controller.recovery.as_ref().map_or_else(Vec::new, |store| {
+                recent_failures(&store.entries(""), crate::history::now_ms())
             });
+            let pending_recovery = failures.len();
+            controller.recovery_target = failures.into_iter().next();
             controller.recovery_item.setHidden(pending_recovery == 0);
             if pending_recovery > 0 {
                 controller
@@ -1290,6 +1326,41 @@ mod tests {
                 "{differing} pixels differ"
             );
         });
+    }
+
+    #[test]
+    fn menu_offers_only_recent_unrecovered_failures_newest_first() {
+        let now = 1_000 * RECENT_FAILURE_WINDOW_MS;
+        let entry = |id: char, age: u64, status: &str, busy: bool| {
+            let mut entry: crate::recording_recovery::RecoveryEntry =
+                serde_json::from_value(serde_json::json!({
+                    "version": 1,
+                    "id": id.to_string().repeat(32),
+                    "timestamp_ms": now - age,
+                    "audio_ms": 1000,
+                    "status": status,
+                    "message": null,
+                    "text": null,
+                }))
+                .unwrap();
+            entry.busy = busy;
+            entry
+        };
+        let entries = [
+            entry('a', 60_000, "failed", false),
+            entry('b', 120_000, "pending", false),
+            entry('c', 0, "failed", true),
+            entry('d', 0, "recovered", false),
+            entry('e', RECENT_FAILURE_WINDOW_MS, "failed", false),
+            entry('f', RECENT_FAILURE_WINDOW_MS + 1, "failed", false),
+            entry('1', 4 * 24 * 60 * 60 * 1000, "failed", false),
+        ];
+        let ids: Vec<_> = recent_failures(&entries, now)
+            .into_iter()
+            .map(|id| id.chars().next().unwrap())
+            .collect();
+        assert_eq!(ids, ['a', 'b', 'e']);
+        assert!(recent_failures(&entries[3..4], now).is_empty());
     }
 
     #[test]
