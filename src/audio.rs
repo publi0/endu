@@ -11,6 +11,8 @@ use color_eyre::eyre::{Result, WrapErr, eyre};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, SizedSample, Stream, StreamConfig};
 
+mod overloads;
+
 #[cfg(target_os = "macos")]
 /// Preferred inputs, tried in order before the macOS default when no microphone
 /// is selected in Settings.
@@ -334,6 +336,9 @@ impl AudioInput {
     }
 
     pub fn recv_timeout(&self, timeout: Duration) -> AudioInputEvent {
+        // The one place overloads reach the log: the error callback only
+        // counts them.
+        overloads::report();
         // A stream failure reported before or during the wait outranks any
         // chunk delivered alongside it.
         if let Ok(error) = self.stream_errors.try_recv() {
@@ -353,6 +358,15 @@ impl AudioInput {
                 AudioInputEvent::StreamFailed("microphone audio channel disconnected".into())
             }
         }
+    }
+}
+
+impl Drop for AudioInput {
+    fn drop(&mut self) {
+        // Stop the stream before the count is taken, so a closing stream's
+        // last burst is written here instead of beside the next open's lines.
+        self._stream = None;
+        overloads::flush();
     }
 }
 
@@ -1071,8 +1085,16 @@ fn send(
     let _ = sender.send((chunk, captured_through));
 }
 
+/// Runs on the host's stream thread, CoreAudio's real-time thread included.
 fn stream_error(sender: &SyncSender<String>, error: cpal::Error) {
-    report_stream_error(sender, error.to_string());
+    match error.kind() {
+        // A processor overload or a refused real-time promotion is a glitch on
+        // a stream that keeps running. Only a counter moves here; the owner
+        // writes the burst. Lost samples still surface as a capture gap in
+        // the owner's timeline.
+        cpal::ErrorKind::Xrun | cpal::ErrorKind::RealtimeDenied => overloads::record(),
+        _ => report_stream_error(sender, error.to_string()),
+    }
 }
 
 fn report_stream_error(sender: &SyncSender<String>, error: String) {
@@ -1469,6 +1491,18 @@ mod tests {
         report_stream_error(&sender, "Device sample rate changed".into());
 
         assert_eq!(errors.try_recv().unwrap(), "Device sample rate changed");
+    }
+
+    #[test]
+    fn overloads_continue_the_stream_and_real_failures_stop_it() {
+        let (sender, errors) = mpsc::sync_channel(1);
+
+        stream_error(&sender, cpal::ErrorKind::Xrun.into());
+        stream_error(&sender, cpal::ErrorKind::RealtimeDenied.into());
+        assert!(errors.try_recv().is_err());
+
+        stream_error(&sender, cpal::ErrorKind::DeviceNotAvailable.into());
+        assert!(errors.try_recv().is_ok());
     }
 
     #[test]
