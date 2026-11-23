@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use color_eyre::eyre::{Result, eyre};
 
@@ -11,6 +12,17 @@ const KEY_ACTION_DISPLAY: u16 = 3;
 const NO_DEAD_KEYS: isize = 0;
 const COMMAND_KEY_CODE: u16 = 55;
 const COMMAND_FLAG: u64 = 1 << 20;
+const RETURN_KEY_CODE: u16 = 36;
+/// Right Command through Fn: keys a real keyboard reports as flags-changed
+/// events, never as key down or up.
+const MODIFIER_KEY_CODES: std::ops::RangeInclusive<u16> = 54..=63;
+const FLAGS_CHANGED_EVENT: u32 = 12;
+/// Pause between a posted shortcut's events. Remote desktop and VM clients
+/// (Microsoft's Windows App) track modifiers from their own events and can
+/// read a burst posted in one instant as the bare key, typing "v". Shortcuts
+/// are posted only from the output worker, never the capture or shortcut
+/// threads, so the pause never delays capture.
+const SHORTCUT_EVENT_GAP: Duration = Duration::from_millis(15);
 const EVENT_SOURCE_USER_DATA: u32 = 42;
 pub const SYNTHETIC_EVENT_MARKER: i64 = 0x0056_4f49_4345;
 static KEY_CODES: LayoutSnapshot = LayoutSnapshot::new();
@@ -69,6 +81,7 @@ unsafe extern "C" {
 unsafe extern "C" {
     fn CGEventCreateKeyboardEvent(source: *mut c_void, key: u16, down: bool) -> EventRef;
     fn CGEventSetFlags(event: EventRef, flags: u64);
+    fn CGEventSetType(event: EventRef, event_type: u32);
     fn CGEventSetIntegerValueField(event: EventRef, field: u32, value: i64);
     fn CGEventPostToPid(pid: i32, event: EventRef);
 }
@@ -306,16 +319,24 @@ pub fn post_return_to_pid(pid: i32) -> Result<()> {
     if pid <= 0 {
         return Err(eyre!("submit target is unavailable"));
     }
-    post_key_code(36, &[], 1, pid)
+    post_key_code(RETURN_KEY_CODE, &[], 1, pid)
 }
 
 fn post_key_code(key_code: u16, modifiers: &[(u64, u16)], count: u8, pid: i32) -> Result<()> {
     let specs = shortcut_event_specs(key_code, modifiers, count);
     let events = specs.map(KeyboardEvent::new).collect::<Result<Vec<_>>>()?;
-    for event in events {
-        event.post(pid);
-    }
+    post_spaced(&events, |event| event.post(pid), std::thread::sleep);
     Ok(())
+}
+
+/// Posts `events` in order with `SHORTCUT_EVENT_GAP` between neighbours.
+fn post_spaced<E>(events: &[E], mut post: impl FnMut(&E), mut wait: impl FnMut(Duration)) {
+    for (index, event) in events.iter().enumerate() {
+        if index > 0 {
+            wait(SHORTCUT_EVENT_GAP);
+        }
+        post(event);
+    }
 }
 
 fn shortcut_event_specs(
@@ -349,6 +370,12 @@ impl KeyboardEvent {
             return Err(eyre!("could not create keyboard event"));
         }
         unsafe {
+            // A real keyboard reports a modifier key as flags-changed, never
+            // key down or up; clients that track modifiers from those events
+            // (remote desktops, VMs) otherwise miss the held Command.
+            if MODIFIER_KEY_CODES.contains(&key) {
+                CGEventSetType(event, FLAGS_CHANGED_EVENT);
+            }
             CGEventSetFlags(event, flags);
             CGEventSetIntegerValueField(event, EVENT_SOURCE_USER_DATA, SYNTHETIC_EVENT_MARKER);
         }
@@ -511,6 +538,56 @@ mod tests {
         for reader in readers {
             reader.join().unwrap();
         }
+    }
+
+    /// Remote desktop clients read Command from flags-changed events, as a
+    /// real keyboard sends them; the shortcut's own key stays key down/up.
+    /// The events are created, never posted.
+    #[test]
+    fn posted_modifiers_are_flags_changed_events() {
+        #[link(name = "ApplicationServices", kind = "framework")]
+        unsafe extern "C" {
+            fn CGEventGetType(event: EventRef) -> u32;
+            fn CGEventGetIntegerValueField(event: EventRef, field: u32) -> i64;
+        }
+        const KEY_DOWN: u32 = 10;
+        const KEY_UP: u32 = 11;
+        let events = shortcut_event_specs(9, &[(COMMAND_FLAG, COMMAND_KEY_CODE)], 1)
+            .map(|spec| KeyboardEvent::new(spec).unwrap())
+            .collect::<Vec<_>>();
+        // SAFETY: each event is valid until `events` drops.
+        let types = events
+            .iter()
+            .map(|event| unsafe { CGEventGetType(event.0) })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            [FLAGS_CHANGED_EVENT, KEY_DOWN, KEY_UP, FLAGS_CHANGED_EVENT]
+        );
+        for event in &events {
+            // SAFETY: as above.
+            let marker = unsafe { CGEventGetIntegerValueField(event.0, EVENT_SOURCE_USER_DATA) };
+            assert_eq!(marker, SYNTHETIC_EVENT_MARKER, "Endu's tap must ignore it");
+        }
+    }
+
+    #[test]
+    fn shortcut_events_are_spaced_without_a_leading_or_trailing_pause() {
+        let steps = std::cell::RefCell::new(Vec::new());
+        post_spaced(
+            &[1, 2, 3, 4],
+            |event| steps.borrow_mut().push(format!("post {event}")),
+            |gap| steps.borrow_mut().push(format!("wait {}", gap.as_millis())),
+        );
+        assert_eq!(
+            steps.into_inner(),
+            [
+                "post 1", "wait 15", "post 2", "wait 15", "post 3", "wait 15", "post 4"
+            ]
+        );
+        let mut waits = 0;
+        post_spaced(&[1], |_| {}, |_| waits += 1);
+        assert_eq!(waits, 0);
     }
 
     #[test]
