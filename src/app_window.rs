@@ -3899,6 +3899,26 @@ mod tests {
     }
 
     #[test]
+    fn recorded_navigation_keys_drop_the_fn_flag_macos_adds() {
+        let implied = HotkeyModifiers {
+            function: true,
+            ..Default::default()
+        };
+        let command = HotkeyModifiers {
+            command: Some(Default::default()),
+            function: true,
+            ..Default::default()
+        };
+        for code in [96, 107, 123, 126, 115, 117] {
+            assert!(recorded_key_modifiers(implied, code).is_empty());
+            let recorded = recorded_key_modifiers(command, code);
+            assert!(recorded.command.is_some() && !recorded.function);
+        }
+        // Fn stays part of a press of any other key.
+        assert!(recorded_key_modifiers(implied, 49).function);
+    }
+
+    #[test]
     fn toggle_spring_is_frame_rate_independent_and_settles() {
         let simulate = |frame_rate: u32| {
             let mut spring = ToggleSpring::new(false);
