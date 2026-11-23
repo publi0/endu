@@ -691,6 +691,8 @@ impl RecoveringAudioInput {
         }
     }
 
+    /// Only while [`Self::is_open`]: a failed stream is dropped before its
+    /// replacement opens.
     pub fn sample_rate(&self) -> u32 {
         self.input
             .as_ref()
@@ -698,6 +700,7 @@ impl RecoveringAudioInput {
             .sample_rate
     }
 
+    /// Only while [`Self::is_open`], like [`Self::sample_rate`].
     pub fn device_name(&self) -> &str {
         &self
             .input
@@ -721,6 +724,13 @@ impl RecoveringAudioInput {
         let allow_fallback = self.input.is_none()
             || self.recovery.blocks_audio()
             || self.recovery.reason == Some(MicrophoneRecoveryReason::AvailabilityChanged);
+        // A failed stream lets go of the device before its replacement opens,
+        // so the replacement starts cold, as at launch, instead of opening
+        // beside a dead stream on the same device. A live stream (a routing
+        // or selection change) keeps running until its replacement installs.
+        if self.recovery.blocks_audio() {
+            self.input = None;
+        }
         let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let result = open_configured_input(
@@ -1654,6 +1664,46 @@ mod tests {
 
         stream_error(&sender, cpal::ErrorKind::DeviceNotAvailable.into());
         assert!(errors.try_recv().is_ok());
+    }
+
+    #[test]
+    fn a_dead_stream_is_dropped_before_its_replacement_opens() {
+        let mut input = RecoveringAudioInput::closed(
+            Some("Endu nonexistent microphone for dead stream test"),
+            3,
+            None,
+            &[],
+        );
+        let (failed, samples) = AudioInput::channel_for_test();
+        input.finish_initial_open(Ok(failed), Instant::now());
+        drop(samples);
+        assert!(matches!(
+            input.recv_timeout(Duration::ZERO, true),
+            RecoveringAudioInputEvent::Interrupted
+        ));
+        // Metadata of the failed stream is still readable for the report.
+        assert!(input.is_open());
+        assert!(matches!(
+            input.recv_timeout(Duration::ZERO, true),
+            RecoveringAudioInputEvent::Timeout
+        ));
+        assert!(input.is_opening());
+        assert!(!input.is_open(), "no dead stream stays on the device");
+        assert!(input.description().is_none());
+
+        // A routing change keeps the working stream until its replacement.
+        let mut routed = RecoveringAudioInput::closed(
+            Some("Endu nonexistent microphone for dead stream test"),
+            3,
+            None,
+            &[],
+        );
+        let (live, _samples) = AudioInput::channel_for_test();
+        routed.finish_initial_open(Ok(live), Instant::now());
+        routed.recovery.request_routing_change(3, Instant::now());
+        let _ = routed.recv_timeout(Duration::ZERO, true);
+        assert!(routed.is_opening());
+        assert!(routed.is_open());
     }
 
     #[test]
