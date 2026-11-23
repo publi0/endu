@@ -136,7 +136,9 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
         crate::clamshell::watch();
     }
     let settings = if listener.is_some() {
-        AppSettings::load()?
+        // A broken settings file never blocks launch; the window shows why
+        // and refuses to save defaults over it.
+        AppSettings::load_for_launch().0
     } else {
         AppSettings::default()
     };

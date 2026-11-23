@@ -237,6 +237,9 @@ fn import_at(
     mut save_models: impl FnMut(&Config, &Path) -> Result<()>,
 ) -> Result<ImportOutcome> {
     bundle.validate()?;
+    // Refuse before touching Models: a settings file Endu could not load is
+    // never replaced, and current settings may be stale defaults.
+    crate::app_settings::check_replaceable(app_path)?;
     let settings = bundle.app.apply_to(current);
     openrouter::with_config_edits(|| {
         // Read without load_config_at's template creation so an aborted import
@@ -1168,6 +1171,33 @@ mod tests {
         let saved: serde_json::Value =
             serde_json::from_slice(&fs::read(&files.app).unwrap()).unwrap();
         assert_eq!(saved["sound_volumes"]["start"], json!(0.1));
+    }
+
+    #[test]
+    fn import_never_replaces_settings_that_could_not_be_read() {
+        let files = Files::new();
+        fs::write(&files.app, b"{ not json").unwrap();
+        let original = Config::default();
+        openrouter::save_config_at(&files.models, &original).unwrap();
+        let models_before = fs::read(&files.models).unwrap();
+        let mut imported = bundle();
+        imported.transcription.models = vec!["fixture/new-model".into()];
+        let mut models_saved = false;
+        let result = import_at(
+            imported,
+            &settings(),
+            &files.app,
+            &files.models,
+            |settings, path| settings.write_to(path),
+            |config, path| {
+                models_saved = true;
+                openrouter::save_config_at(path, config)
+            },
+        );
+        assert!(result.is_err());
+        assert!(!models_saved, "Models stay untouched");
+        assert_eq!(fs::read(&files.app).unwrap(), b"{ not json");
+        assert_eq!(fs::read(&files.models).unwrap(), models_before);
     }
 
     #[test]

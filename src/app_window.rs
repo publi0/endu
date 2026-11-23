@@ -692,19 +692,7 @@ impl AppWindow {
         let (settings, settings_error) = if preview_mode {
             (AppSettings::default(), None)
         } else {
-            match AppSettings::load() {
-                Ok(settings) => (settings, None),
-                Err(error) => {
-                    tracing::error!(%error, "could not load app settings");
-                    (
-                        AppSettings::default(),
-                        Some(tf!(
-                            "Could not load app settings: {error}",
-                            error = format!("{error:#}")
-                        )),
-                    )
-                }
-            }
+            AppSettings::load_for_launch()
         };
         if !preview_mode {
             crate::app_settings::set_dock_icon_visible(true);

@@ -133,20 +133,29 @@ impl DictationIndicatorSender {
     }
 
     pub fn meter(&self, samples: &[f32]) {
-        if samples.is_empty() {
-            return;
+        if let Some((average, peak)) = meter_levels(samples) {
+            self.send(DictationIndicatorEvent::Meter { average, peak });
         }
-        let mut sum_of_squares = 0.0;
-        let mut peak = 0.0_f32;
-        for sample in samples {
-            sum_of_squares += sample * sample;
-            peak = peak.max(sample.abs());
-        }
-        self.send(DictationIndicatorEvent::Meter {
-            average: (sum_of_squares / samples.len() as f32).sqrt(),
-            peak,
-        });
     }
+}
+
+/// RMS and absolute peak around the chunk's mean, so a microphone's DC offset
+/// never reads as loudness; `None` for no samples. Only a measurement: the
+/// audio itself is never changed.
+fn meter_levels(samples: &[f32]) -> Option<(f32, f32)> {
+    if samples.is_empty() {
+        return None;
+    }
+    let count = samples.len() as f32;
+    let mean = samples.iter().sum::<f32>() / count;
+    let mut sum_of_squares = 0.0;
+    let mut peak = 0.0_f32;
+    for sample in samples {
+        let centered = sample - mean;
+        sum_of_squares += centered * centered;
+        peak = peak.max(centered.abs());
+    }
+    Some(((sum_of_squares / count).sqrt(), peak))
 }
 
 pub fn channel() -> (DictationIndicatorSender, Receiver<DictationIndicatorEvent>) {
@@ -1289,6 +1298,20 @@ mod tests {
         };
         assert!((average - 0.5).abs() < f32::EPSILON);
         assert!((peak - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_dc_offset_never_reads_as_loudness() {
+        let (average, peak) = meter_levels(&[0.2; 512]).unwrap();
+        assert!(
+            average < 1e-5,
+            "a constant offset reads as silence: {average}"
+        );
+        assert!(peak < 1e-5, "and has no peak: {peak}");
+        let (average, peak) = meter_levels(&[0.7, -0.3]).unwrap();
+        assert!((average - 0.5).abs() < 1e-6);
+        assert!((peak - 0.5).abs() < 1e-6);
+        assert!(meter_levels(&[]).is_none());
     }
 
     #[test]

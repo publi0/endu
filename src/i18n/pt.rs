@@ -246,10 +246,6 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
         "Não foi possível criar a exportação de preferências.",
     ),
     (
-        "Could not load app settings: {error}",
-        "Não foi possível carregar os ajustes do app: {error}",
-    ),
-    (
         "Could not open the export dialog.",
         "Não foi possível abrir a janela de exportação.",
     ),
@@ -1488,4 +1484,36 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
         "{count} de {total} tentativas",
     ),
     ("Partial: {partial}", "Parcial: {partial}"),
+    (
+        "Endu couldn't load its settings and is using defaults. Your settings file was left unchanged; changes made here won't be saved until you fix or remove it and restart Endu. {error}",
+        "O Endu não conseguiu carregar seus ajustes e está usando os padrões. Seu arquivo de ajustes ficou intacto; as mudanças feitas aqui não serão salvas até você corrigir ou remover o arquivo e reiniciar o Endu. {error}",
+    ),
+    (
+        "Could not read settings.json: {error}",
+        "Não foi possível ler o settings.json: {error}",
+    ),
+    (
+        "Endu couldn't load settings.json when it started, so nothing was saved. Fix or remove the file, then restart Endu.",
+        "O Endu não conseguiu carregar o settings.json ao iniciar, então nada foi salvo. Corrija ou remova o arquivo e reinicie o Endu.",
+    ),
+    (
+        "settings.json is not valid, so nothing was saved. Fix or remove the file, then restart Endu.",
+        "O settings.json não é válido, então nada foi salvo. Corrija ou remova o arquivo e reinicie o Endu.",
+    ),
+    (
+        "settings.json has a value Endu can't use (line {line}, column {column}).",
+        "O settings.json tem um valor que o Endu não consegue usar (linha {line}, coluna {column}).",
+    ),
+    (
+        "settings.json isn't valid JSON (line {line}, column {column}).",
+        "O settings.json não é um JSON válido (linha {line}, coluna {column}).",
+    ),
+    (
+        "settings.json doesn't hold a settings object.",
+        "O settings.json não contém um objeto de ajustes.",
+    ),
+    (
+        "History couldn't be read when Endu started, so it was left unchanged. Restart Endu once the file can be read.",
+        "Não foi possível ler o histórico quando o Endu iniciou, então ele ficou intacto. Reinicie o Endu quando o arquivo puder ser lido.",
+    ),
 ];
