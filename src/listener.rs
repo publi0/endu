@@ -703,7 +703,8 @@ pub fn listen(
             // replays the token. Out-of-band suspend, recovery and cancellation
             // invalidate the event tap's Enter prediction through the reset
             // epoch (`reset_submit_guard`).
-            let mut action = hotkey.process(input_event, observed.capture_at);
+            let mut action =
+                hotkey.process_with_physical(input_event, observed.capture_at, observed.physical);
             if observed.submit_epoch == Some(input_monitor.submit_epoch()) && hotkey.finish_locked()
             {
                 action = Some(HotkeyAction::FinishAndSubmit);
@@ -824,7 +825,7 @@ fn refresh_hotkey_settings(hotkey: &mut DictationHotkey) {
 mod tests {
     use super::*;
     use crate::paste::{PasteOptions, PasteOutcome};
-    use std::sync::mpsc::{Receiver, Sender};
+    use std::sync::mpsc::Receiver;
 
     const TAIL: Duration = Duration::from_millis(300);
 
@@ -886,7 +887,7 @@ mod tests {
         };
         assert!(!is_shortcut_press(empty, InputEvent::Flags(0)));
     }
-    type Microphone = Sender<(Vec<f32>, CaptureInstant)>;
+    type Microphone = crate::audio::TestChunkSender;
     /// 16 kHz samples in `ms` of transcribed audio.
     fn samples_ms(ms: usize) -> usize {
         ms * 16

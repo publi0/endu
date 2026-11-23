@@ -163,6 +163,10 @@ pub struct ObservedInputEvent {
     pub capture_at: CaptureInstant,
     pub submit_epoch: Option<u64>,
     pub interaction_revision: u64,
+    /// The physical keyboard as the tap's Enter predictor read it for this
+    /// event, so the listener's machine decides a stale-press resync from the
+    /// same reading instead of sampling the keyboard again later.
+    pub physical: Option<PhysicalSample>,
 }
 
 #[derive(Clone, Default)]
@@ -1018,12 +1022,14 @@ unsafe extern "C" fn event_callback(
         },
         context.submit_guard_state.load(Ordering::Acquire),
     );
+    let physical = suppression.take_physical_read();
     let delivered = send_input_with_submit(
         context,
         input,
         capture_at,
         submit_epoch,
         interaction_revision,
+        physical,
     );
     let suppress = suppression.process_with_submit(
         input,
@@ -1045,6 +1051,7 @@ fn send_input(context: &EventTapContext, event: InputEvent, capture_at: CaptureI
         capture_at,
         None,
         context.activity.interaction_revision(),
+        None,
     )
 }
 
@@ -1054,6 +1061,7 @@ fn send_input_with_submit(
     capture_at: CaptureInstant,
     submit_epoch: Option<u64>,
     interaction_revision: u64,
+    physical: Option<PhysicalSample>,
 ) -> bool {
     let sequence = context.next_sequence.fetch_add(1, Ordering::Relaxed);
     context.pending.push(sequence, capture_at);
@@ -1063,6 +1071,7 @@ fn send_input_with_submit(
         capture_at,
         submit_epoch,
         interaction_revision,
+        physical,
     }) {
         Ok(()) => true,
         Err(_) => {
@@ -1079,6 +1088,8 @@ struct ShortcutSuppression {
     // Repeats and releases keep the original press's suppression decision.
     key_presses: HashMap<u16, bool>,
     submit_guard: Option<SubmitGuard>,
+    /// The predictor's physical keyboard reading for the current event.
+    physical_read: Option<PhysicalSample>,
 }
 
 #[derive(Clone, Copy)]
@@ -1098,6 +1109,12 @@ impl ShortcutSuppression {
     fn reset(&mut self) {
         self.key_presses.clear();
         self.submit_guard = None;
+        self.physical_read = None;
+    }
+
+    /// The physical keyboard reading the last `observe_submit` made.
+    fn take_physical_read(&mut self) -> Option<PhysicalSample> {
+        self.physical_read.take()
     }
 
     // Predict only whether Enter must be withheld. The listener still owns audio
@@ -1146,7 +1163,9 @@ impl ShortcutSuppression {
                 InputEvent::Key { code, .. } => !self.key_presses.contains_key(&code),
                 _ => false,
             };
+        guard.gesture.physical_read = None;
         guard.gesture.process(input, at);
+        self.physical_read = guard.gesture.take_physical_read();
         if request && guard.gesture.finish_locked() {
             Some(epoch)
         } else {
@@ -1301,6 +1320,35 @@ impl ModifierHistory {
     }
 }
 
+/// What a stale-press check read from the physical keyboard: the modifier
+/// flags, if read, and the state of each queried key code below 128. Kept
+/// small, since every observed input event carries one; anything it lacks
+/// is read live.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PhysicalSample {
+    flags: Option<u32>,
+    queried: [u64; 2],
+    down: [u64; 2],
+}
+
+impl PhysicalSample {
+    fn key(&self, code: u16) -> Option<bool> {
+        let (word, bit) = (usize::from(code / 64), code % 64);
+        (word < 2 && self.queried[word] & (1 << bit) != 0)
+            .then(|| self.down[word] & (1 << bit) != 0)
+    }
+
+    fn record_key(&mut self, code: u16, down: bool) {
+        let (word, bit) = (usize::from(code / 64), code % 64);
+        if word < 2 {
+            self.queried[word] |= 1 << bit;
+            if down {
+                self.down[word] |= 1 << bit;
+            }
+        }
+    }
+}
+
 /// Live keyboard state, read only by the stale-press check.
 #[derive(Clone, Copy)]
 struct PhysicalKeyboard {
@@ -1344,6 +1392,11 @@ pub struct DictationHotkey {
     // When each tracked key last went down, key repeats included.
     key_down_at: HashMap<u16, CaptureInstant>,
     physical: PhysicalKeyboard,
+    /// A reading made elsewhere for the event being processed; it answers
+    /// before the live keyboard does.
+    physical_given: Option<PhysicalSample>,
+    /// What the last processed event read, for another machine to reuse.
+    physical_read: Option<PhysicalSample>,
 }
 
 impl DictationHotkey {
@@ -1410,6 +1463,8 @@ impl DictationHotkey {
             modifier_history: ModifierHistory::reset(CaptureInstant::ZERO),
             key_down_at: HashMap::new(),
             physical: PhysicalKeyboard::SESSION,
+            physical_given: None,
+            physical_read: None,
         }
     }
 
@@ -1883,6 +1938,51 @@ impl DictationHotkey {
     /// event, not even a repeat, for `TRACKED_KEY_REPEAT_TIMEOUT` is latched,
     /// not held. A lock stays locked, so the press finishes it. Returns why
     /// the press stays ignored.
+    /// One key's physical state, from the given reading when it has it.
+    fn physical_key_down(&mut self, code: u16) -> bool {
+        let down = self
+            .physical_given
+            .and_then(|sample| sample.key(code))
+            .unwrap_or_else(|| (self.physical.key_down)(code));
+        self.physical_read
+            .get_or_insert_with(PhysicalSample::default)
+            .record_key(code, down);
+        down
+    }
+
+    /// The physical modifier flags, from the given reading when it has them.
+    fn physical_flags(&mut self) -> u64 {
+        let flags = self
+            .physical_given
+            .and_then(|sample| sample.flags)
+            .map(u64::from)
+            .unwrap_or_else(|| (self.physical.flags)());
+        // Every modifier the check compares lives in the low 32 bits.
+        self.physical_read
+            .get_or_insert_with(PhysicalSample::default)
+            .flags = Some(flags as u32);
+        flags
+    }
+
+    /// Processes `event` deciding any stale-press resync from `physical`,
+    /// the reading another machine made for the same event.
+    pub fn process_with_physical(
+        &mut self,
+        event: InputEvent,
+        now: CaptureInstant,
+        physical: Option<PhysicalSample>,
+    ) -> Option<HotkeyAction> {
+        self.physical_given = physical;
+        let action = self.process(event, now);
+        self.physical_given = None;
+        action
+    }
+
+    /// What the last processed event read from the physical keyboard.
+    fn take_physical_read(&mut self) -> Option<PhysicalSample> {
+        self.physical_read.take()
+    }
+
     fn resync_stale_press(&mut self, now: CaptureInstant) -> Option<&'static str> {
         let binding_key = self.binding.key_code;
         let stale = |code: &u16| Some(*code) != binding_key;
@@ -1914,6 +2014,16 @@ impl DictationHotkey {
         if history.since_neutral & !binding_mask != 0 {
             return Some("another modifier went down since the keyboard was neutral");
         }
+        let stale_codes: Vec<u16> = self
+            .pressed_keys
+            .iter()
+            .filter(|code| stale(code))
+            .copied()
+            .collect();
+        let held: Vec<u16> = stale_codes
+            .into_iter()
+            .filter(|&code| self.physical_key_down(code))
+            .collect();
         // Key repeats refresh `key_down_at`, so a silent key is latched.
         let silent = |code: &u16| {
             self.key_down_at.get(code).is_some_and(|down| {
@@ -1921,13 +2031,6 @@ impl DictationHotkey {
                     .is_some_and(|age| age >= TRACKED_KEY_REPEAT_TIMEOUT)
             })
         };
-        let held: Vec<u16> = self
-            .pressed_keys
-            .iter()
-            .filter(|code| stale(code))
-            .filter(|&&code| (self.physical.key_down)(code))
-            .copied()
-            .collect();
         if !held.iter().all(silent) {
             return Some("a tracked key is physically down");
         }
@@ -1936,7 +2039,7 @@ impl DictationHotkey {
         if self.function_modifier.1 == Some(false) {
             others &= !crate::app_settings::FUNCTION_KEY_MASK;
         }
-        if (self.physical.flags)() & others != 0 {
+        if self.physical_flags() & others != 0 {
             return Some("another modifier is physically down");
         }
         if !held.is_empty() {
@@ -3942,6 +4045,42 @@ mod tests {
         hotkey.suspend();
         assert_eq!(hotkey.modifier_history.flags, NO_FLAGS);
         assert_eq!(hotkey.modifier_history.neutral_at, None);
+    }
+
+    #[test]
+    fn the_listener_resyncs_from_the_predictors_physical_reading() {
+        let now = capture_time();
+        let fn_down = InputEvent::Flags(FUNCTION_KEY_MASK);
+        let released = PhysicalKeyboard {
+            flags: || NO_FLAGS,
+            key_down: |_| false,
+        };
+        // By the time the listener runs, Tab reads down again.
+        let held_later = PhysicalKeyboard {
+            flags: || NO_FLAGS,
+            key_down: |code| code == 48,
+        };
+        let mut predictor = DictationHotkey::with_binding(false, now, true, function_binding());
+        predictor.physical = released;
+        let at = command_tab(&mut predictor, now) + Duration::from_millis(200);
+        predictor.physical_read = None;
+        assert_eq!(predictor.process(fn_down, at), Some(HotkeyAction::Start));
+        let reading = predictor.take_physical_read();
+        assert_eq!(reading.and_then(|sample| sample.key(48)), Some(false));
+
+        let mut listener = DictationHotkey::with_binding(false, now, true, function_binding());
+        listener.physical = held_later;
+        command_tab(&mut listener, now);
+        assert_eq!(
+            listener.process_with_physical(fn_down, at, reading),
+            Some(HotkeyAction::Start)
+        );
+
+        // Without the shared reading the listener would disagree.
+        let mut alone = DictationHotkey::with_binding(false, now, true, function_binding());
+        alone.physical = held_later;
+        command_tab(&mut alone, now);
+        assert_eq!(alone.process_with_physical(fn_down, at, None), None);
     }
 
     #[test]
