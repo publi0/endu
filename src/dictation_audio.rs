@@ -118,6 +118,8 @@ enum Command {
         preferences: Vec<DevicePreference>,
     },
     SetReleaseWhileIdle(bool),
+    /// A shortcut press while the microphone is recovering: try it now.
+    RetryMicrophone,
     Shutdown,
     InvalidateRecognition {
         reply: SyncSender<u64>,
@@ -138,6 +140,9 @@ struct Owner {
     recognition_overflowed: bool,
     pending_input: PendingInputEvents,
     last_captured_through: Option<CaptureInstant>,
+    /// The capture queue dropped audio before the next chunk: that chunk
+    /// follows a hole however short, so it is a gap.
+    chunk_dropped: bool,
     /// A released clip whose tail was cut short by a capture gap or a device
     /// interruption. It is accepted work: the next Finish returns it, ending
     /// at the release edge or its last audio, whichever is later.
@@ -258,6 +263,7 @@ impl DictationAudio {
                     recognition_overflowed: false,
                     pending_input,
                     last_captured_through: None,
+                    chunk_dropped: false,
                     released: None,
                     keep_open: false,
                 }
@@ -338,6 +344,12 @@ impl DictationAudio {
 
     pub fn set_release_while_idle(&self, release: bool) {
         let _ = self.commands.send(Command::SetReleaseWhileIdle(release));
+    }
+
+    /// Asks a recovering microphone to reopen now instead of waiting out its
+    /// backoff. The press itself still does not record.
+    pub fn retry_microphone(&self) {
+        let _ = self.commands.send(Command::RetryMicrophone);
     }
 
     pub fn recognition_generation(&self) -> u64 {
@@ -488,6 +500,23 @@ impl Owner {
                     Err(_) => break,
                 }
             }
+            // A failed microphone backing off has nothing to read: sleep until
+            // its next attempt or a command, not in 10 ms turns.
+            if let Some(wait) = self.input.retry_wait(Instant::now())
+                && !wait.is_zero()
+            {
+                match self.commands.recv_timeout(wait) {
+                    Ok(command) => {
+                        if !self.handle(command) {
+                            break;
+                        }
+                        self.reconcile_input();
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
             let can_reconfigure = self.can_reconfigure_input();
             let event = self
                 .input
@@ -507,6 +536,10 @@ impl Owner {
                     self.drain_through(at);
                 }
                 if self.input.is_recovering() {
+                    // A failing stream waits out a growing backoff; the press
+                    // asks for the microphone now, though it still cannot
+                    // capture until the stream opens.
+                    self.input.retry_now();
                     let _ = reply.send(CaptureStart::Rejected);
                     return true;
                 }
@@ -597,6 +630,11 @@ impl Owner {
                         }
                     }
                 };
+                if let Finish::Transcribe(clip) = &finish
+                    && clip.is_digital_silence()
+                {
+                    self.reopen_silent_stream();
+                }
                 self.keep_open = keep_open && self.input.is_open();
                 self.state.recording.store(false, Ordering::Release);
                 let _ = reply.send(finish);
@@ -623,6 +661,7 @@ impl Owner {
             Command::SetReleaseWhileIdle(release) => {
                 self.release_while_idle = release;
             }
+            Command::RetryMicrophone => self.input.retry_now(),
             Command::InvalidateRecognition { reply } => {
                 let _ = reply.send(self.next_recognition_generation());
             }
@@ -675,8 +714,10 @@ impl Owner {
                 let captured_from = captured_through
                     .checked_sub(Duration::from_nanos(chunk_nanos as u64))
                     .unwrap_or(captured_through);
+                let follows_drop = std::mem::take(&mut self.chunk_dropped);
                 if let Some(previous) = self.last_captured_through
-                    && captured_from.duration_since(previous) > Duration::from_millis(50)
+                    && (follows_drop
+                        || captured_from.duration_since(previous) > Duration::from_millis(50))
                 {
                     let gap = captured_from.duration_since(previous);
                     let was_recording = !self.set_aside_released() && self.capture.is_recording();
@@ -705,9 +746,11 @@ impl Owner {
                     self.forward_recognition(samples);
                 }
             }
+            RecoveringAudioInputEvent::Dropped => self.chunk_dropped = true,
             RecoveringAudioInputEvent::Timeout => {}
             RecoveringAudioInputEvent::Interrupted => {
                 self.last_captured_through = None;
+                self.chunk_dropped = false;
                 self.next_recognition_generation();
                 let was_recording = !self.set_aside_released() && self.capture.is_recording();
                 let capture_generation = self.state.capture_generation.load(Ordering::Acquire);
@@ -724,6 +767,7 @@ impl Owner {
             }
             RecoveringAudioInputEvent::Reopened => {
                 self.last_captured_through = None;
+                self.chunk_dropped = false;
                 self.next_recognition_generation();
                 let sample_rate = self.input.sample_rate();
                 self.capture = new_capture(sample_rate, &self.recording_environment);
@@ -874,9 +918,27 @@ impl Owner {
         }
     }
 
+    /// A finished dictation's audio was exactly zero: the stream runs but
+    /// delivers digital silence, as after some call apps release the device,
+    /// and stays that way until reopened. Reopen it now, as after a stream
+    /// failure; the clip itself is untouched. A microphone released while
+    /// idle closes anyway and opens fresh for the next press.
+    fn reopen_silent_stream(&mut self) {
+        if self.release_while_idle || !self.input.is_open() || self.input.is_recovering() {
+            return;
+        }
+        tracing::warn!(
+            device = %self.input.device_name(),
+            "dictation audio was digital silence; reopening the microphone"
+        );
+        self.input.request_recovery();
+        self.state.recovering.store(true, Ordering::Release);
+    }
+
     fn close_input(&mut self) {
         self.input.close();
         self.last_captured_through = None;
+        self.chunk_dropped = false;
         self.next_recognition_generation();
         self.state.captured_through.store(0, Ordering::Release);
         self.state.recovering.store(false, Ordering::Release);
@@ -939,6 +1001,7 @@ mod tests {
             recognition_overflowed: false,
             pending_input: PendingInputEvents::default(),
             last_captured_through: None,
+            chunk_dropped: false,
             released: None,
             keep_open: false,
         };
@@ -1626,6 +1689,115 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn a_dropped_chunk_fails_the_capture_even_when_its_hole_is_short() {
+        let (mut owner, input, _samples) = owner_for_test(true);
+        let at = capture_time();
+        owner.handle_input(RecoveringAudioInputEvent::Chunk {
+            samples: vec![0.25; 480],
+            captured_through: at,
+        });
+        start(&mut owner, at);
+        owner.handle_input(RecoveringAudioInputEvent::Chunk {
+            samples: vec![0.25; 480],
+            captured_through: at + Duration::from_millis(10),
+        });
+        // A 10 ms hole is below the timestamp tolerance, but the queue said
+        // it dropped audio there.
+        owner.handle_input(RecoveringAudioInputEvent::Dropped);
+        owner.handle_input(RecoveringAudioInputEvent::Chunk {
+            samples: vec![0.25; 480],
+            captured_through: at + Duration::from_millis(30),
+        });
+        assert!(!input.is_recording());
+        assert!(matches!(
+            input.try_recv_event(),
+            Some(DictationAudioEvent::CaptureDiscontinuity {
+                was_recording: true,
+                gap_ms: 10,
+                ..
+            })
+        ));
+        // The mark is spent: the audio after it continues the timeline.
+        owner.handle_input(RecoveringAudioInputEvent::Chunk {
+            samples: vec![0.25; 480],
+            captured_through: at + Duration::from_millis(40),
+        });
+        assert!(input.try_recv_event().is_none());
+    }
+
+    #[test]
+    fn a_dictation_of_digital_silence_reopens_the_microphone() {
+        for (value, reopens) in [(0.0, true), (0.25, false)] {
+            let (mut owner, input, _samples) = owner_for_test(true);
+            let at = capture_time();
+            owner.handle_input(RecoveringAudioInputEvent::Chunk {
+                samples: vec![value; 480],
+                captured_through: at,
+            });
+            start(&mut owner, at);
+            let released = at + Duration::from_millis(400);
+            owner.handle_input(RecoveringAudioInputEvent::Chunk {
+                samples: vec![value; 19_200],
+                captured_through: released,
+            });
+            control(&mut owner, |reply| Command::BecomeIntentional {
+                at: at + crate::dictation::MINIMUM_HOLD_DURATION,
+                reply,
+            });
+            let Finish::Transcribe(clip) = control(&mut owner, |reply| Command::Finish {
+                at: released,
+                keep_open: false,
+                reply,
+            }) else {
+                panic!("expected transcription");
+            };
+            // Detection only reads the clip, which still goes on to be
+            // transcribed (and trimmed as silence) as before.
+            assert_eq!(clip.is_digital_silence(), reopens, "{value}");
+            assert!(!clip.into_transcription_samples().is_empty());
+            assert_eq!(owner.input.is_recovering(), reopens, "{value}");
+            assert_eq!(input.is_recovering(), reopens, "{value}");
+        }
+    }
+
+    #[test]
+    fn a_press_retries_a_backing_off_microphone_now() {
+        let (mut owner, input, samples) = owner_for_test(true);
+        // The warm stream fails before it ever delivered steadily.
+        drop(samples);
+        let event = owner.input.recv_timeout(Duration::ZERO, true);
+        owner.handle_input(event);
+        assert!(matches!(
+            input.try_recv_event(),
+            Some(DictationAudioEvent::Interrupted { .. })
+        ));
+        let _ = owner.input.recv_timeout(Duration::ZERO, true);
+        let wait = owner.input.retry_wait(Instant::now()).unwrap();
+        assert!(!wait.is_zero(), "it backs off instead of reopening at once");
+
+        assert_eq!(
+            control(&mut owner, |reply| Command::Start {
+                at: capture_time(),
+                reply,
+            }),
+            CaptureStart::Rejected
+        );
+        assert_eq!(owner.input.retry_wait(Instant::now()), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn a_retry_command_asks_a_backing_off_microphone_now() {
+        let (mut owner, _input, samples) = owner_for_test(true);
+        drop(samples);
+        let event = owner.input.recv_timeout(Duration::ZERO, true);
+        owner.handle_input(event);
+        let _ = owner.input.recv_timeout(Duration::ZERO, true);
+        assert!(!owner.input.retry_wait(Instant::now()).unwrap().is_zero());
+        assert!(owner.handle(Command::RetryMicrophone));
+        assert_eq!(owner.input.retry_wait(Instant::now()), Some(Duration::ZERO));
     }
 
     #[test]

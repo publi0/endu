@@ -56,6 +56,14 @@ impl DictationClip {
         self.samples
     }
 
+    /// Whether every sample is exactly zero. A real microphone always
+    /// carries some noise, so this is a stream still running but delivering
+    /// digital silence (as after some call apps release the device), not a
+    /// quiet room. Read-only: the audio is never changed.
+    pub fn is_digital_silence(&self) -> bool {
+        !self.samples.is_empty() && self.samples.iter().all(|&sample| sample == 0.0)
+    }
+
     #[cfg(test)]
     pub fn from_samples(samples: Vec<f32>) -> Self {
         Self {

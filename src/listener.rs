@@ -20,7 +20,7 @@ use crate::events::{DictationPhase, EventLog, VoiceEvent, VoiceState, now_ms};
 use crate::feedback::{self, Tone};
 use crate::pipeline::{DictationWorker, WorkerEvent};
 use crate::recording_environment::RecordingEnvironmentController;
-use crate::suppression::{DictationHotkey, HotkeyAction, InputMonitor};
+use crate::suppression::{DictationHotkey, HotkeyAction, InputEvent, InputMonitor};
 
 fn capture_start_event(start: CaptureStart) -> Option<DictationIndicatorEvent> {
     match start {
@@ -667,6 +667,13 @@ pub fn listen(
         while let Ok(observed) = input_monitor.events.try_recv() {
             let _acknowledge = input_monitor.acknowledge_after(observed);
             if suspended {
+                // A press cannot record while the microphone recovers, but
+                // asks it to reopen now rather than after its backoff.
+                if input.is_recovering()
+                    && is_shortcut_press(crate::app_settings::dictation_hotkey(), observed.event)
+                {
+                    input.retry_microphone();
+                }
                 hotkey.track_key_state(observed.event, observed.capture_at);
                 continue;
             }
@@ -789,6 +796,23 @@ pub fn listen(
     Ok(())
 }
 
+/// Whether `event` presses the dictation shortcut: its key with exactly its
+/// modifiers, or, for a modifier-only shortcut, exactly its modifiers.
+fn is_shortcut_press(binding: crate::app_settings::RuntimeHotkey, event: InputEvent) -> bool {
+    match (binding.key_code, event) {
+        (
+            Some(_),
+            InputEvent::Key {
+                code,
+                down: true,
+                flags,
+            },
+        ) => binding.matches_key_press(code, flags),
+        (None, InputEvent::Flags(flags)) => !binding.is_empty() && binding.exact_modifiers(flags),
+        _ => false,
+    }
+}
+
 fn refresh_hotkey_settings(hotkey: &mut DictationHotkey) {
     hotkey.set_mode(crate::app_settings::dictation_mode());
     hotkey.set_binding(crate::app_settings::dictation_hotkey());
@@ -803,6 +827,65 @@ mod tests {
     use std::sync::mpsc::{Receiver, Sender};
 
     const TAIL: Duration = Duration::from_millis(300);
+
+    #[test]
+    fn only_the_dictation_shortcut_counts_as_a_retry_press() {
+        use crate::app_settings::{
+            COMMAND_KEY_MASK, HotkeyModifiers, LEFT_OPTION_MASK, OPTION_KEY_MASK, RuntimeHotkey,
+            SHIFT_KEY_MASK,
+        };
+        let option_only = RuntimeHotkey {
+            modifiers: HotkeyModifiers::option(),
+            key_code: None,
+        };
+        let option = OPTION_KEY_MASK | LEFT_OPTION_MASK;
+        assert!(is_shortcut_press(option_only, InputEvent::Flags(option)));
+        assert!(!is_shortcut_press(
+            option_only,
+            InputEvent::Flags(option | SHIFT_KEY_MASK)
+        ));
+        assert!(!is_shortcut_press(option_only, InputEvent::Flags(0)));
+        // Typing never retries a modifier-only shortcut.
+        assert!(!is_shortcut_press(
+            option_only,
+            InputEvent::Key {
+                code: 0,
+                down: true,
+                flags: option,
+            }
+        ));
+
+        let command_k = RuntimeHotkey {
+            modifiers: HotkeyModifiers {
+                command: Some(crate::app_settings::ModifierSide::Either),
+                ..HotkeyModifiers::default()
+            },
+            key_code: Some(40),
+        };
+        let press = |code, down, flags| InputEvent::Key { code, down, flags };
+        assert!(is_shortcut_press(
+            command_k,
+            press(40, true, COMMAND_KEY_MASK)
+        ));
+        assert!(!is_shortcut_press(
+            command_k,
+            press(40, false, COMMAND_KEY_MASK)
+        ));
+        assert!(!is_shortcut_press(
+            command_k,
+            press(41, true, COMMAND_KEY_MASK)
+        ));
+        assert!(!is_shortcut_press(command_k, press(40, true, 0)));
+        assert!(!is_shortcut_press(
+            command_k,
+            InputEvent::Flags(COMMAND_KEY_MASK)
+        ));
+        let empty = RuntimeHotkey {
+            modifiers: HotkeyModifiers::default(),
+            key_code: None,
+        };
+        assert!(!is_shortcut_press(empty, InputEvent::Flags(0)));
+    }
     type Microphone = Sender<(Vec<f32>, CaptureInstant)>;
     /// 16 kHz samples in `ms` of transcribed audio.
     fn samples_ms(ms: usize) -> usize {
