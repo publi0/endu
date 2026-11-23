@@ -1002,7 +1002,7 @@ impl DictationHotkey {
             CaptureInstant::now,
             // Match the annotated-session tap, including assistive keyboard input.
             || unsafe { CGEventSourceFlagsState(COMBINED_SESSION_STATE) },
-            |code| unsafe { CGEventSourceKeyState(COMBINED_SESSION_STATE, code) },
+            input_is_held,
         )
     }
 
@@ -1309,6 +1309,22 @@ impl DictationHotkey {
             }
         }
     }
+}
+
+/// Whether a key the shortcut machine tracks still reads as held. Combined-
+/// session state can keep a key down for good after a system shortcut
+/// swallows its release (Tab after Command-Tab, Q after Command-Q), which
+/// blocked every shortcut press until Endu restarted, so HID state, the
+/// physical keyboard, must agree.
+fn input_is_held(code: u16) -> bool {
+    // SAFETY: Read-only queries of documented event-source states.
+    reads_held(code, |state, code| unsafe {
+        CGEventSourceKeyState(state, code)
+    })
+}
+
+fn reads_held(code: u16, down: impl Fn(u32, u16) -> bool) -> bool {
+    down(COMBINED_SESSION_STATE, code) && down(HID_SYSTEM_STATE, code)
 }
 
 fn trigger_is_physically_down(binding: RuntimeHotkey) -> bool {
@@ -1811,6 +1827,26 @@ mod tests {
             }
         }
         receiver.try_iter().collect()
+    }
+
+    #[test]
+    fn a_key_latched_only_in_session_state_reads_as_released() {
+        const TAB: u16 = 48;
+        let state = |session: bool, hid: bool| {
+            move |source: u32, _: u16| {
+                if source == COMBINED_SESSION_STATE {
+                    session
+                } else {
+                    hid
+                }
+            }
+        };
+        // Command-Tab swallowed Tab's release: the session still says down,
+        // the physical keyboard says up.
+        assert!(!reads_held(TAB, state(true, false)));
+        assert!(reads_held(TAB, state(true, true)));
+        assert!(!reads_held(TAB, state(false, true)));
+        assert!(!reads_held(TAB, state(false, false)));
     }
 
     #[test]
