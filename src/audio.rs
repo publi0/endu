@@ -121,6 +121,12 @@ impl Add<Duration> for CaptureInstant {
 /// that does not fit is dropped and reported as a gap, never waited for.
 const CHUNK_QUEUE_CAPACITY: usize = 512;
 
+/// A running stream delivers audio every few milliseconds, even silence. One
+/// that has delivered nothing for this long has stopped without reporting an
+/// error (seen after a burst of overloads) and is reopened. The owner checks
+/// it on the turns it already takes while the stream is open.
+const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(4);
+
 pub struct AudioInput {
     // Tests can deliver PCM through channels without opening a native microphone.
     _stream: Option<Stream>,
@@ -131,6 +137,11 @@ pub struct AudioInput {
     /// The chunk right after a dropped one, held back for one turn so the
     /// owner hears of the hole before the audio that follows it.
     after_drop: Option<(Vec<f32>, CaptureInstant)>,
+    /// How long the stream may go without delivering audio before it counts
+    /// as failed; `None` for test inputs fed by hand.
+    stall_after: Option<Duration>,
+    /// When the stream opened or last delivered a chunk.
+    last_delivery: Instant,
     pub sample_rate: u32,
     pub device_name: String,
     pub description: InputDescription,
@@ -264,6 +275,8 @@ impl AudioInput {
                 chunks,
                 dropped_through: Arc::default(),
                 after_drop: None,
+                stall_after: None,
+                last_delivery: Instant::now(),
                 stream_errors,
                 sample_rate: 48_000,
                 device_name: "Test microphone".into(),
@@ -359,6 +372,8 @@ impl AudioInput {
             chunks,
             dropped_through,
             after_drop: None,
+            stall_after: Some(STREAM_STALL_TIMEOUT),
+            last_delivery: Instant::now(),
             sample_rate,
             device_name,
             description,
@@ -385,6 +400,9 @@ impl AudioInput {
         if let Ok(error) = self.stream_errors.try_recv() {
             return AudioInputEvent::StreamFailed(error);
         }
+        if received.is_ok() {
+            self.last_delivery = Instant::now();
+        }
         match received {
             Ok((samples, captured_through)) if self.follows_drop(captured_through) => {
                 self.after_drop = Some((samples, captured_through));
@@ -394,11 +412,25 @@ impl AudioInput {
                 samples,
                 captured_through,
             },
+            Err(RecvTimeoutError::Timeout) if self.stalled(Instant::now()) => {
+                AudioInputEvent::StreamFailed("microphone stopped delivering audio".into())
+            }
             Err(RecvTimeoutError::Timeout) => AudioInputEvent::Timeout,
             Err(RecvTimeoutError::Disconnected) => {
                 AudioInputEvent::StreamFailed("microphone audio channel disconnected".into())
             }
         }
+    }
+
+    fn stalled(&self, now: Instant) -> bool {
+        self.stall_after
+            .is_some_and(|after| now.saturating_duration_since(self.last_delivery) >= after)
+    }
+
+    #[cfg(test)]
+    fn watch_stalls_for_test(&mut self, after: Duration) {
+        self.stall_after = Some(after);
+        self.last_delivery = Instant::now();
     }
 
     /// Whether a chunk ending at `captured_through` is newer than audio the
@@ -1704,6 +1736,41 @@ mod tests {
         let _ = routed.recv_timeout(Duration::ZERO, true);
         assert!(routed.is_opening());
         assert!(routed.is_open());
+    }
+
+    #[test]
+    fn a_stream_that_stops_delivering_audio_is_reopened() {
+        let stall = Duration::from_secs(4);
+        let mut input = RecoveringAudioInput::closed(
+            Some("Endu nonexistent microphone for stall test"),
+            1,
+            None,
+            &[],
+        );
+        let (mut opened, samples) = AudioInput::channel_for_test();
+        opened.watch_stalls_for_test(stall);
+        input.finish_initial_open(Ok(opened), Instant::now());
+
+        // Delivering audio keeps the stream alive.
+        samples
+            .send((vec![0.5; 240], CaptureInstant::from_nanos(10_000_000_000)))
+            .unwrap();
+        assert!(matches!(
+            input.recv_timeout(Duration::ZERO, true),
+            RecoveringAudioInputEvent::Chunk { .. }
+        ));
+        assert!(matches!(
+            input.recv_timeout(Duration::ZERO, true),
+            RecoveringAudioInputEvent::Timeout
+        ));
+
+        // A quiet stream with no error counts as failed and recovers.
+        input.input.as_mut().unwrap().last_delivery = Instant::now() - stall;
+        assert!(matches!(
+            input.recv_timeout(Duration::ZERO, true),
+            RecoveringAudioInputEvent::Interrupted
+        ));
+        assert!(input.is_recovering());
     }
 
     #[test]
