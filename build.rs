@@ -52,8 +52,14 @@ fn compile_indicator_shader() {
     let air = output_dir.join("dictation_indicator.air");
     let library = output_dir.join("dictation_indicator.metallib");
     println!("cargo:rerun-if-changed={}", source.display());
+    println!("cargo:rerun-if-env-changed=HEX_SKIP_SHADER_BUILD");
 
     if std::env::var_os("HEX_SKIP_SHADER_BUILD").is_some() {
+        assert_ne!(
+            std::env::var("PROFILE").as_deref(),
+            Ok("release"),
+            "HEX_SKIP_SHADER_BUILD must not be set for release builds"
+        );
         // Developer machines without the Xcode Metal toolchain can still run
         // unit tests that never touch the shader. Release builds must not set
         // this flag.

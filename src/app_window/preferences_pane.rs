@@ -99,9 +99,9 @@ impl AppWindow {
                 match result {
                     Ok(Some(bundle)) => {
                         let imported = if this.key_operation_pending(cx) {
-                            Err(color_eyre::eyre::eyre!(
+                            Err(color_eyre::eyre::eyre!(t(
                                 "Wait for the key operation to finish before importing preferences."
-                            ))
+                            )))
                         } else if this.preview {
                             crate::preferences_transfer::preview_bundle(
                                 bundle,
@@ -234,7 +234,7 @@ impl AppWindow {
                     }),
             );
         settings_panel().child(settings_row(
-            "Import / export",
+            t("Import / export"),
             t("App and model preferences. Keys, API address, history and permissions stay on this Mac."),
             actions,
         ).border_b_0())

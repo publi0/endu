@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SendError, Sender, SyncSender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -204,13 +204,65 @@ impl PendingInputEvents {
     }
 }
 
+/// Bounds the event-tap-to-listener queue so a stalled listener cannot grow
+/// memory without limit.
+const INPUT_QUEUE_CAPACITY: usize = 256;
+
+/// Coordinates clean, deadlock-free shutdown of the event-tap thread's
+/// `CFRunLoop` via a sticky version-0 `CFRunLoopSource`, guarded by a mutex
+/// cleared before the run loop and source are released.
+#[derive(Default)]
+struct RunLoopStop {
+    state: Mutex<RunLoopStopState>,
+}
+
+#[derive(Default)]
+struct RunLoopStopState {
+    stopped: bool,
+    target: Option<(usize, usize)>,
+}
+
+impl RunLoopStop {
+    fn register(&self, source: *mut c_void, run_loop: *mut c_void) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.stopped {
+            return false;
+        }
+        state.target = Some((source as usize, run_loop as usize));
+        true
+    }
+
+    fn stop(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.stopped = true;
+        if let Some((source, run_loop)) = state.target {
+            // SAFETY: The source and run loop stay alive until `clear()` runs
+            // under this same mutex before thread exit.
+            unsafe {
+                CFRunLoopSourceSignal(source as *mut c_void);
+                CFRunLoopWakeUp(run_loop as *mut c_void);
+            }
+        }
+    }
+
+    fn clear(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).target = None;
+    }
+}
+
+unsafe extern "C" fn stop_run_loop(_info: *mut c_void) {
+    // SAFETY: Runs on the event-tap thread's own run loop.
+    unsafe { CFRunLoopStop(CFRunLoopGetCurrent()) };
+}
+
 pub struct InputMonitor {
     pub events: Receiver<ObservedInputEvent>,
     pub activity: InputActivity,
     pending: PendingInputEvents,
     escape_cancels: Arc<AtomicBool>,
+    suspended: Arc<AtomicBool>,
     submit_guard_state: Arc<AtomicU64>,
-    run_loop: Arc<AtomicPtr<c_void>>,
+    stop: Arc<RunLoopStop>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -275,7 +327,7 @@ impl InputMonitor {
     /// Starts the event tap. `wake` rings after every queued event so an
     /// idle listener can block instead of polling.
     pub fn start(wake: Arc<Doorbell>) -> Result<Self> {
-        let (sender, events) = mpsc::channel::<ObservedInputEvent>();
+        let (sender, events) = mpsc::sync_channel::<ObservedInputEvent>(INPUT_QUEUE_CAPACITY);
         let sender = InputSender {
             events: sender,
             wake,
@@ -283,10 +335,12 @@ impl InputMonitor {
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let activity = InputActivity::default();
         let tap_activity = activity.clone();
-        let run_loop = Arc::new(AtomicPtr::new(ptr::null_mut()));
-        let tap_run_loop = run_loop.clone();
+        let stop = Arc::new(RunLoopStop::default());
+        let tap_stop = stop.clone();
         let escape_cancels = Arc::new(AtomicBool::new(false));
         let tap_escape_cancels = escape_cancels.clone();
+        let suspended = Arc::new(AtomicBool::new(false));
+        let tap_suspended = suspended.clone();
         let submit_guard_state = Arc::new(AtomicU64::new(0));
         let tap_submit_guard_state = submit_guard_state.clone();
         let paste_key_code = crate::keyboard::key_code_for('v').unwrap_or(9);
@@ -301,28 +355,43 @@ impl InputMonitor {
                 sender,
                 tap_activity,
                 tap_escape_cancels,
+                tap_suspended,
                 tap_submit_guard_state,
                 tap_pending,
-                tap_run_loop,
+                tap_stop,
                 ready_sender,
             )
         });
-        ready_receiver
-            .recv_timeout(Duration::from_secs(2))
-            .map_err(|_| eyre!("timed out starting the keyboard event tap"))??;
+        match ready_receiver.recv_timeout(Duration::from_secs(2)) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                stop.stop();
+                let _ = worker.join();
+                return Err(error);
+            }
+            Err(_) => {
+                stop.stop();
+                return Err(eyre!("timed out starting the keyboard event tap"));
+            }
+        }
         Ok(Self {
             events,
             activity,
             pending,
             escape_cancels,
+            suspended,
             submit_guard_state,
-            run_loop,
+            stop,
             worker: Some(worker),
         })
     }
 
     pub fn set_escape_cancels(&self, enabled: bool) {
         self.escape_cancels.store(enabled, Ordering::Release);
+    }
+
+    pub fn set_suspended(&self, suspended: bool) {
+        self.suspended.store(suspended, Ordering::Release);
     }
 
     pub fn reset_submit_guard(&self, locked: bool) {
@@ -351,11 +420,7 @@ impl InputMonitor {
 
 impl Drop for InputMonitor {
     fn drop(&mut self) {
-        let run_loop = self.run_loop.load(Ordering::Acquire);
-        if !run_loop.is_null() {
-            // SAFETY: Core Foundation run loops may be stopped from any thread.
-            unsafe { CFRunLoopStop(run_loop) };
-        }
+        self.stop.stop();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -363,13 +428,16 @@ impl Drop for InputMonitor {
 }
 
 struct InputSender {
-    events: Sender<ObservedInputEvent>,
+    events: SyncSender<ObservedInputEvent>,
     wake: Arc<Doorbell>,
 }
 
 impl InputSender {
-    fn send(&self, event: ObservedInputEvent) -> Result<(), SendError<ObservedInputEvent>> {
-        self.events.send(event)?;
+    fn try_send(
+        &self,
+        event: ObservedInputEvent,
+    ) -> Result<(), mpsc::TrySendError<ObservedInputEvent>> {
+        self.events.try_send(event)?;
         self.wake.ring();
         Ok(())
     }
@@ -379,6 +447,7 @@ struct EventTapContext {
     sender: InputSender,
     activity: InputActivity,
     escape_cancels: Arc<AtomicBool>,
+    suspended: Arc<AtomicBool>,
     submit_guard_state: Arc<AtomicU64>,
     key_tap: AtomicPtr<c_void>,
     observation_tap: AtomicPtr<c_void>,
@@ -390,13 +459,15 @@ struct EventTapContext {
     next_sequence: AtomicU64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_event_tap(
     sender: InputSender,
     activity: InputActivity,
     escape_cancels: Arc<AtomicBool>,
+    suspended: Arc<AtomicBool>,
     submit_guard_state: Arc<AtomicU64>,
     pending: PendingInputEvents,
-    run_loop: Arc<AtomicPtr<c_void>>,
+    stop: Arc<RunLoopStop>,
     ready: SyncSender<Result<()>>,
 ) {
     // Declared before every tap, source and observer so it outlives them all.
@@ -404,6 +475,7 @@ fn run_event_tap(
         sender,
         activity,
         escape_cancels,
+        suspended,
         submit_guard_state,
         key_tap: AtomicPtr::new(ptr::null_mut()),
         observation_tap: AtomicPtr::new(ptr::null_mut()),
@@ -416,6 +488,44 @@ fn run_event_tap(
     let context_ptr = &raw mut *context;
     // SAFETY: This is the dedicated event-tap thread's current run loop.
     let current_run_loop = unsafe { CFRunLoopGetCurrent() };
+    let mut stop_context = RunLoopSourceContext {
+        version: 0,
+        info: ptr::null_mut(),
+        retain: None,
+        release: None,
+        copy_description: None,
+        equal: None,
+        hash: None,
+        schedule: None,
+        cancel: None,
+        perform: Some(stop_run_loop),
+    };
+    // SAFETY: CoreFoundation copies `stop_context`; released before exit.
+    let stop_source = unsafe { CFRunLoopSourceCreate(ptr::null(), 0, &raw mut stop_context) };
+    if stop_source.is_null() {
+        let _ = ready.send(Err(eyre!("could not create input stop source")));
+        return;
+    }
+    // SAFETY: `stop_source` is a valid version-0 source for this run loop.
+    unsafe { CFRunLoopAddSource(current_run_loop, stop_source, kCFRunLoopCommonModes) };
+    struct StopSourceGuard {
+        source: *mut c_void,
+        stop: Arc<RunLoopStop>,
+    }
+    impl Drop for StopSourceGuard {
+        fn drop(&mut self) {
+            self.stop.clear();
+            // SAFETY: `source` was created above and owned by this guard.
+            unsafe {
+                CFRunLoopSourceInvalidate(self.source);
+                CFRelease(self.source.cast_const());
+            }
+        }
+    }
+    let _stop_guard = StopSourceGuard {
+        source: stop_source,
+        stop: stop.clone(),
+    };
     let mut taps = Box::new(TapSet::new(NativeTaps {
         context: context_ptr,
         run_loop: current_run_loop,
@@ -442,16 +552,20 @@ fn run_event_tap(
     let shared = unsafe { &*context_ptr };
     shared.health_source.store(health.source, Ordering::Release);
     let _observers = TapHealthObservers::register(health.request.clone());
-    run_loop.store(current_run_loop, Ordering::Release);
+    if !stop.register(stop_source, current_run_loop) {
+        let _ = ready.send(Err(eyre!("keyboard event tap stopped before startup")));
+        return;
+    }
     let _ = ready.send(Ok(()));
     // SAFETY: This dedicated thread exists solely to dispatch the event tap.
+    // A signal sent to `stop_source` before `CFRunLoopRun` is sticky and runs
+    // on the first turn, eliminating startup/drop shutdown races.
     unsafe { CFRunLoopRun() };
-    run_loop.store(ptr::null_mut(), Ordering::Release);
     shared
         .health_source
         .store(ptr::null_mut(), Ordering::Release);
-    // Drop order: observers, then the health source, then the taps, then the
-    // context they all point to.
+    // Drop order: observers, then health source, then taps, then stop guard,
+    // then the context they all point to.
 }
 
 /// Which of the two session taps a [`TapSet`] slot holds.
@@ -828,7 +942,7 @@ unsafe extern "C" fn check_tap_health(info: *mut c_void) {
         // SAFETY: The context outlives the tap set.
         let context = unsafe { &*taps.backend.context };
         context.activity.invalidate();
-        send_input(context, InputEvent::TapDisabled, CaptureInstant::ZERO);
+        send_input(context, InputEvent::TapDisabled, CaptureInstant::now());
     }
 }
 
@@ -939,7 +1053,7 @@ unsafe extern "C" fn event_callback(
         // Confirm the re-enable took, and recreate a tap it could not revive.
         request_tap_check(context);
         context.activity.invalidate();
-        send_input(context, InputEvent::TapDisabled, CaptureInstant::ZERO);
+        send_input(context, InputEvent::TapDisabled, CaptureInstant::now());
         return event;
     }
     if event.is_null() {
@@ -949,6 +1063,16 @@ unsafe extern "C" fn event_callback(
     if unsafe { CGEventGetIntegerValueField(event, EVENT_SOURCE_USER_DATA) }
         == crate::keyboard::SYNTHETIC_EVENT_MARKER
     {
+        return event;
+    }
+    if matches!(
+        event_type,
+        EVENT_SCROLL_WHEEL | EVENT_GESTURE_STARTED | EVENT_GESTURE_ENDED
+    ) {
+        // Scroll and trackpad gestures only invalidate Enter-to-submit; never
+        // forward them as MouseDown (which would wake the idle listener at
+        // 60-120 Hz and discard captures started during scroll inertia).
+        context.activity.mark_interaction(InputEvent::MouseDown);
         return event;
     }
     let input = match event_type {
@@ -966,7 +1090,6 @@ unsafe extern "C" fn event_callback(
         EVENT_LEFT_MOUSE_DOWN | EVENT_RIGHT_MOUSE_DOWN | EVENT_OTHER_MOUSE_DOWN => {
             InputEvent::MouseDown
         }
-        EVENT_SCROLL_WHEEL | EVENT_GESTURE_STARTED | EVENT_GESTURE_ENDED => InputEvent::MouseDown,
         _ => return event,
     };
     // Both taps are annotated-session taps: their timestamps are nanoseconds.
@@ -1003,6 +1126,17 @@ unsafe extern "C" fn event_callback(
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .reset();
+        return event;
+    }
+    if context.suspended.load(Ordering::Acquire) {
+        context
+            .shortcut_suppression
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .reset();
+        let _ =
+            send_input_with_submit(context, input, capture_at, None, interaction_revision, None);
+        context.activity.observe(input, false);
         return event;
     }
     let mut suppression = context
@@ -1065,7 +1199,7 @@ fn send_input_with_submit(
 ) -> bool {
     let sequence = context.next_sequence.fetch_add(1, Ordering::Relaxed);
     context.pending.push(sequence, capture_at);
-    match context.sender.send(ObservedInputEvent {
+    match context.sender.try_send(ObservedInputEvent {
         sequence,
         event,
         capture_at,
@@ -1074,7 +1208,11 @@ fn send_input_with_submit(
         physical,
     }) {
         Ok(()) => true,
-        Err(_) => {
+        Err(mpsc::TrySendError::Full(_)) => {
+            context.pending.acknowledge(sequence);
+            false
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => {
             context.pending.acknowledge(sequence);
             // SAFETY: The callback runs on the event-tap thread's run loop.
             unsafe { CFRunLoopStop(CFRunLoopGetCurrent()) };
@@ -1601,8 +1739,7 @@ impl DictationHotkey {
         // Avoid a full scan when a tracked key is still physically held.
         let sampled_flags = flags();
         if sampled_flags & modifiers_mask != 0
-            || (!self.pressed_keys.is_empty()
-                && self.pressed_keys.iter().all(|&code| key_down(code)))
+            || self.pressed_keys.iter().any(|&code| key_down(code))
             || (0..128).any(&mut key_down)
             || flags() & modifiers_mask != 0
         {
@@ -2585,7 +2722,7 @@ mod tests {
 
     // Drive the real callback without installing a tap or posting global input.
     fn callback_input(timestamps_and_events: &[(u64, InputEvent)]) -> Vec<ObservedInputEvent> {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(INPUT_QUEUE_CAPACITY);
         let mut context = EventTapContext {
             sender: InputSender {
                 events: sender,
@@ -2593,6 +2730,7 @@ mod tests {
             },
             activity: InputActivity::default(),
             escape_cancels: Arc::new(AtomicBool::new(false)),
+            suspended: Arc::new(AtomicBool::new(false)),
             submit_guard_state: Arc::new(AtomicU64::new(0)),
             key_tap: AtomicPtr::new(ptr::null_mut()),
             observation_tap: AtomicPtr::new(ptr::null_mut()),

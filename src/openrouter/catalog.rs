@@ -181,6 +181,9 @@ pub fn capability_badges(id: &str, verified_keywords: bool) -> Vec<(&'static str
 /// Fetches the models that output transcriptions. The endpoint is public, so
 /// a missing key is not an error here.
 pub fn fetch(config: &Config) -> Result<Vec<CatalogModel>> {
+    if cfg!(test) {
+        bail!("OpenRouter catalog fetch is disabled in unit tests.");
+    }
     let response = http::get(
         &config.endpoint("models?output_modalities=transcription"),
         "",
@@ -188,11 +191,7 @@ pub fn fetch(config: &Config) -> Result<Vec<CatalogModel>> {
     )
     .wrap_err("could not reach OpenRouter")?;
     if !response.is_success() {
-        bail!(
-            "OpenRouter returned HTTP {}: {}",
-            response.status,
-            super::excerpt(&response.body)
-        );
+        bail!("OpenRouter returned HTTP {}.", response.status);
     }
     parse(&response.body)
 }
@@ -262,17 +261,18 @@ pub fn selector_label(id: &str, catalog: &[CatalogModel]) -> String {
 
 pub fn label(id: &str, catalog: &[CatalogModel]) -> String {
     // A native model always reads with its own name; catalogs describe routes.
-    native_catalog()
-        .into_iter()
-        .find(|model| model.id == id)
-        .map(|model| model.name)
+    let parsed = crate::providers::ModelRef::parse(id);
+    crate::providers::native_models()
+        .iter()
+        .find(|model| model.provider == parsed.provider && model.id == parsed.model)
+        .map(|model| model.name.to_owned())
         .or_else(|| {
             catalog
                 .iter()
                 .find(|model| model.id == id)
                 .map(|model| model.name.clone())
         })
-        .unwrap_or_else(|| crate::providers::ModelRef::parse(id).model.to_owned())
+        .unwrap_or_else(|| parsed.model.to_owned())
 }
 
 #[cfg(test)]

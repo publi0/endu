@@ -2,7 +2,7 @@
 
 use crate::i18n::t;
 use std::collections::BTreeMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use color_eyre::Result;
@@ -29,7 +29,18 @@ pub(crate) enum KeychainRead {
 
 static CACHE: LazyLock<Mutex<BTreeMap<Provider, CachedKey>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
+static IN_FLIGHT: LazyLock<Mutex<BTreeMap<Provider, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
 const RECHECK_MISSING: Duration = Duration::from_secs(5);
+
+fn provider_read_lock(provider: Provider) -> Arc<Mutex<()>> {
+    IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .entry(provider)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
 
 pub fn validate_key(provider: Provider, key: &str) -> Result<&str> {
     if provider == Provider::OpenRouter {
@@ -62,19 +73,31 @@ pub fn api_key(provider: Provider, config: &Config) -> Result<String> {
     {
         return validate_key(provider, &key).map(str::to_owned);
     }
-    let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
-    match cache.get(&provider) {
-        Some(CachedKey::Found(key)) => return Ok(key.clone()),
-        Some(CachedKey::Missing(at)) if at.elapsed() < RECHECK_MISSING => {
-            bail!(
+    let check_cache = || -> Option<Result<String>> {
+        let cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
+        match cache.get(&provider) {
+            Some(CachedKey::Found(key)) => Some(Ok(key.clone())),
+            Some(CachedKey::Missing(at)) if at.elapsed() < RECHECK_MISSING => Some(Err(eyre!(
                 "{} API key not found. Add it in Providers.",
                 provider.label()
-            );
+            ))),
+            Some(CachedKey::Unavailable) => Some(Err(eyre!(unavailable_message(provider.label())))),
+            _ => None,
         }
-        Some(CachedKey::Unavailable) => bail!(unavailable_message(provider.label())),
-        _ => {}
+    };
+    if let Some(result) = check_cache() {
+        return result;
     }
-    match read_keychain(provider) {
+    // Serialize Keychain reads per provider while leaving CACHE unlocked so
+    // an interactive macOS prompt never blocks other providers or status checks.
+    let flight = provider_read_lock(provider);
+    let _flight_guard = flight.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(result) = check_cache() {
+        return result;
+    }
+    let read = read_keychain(provider);
+    let mut cache = CACHE.lock().unwrap_or_else(|error| error.into_inner());
+    match read {
         KeychainRead::Found(key) => {
             cache.insert(provider, CachedKey::Found(key.clone()));
             Ok(key)
@@ -318,6 +341,9 @@ pub(crate) fn read_secret(account: &str) -> KeychainRead {
 /// protected by the item's access list, so this never shows a prompt.
 #[cfg(target_os = "macos")]
 pub(crate) fn keychain_item_exists(account: &str) -> bool {
+    if cfg!(test) {
+        return false;
+    }
     use security_framework::item::{ItemClass, ItemSearchOptions};
     ItemSearchOptions::new()
         .class(ItemClass::generic_password())

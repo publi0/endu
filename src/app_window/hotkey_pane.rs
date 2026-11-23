@@ -104,13 +104,14 @@ impl AppWindow {
                 started_at,
                 ..
             } if *active == kind => {
-                window.request_animation_frame();
-                (started_at.elapsed().as_secs_f32() * 4.5).sin() * 0.5 + 0.5
+                if crate::desktop_ui::reduce_motion() {
+                    0.5
+                } else {
+                    window.request_animation_frame();
+                    (started_at.elapsed().as_secs_f32() * 4.5).sin() * 0.5 + 0.5
+                }
             }
-            HotkeyCaptureState::Saved { kind: active, .. } if *active == kind => {
-                window.request_animation_frame();
-                1.0
-            }
+            HotkeyCaptureState::Saved { kind: active, .. } if *active == kind => 1.0,
             HotkeyCaptureState::Idle
             | HotkeyCaptureState::Listening { .. }
             | HotkeyCaptureState::Saved { .. } => 0.0,
@@ -208,12 +209,13 @@ impl AppWindow {
                 )
                 .into_any_element(),
         };
+        let focus_index = hotkey_kind_index(kind);
         div()
             .id(match kind {
                 HotkeyKind::Dictation => "dictation-hotkey-control",
                 HotkeyKind::PasteLast => "paste-last-hotkey-control",
             })
-            .track_focus(&self.hotkey_focus)
+            .track_focus(&self.hotkey_focus[focus_index])
             .w(px(control_width))
             .min_w(px(HOTKEY_MIN_WIDTH))
             .h(px(32.0))
@@ -229,6 +231,7 @@ impl AppWindow {
                 rgb(TEXT_SOFT),
                 control_intensity * 0.55,
             ))
+            .focus(|style| style.border_color(rgb(ACCENT)))
             .bg(mix_color(
                 rgb(crate::desktop_ui::ThemeColor::Track),
                 capture_color,
@@ -245,7 +248,14 @@ impl AppWindow {
                     this.begin_hotkey_capture(kind, window, cx);
                 }
             }))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                if !this.hotkey_capture.is_listening() {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        cx.stop_propagation();
+                        this.begin_hotkey_capture(kind, window, cx);
+                    }
+                    return;
+                }
                 this.capture_hotkey_key(event, cx);
             }))
             .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, cx| {
@@ -393,7 +403,7 @@ impl AppWindow {
             started_at: Instant::now(),
         };
         self.hotkey_capture_animation.set_enabled(true);
-        self.hotkey_focus.focus(window);
+        self.hotkey_focus[hotkey_kind_index(kind)].focus(window);
         cx.notify();
     }
 
@@ -536,10 +546,26 @@ impl AppWindow {
         if !self.preview {
             crate::app_settings::set_hotkey_capture_active(false);
         }
-        self.hotkey_capture = HotkeyCaptureState::Saved {
-            kind,
-            saved_at: Instant::now(),
-        };
+        let saved_at = Instant::now();
+        self.hotkey_capture = HotkeyCaptureState::Saved { kind, saved_at };
+        // Clear the brief saved confirmation with a single timer instead of
+        // requesting 60-120 Hz animation frames for 700 ms.
+        cx.spawn(async move |window, cx| {
+            gpui::Timer::after(Duration::from_millis(700)).await;
+            let _ = window.update(cx, |this, cx| {
+                if matches!(
+                    this.hotkey_capture,
+                    HotkeyCaptureState::Saved {
+                        saved_at: current, ..
+                    } if current == saved_at
+                ) {
+                    this.hotkey_capture = HotkeyCaptureState::Idle;
+                    this.hotkey_capture_animation.set_enabled(false);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
         cx.notify();
     }
 }

@@ -66,7 +66,7 @@ codesign "$@" "$bundle" >&2
 codesign --verify --deep --strict --verbose=2 "$bundle" >&2
 python3 "$root/scripts/code_signing.py" --verify-bundle "$bundle"
 
-archive="$root/target/app/Hex-$version.zip"
+archive="$root/target/app/Endu-$version.zip"
 rm -f "$archive"
 (cd "$root/target/app" && /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$bundle_name" "$archive")
 echo "$archive"

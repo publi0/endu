@@ -1,12 +1,61 @@
 use std::fs::{self, File, OpenOptions};
-use std::io;
-use std::path::PathBuf;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use color_eyre::eyre::{Result, eyre};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 use tracing_subscriber::prelude::*;
+
+static ATOMIC_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Atomically writes `bytes` to `path` with owner-only (`0o600`) permissions
+/// from file creation, syncing file contents before rename and removing the
+/// temporary file if any step fails.
+pub(crate) fn write_private_file_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = unique_temporary_path(path);
+    let write_result = (|| -> io::Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub(crate) fn unique_temporary_path(path: &Path) -> PathBuf {
+    let sequence = ATOMIC_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_else(|| std::ffi::OsString::from("file"));
+    name.push(format!(".{}.{}.tmp", std::process::id(), sequence));
+    path.with_file_name(name)
+}
 
 pub fn support_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("HEX_APPLICATION_SUPPORT_DIR") {

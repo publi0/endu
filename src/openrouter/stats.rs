@@ -4,9 +4,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
+#[cfg(not(test))]
+use std::path::PathBuf;
 use std::sync::Mutex;
+#[cfg(not(test))]
+use std::sync::{OnceLock, mpsc};
 
 use color_eyre::Result;
 use serde::{Deserialize, Serialize};
@@ -16,8 +20,80 @@ const VERSION: u32 = 3;
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// Daily buckets kept on disk; older saved buckets are dropped, including across gaps.
 const MAX_DAYS: usize = 400;
+#[cfg(not(test))]
+const WRITER_QUEUE_CAPACITY: usize = 64;
 
 static LOCK: Mutex<()> = Mutex::new(());
+#[cfg(not(test))]
+static WRITER: OnceLock<mpsc::SyncSender<StatsWriterCommand>> = OnceLock::new();
+
+#[cfg(not(test))]
+enum StatsWriterCommand {
+    Record {
+        path: PathBuf,
+        sample: Box<Sample>,
+        day: String,
+    },
+    Clear,
+    Flush(mpsc::SyncSender<()>),
+}
+
+#[cfg(not(test))]
+fn stats_writer() -> &'static mpsc::SyncSender<StatsWriterCommand> {
+    WRITER.get_or_init(|| {
+        let (sender, receiver) = mpsc::sync_channel::<StatsWriterCommand>(WRITER_QUEUE_CAPACITY);
+        let _ = std::thread::Builder::new()
+            .name("dictation-stats".into())
+            .spawn(move || {
+                let mut cache: Option<(PathBuf, StatsFile)> = None;
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        StatsWriterCommand::Record { path, sample, day } => {
+                            let result = (|| -> Result<()> {
+                                let _guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
+                                let mut file = match &cache {
+                                    Some((cached_path, cached_file))
+                                        if cached_path == &path && path.exists() =>
+                                    {
+                                        cached_file.clone()
+                                    }
+                                    _ => load(&path)?,
+                                };
+                                apply_sample(&mut file, &sample, &day);
+                                save(&path, &file)?;
+                                cache = Some((path, file));
+                                Ok(())
+                            })();
+                            if let Err(error) = result {
+                                cache = None;
+                                tracing::warn!(%error, "could not record dictation statistics");
+                            }
+                        }
+                        StatsWriterCommand::Clear => {
+                            cache = None;
+                        }
+                        StatsWriterCommand::Flush(done) => {
+                            let _ = done.send(());
+                        }
+                    }
+                }
+            });
+        sender
+    })
+}
+
+#[cfg(not(test))]
+fn flush_writer() {
+    if let Some(sender) = WRITER.get() {
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        if sender.send(StatsWriterCommand::Flush(done_tx)).is_ok() {
+            let _ = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+        }
+    }
+}
+
+#[cfg(test)]
+fn flush_writer() {}
 
 fn add_counter(total: &mut u64, count: u64) {
     *total = total.saturating_add(count);
@@ -419,6 +495,9 @@ pub struct Sample {
     pub latency_ms: u64,
     pub tokens: u64,
     pub cost_usd: f64,
+    /// Optional estimated cost when not already carried by a telemetry attempt
+    /// (for example, silent audio that was already streamed before VAD rejected it).
+    pub estimated_cost_usd: Option<f64>,
     pub failures: Vec<Failure>,
     pub skipped_silent: bool,
     /// A live session that sent audio but ended without any dictation, for
@@ -517,6 +596,9 @@ impl Totals {
                     add_cost(&mut self.estimated_cost_usd, cost);
                 }
             }
+        }
+        if let Some(cost) = sample.estimated_cost_usd {
+            add_cost(&mut self.estimated_cost_usd, cost);
         }
         match sample.words {
             Some(words) => {
@@ -618,7 +700,7 @@ impl Totals {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct StatsFile {
     version: u32,
     /// Local calendar day (`YYYY-MM-DD`) to totals.
@@ -665,6 +747,7 @@ pub struct Dashboard {
 }
 
 pub fn dashboard(period: Period) -> Result<Dashboard> {
+    flush_writer();
     let path = crate::app_paths::support_dir()?.join(FILE);
     dashboard_at(&path, period, now_seconds())
 }
@@ -703,20 +786,34 @@ pub fn dashboard_at(path: &Path, period: Period, now: i64) -> Result<Dashboard> 
     })
 }
 
-/// Add one dictation to today's totals. Failures are logged, never raised:
-/// statistics must not affect dictation.
+/// Add one dictation to today's totals on a bounded background writer so
+/// statistics I/O never adds latency to pasting. Failures are logged, never
+/// raised: statistics must not affect dictation.
 #[cfg(not(test))]
 pub fn record(sample: &Sample) {
-    let result = (|| -> Result<()> {
-        let path = crate::app_paths::support_dir()?.join(FILE);
-        record_at(&path, sample, &local_day(now_seconds()))
-    })();
-    if let Err(error) = result {
-        tracing::warn!(%error, "could not record dictation statistics");
+    let path = match crate::app_paths::support_dir() {
+        Ok(dir) => dir.join(FILE),
+        Err(error) => {
+            tracing::warn!(%error, "could not locate dictation statistics path");
+            return;
+        }
+    };
+    let command = StatsWriterCommand::Record {
+        path,
+        sample: Box::new(sample.clone()),
+        day: local_day(now_seconds()),
+    };
+    if let Err(error) = stats_writer().try_send(command) {
+        tracing::warn!(%error, "could not enqueue dictation statistics update");
     }
 }
 
 pub fn clear() -> Result<()> {
+    #[cfg(not(test))]
+    if let Some(sender) = WRITER.get() {
+        let _ = sender.send(StatsWriterCommand::Clear);
+    }
+    flush_writer();
     let _guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let path = crate::app_paths::support_dir()?.join(FILE);
     match fs::remove_file(path) {
@@ -725,9 +822,7 @@ pub fn clear() -> Result<()> {
     }
 }
 
-fn record_at(path: &Path, sample: &Sample, day: &str) -> Result<()> {
-    let _guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
-    let mut file = load(path)?;
+fn apply_sample(file: &mut StatsFile, sample: &Sample, day: &str) {
     file.days
         .entry(day.to_owned())
         .or_default()
@@ -738,6 +833,13 @@ fn record_at(path: &Path, sample: &Sample, day: &str) -> Result<()> {
             file.days.remove(&oldest);
         }
     }
+}
+
+#[cfg(test)]
+fn record_at(path: &Path, sample: &Sample, day: &str) -> Result<()> {
+    let _guard = LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let mut file = load(path)?;
+    apply_sample(&mut file, sample, day);
     save(path, &file)
 }
 
@@ -804,32 +906,24 @@ fn read_bounded(reader: impl Read, limit: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[derive(Serialize)]
+struct SavedStatsFile<'a> {
+    version: u32,
+    days: &'a BTreeMap<String, Totals>,
+}
+
 fn save(path: &Path, file: &StatsFile) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let file = StatsFile {
+    let saved = SavedStatsFile {
         version: VERSION,
-        days: file.days.clone(),
+        days: &file.days,
     };
-    let bytes = serde_json::to_vec(&file)?;
+    let bytes = serde_json::to_vec(&saved)?;
     if bytes.len() as u64 > MAX_FILE_BYTES {
         color_eyre::eyre::bail!(
             "Statistics file exceeds the size limit. The existing file was preserved."
         );
     }
-    let temporary = path.with_extension("json.tmp");
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut handle = options.open(&temporary)?;
-    handle.write_all(&bytes)?;
-    handle.sync_all()?;
-    fs::rename(temporary, path)?;
+    crate::app_paths::write_private_file_atomic(path, &bytes)?;
     Ok(())
 }
 
@@ -1265,6 +1359,7 @@ mod tests {
             latency_ms: 800,
             tokens: 120,
             cost_usd: 0.001,
+            estimated_cost_usd: None,
             failures,
             skipped_silent: false,
             discarded: None,

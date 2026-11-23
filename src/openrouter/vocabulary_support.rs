@@ -192,9 +192,22 @@ pub fn status() -> Vec<(String, String)> {
     STATE.lock().unwrap_or_else(|e| e.into_inner()).rows.clone()
 }
 
+static VALIDATE_LOCK: Mutex<()> = Mutex::new(());
+
+struct RunningGuard;
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        STATE.lock().unwrap_or_else(|e| e.into_inner()).running = false;
+    }
+}
+
 pub fn schedule(force: bool) {
     #[cfg(target_os = "macos")]
     if crate::SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if cfg!(test) {
         return;
     }
     let Ok(mut config) = super::load_config() else {
@@ -208,6 +221,7 @@ pub fn schedule(force: bool) {
     }
     let signature = format!("{}:{:?}", config.base_url, config.transcription.models);
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    load(&mut state);
     let elapsed = now().saturating_sub(state.last_started);
     let cached = config.transcription.models.iter().all(|model| {
         state.entries.iter().any(|entry| {
@@ -226,8 +240,9 @@ pub fn schedule(force: bool) {
     state.last_configuration = signature;
     drop(state);
     std::thread::spawn(move || {
+        let _running = RunningGuard;
         validate(&config, force);
-        STATE.lock().unwrap_or_else(|e| e.into_inner()).running = false;
+        drop(_running);
         // A model selection may have changed while the worker was checking.
         schedule(false);
     });
@@ -292,7 +307,14 @@ pub fn has_verified_support(config: &Config, model: &str) -> bool {
     })
 }
 
+fn set_row_status(state: &mut State, model: &str, status: String) {
+    if let Some((_, label)) = state.rows.iter_mut().find(|(id, _)| id == model) {
+        *label = status;
+    }
+}
+
 pub fn validate(config: &Config, force: bool) -> Vec<(String, String)> {
+    let _validate_guard = VALIDATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let models: Vec<_> = config
         .transcription
         .models
@@ -317,7 +339,7 @@ pub fn validate(config: &Config, force: bool) -> Vec<(String, String)> {
     // Fresh cached evidence needs no key; reading it eagerly would show a
     // Keychain prompt at launch after every update.
     let mut key: Option<Option<String>> = None;
-    for (index, model) in models.iter().enumerate() {
+    for model in &models {
         #[cfg(target_os = "macos")]
         if crate::SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
             break;
@@ -341,8 +363,11 @@ pub fn validate(config: &Config, force: bool) -> Vec<(String, String)> {
                 state
                     .entries
                     .retain(|entry| entry.model != *model || entry.base != config.base_url);
-                state.rows[index].1 =
-                    "Multiple routes · verification cannot isolate a provider · local only".into();
+                set_row_status(
+                    &mut state,
+                    model,
+                    "Multiple routes · verification cannot isolate a provider · local only".into(),
+                );
                 continue;
             }
             // Discovery is authoritative: never retain a provider/version that vanished.
@@ -471,7 +496,8 @@ pub fn validate(config: &Config, force: bool) -> Vec<(String, String)> {
                 .into(),
             );
         }
-        STATE.lock().unwrap_or_else(|e| e.into_inner()).rows[index].1 = descriptions.join("; ");
+        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        set_row_status(&mut state, model, descriptions.join("; "));
     }
     save();
     status()
@@ -645,7 +671,9 @@ impl HintPlan {
             }
         }
         drop(state);
-        save();
+        if !cfg!(test) {
+            save();
+        }
     }
 }
 

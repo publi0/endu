@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use color_eyre::Result;
-use color_eyre::eyre::{WrapErr, bail};
+use color_eyre::eyre::{WrapErr, bail, eyre};
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_FILE: &str = "openrouter.json";
@@ -332,6 +332,9 @@ pub fn key_status(config: &Config) -> KeyStatus {
     {
         return KeyStatus::ConfigFile;
     }
+    if cfg!(test) {
+        return KeyStatus::Missing;
+    }
     // Never decrypt for status: after an update macOS asks for the login
     // password once per item read, and status refreshes on every launch.
     if let Some(CachedKey::Found(key)) = KEYCHAIN_KEY
@@ -352,7 +355,7 @@ pub fn key_status(config: &Config) -> KeyStatus {
 /// paste mistake (and would need quoting for `security`).
 pub fn validate_key(key: &str) -> Result<&str> {
     let key = key.trim();
-    if key.len() < 16 {
+    if !(16..=4096).contains(&key.len()) {
         bail!("That does not look like an OpenRouter key.");
     }
     if !key
@@ -406,6 +409,12 @@ pub fn delete_keychain_key() -> Result<()> {
 
 /// Ask OpenRouter about the key in use. Blocking; makes one GET request.
 pub fn check_key(config: &Config) -> Result<String> {
+    if cfg!(test) {
+        bail!("OpenRouter network checks are disabled in unit tests.");
+    }
+    let endpoint = config.endpoint("key");
+    // Validate the parsed URL host before resolving any credentials.
+    http::validate_url(&endpoint)?;
     // Testing is the explicit way to ask macOS again after a refused prompt.
     {
         let mut cached = KEYCHAIN_KEY
@@ -416,7 +425,7 @@ pub fn check_key(config: &Config) -> Result<String> {
         }
     }
     let key = api_key(config)?;
-    let response = http::get(&config.endpoint("key"), &key, Duration::from_secs(15))?;
+    let response = http::get(&endpoint, &key, Duration::from_secs(15))?;
     if response.status == 401 {
         forget_cached_key();
         bail!(
@@ -425,7 +434,7 @@ pub fn check_key(config: &Config) -> Result<String> {
         );
     }
     if !response.is_success() {
-        bail!("HTTP {}: {}", response.status, excerpt(&response.body));
+        bail!("OpenRouter returned HTTP {}.", response.status);
     }
     describe_key(&response.body)
 }
@@ -469,6 +478,7 @@ enum CachedKey {
 use crate::providers::keys::KeychainRead;
 
 static KEYCHAIN_KEY: Mutex<Option<CachedKey>> = Mutex::new(None);
+static KEYCHAIN_READ_LOCK: Mutex<()> = Mutex::new(());
 const MISSING_KEY_RECHECK: Duration = Duration::from_secs(5);
 
 /// Resolve the API key: environment, then config file, then Keychain.
@@ -477,7 +487,7 @@ pub fn api_key(config: &Config) -> Result<String> {
         .ok()
         .filter(|key| !key.trim().is_empty())
     {
-        return Ok(key.trim().to_owned());
+        return validate_key(&key).map(str::to_owned);
     }
     if let Some(key) = config
         .api_key
@@ -485,35 +495,63 @@ pub fn api_key(config: &Config) -> Result<String> {
         .map(str::trim)
         .filter(|key| !key.is_empty())
     {
-        return Ok(key.to_owned());
+        return validate_key(key).map(str::to_owned);
     }
+    if cfg!(test) {
+        bail!("OpenRouter Keychain credentials are disabled in unit tests.");
+    }
+    let check_cache = || -> Option<Result<String>> {
+        let cached = KEYCHAIN_KEY
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match cached.as_ref() {
+            Some(CachedKey::Found(key)) => Some(Ok(key.clone())),
+            Some(CachedKey::Missing(at)) if at.elapsed() < MISSING_KEY_RECHECK => Some(Err(eyre!(
+                "OpenRouter API key not found. Run: security add-generic-password -s {KEYCHAIN_SERVICE} -a {KEYCHAIN_ACCOUNT} -w"
+            ))),
+            Some(CachedKey::Unavailable) => Some(Err(eyre!(
+                crate::providers::keys::unavailable_message("OpenRouter")
+            ))),
+            _ => None,
+        }
+    };
+    if let Some(result) = check_cache() {
+        return result;
+    }
+    // Keep KEYCHAIN_KEY unlocked across `/usr/bin/security` so status checks
+    // and invalidations never stall behind a macOS prompt.
+    let _read_guard = KEYCHAIN_READ_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(result) = check_cache() {
+        return result;
+    }
+    let read = match keychain_key() {
+        KeychainRead::Found(key) => match validate_key(&key) {
+            Ok(valid) => KeychainRead::Found(valid.to_owned()),
+            Err(_) => KeychainRead::Missing,
+        },
+        other => other,
+    };
     let mut cached = KEYCHAIN_KEY
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let recheck = match cached.as_ref() {
-        Some(CachedKey::Found(key)) => return Ok(key.clone()),
-        Some(CachedKey::Missing(at)) => at.elapsed() >= MISSING_KEY_RECHECK,
-        Some(CachedKey::Unavailable) => {
+    match read {
+        KeychainRead::Found(key) => {
+            *cached = Some(CachedKey::Found(key.clone()));
+            Ok(key)
+        }
+        KeychainRead::Missing => {
+            *cached = Some(CachedKey::Missing(Instant::now()));
+            bail!(
+                "OpenRouter API key not found. Run: security add-generic-password -s {KEYCHAIN_SERVICE} -a {KEYCHAIN_ACCOUNT} -w"
+            )
+        }
+        KeychainRead::Unavailable => {
+            *cached = Some(CachedKey::Unavailable);
             bail!(crate::providers::keys::unavailable_message("OpenRouter"))
         }
-        None => true,
-    };
-    if recheck {
-        *cached = Some(match keychain_key() {
-            KeychainRead::Found(key) => CachedKey::Found(key),
-            KeychainRead::Missing => CachedKey::Missing(Instant::now()),
-            KeychainRead::Unavailable => {
-                *cached = Some(CachedKey::Unavailable);
-                bail!(crate::providers::keys::unavailable_message("OpenRouter"))
-            }
-        });
-        if let Some(CachedKey::Found(key)) = cached.as_ref() {
-            return Ok(key.clone());
-        }
     }
-    bail!(
-        "OpenRouter API key not found. Run: security add-generic-password -s {KEYCHAIN_SERVICE} -a {KEYCHAIN_ACCOUNT} -w"
-    )
 }
 
 /// Drop the cached Keychain key so a rotated key is picked up after a 401.

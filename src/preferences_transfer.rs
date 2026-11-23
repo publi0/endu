@@ -375,10 +375,19 @@ impl PreferenceBundle {
                 bail!("Model identifiers must be unique and contain no whitespace.");
             }
         }
-        if transcription
+        let active_models: Vec<&str> = transcription
             .models
             .iter()
+            .map(String::as_str)
+            .filter(|id| !crate::providers::is_retired_model(id))
+            .collect();
+        if active_models.is_empty() {
+            bail!("Choose at least one supported transcription model.");
+        }
+        if active_models
+            .iter()
             .skip(1)
+            .take(crate::openrouter::form::MODEL_SLOTS.saturating_sub(1))
             .any(|id| crate::providers::is_realtime_only(id))
         {
             bail!("Only the primary model can be one that works only live.");
@@ -668,11 +677,25 @@ impl TranscriptionPreferences {
     }
 
     fn into_config(self, previous: &TranscriptionConfig) -> TranscriptionConfig {
+        let mut model_options = self
+            .model_options
+            .unwrap_or_else(|| previous.model_options.clone());
+        model_options.retain(|id, _| !crate::providers::is_retired_model(id));
+        let mut models: Vec<String> = self
+            .models
+            .into_iter()
+            .filter(|id| !crate::providers::is_retired_model(id))
+            .collect();
+        let mut slot = 0;
+        models.retain(|id| {
+            let keep = slot == 0 || !crate::providers::is_realtime_only(id);
+            slot += 1;
+            keep
+        });
+        models.truncate(crate::openrouter::form::MODEL_SLOTS);
         TranscriptionConfig {
-            model_options: self
-                .model_options
-                .unwrap_or_else(|| previous.model_options.clone()),
-            models: self.models,
+            model_options,
+            models,
             language: self.language,
             attempt_timeout_seconds: self.attempt_timeout_seconds,
             total_timeout_seconds: self.total_timeout_seconds,
@@ -1440,5 +1463,43 @@ mod tests {
                 local.hud.audio_notices
             );
         }
+    }
+
+    #[test]
+    fn import_strips_retired_models_and_caps_model_slots() {
+        let mut config = Config::default();
+        config.transcription.models = vec![
+            "microsoft::MAI-Transcribe-2".into(),
+            "openai/whisper-1".into(),
+            "openai/gpt-4o-transcribe".into(),
+            "openai/gpt-4o-mini-transcribe".into(),
+        ];
+        config
+            .transcription
+            .model_options
+            .insert("microsoft::MAI-Transcribe-2".into(), Default::default());
+        let bytes = export_bytes(&settings(), &config).unwrap();
+        let imported = decode(&bytes).unwrap();
+        let preview = preview_bundle(imported, &settings(), &Config::default()).unwrap();
+        assert_eq!(
+            preview.config.transcription.models,
+            vec!["openai/whisper-1", "openai/gpt-4o-transcribe"]
+        );
+        assert!(
+            !preview
+                .config
+                .transcription
+                .model_options
+                .contains_key("microsoft::MAI-Transcribe-2")
+        );
+
+        let mut retired_only = Config::default();
+        retired_only.transcription.models = vec!["microsoft::MAI-Transcribe-2".into()];
+        assert!(export_bytes(&settings(), &retired_only).is_err());
+
+        let mut raw_value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        raw_value["transcription"]["models"] = serde_json::json!(["microsoft::MAI-Transcribe-2"]);
+        let retired_bytes = serde_json::to_vec(&raw_value).unwrap();
+        assert!(decode(&retired_bytes).is_err());
     }
 }

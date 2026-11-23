@@ -70,11 +70,20 @@ impl AppWindow {
                                 )),
                         )
                         .child(
-                            compact_button(t("Open Providers"))
+                            crate::desktop_ui::layout_item(div())
                                 .id("open-key-models")
+                                .h(px(crate::desktop_ui::CONTROL_HEIGHT))
+                                .px_3()
+                                .flex()
+                                .items_center()
                                 .flex_none()
+                                .rounded(px(crate::desktop_ui::CONTROL_RADIUS))
+                                .text_size(px(crate::desktop_ui::CONTROL_TEXT_SIZE))
                                 .bg(rgb(ACCENT))
-                                .text_color(rgb(TEXT))
+                                .text_color(rgb(crate::desktop_ui::ON_ACCENT))
+                                .hover(|button| button.opacity(0.88))
+                                .cursor_pointer()
+                                .child(t("Open Providers"))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.select_pane(Pane::Providers, cx);
                                     this.focus_pane(window);

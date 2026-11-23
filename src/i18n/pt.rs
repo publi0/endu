@@ -1516,4 +1516,23 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
         "History couldn't be read when Endu started, so it was left unchanged. Restart Endu once the file can be read.",
         "Não foi possível ler o histórico quando o Endu iniciou, então ele ficou intacto. Reinicie o Endu quando o arquivo puder ser lido.",
     ),
+    (
+        "Auto-paste did not complete. Press ⌘V\nto paste the text in the app you choose.",
+        "A colagem automática não foi concluída. Pressione ⌘V\npara colar o texto no app escolhido.",
+    ),
+    (
+        "Auto-paste paused. Use Paste Last Dictation in the\nmenu bar to insert the text in the app you choose.",
+        "Colagem automática pausada. Use Colar último ditado na\nbarra de menus para inserir o texto no app escolhido.",
+    ),
+    ("Import / export", "Importar / exportar"),
+    ("older records excluded", "registros antigos excluídos"),
+    ("transcribing", "transcrevendo"),
+    (
+        "No models match. Paste a full id such as provider/model.",
+        "Nenhum modelo corresponde. Cole um id completo como provedor/modelo.",
+    ),
+    (
+        "The file no longer contains an API key.",
+        "O arquivo não contém mais uma chave de API.",
+    ),
 ];

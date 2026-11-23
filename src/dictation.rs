@@ -83,6 +83,9 @@ pub struct DictationCapture {
     /// instant: a new clip never repeats audio already in the previous one.
     previous_clip_end: Option<CaptureInstant>,
     recording: Option<Recording>,
+    /// Reused across captures for the same microphone rate so shortcut presses
+    /// do not recompute FFT plans and Blackman-Harris windows on every start.
+    resampler: Option<Fft<f32>>,
     #[cfg(target_os = "macos")]
     recording_environment: Option<RecordingEnvironmentController>,
 }
@@ -126,29 +129,55 @@ impl RecordingEnvironmentState {
     }
 }
 
+/// Validates that a microphone sample rate is positive and can be resampled to
+/// [`TRANSCRIPTION_SAMPLE_RATE`]. Call during device open so unsupported rates
+/// fail cleanly instead of panicking on the first shortcut press.
+pub fn validate_sample_rate(source_rate: u32) -> Result<(), String> {
+    if source_rate == 0 {
+        return Err("microphone reported a 0 Hz sample rate".into());
+    }
+    if source_rate != TRANSCRIPTION_SAMPLE_RATE {
+        make_resampler(source_rate)?;
+    }
+    Ok(())
+}
+
+fn make_resampler(source_rate: u32) -> Result<Fft<f32>, String> {
+    Fft::new_custom(
+        source_rate as usize,
+        TRANSCRIPTION_SAMPLE_RATE as usize,
+        Recording::CHUNK_SIZE,
+        1,
+        1,
+        WindowFunction::BlackmanHarris2,
+        FixedSync::Input,
+    )
+    .map_err(|error| error.to_string())
+}
+
 impl Recording {
     const CHUNK_SIZE: usize = 1024;
 
+    #[cfg(test)]
     fn new(started_at: CaptureInstant, source_rate: u32) -> Self {
-        Self::try_new(started_at, source_rate).expect("microphone sample rate must be resampleable")
+        Self::new_with_resampler(started_at, source_rate, None)
     }
 
-    fn try_new(started_at: CaptureInstant, source_rate: u32) -> Result<Self, String> {
-        let resampler = (source_rate != TRANSCRIPTION_SAMPLE_RATE)
-            .then(|| {
-                Fft::new_custom(
-                    source_rate as usize,
-                    TRANSCRIPTION_SAMPLE_RATE as usize,
-                    Self::CHUNK_SIZE,
-                    1,
-                    1,
-                    WindowFunction::BlackmanHarris2,
-                    FixedSync::Input,
-                )
-                .map_err(|error| error.to_string())
-            })
-            .transpose()?;
-        Ok(Self {
+    fn new_with_resampler(
+        started_at: CaptureInstant,
+        source_rate: u32,
+        cached_resampler: Option<Fft<f32>>,
+    ) -> Self {
+        let resampler = if source_rate == TRANSCRIPTION_SAMPLE_RATE {
+            None
+        } else {
+            let mut resampler = cached_resampler.unwrap_or_else(|| {
+                make_resampler(source_rate).expect("microphone sample rate must be resampleable")
+            });
+            resampler.reset();
+            Some(resampler)
+        };
+        Self {
             started_at,
             intentional: false,
             samples: Vec::with_capacity(samples_for(
@@ -166,7 +195,7 @@ impl Recording {
             seal_at: None,
             #[cfg(target_os = "macos")]
             environment: RecordingEnvironmentState::Disabled,
-        })
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -223,7 +252,15 @@ impl Recording {
             .min(self.samples.len().saturating_sub(delay))
     }
 
-    fn finish(mut self, ended_at: Option<CaptureInstant>) -> Vec<f32> {
+    #[cfg(test)]
+    fn finish(self, ended_at: Option<CaptureInstant>) -> Vec<f32> {
+        self.finish_returning_resampler(ended_at).0
+    }
+
+    fn finish_returning_resampler(
+        mut self,
+        ended_at: Option<CaptureInstant>,
+    ) -> (Vec<f32>, Option<Fft<f32>>) {
         if let (Some(ended_at), Some(recorded_through)) = (ended_at, self.recorded_through)
             && let Some(post_release) = recorded_through.checked_duration_since(ended_at)
         {
@@ -250,7 +287,7 @@ impl Recording {
         } else {
             self.samples.truncate(self.source_samples);
         }
-        self.samples
+        (self.samples, self.resampler)
     }
 }
 
@@ -271,12 +308,16 @@ fn resample_chunk(resampler: &mut Fft<f32>, samples: &[f32], partial: bool) -> V
 
 impl DictationCapture {
     pub fn new(sample_rate: u32) -> Self {
+        let resampler = (sample_rate != TRANSCRIPTION_SAMPLE_RATE && sample_rate > 0)
+            .then(|| make_resampler(sample_rate).ok())
+            .flatten();
         Self {
             sample_rate,
             ring: VecDeque::with_capacity(samples_for(TIMELINE_BUFFER_DURATION, sample_rate)),
             ring_captured_through: None,
             previous_clip_end: None,
             recording: None,
+            resampler,
             #[cfg(target_os = "macos")]
             recording_environment: None,
         }
@@ -312,6 +353,12 @@ impl DictationCapture {
 
     pub fn is_recording(&self) -> bool {
         self.recording.is_some()
+    }
+
+    pub fn is_intentional(&self) -> bool {
+        self.recording
+            .as_ref()
+            .is_some_and(|recording| recording.intentional)
     }
 
     /// A released clip recording its tail: accepted work, not a live capture.
@@ -366,8 +413,13 @@ impl DictationCapture {
         };
         #[cfg(not(target_os = "macos"))]
         let _ = intentional;
+        if let Some(previous) = self.recording.take()
+            && let Some(resampler) = previous.resampler
+        {
+            self.resampler = Some(resampler);
+        }
         let pre_roll = samples_for(duration, self.sample_rate).min(self.ring.len());
-        let recording = Recording::new(now, self.sample_rate);
+        let recording = Recording::new_with_resampler(now, self.sample_rate, self.resampler.take());
         #[cfg(target_os = "macos")]
         let mut recording = recording.with_environment(environment);
         #[cfg(not(target_os = "macos"))]
@@ -461,7 +513,11 @@ impl DictationCapture {
     }
 
     pub fn cancel(&mut self) {
-        self.recording = None;
+        if let Some(recording) = self.recording.take()
+            && let Some(resampler) = recording.resampler
+        {
+            self.resampler = Some(resampler);
+        }
     }
 
     /// Applies the user's finishing edge. A short, unintentional capture is
@@ -479,7 +535,7 @@ impl DictationCapture {
         if !recording.intentional
             && released_at.duration_since(recording.started_at) < MINIMUM_HOLD_DURATION
         {
-            self.recording = None;
+            self.cancel();
             return Release::Discard;
         }
         let until = released_at.checked_add(tail).unwrap_or(released_at);
@@ -497,6 +553,9 @@ impl DictationCapture {
         if !recording.intentional
             && released_at.duration_since(recording.started_at) < MINIMUM_HOLD_DURATION
         {
+            if let Some(resampler) = recording.resampler {
+                self.resampler = Some(resampler);
+            }
             return Finish::Discard;
         }
 
@@ -504,7 +563,10 @@ impl DictationCapture {
             .seal_at
             .map_or(now, |seal| seal.min(now).max(released_at));
         let live = recording.live.take();
-        let samples = recording.finish(Some(ended_at));
+        let (samples, resampler) = recording.finish_returning_resampler(Some(ended_at));
+        if let Some(resampler) = resampler {
+            self.resampler = Some(resampler);
+        }
         self.previous_clip_end = Some(ended_at);
         let live = live.map(|live| Box::new(live.finish(&samples)));
         Finish::Transcribe(DictationClip {

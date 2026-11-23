@@ -27,9 +27,14 @@ const MIN_TOTAL_SPEECH_FRAMES: usize = 8; // 160 ms
 const ABSOLUTE_FLOOR: f32 = 0.002;
 /// Speech must be this far above the noise floor (10 dB).
 const ABOVE_NOISE: f32 = 3.16;
-/// But never require more than this fraction of the loudest frame (-14 dB),
-/// so a recording that is speech throughout keeps its quieter syllables.
+/// But never require more than this fraction of the loudest frame (-14 dB)
+/// when the clip's 10th-percentile floor itself is already speech-loud
+/// (`CONTINUOUS_SPEECH_FLOOR`), so a recording that is speech throughout keeps
+/// its quieter syllables without dropping the threshold below room noise.
 const BELOW_PEAK: f32 = 0.2;
+/// About -32 dBFS: only when the 10th-percentile frame is at least this loud
+/// could the clip be continuous speech without silence frames.
+const CONTINUOUS_SPEECH_FLOOR: f32 = 0.025;
 /// The quiet-microphone path: a frame must be this far above the clip's own
 /// noise floor (12 dB) to count as speech there.
 const QUIET_ABOVE_NOISE: f32 = 3.98;
@@ -50,45 +55,78 @@ pub enum Trimmed {
     Speech(Vec<f32>),
 }
 
-pub fn trim(samples: &[f32]) -> Trimmed {
-    let energies: Vec<f32> = samples.chunks(FRAME).map(rms).collect();
-    if energies.is_empty() {
-        return Trimmed::Silent;
-    }
-    let threshold = threshold(&energies);
-    let mut speech = speech_frames(&energies, threshold);
-    if !enough_speech(&speech) {
-        match quiet_threshold(&energies) {
-            Some(quiet) if quiet < threshold => speech = speech_frames(&energies, quiet),
-            _ => return Trimmed::Silent,
+/// Speech detection computed once without allocating trimmed PCM unless needed
+/// (e.g., when a live transcript fails and batch fallback needs trimmed audio).
+pub struct SpeechAnalysis {
+    regions: Vec<Range<usize>>,
+}
+
+impl SpeechAnalysis {
+    pub fn analyze(samples: &[f32]) -> Self {
+        let energies: Vec<f32> = samples.chunks(FRAME).map(rms).collect();
+        if energies.is_empty() {
+            return Self {
+                regions: Vec::new(),
+            };
         }
+        let threshold = threshold(&energies);
+        let mut speech = speech_frames(&energies, threshold);
         if !enough_speech(&speech) {
-            return Trimmed::Silent;
-        }
-    }
-    let regions = regions(&speech);
-    let mut output = Vec::with_capacity(samples.len());
-    let to_samples = |frames: Range<usize>| {
-        (frames.start * FRAME).min(samples.len())..(frames.end * FRAME).min(samples.len())
-    };
-    for (index, region) in regions.iter().enumerate() {
-        if index > 0 {
-            // Keep a short slice of each long pause: half from each side, so
-            // the model still hears a boundary it can punctuate.
-            let gap = regions[index - 1].end..region.start;
-            if gap.len() <= KEPT_GAP_FRAMES {
-                output.extend_from_slice(&samples[to_samples(gap)]);
-            } else {
-                let half = KEPT_GAP_FRAMES / 2;
-                output.extend_from_slice(&samples[to_samples(gap.start..gap.start + half)]);
-                output.extend_from_slice(
-                    &samples[to_samples(gap.end - (KEPT_GAP_FRAMES - half)..gap.end)],
-                );
+            match quiet_threshold(&energies) {
+                Some(quiet) if quiet < threshold => speech = speech_frames(&energies, quiet),
+                _ => {
+                    return Self {
+                        regions: Vec::new(),
+                    };
+                }
+            }
+            if !enough_speech(&speech) {
+                return Self {
+                    regions: Vec::new(),
+                };
             }
         }
-        output.extend_from_slice(&samples[to_samples(region.clone())]);
+        Self {
+            regions: regions(&speech),
+        }
     }
-    Trimmed::Speech(output)
+
+    pub fn is_silent(&self) -> bool {
+        self.regions.is_empty()
+    }
+
+    pub fn into_trimmed(self, samples: &[f32]) -> Trimmed {
+        if self.regions.is_empty() {
+            return Trimmed::Silent;
+        }
+        let mut output = Vec::with_capacity(samples.len());
+        let to_samples = |frames: Range<usize>| {
+            (frames.start * FRAME).min(samples.len())..(frames.end * FRAME).min(samples.len())
+        };
+        for (index, region) in self.regions.iter().enumerate() {
+            if index > 0 {
+                // Keep a short slice of each long pause: half from each side, so
+                // the model still hears a boundary it can punctuate.
+                let gap = self.regions[index - 1].end..region.start;
+                if gap.len() <= KEPT_GAP_FRAMES {
+                    output.extend_from_slice(&samples[to_samples(gap)]);
+                } else {
+                    let half = KEPT_GAP_FRAMES / 2;
+                    output.extend_from_slice(&samples[to_samples(gap.start..gap.start + half)]);
+                    output.extend_from_slice(
+                        &samples[to_samples(gap.end - (KEPT_GAP_FRAMES - half)..gap.end)],
+                    );
+                }
+            }
+            output.extend_from_slice(&samples[to_samples(region.clone())]);
+        }
+        Trimmed::Speech(output)
+    }
+}
+
+#[cfg(test)]
+pub fn trim(samples: &[f32]) -> Trimmed {
+    SpeechAnalysis::analyze(samples).into_trimmed(samples)
 }
 
 /// The frame's RMS around its own mean, so a microphone's DC offset never
@@ -109,13 +147,23 @@ fn rms(frame: &[f32]) -> f32 {
 }
 
 fn threshold(energies: &[f32]) -> f32 {
-    let mut sorted = energies.to_vec();
-    sorted.sort_by(f32::total_cmp);
-    let noise_floor = sorted[sorted.len() / 10];
-    let peak = sorted[sorted.len() - 1];
-    (noise_floor * ABOVE_NOISE)
-        .min(peak * BELOW_PEAK)
-        .max(ABSOLUTE_FLOOR)
+    let mut audible: Vec<f32> = energies
+        .iter()
+        .copied()
+        .filter(|energy| *energy > DIGITAL_SILENCE)
+        .collect();
+    if audible.is_empty() {
+        return ABSOLUTE_FLOOR;
+    }
+    audible.sort_by(f32::total_cmp);
+    let noise_floor = audible[(audible.len() - 1) / 10];
+    let peak = audible[audible.len() - 1];
+    let adaptive = if noise_floor >= CONTINUOUS_SPEECH_FLOOR {
+        (noise_floor * ABOVE_NOISE).min(peak * BELOW_PEAK)
+    } else {
+        noise_floor * ABOVE_NOISE
+    };
+    adaptive.max(ABSOLUTE_FLOOR)
 }
 
 fn enough_speech(speech: &[bool]) -> bool {
@@ -436,5 +484,30 @@ mod tests {
         assert_eq!(longest_run(&two, 0.5), 5);
         let leading = [&gap(1), &loud[..], &gap(1), &loud[..]].concat();
         assert_eq!(longest_run(&leading, 0.5), 10);
+    }
+
+    #[test]
+    fn ambient_noise_above_absolute_floor_stays_silent() {
+        // Steady ambient noise at -46 dBFS (~0.005 RMS) and -39 dBFS (~0.0115 RMS)
+        // must not collapse the threshold below the noise floor.
+        assert_eq!(trim(&hum(3.0, -46.0)), Trimmed::Silent);
+        assert_eq!(trim(&noise(3.0, 0.02)), Trimmed::Silent);
+        // Leading digital silence during device warmup followed by ambient noise.
+        let warmup_then_noise = concat(&[vec![0.0; SECOND / 2], hum(2.0, -46.0)]);
+        assert_eq!(trim(&warmup_then_noise), Trimmed::Silent);
+    }
+
+    #[test]
+    fn moderate_snr_speech_over_ambient_noise_trims_surrounding_noise() {
+        // 12 dB SNR: speech at -34 dBFS over -46 dBFS room hum.
+        let samples = concat(&[hum(2.0, -46.0), speech_at(1.0, -34.0), hum(2.0, -46.0)]);
+        let Trimmed::Speech(trimmed) = trim(&samples) else {
+            panic!("speech expected");
+        };
+        assert!(
+            (seconds(&trimmed) - 1.4).abs() < 0.05,
+            "{}",
+            seconds(&trimmed)
+        );
     }
 }

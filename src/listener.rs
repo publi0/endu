@@ -269,6 +269,7 @@ impl Session<'_> {
     }
 
     /// Nothing is recording, sealing, pending or recovering.
+    #[cfg(test)]
     fn is_idle(&self, hotkey_quiescent: bool, input_pending: bool) -> bool {
         hotkey_quiescent
             && !input_pending
@@ -532,7 +533,7 @@ enum CaptureEnd {
 /// The instant a shortcut edge applies to. A released microphone has no
 /// authoritative timeline yet, so the edge uses wall-clock time instead.
 fn capture_boundary(input: &DictationAudio, release_while_idle: bool) -> CaptureInstant {
-    if release_while_idle {
+    if release_while_idle && !input.is_open() {
         CaptureInstant::now()
     } else {
         input.captured_through()
@@ -559,7 +560,7 @@ pub fn listen(
         .as_ref()
         .map_or_else(Arc::default, |controls| controls.wake.clone());
     let input_monitor = InputMonitor::start(wake.clone())?;
-    let context_monitor = ContextMonitor::start();
+    let context_monitor = ContextMonitor::start(wake.clone());
     let mut context = ContextSnapshot::default();
     let mut hotkey = DictationHotkey::new(
         CaptureInstant::now(),
@@ -571,7 +572,7 @@ pub fn listen(
     let recording_environment = RecordingEnvironmentController::start();
     let (mut microphone_revision, microphone, priority) =
         crate::app_settings::microphone_selection();
-    let input = DictationAudio::open(
+    let input = DictationAudio::open_with_wake(
         device_override,
         microphone_revision,
         microphone.as_deref(),
@@ -579,6 +580,7 @@ pub fn listen(
         recording_environment,
         input_monitor.pending_events(),
         release_while_idle,
+        Some(wake.clone()),
     )?;
     let shutdown_recovery = recovery.clone();
     let worker = DictationWorker::start(
@@ -660,6 +662,7 @@ pub fn listen(
         }
 
         let suspended = crate::app_settings::hotkey_capture_active() || input.is_recovering();
+        input_monitor.set_suspended(suspended);
         if suspended && hotkey.suspend().is_some() {
             input_monitor.reset_submit_guard(false);
             session.end(CaptureEnd::Cancelled)?;
@@ -674,6 +677,7 @@ pub fn listen(
                 {
                     input.retry_microphone();
                 }
+                input_monitor.reset_submit_guard(false);
                 hotkey.track_key_state(observed.event, observed.capture_at);
                 continue;
             }
@@ -756,17 +760,20 @@ pub fn listen(
         // idle listener could keep swallowing Escape system-wide.
         input_monitor.set_escape_cancels(session.escape_cancels(hotkey.is_recording()));
 
-        // Nothing is recording, pending or recovering, and no input awaits
-        // processing: sleep until the next edge, control or fallback instead
-        // of polling. Capture boundaries come from event timestamps, so the
-        // wait never moves them.
-        let idle = session.is_idle(
-            hotkey.is_quiescent(),
-            input_monitor.pending_events().oldest().is_some(),
-        );
-        if idle {
+        // Only poll recognition chunks while actively recording or sealing a
+        // release tail. While recovering a microphone, waiting on remote
+        // transcription, or fully idle, block on `wake` (Doorbell) so events
+        // wake immediately with zero background polling.
+        let needs_meter = hotkey.is_recording() || session.has_tail();
+        if !needs_meter {
             input.discard_recognition_backlog();
-            wake.wait_timeout(IDLE_TURN);
+            let timeout =
+                if hotkey.is_quiescent() && input_monitor.pending_events().oldest().is_none() {
+                    IDLE_TURN
+                } else {
+                    ACTIVE_TURN
+                };
+            wake.wait_timeout(timeout);
             continue;
         }
 
@@ -777,7 +784,6 @@ pub fn listen(
         let audio = input.recv_timeout(ACTIVE_TURN)?;
         if let Some(audio) = input.latest_recognition(audio)
             && audio.is_current(input.recognition_generation())
-            && (hotkey.is_recording() || session.has_tail())
             && let Some(indicator) = &indicator
         {
             indicator.meter(&audio.samples);

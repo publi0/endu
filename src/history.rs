@@ -8,7 +8,7 @@
 
 use crate::i18n::t;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, TryLockError, mpsc};
 use std::thread;
@@ -247,9 +247,11 @@ impl HistoryStore {
         if self.retention.is_off() {
             return Ok(None);
         }
+        self.check_writable()?;
         let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
-        self.entries.push(HistoryEntry {
+        let next_id = self.next_id.saturating_add(1);
+        let mut entries = self.entries.clone();
+        entries.push(HistoryEntry {
             id,
             timestamp_ms: now_ms,
             text: truncated(&draft.text, MAX_TEXT_BYTES),
@@ -263,35 +265,46 @@ impl HistoryStore {
                 .transcription
                 .map(crate::openrouter::StepReport::bounded),
         });
+        prune_entries(&mut entries, self.retention, now_ms);
+        self.persist_snapshot(next_id, &entries)?;
+        self.entries = entries;
+        self.next_id = next_id;
         self.revision += 1;
-        self.prune(now_ms);
-        self.persist()?;
+        self.prune_pending = false;
+        self.prune_error_reported = false;
         Ok(Some(id))
     }
 
     /// Delete one entry. Returns whether it existed.
     pub fn delete(&mut self, id: u64) -> io::Result<bool> {
-        let before = self.entries.len();
-        self.entries.retain(|entry| entry.id != id);
-        if self.entries.len() == before {
+        self.check_writable()?;
+        if !self.entries.iter().any(|entry| entry.id == id) {
             return Ok(false);
         }
+        let mut entries = self.entries.clone();
+        entries.retain(|entry| entry.id != id);
+        self.persist_snapshot(self.next_id, &entries)?;
+        self.entries = entries;
         self.revision += 1;
-        self.persist()?;
+        self.prune_pending = false;
+        self.prune_error_reported = false;
         Ok(true)
     }
 
     /// Delete every entry.
     pub fn clear(&mut self) -> io::Result<()> {
+        self.check_writable()?;
+        if !self.entries.is_empty() {
+            self.persist_snapshot(self.next_id, &[])?;
+            self.entries.clear();
+            self.revision += 1;
+            self.prune_pending = false;
+            self.prune_error_reported = false;
+        }
         // A corrupt-file backup predating the current store is stale once the
         // user clears history deliberately.
         let _ = fs::remove_file(self.path.with_extension("json.corrupt"));
-        if self.entries.is_empty() {
-            return Ok(());
-        }
-        self.entries.clear();
-        self.revision += 1;
-        self.persist()
+        Ok(())
     }
 
     /// Change retention and immediately prune to the new window. Turning
@@ -369,27 +382,7 @@ impl HistoryStore {
     }
 
     fn prune(&mut self, now_ms: u64) -> bool {
-        let mut changed = false;
-        if let Some(max_age) = self.retention.max_age_ms() {
-            let cutoff = now_ms.saturating_sub(max_age);
-            let before = self.entries.len();
-            self.entries.retain(|entry| entry.timestamp_ms >= cutoff);
-            changed |= self.entries.len() != before;
-        }
-        // Drop the oldest entries in one pass rather than shifting the vector per removal.
-        let mut excess = self.entries.len().saturating_sub(MAX_ENTRIES);
-        let mut total: usize = self.entries[excess..]
-            .iter()
-            .map(HistoryEntry::text_bytes)
-            .sum();
-        while total > MAX_TOTAL_TEXT_BYTES && self.entries.len() - excess > 1 {
-            total -= self.entries[excess].text_bytes();
-            excess += 1;
-        }
-        if excess > 0 {
-            self.entries.drain(..excess);
-            changed = true;
-        }
+        let changed = prune_entries(&mut self.entries, self.retention, now_ms);
         if changed {
             self.revision += 1;
         }
@@ -397,29 +390,28 @@ impl HistoryStore {
         changed
     }
 
-    fn persist(&mut self) -> io::Result<()> {
+    fn check_writable(&self) -> io::Result<()> {
         if self.read_only {
             return Err(io::Error::other(t(
                 "History couldn't be read when Endu started, so it was left unchanged. Restart Endu once the file can be read.",
             )));
         }
+        Ok(())
+    }
+
+    fn persist_snapshot(&self, next_id: u64, entries: &[HistoryEntry]) -> io::Result<()> {
+        self.check_writable()?;
         let saved = SavedHistory {
             version: VERSION,
-            next_id: self.next_id,
-            entries: &self.entries,
+            next_id,
+            entries,
         };
         let json = serde_json::to_vec(&saved).map_err(io::Error::other)?;
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let temporary = self.path.with_extension("json.tmp");
-        {
-            let mut file = fs::File::create(&temporary)?;
-            restrict_to_owner(&file)?;
-            file.write_all(&json)?;
-            file.sync_all()?;
-        }
-        fs::rename(&temporary, &self.path)?;
+        crate::app_paths::write_private_file_atomic(&self.path, &json)
+    }
+
+    fn persist(&mut self) -> io::Result<()> {
+        self.persist_snapshot(self.next_id, &self.entries)?;
         self.prune_pending = false;
         self.prune_error_reported = false;
         Ok(())
@@ -534,15 +526,30 @@ fn truncated(text: &str, max_bytes: usize) -> String {
     text[..end].to_string()
 }
 
-#[cfg(unix)]
-fn restrict_to_owner(file: &fs::File) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn restrict_to_owner(_file: &fs::File) -> io::Result<()> {
-    Ok(())
+fn prune_entries(
+    entries: &mut Vec<HistoryEntry>,
+    retention: HistoryRetention,
+    now_ms: u64,
+) -> bool {
+    let mut changed = false;
+    if let Some(max_age) = retention.max_age_ms() {
+        let cutoff = now_ms.saturating_sub(max_age);
+        let before = entries.len();
+        entries.retain(|entry| entry.timestamp_ms >= cutoff);
+        changed |= entries.len() != before;
+    }
+    // Drop the oldest entries in one pass rather than shifting the vector per removal.
+    let mut excess = entries.len().saturating_sub(MAX_ENTRIES);
+    let mut total: usize = entries[excess..].iter().map(HistoryEntry::text_bytes).sum();
+    while total > MAX_TOTAL_TEXT_BYTES && entries.len() - excess > 1 {
+        total -= entries[excess].text_bytes();
+        excess += 1;
+    }
+    if excess > 0 {
+        entries.drain(..excess);
+        changed = true;
+    }
+    changed
 }
 
 #[cfg(test)]
@@ -735,14 +742,18 @@ mod tests {
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), UNIX_EPOCH);
     }
 
+    #[cfg(unix)]
     #[test]
     fn failed_expiry_persistence_retries_without_new_removals() {
-        let path = temp_path("expiry-retry");
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_path("expiry-retry-dir");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.json");
         let day_ms = HistoryRetention::Day.max_age_ms().unwrap();
         let mut store = HistoryStore::open(path.clone(), HistoryRetention::Day, 0);
         store.record(draft("old"), 1_000).unwrap();
-        let temporary = path.with_extension("json.tmp");
-        fs::create_dir(&temporary).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
 
         store.expire(day_ms + 1_001);
         assert!(store.entries.is_empty());
@@ -754,12 +765,13 @@ mod tests {
         assert!(store.prune_pending);
         assert!(store.prune_error_reported);
 
-        fs::remove_dir(temporary).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         store.expire(day_ms + 1_003);
         assert!(!store.prune_pending);
         assert!(!store.prune_error_reported);
         let saved: LoadedHistory = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert!(saved.entries.is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -908,7 +920,12 @@ mod tests {
             return;
         }
         let mut store = HistoryStore::open(path.clone(), HistoryRetention::Week, 0);
+        let corrupt = path.with_extension("json.corrupt");
+        fs::write(&corrupt, b"backup").unwrap();
         assert!(store.record(draft("new"), 1_000).is_err());
+        assert_eq!(store.len(), 0);
+        assert!(store.clear().is_err());
+        assert!(corrupt.exists());
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
             fs::read(&path).unwrap(),

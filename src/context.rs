@@ -1,14 +1,25 @@
 //! The foreground application, recorded with each History entry.
 
-use std::sync::Arc;
+use std::ptr::NonNull;
+#[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TrySendError};
+use std::sync::{Arc, Mutex};
+#[cfg(test)]
 use std::thread;
+#[cfg(test)]
 use std::time::Duration;
 
+use block2::RcBlock;
 use color_eyre::eyre::{Result, eyre};
 use objc2::rc::{Retained, autoreleasepool};
-use objc2_app_kit::{NSRunningApplication, NSWorkspace};
+use objc2::runtime::ProtocolObject;
+use objc2_app_kit::{
+    NSRunningApplication, NSWorkspace, NSWorkspaceDidActivateApplicationNotification,
+};
+use objc2_foundation::{NSNotification, NSNotificationCenter, NSObjectProtocol};
+
+use crate::doorbell::Doorbell;
 
 /// A retained application instance, not just a display name or reusable PID.
 /// NSRunningApplication's equality is the SDK's supported identity comparison.
@@ -74,16 +85,66 @@ pub struct ContextSnapshot {
     pub target: Option<ForegroundApplication>,
 }
 
+type ObserverToken = Retained<ProtocolObject<dyn NSObjectProtocol>>;
+
 pub struct ContextMonitor {
     pub updates: Receiver<ContextSnapshot>,
-    stop: Arc<AtomicBool>,
+    observer: Option<(Retained<NSNotificationCenter>, ObserverToken)>,
+    #[cfg(test)]
+    stop: Option<Arc<AtomicBool>>,
 }
 
 impl ContextMonitor {
-    pub fn start() -> Self {
-        Self::start_with_capture(ContextSnapshot::capture, Duration::from_millis(500))
+    pub fn start(wake: Arc<Doorbell>) -> Self {
+        let (sender, updates) = mpsc::sync_channel(8);
+        let state = Arc::new(Mutex::new((None::<ContextSnapshot>, None::<String>)));
+        let capture_and_publish = {
+            let sender = sender.clone();
+            let state = state.clone();
+            let wake = wake.clone();
+            move || {
+                let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
+                let (previous, previous_error) = &mut *guard;
+                let context = match ContextSnapshot::capture() {
+                    Ok(context) => {
+                        *previous_error = None;
+                        context
+                    }
+                    Err(error) => {
+                        let error = error.to_string();
+                        if previous_error.as_ref() != Some(&error) {
+                            tracing::warn!(%error, "could not capture foreground context");
+                            *previous_error = Some(error);
+                        }
+                        ContextSnapshot::default()
+                    }
+                };
+                if publish_context_and_wake(&sender, previous, context, Some(&wake)) {
+                    // Published or unchanged.
+                }
+            }
+        };
+        capture_and_publish();
+        let observer = autoreleasepool(|_| {
+            let center = NSWorkspace::sharedWorkspace().notificationCenter();
+            // SAFETY: AppKit's notification name is an immutable static.
+            let name = unsafe { NSWorkspaceDidActivateApplicationNotification };
+            let callback = RcBlock::new(move |_: NonNull<NSNotification>| capture_and_publish());
+            // SAFETY: The observer is removed on Drop before the monitor ends.
+            let token = unsafe {
+                center.addObserverForName_object_queue_usingBlock(Some(name), None, None, &callback)
+            };
+            (center, token)
+        });
+        Self {
+            updates,
+            observer: Some(observer),
+            #[cfg(test)]
+            stop: None,
+        }
     }
 
+    #[cfg(test)]
     fn start_with_capture(
         mut capture: impl FnMut() -> Result<ContextSnapshot> + Send + 'static,
         poll_interval: Duration,
@@ -115,20 +176,39 @@ impl ContextMonitor {
                 thread::sleep(poll_interval);
             }
         });
-        Self { updates, stop }
+        Self {
+            updates,
+            observer: None,
+            stop: Some(stop),
+        }
     }
 }
 
+#[cfg(test)]
 fn publish_context(
     sender: &mpsc::SyncSender<ContextSnapshot>,
     previous: &mut Option<ContextSnapshot>,
     context: ContextSnapshot,
 ) -> bool {
+    publish_context_and_wake(sender, previous, context, None)
+}
+
+fn publish_context_and_wake(
+    sender: &mpsc::SyncSender<ContextSnapshot>,
+    previous: &mut Option<ContextSnapshot>,
+    context: ContextSnapshot,
+    wake: Option<&Doorbell>,
+) -> bool {
     if previous.as_ref() == Some(&context) {
         return true;
     }
     match sender.try_send(context.clone()) {
-        Ok(()) => *previous = Some(context),
+        Ok(()) => {
+            *previous = Some(context);
+            if let Some(wake) = wake {
+                wake.ring();
+            }
+        }
         Err(TrySendError::Full(_)) => {}
         Err(TrySendError::Disconnected(_)) => return false,
     }
@@ -137,7 +217,14 @@ fn publish_context(
 
 impl Drop for ContextMonitor {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        if let Some((center, token)) = self.observer.take() {
+            // SAFETY: Token came from this center's addObserver call.
+            unsafe { center.removeObserver(token.as_ref()) };
+        }
+        #[cfg(test)]
+        if let Some(stop) = &self.stop {
+            stop.store(true, Ordering::Release);
+        }
     }
 }
 

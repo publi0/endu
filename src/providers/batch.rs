@@ -2,6 +2,7 @@
 //! Requests, credentials, vocabulary and remote bodies never become diagnostics.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -807,10 +808,10 @@ fn dropped_while_sending(error: &ureq::Error, unsent: bool) -> bool {
         return false;
     };
     match error.kind() {
-        std::io::ErrorKind::BrokenPipe
-        | std::io::ErrorKind::NotConnected
-        | std::io::ErrorKind::ConnectionAborted => true,
-        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::InvalidInput => unsent,
+        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::NotConnected => true,
+        std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::InvalidInput => unsent,
         _ => false,
     }
 }
@@ -1213,9 +1214,8 @@ impl Chain<'_> {
     ) -> Result<Success> {
         let started = Instant::now();
         let mut spent = initial_spent;
-        let wav =
-            encode_wav(samples).map_err(|_| eyre!("Could not encode transcription audio."))?;
-        // These samples' Opus encoding, made on the first model that takes it.
+        // Encode WAV and Opus lazily on first model that actually needs each format.
+        let wav = std::cell::OnceCell::new();
         let opus = std::cell::OnceCell::new();
         for (model_index, id) in self
             .config
@@ -1310,6 +1310,11 @@ impl Chain<'_> {
                         Err(error) => {
                             let live_error = error.downcast_ref::<streaming::LiveError>();
                             let status = live_error.and_then(|error| error.status);
+                            if status == Some(401)
+                                || live_error.is_some_and(|e| e.error_kind == ErrorKind::Auth)
+                            {
+                                super::keys::invalidate(model.provider);
+                            }
                             if live_error.is_none_or(|error| error.attempted) {
                                 let kind =
                                     live_error.map_or(ErrorKind::Network, |error| error.error_kind);
@@ -1380,12 +1385,12 @@ impl Chain<'_> {
                 // Validate the request without audio first, so an invalid
                 // endpoint or option never costs an encode.
                 let valid = build(Upload::wav(&[]));
-                let mut audio = Upload::wav(&wav);
+                let mut opus_bytes: Option<&[u8]> = None;
                 if valid.is_ok() && accepts_opus(model) && !opus_retried && !opus_refused(id) {
                     // The encode counts against this attempt's deadline as
                     // well as the chain's.
                     let at = Instant::now();
-                    audio.opus = opus.get_or_init(|| encode_opus(samples)).as_deref();
+                    opus_bytes = opus.get_or_init(|| encode_opus(samples)).as_deref();
                     let encoding = at.elapsed();
                     spent = spent.saturating_add(encoding);
                     check_cancelled(self.cancelled)?;
@@ -1404,6 +1409,21 @@ impl Chain<'_> {
                         break;
                     }
                 }
+                let audio = if let Some(opus_bytes) = opus_bytes {
+                    Upload {
+                        wav: &[],
+                        opus: Some(opus_bytes),
+                    }
+                } else {
+                    let wav_bytes = match wav.get_or_init(|| {
+                        encode_wav(samples)
+                            .map_err(|_| eyre!("Could not encode transcription audio."))
+                    }) {
+                        Ok(bytes) => bytes.as_slice(),
+                        Err(_) => return Err(eyre!("Could not encode transcription audio.")),
+                    };
+                    Upload::wav(wav_bytes)
+                };
                 let request = match valid.and_then(|_| build(audio)) {
                     Ok(request) => request,
                     Err(_) => {
@@ -1617,6 +1637,15 @@ pub fn transcribe(
     vocabulary: &Snapshot,
     live: Option<streaming::PendingLive>,
 ) -> Result<Transcription> {
+    transcribe_cancellable(samples, vocabulary, live, None)
+}
+
+pub fn transcribe_cancellable(
+    samples: &[f32],
+    vocabulary: &Snapshot,
+    live: Option<streaming::PendingLive>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> Result<Transcription> {
     if samples.is_empty() {
         return Ok(Transcription {
             text: String::new(),
@@ -1633,11 +1662,13 @@ pub fn transcribe(
     let vocabulary = live
         .as_ref()
         .map_or_else(|| vocabulary.clone(), |live| live.vocabulary.clone());
-    let cancelled = live.as_ref().map(streaming::PendingLive::cancellation_flag);
-    transcribe_configured(
+    let cancelled =
+        cancel_flag.or_else(|| live.as_ref().map(streaming::PendingLive::cancellation_flag));
+    transcribe_configured_with_cancel(
         samples,
         &vocabulary,
         live,
+        cancelled.clone(),
         &config,
         &mut |request, timeout| {
             let at = Instant::now();
@@ -1666,6 +1697,7 @@ pub fn transcribe(
     )
 }
 
+#[cfg(test)]
 fn transcribe_configured(
     samples: &[f32],
     vocabulary: &Snapshot,
@@ -1676,6 +1708,24 @@ fn transcribe_configured(
     sleep: &mut dyn FnMut(Duration),
 ) -> Result<Transcription> {
     let cancelled = live.as_ref().map(streaming::PendingLive::cancellation_flag);
+    transcribe_configured_with_cancel(
+        samples, vocabulary, live, cancelled, config, send, completed, sleep,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transcribe_configured_with_cancel(
+    samples: &[f32],
+    vocabulary: &Snapshot,
+    live: Option<streaming::PendingLive>,
+    cancelled: Option<Arc<AtomicBool>>,
+    config: &Config,
+    send: &mut RequestSender<'_>,
+    completed: &mut CompletedSender<'_>,
+    sleep: &mut dyn FnMut(Duration),
+) -> Result<Transcription> {
+    let cancelled =
+        cancelled.or_else(|| live.as_ref().map(streaming::PendingLive::cancellation_flag));
     // Returning without a sample (cancellation) leaves streamed audio unaccounted,
     // so the session reports it as discarded when its last owner drops.
     let account = live.as_ref().map(streaming::PendingLive::account);
@@ -1697,18 +1747,37 @@ fn transcribe_configured(
     let mut live_latency_ms = 0;
     let mut sent_ms = recorded_ms;
     // The final exact clip can be silent even if a speculative live provider
-    // returned text. Never accept that hallucination or label already-sent PCM as 0.
-    let trimmed = if config.transcription.trim_silence {
-        Some(vad::trim(samples))
+    // returned text. Never accept that hallucination or label already-sent PCM
+    // as 0, and avoid copying trimmed samples unless batch fallback runs.
+    let speech_analysis = if config.transcription.trim_silence {
+        Some(vad::SpeechAnalysis::analyze(samples))
     } else {
         None
     };
-    if matches!(trimmed, Some(Trimmed::Silent)) {
-        let streamed = live.is_some();
+    if speech_analysis
+        .as_ref()
+        .is_some_and(vad::SpeechAnalysis::is_silent)
+    {
         let sent_ms = duration_ms(
             live.as_ref()
                 .map_or(0, streaming::PendingLive::sent_samples),
         );
+        let streamed = sent_ms > 0;
+        let estimated_cost_usd = live.as_ref().filter(|_| streamed).and_then(|live| {
+            let model_id = live.model_id();
+            let options = super::options(config, model_id);
+            let auto_language = options.language.trim().is_empty()
+                || options.language == crate::openrouter::AUTO_LANGUAGE;
+            super::pricing::estimate(
+                ModelRef::parse(model_id),
+                RequestMode::Live,
+                super::pricing::Billing {
+                    audio_ms: sent_ms,
+                    auto_language,
+                },
+                live.sent_keyword_count(),
+            )
+        });
         // Dropping the live session stops it at once.
         drop(live);
         record_sample(Sample {
@@ -1716,6 +1785,7 @@ fn transcribe_configured(
             skipped_silent: !streamed,
             recorded_ms,
             sent_ms,
+            estimated_cost_usd,
             telemetry: Some(DictationTelemetry::default()),
             ..Sample::default()
         });
@@ -1790,6 +1860,11 @@ fn transcribe_configured(
                 check_cancelled(cancelled.as_deref())?;
                 let live_error = error.downcast_ref::<streaming::LiveError>();
                 let status = live_error.and_then(|error| error.status);
+                if status == Some(401)
+                    || live_error.is_some_and(|e| e.error_kind == ErrorKind::Auth)
+                {
+                    super::keys::invalidate(ModelRef::parse(&model_id).provider);
+                }
                 // LiveError text is Hex's own fixed wording plus a status code, never
                 // provider payloads, so it is safe to keep for diagnosing fallbacks.
                 tracing::warn!(
@@ -1826,6 +1901,7 @@ fn transcribe_configured(
         }
     }
     if !live_succeeded {
+        let trimmed = speech_analysis.map(|analysis| analysis.into_trimmed(samples));
         let samples = match &trimmed {
             Some(Trimmed::Speech(speech)) => speech.as_slice(),
             _ => samples,

@@ -329,35 +329,66 @@ pub fn post_return_to_pid(pid: i32) -> Result<()> {
 
 /// Types `text` into `pid` as Unicode key events, never touching the
 /// clipboard. Line breaks are Shift-Return so chat boxes insert a newline
-/// instead of sending. Every event carries the synthetic marker, so Endu's
-/// own event tap ignores them.
+/// instead of sending, spaced apart so modifier-tracking clients do not treat
+/// the burst as a bare Return. Every event carries the synthetic marker, so
+/// Endu's own event tap ignores them.
 pub fn type_text_to_pid(text: &str, pid: i32) -> Result<()> {
     if pid <= 0 {
         return Err(eyre!("typing target is unavailable"));
     }
-    let mut events = Vec::new();
+    let actions = typing_actions(text)?;
+    post_typing_actions(&actions, |event| event.post(pid), std::thread::sleep);
+    Ok(())
+}
+
+enum TypingAction<E> {
+    Immediate(E),
+    Spaced(Vec<E>),
+}
+
+fn typing_actions(text: &str) -> Result<Vec<TypingAction<KeyboardEvent>>> {
+    let mut actions = Vec::new();
     for stroke in typing_strokes(text) {
         match stroke {
             Stroke::Text(units) => {
                 for down in [true, false] {
                     let event = KeyboardEvent::new((0, down, 0))?;
                     event.set_unicode(&units);
-                    events.push(event);
+                    actions.push(TypingAction::Immediate(event));
                 }
             }
             Stroke::LineBreak => {
-                for spec in
-                    shortcut_event_specs(RETURN_KEY_CODE, &[(SHIFT_FLAG, SHIFT_KEY_CODE)], 1)
-                {
-                    events.push(KeyboardEvent::new(spec)?);
-                }
+                let specs =
+                    shortcut_event_specs(RETURN_KEY_CODE, &[(SHIFT_FLAG, SHIFT_KEY_CODE)], 1);
+                let events = specs.map(KeyboardEvent::new).collect::<Result<Vec<_>>>()?;
+                actions.push(TypingAction::Spaced(events));
             }
         }
     }
-    for event in events {
-        event.post(pid);
+    Ok(actions)
+}
+
+fn post_typing_actions<E>(
+    actions: &[TypingAction<E>],
+    mut post: impl FnMut(&E),
+    mut wait: impl FnMut(Duration),
+) {
+    let mut prev_was_spaced = false;
+    for action in actions {
+        match action {
+            TypingAction::Immediate(event) => {
+                if prev_was_spaced {
+                    wait(SHORTCUT_EVENT_GAP);
+                    prev_was_spaced = false;
+                }
+                post(event);
+            }
+            TypingAction::Spaced(events) => {
+                post_spaced(events, &mut post, &mut wait);
+                prev_was_spaced = true;
+            }
+        }
     }
-    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -722,6 +753,36 @@ mod tests {
                 (RETURN_KEY_CODE, true, SHIFT_FLAG),
                 (RETURN_KEY_CODE, false, SHIFT_FLAG),
                 (SHIFT_KEY_CODE, false, 0),
+            ]
+        );
+        let steps = std::cell::RefCell::new(Vec::new());
+        let actions = [
+            TypingAction::Immediate("a-down"),
+            TypingAction::Immediate("a-up"),
+            TypingAction::Spaced(vec!["shift-down", "ret-down", "ret-up", "shift-up"]),
+            TypingAction::Immediate("b-down"),
+            TypingAction::Immediate("b-up"),
+        ];
+        post_typing_actions(
+            &actions,
+            |event| steps.borrow_mut().push(format!("post {event}")),
+            |gap| steps.borrow_mut().push(format!("wait {}", gap.as_millis())),
+        );
+        assert_eq!(
+            steps.into_inner(),
+            [
+                "post a-down",
+                "post a-up",
+                "post shift-down",
+                "wait 15",
+                "post ret-down",
+                "wait 15",
+                "post ret-up",
+                "wait 15",
+                "post shift-up",
+                "wait 15",
+                "post b-down",
+                "post b-up",
             ]
         );
     }

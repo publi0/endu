@@ -18,7 +18,7 @@ fn notice_copy(copied_to_clipboard: bool, paste_last: Option<&str>) -> (&'static
     if copied_to_clipboard {
         (
             t("Dictation copied"),
-            "Auto-paste did not complete. Press ⌘V\nto paste the text in the app you choose."
+            t("Auto-paste did not complete. Press ⌘V\nto paste the text in the app you choose.")
                 .into(),
         )
     } else if let Some(shortcut) = paste_last {
@@ -32,7 +32,7 @@ fn notice_copy(copied_to_clipboard: bool, paste_last: Option<&str>) -> (&'static
     } else {
         (
             t("Dictation ready"),
-            "Auto-paste paused. Use Paste Last Dictation in the\nmenu bar to insert the text in the app you choose."
+            t("Auto-paste paused. Use Paste Last Dictation in the\nmenu bar to insert the text in the app you choose.")
                 .into(),
         )
     }

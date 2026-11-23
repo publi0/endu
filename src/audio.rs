@@ -187,6 +187,7 @@ pub struct RecoveringAudioInput {
     /// The reopen error last logged, so a microphone that stays gone (an
     /// unplugged headset, a closed lid) logs once, not on every retry.
     retry_warning: Option<String>,
+    hardware_generation: u64,
 }
 
 pub enum RecoveringAudioInputEvent {
@@ -213,7 +214,86 @@ const MICROPHONE_STALL_RETRY_MAX: Duration = Duration::from_secs(60);
 /// How long a stream must have been delivering before its failure counts as
 /// an accident of a working microphone, reopened at once.
 const STREAM_PROVEN_UPTIME: Duration = STREAM_STALL_TIMEOUT.saturating_mul(2);
+const ROUTING_PROBE_FALLBACK_INTERVAL: Duration = Duration::from_secs(60);
 const ROUTING_PROBE_INTERVAL: Duration = Duration::from_secs(3);
+
+#[cfg(target_os = "macos")]
+static HARDWARE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static HARDWARE_WATCHING: OnceLock<bool> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+fn hardware_generation() -> u64 {
+    HARDWARE_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn hardware_generation() -> u64 {
+    0
+}
+
+#[cfg(target_os = "macos")]
+fn watch_hardware_changes() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    *HARDWARE_WATCHING.get_or_init(|| {
+        use objc2_core_audio::{
+            AudioObjectAddPropertyListener, AudioObjectID, AudioObjectPropertyAddress,
+            kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDevices,
+            kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal,
+            kAudioObjectSystemObject,
+        };
+        use std::ffi::c_void;
+        use std::ptr::NonNull;
+
+        unsafe extern "C-unwind" fn on_hardware_change(
+            _object_id: AudioObjectID,
+            _num_addresses: u32,
+            _addresses: NonNull<AudioObjectPropertyAddress>,
+            _client_data: *mut c_void,
+        ) -> i32 {
+            HARDWARE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            0
+        }
+
+        let mut ok = true;
+        for selector in [
+            kAudioHardwarePropertyDevices,
+            kAudioHardwarePropertyDefaultInputDevice,
+        ] {
+            let mut address = AudioObjectPropertyAddress {
+                mSelector: selector,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain,
+            };
+            // SAFETY: Process-lifetime CoreAudio property listener whose
+            // callback only increments an atomic counter.
+            let status = unsafe {
+                AudioObjectAddPropertyListener(
+                    kAudioObjectSystemObject as AudioObjectID,
+                    NonNull::from(&mut address),
+                    Some(on_hardware_change),
+                    std::ptr::null_mut(),
+                )
+            };
+            if status != 0 {
+                tracing::warn!(
+                    status,
+                    selector,
+                    "could not register CoreAudio device listener"
+                );
+                ok = false;
+            }
+        }
+        ok
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn watch_hardware_changes() -> bool {
+    false
+}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum MicrophoneRecoveryReason {
@@ -414,12 +494,14 @@ impl AudioInput {
         if channels == 0 {
             return Err(eyre!("microphone reports no input channels"));
         }
+        crate::dictation::validate_sample_rate(sample_rate).map_err(|error| eyre!(error))?;
         let description = describe_device(&device, config.channels);
         let selected_channel = description.channel;
         let (sender, chunks) = mpsc::sync_channel(CHUNK_QUEUE_CAPACITY);
         let sink = ChunkSink {
             sender,
             pending_drop: false,
+            spare: Vec::with_capacity(2048),
         };
         let (error_sender, stream_errors) = mpsc::sync_channel(1);
 
@@ -477,8 +559,9 @@ impl AudioInput {
         // counts them.
         overloads::report();
         // A stream failure reported before or during the wait outranks any
-        // chunk delivered alongside it.
+        // chunk delivered alongside it. Log off the real-time callback thread.
         if let Ok(error) = self.stream_errors.try_recv() {
+            tracing::error!(%error, "microphone stream failed");
             return AudioInputEvent::StreamFailed(error);
         }
         if let Some((samples, captured_through)) = self.after_drop.take() {
@@ -489,6 +572,7 @@ impl AudioInput {
         }
         let received = self.chunks.recv_timeout(timeout);
         if let Ok(error) = self.stream_errors.try_recv() {
+            tracing::error!(%error, "microphone stream failed");
             return AudioInputEvent::StreamFailed(error);
         }
         if received.is_ok() {
@@ -537,8 +621,9 @@ impl Drop for AudioInput {
     fn drop(&mut self) {
         // Stop the stream before the count is taken, so a closing stream's
         // last burst is written here instead of beside the next open's lines.
-        self._stream = None;
-        overloads::flush();
+        if self._stream.take().is_some() {
+            overloads::flush();
+        }
     }
 }
 
@@ -577,6 +662,11 @@ impl RecoveringAudioInput {
         selected_device: Option<&str>,
         preferences: &[DevicePreference],
     ) -> Self {
+        let probe_interval = if watch_hardware_changes() {
+            ROUTING_PROBE_FALLBACK_INTERVAL
+        } else {
+            ROUTING_PROBE_INTERVAL
+        };
         Self {
             input: None,
             device_override: device_override.map(str::to_owned),
@@ -586,8 +676,9 @@ impl RecoveringAudioInput {
             recovery: MicrophoneRecovery::default(),
             replacement: None,
             routing_probe: None,
-            next_routing_probe: Instant::now() + ROUTING_PROBE_INTERVAL,
+            next_routing_probe: Instant::now() + probe_interval,
             lid_generation: crate::clamshell::generation(),
+            hardware_generation: hardware_generation(),
             first_delivery: None,
             proven: false,
             retry_warning: None,
@@ -967,11 +1058,13 @@ impl RecoveringAudioInput {
         {
             return;
         }
-        // Opening or closing the lid turns the internal microphone on or
-        // off without changing the device list: resolve again now.
+        // Opening/closing the lid or CoreAudio device/default-input changes
+        // trigger an immediate routing check without 3-second thread-spawning polls.
         let lid_generation = crate::clamshell::generation();
-        if lid_generation != self.lid_generation {
+        let hw_generation = hardware_generation();
+        if lid_generation != self.lid_generation || hw_generation != self.hardware_generation {
             self.lid_generation = lid_generation;
+            self.hardware_generation = hw_generation;
             self.routing_probe = None;
             self.next_routing_probe = now;
         }
@@ -1002,7 +1095,12 @@ impl RecoveringAudioInput {
         {
             return;
         }
-        self.next_routing_probe = now + ROUTING_PROBE_INTERVAL;
+        let probe_interval = if watch_hardware_changes() {
+            ROUTING_PROBE_FALLBACK_INTERVAL
+        } else {
+            ROUTING_PROBE_INTERVAL
+        };
+        self.next_routing_probe = now + probe_interval;
         let selected = self.selected_device.clone();
         let preferences = self.preferences.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -1480,29 +1578,45 @@ fn input_transport(device: &Device) -> InputTransport {
     }
 }
 
+fn mono_into<T>(
+    samples: &[T],
+    channels: usize,
+    selected_channel: Option<u16>,
+    convert: impl Fn(&T) -> f32,
+    output: &mut Vec<f32>,
+) {
+    output.clear();
+    if channels == 0 {
+        return;
+    }
+    if channels == 1 {
+        output.extend(samples.iter().map(convert));
+        return;
+    }
+    let selected =
+        resolve_channel(selected_channel, channels as u16).map(|channel| usize::from(channel - 1));
+    output.extend(samples.chunks_exact(channels).map(|frame| {
+        selected.map_or_else(
+            || frame.iter().map(&convert).sum::<f32>() / channels as f32,
+            |channel| convert(&frame[channel]),
+        )
+    }));
+}
+
+#[cfg(test)]
 fn mono<T>(
     samples: &[T],
     channels: usize,
     selected_channel: Option<u16>,
     convert: impl Fn(&T) -> f32,
 ) -> Vec<f32> {
-    if channels == 0 {
-        return Vec::new();
-    }
-    if channels == 1 {
-        return samples.iter().map(convert).collect();
-    }
-    let selected =
-        resolve_channel(selected_channel, channels as u16).map(|channel| usize::from(channel - 1));
-    samples
-        .chunks_exact(channels)
-        .map(|frame| {
-            selected.map_or_else(
-                || frame.iter().map(&convert).sum::<f32>() / channels as f32,
-                |channel| convert(&frame[channel]),
-            )
-        })
-        .collect()
+    let mut out = Vec::with_capacity(if channels == 0 {
+        0
+    } else {
+        samples.len() / channels
+    });
+    mono_into(samples, channels, selected_channel, convert, &mut out);
+    out
 }
 
 /// The capture callback's end of the bounded chunk queue.
@@ -1511,21 +1625,36 @@ struct ChunkSink {
     /// Audio was dropped since the last chunk the queue took; the next one
     /// that fits carries the mark, so no hole goes unreported.
     pending_drop: bool,
+    /// Reused when the queue is full so a dropped chunk is never freed on the
+    /// real-time audio callback thread.
+    spare: Vec<f32>,
 }
 
 impl ChunkSink {
     /// Runs on the capture callback: never blocks, locks or touches shared
     /// state. A chunk the full queue cannot take is dropped, and the next
     /// chunk the queue accepts tells the owner a hole precedes it.
-    fn send(&mut self, chunk: Vec<f32>, captured_through: CaptureInstant) {
+    fn send_with(&mut self, captured_through: CaptureInstant, fill: impl FnOnce(&mut Vec<f32>)) {
+        let mut chunk = std::mem::take(&mut self.spare);
+        fill(&mut chunk);
         match self
             .sender
             .try_send((chunk, captured_through, self.pending_drop))
         {
             Ok(()) => self.pending_drop = false,
-            Err(TrySendError::Full(_)) => self.pending_drop = true,
-            Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Full((returned, _, _))) => {
+                self.spare = returned;
+                self.pending_drop = true;
+            }
+            Err(TrySendError::Disconnected((returned, _, _))) => {
+                self.spare = returned;
+            }
         }
+    }
+
+    #[cfg(test)]
+    fn send(&mut self, chunk: Vec<f32>, captured_through: CaptureInstant) {
+        self.send_with(captured_through, |out| *out = chunk);
     }
 }
 
@@ -1556,7 +1685,8 @@ fn stream_error(sender: &SyncSender<String>, error: cpal::Error) {
 }
 
 fn report_stream_error(sender: &SyncSender<String>, error: String) {
-    tracing::error!(%error, "microphone stream failed");
+    // Never log on the real-time CoreAudio callback thread; the consumer logs
+    // when it receives the failure.
     let _ = sender.try_send(error);
 }
 
@@ -1575,10 +1705,15 @@ fn build_stream<T: SizedSample>(
             *config,
             move |data: &[T], info| {
                 let captured_through = captured_through(info, data.len() / channels, sample_rate);
-                sink.send(
-                    mono(data, channels, selected_channel, |sample| convert(*sample)),
-                    captured_through,
-                )
+                sink.send_with(captured_through, |out| {
+                    mono_into(
+                        data,
+                        channels,
+                        selected_channel,
+                        |sample| convert(*sample),
+                        out,
+                    );
+                });
             },
             move |error| stream_error(&error_sender, error),
             None,
@@ -2056,6 +2191,7 @@ mod tests {
         let mut sink = ChunkSink {
             sender,
             pending_drop: false,
+            spare: Vec::new(),
         };
         let at = |ms: u64| CaptureInstant::from_nanos(60_000_000_000 + ms * 1_000_000);
         // The queue holds two chunks; the third is dropped without blocking.
@@ -2090,6 +2226,7 @@ mod tests {
         let mut sink = ChunkSink {
             sender,
             pending_drop: false,
+            spare: Vec::new(),
         };
         let at = |ms: u64| CaptureInstant::from_nanos(60_000_000_000 + ms * 1_000_000);
         let next = |input: &mut AudioInput| match input.recv_timeout(Duration::ZERO) {

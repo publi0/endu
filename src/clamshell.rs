@@ -11,8 +11,8 @@
 //! without polling. Macs without a lid read open.
 
 use std::ffi::{c_char, c_void};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use objc2_core_foundation::CFString;
 
@@ -22,6 +22,40 @@ use objc2_core_foundation::CFString;
 pub const LID_CLOSED_ERROR: &str = "the built-in microphone is off while the lid is closed";
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+static NEXT_WAKE_ID: AtomicU64 = AtomicU64::new(1);
+type WakeCallback = Box<dyn Fn() + Send + Sync>;
+static WAKES: LazyLock<Mutex<Vec<(u64, WakeCallback)>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Unregisters a lid-change wake callback on drop.
+pub struct WakeGuard(u64);
+
+impl Drop for WakeGuard {
+    fn drop(&mut self) {
+        WAKES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|(id, _)| *id != self.0);
+    }
+}
+
+/// Registers a lightweight, non-blocking callback invoked whenever the lid
+/// opens or closes so sleeping loops wake immediately from backoff.
+pub fn on_change(callback: impl Fn() + Send + Sync + 'static) -> WakeGuard {
+    let id = NEXT_WAKE_ID.fetch_add(1, Ordering::Relaxed);
+    WAKES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push((id, Box::new(callback)));
+    WakeGuard(id)
+}
+
+fn notify_change() {
+    GENERATION.fetch_add(1, Ordering::AcqRel);
+    let wakes = WAKES.lock().unwrap_or_else(|error| error.into_inner());
+    for (_, callback) in wakes.iter() {
+        callback();
+    }
+}
 
 /// Advances each time the lid opens or closes.
 pub fn generation() -> u64 {
@@ -129,7 +163,7 @@ pub fn watch() {
         _argument: *mut c_void,
     ) {
         if message == CLAMSHELL_STATE_CHANGE {
-            GENERATION.fetch_add(1, Ordering::AcqRel);
+            notify_change();
         }
     }
     if WATCHING.set(()).is_err() {

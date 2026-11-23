@@ -224,7 +224,7 @@ struct MetalIndicator {
     window: Retained<NSPanel>,
     /// A written notice over the capsule, such as "No audio".
     notice: Retained<NSTextField>,
-    notice_shown: u32,
+    notice_style: Option<(u32, bool, u32, crate::i18n::Language)>,
     renderer: Arc<SharedRenderer>,
     display_link: CVDisplayLink,
     display_link_context: *const SharedRenderer,
@@ -280,18 +280,20 @@ impl MetalIndicator {
         let display_link = CVDisplayLink::from_active_cg_displays()
             .map_err(|status| format!("could not create display link: {status}"))?;
         let display_link_context = Arc::into_raw(renderer.clone());
-        unsafe {
+        if let Err(status) = unsafe {
             display_link.set_output_callback(
                 display_link_callback,
                 display_link_context.cast_mut().cast::<c_void>(),
             )
+        } {
+            unsafe { drop(Arc::from_raw(display_link_context)) };
+            return Err(format!("could not configure display link: {status}"));
         }
-        .map_err(|status| format!("could not configure display link: {status}"))?;
 
         let mut indicator = Self {
             window,
             notice,
-            notice_shown: 0,
+            notice_style: None,
             renderer,
             display_link,
             display_link_context,
@@ -310,11 +312,10 @@ impl MetalIndicator {
             self.visibility.update(&mut self.window, true);
             tracing::info!("Metal dictation indicator presentation requested");
         }
-        // Present first: an off-Space CAMetalLayer may be waiting for a drawable
-        // while holding the renderer lock. WindowServer must see the panel again
-        // before the UI thread waits to update the animation state.
+        // Present first, then update pure CPU animation state (never waiting on GPU).
         self.renderer.handle(event);
-        if !self.display_link.is_running()
+        if self.renderer.is_active()
+            && !self.display_link.is_running()
             && let Err(status) = self.display_link.start()
         {
             tracing::error!(status, "could not start indicator display link");
@@ -324,17 +325,28 @@ impl MetalIndicator {
     /// Shows the renderer's written notice at the capsule's own opacity.
     fn update_notice(&mut self) {
         let (code, alpha) = self.renderer.notice();
-        if code != 0 && code != self.notice_shown {
+        if code == 0 {
+            self.notice_style = None;
+            self.notice.setAlphaValue(0.0);
+            return;
+        }
+        let preferences = crate::hud_settings::current();
+        let dark = preferences
+            .appearance
+            .is_dark(crate::appearance::system_is_dark());
+        let style = (
+            code,
+            dark,
+            preferences.size.scale().to_bits(),
+            crate::i18n::language(),
+        );
+        if self.notice_style != Some(style) {
             let text = if code == HudNotice::NoAudio.code() {
                 crate::i18n::t("No audio")
             } else {
                 crate::i18n::t("Low audio")
             };
             self.notice.setStringValue(&NSString::from_str(text));
-            let preferences = crate::hud_settings::current();
-            let dark = preferences
-                .appearance
-                .is_dark(crate::appearance::system_is_dark());
             let ink = if dark {
                 NSColor::colorWithSRGBRed_green_blue_alpha(0.86, 0.86, 0.86, 1.0)
             } else {
@@ -343,9 +355,7 @@ impl MetalIndicator {
             };
             self.notice.setTextColor(Some(&ink));
             self.layout_notice();
-        }
-        if code != 0 {
-            self.notice_shown = code;
+            self.notice_style = Some(style);
         }
         self.notice.setAlphaValue(f64::from(alpha));
     }
@@ -406,6 +416,7 @@ impl MetalIndicator {
         {
             self.window
                 .setContentSize(NSSize::new(window_width, window_height));
+            self.layout_notice();
         }
         self.renderer
             .set_viewport(screen.backing_scale, size_factor);
@@ -445,13 +456,65 @@ extern "C" fn display_link_callback(
     _flags_out: *mut CVOptionFlags,
     context: *mut c_void,
 ) -> CVReturn {
-    let renderer = unsafe { &*context.cast::<SharedRenderer>() };
-    renderer.draw();
+    // Drain ObjC autoreleased Metal objects (CAMetalDrawable, MTLCommandBuffer,
+    // MTLRenderPassDescriptor, encoders) on every CVDisplayLink frame.
+    objc2::rc::autoreleasepool(|_| {
+        let renderer = unsafe { &*context.cast::<SharedRenderer>() };
+        renderer.draw();
+    });
     0
+}
+
+struct MetalGpu {
+    command_queue: CommandQueue,
+    layer: MetalLayer,
+    pipeline: RenderPipelineState,
+}
+
+impl MetalGpu {
+    fn set_viewport(&self, scale: f32, size_factor: f32) {
+        self.layer.set_contents_scale(f64::from(scale));
+        self.layer.set_drawable_size(CGSize::new(
+            f64::from(WINDOW_WIDTH * scale * size_factor),
+            f64::from(WINDOW_HEIGHT * scale * size_factor),
+        ));
+    }
+
+    fn draw_with(
+        &self,
+        uniforms: &Uniforms,
+        next_drawable: impl FnOnce(&MetalLayer) -> Option<&metal::MetalDrawableRef>,
+    ) {
+        let Some(drawable) = next_drawable(&self.layer) else {
+            return;
+        };
+        let descriptor = RenderPassDescriptor::new();
+        let attachment = descriptor.color_attachments().object_at(0).unwrap();
+        attachment.set_texture(Some(drawable.texture()));
+        attachment.set_load_action(MTLLoadAction::Clear);
+        attachment.set_clear_color(metal::MTLClearColor::new(0.0, 0.0, 0.0, 0.0));
+        attachment.set_store_action(MTLStoreAction::Store);
+
+        let command_buffer = self.command_queue.new_command_buffer();
+        let encoder = command_buffer.new_render_command_encoder(descriptor);
+        encoder.set_render_pipeline_state(&self.pipeline);
+        encoder.set_fragment_bytes(
+            0,
+            std::mem::size_of::<Uniforms>() as u64,
+            (uniforms as *const Uniforms).cast::<c_void>(),
+        );
+        encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
+        encoder.end_encoding();
+        command_buffer.present_drawable(drawable);
+        command_buffer.commit();
+    }
 }
 
 struct SharedRenderer {
     renderer: Mutex<MetalRenderer>,
+    /// Separate lock for Metal drawable acquisition and command encoding so the
+    /// main UI thread's `handle()` never blocks behind a stalled `next_drawable()`.
+    gpu: Mutex<MetalGpu>,
     active: AtomicBool,
     live_work: AtomicBool,
     /// The notice code and its opacity's bits, published after each frame
@@ -467,8 +530,14 @@ unsafe impl Sync for SharedRenderer {}
 
 impl SharedRenderer {
     fn new() -> Result<Self, String> {
+        let mut renderer = MetalRenderer::new()?;
+        let gpu = renderer
+            .gpu
+            .take()
+            .expect("MetalRenderer starts with GPU resources");
         Ok(Self {
-            renderer: Mutex::new(MetalRenderer::new()?),
+            renderer: Mutex::new(renderer),
+            gpu: Mutex::new(gpu),
             active: AtomicBool::new(false),
             live_work: AtomicBool::new(false),
             notice_code: AtomicU32::new(0),
@@ -490,18 +559,18 @@ impl SharedRenderer {
     }
 
     fn layer(&self) -> *const metal::MetalLayerRef {
-        self.renderer.lock().unwrap().layer.as_ref()
+        self.gpu.lock().unwrap().layer.as_ref()
     }
 
     fn handle(&self, event: DictationIndicatorEvent) {
         let mut renderer = self.renderer.lock().unwrap();
         renderer.handle(event);
         self.publish_notice(&renderer);
-        self.live_work.store(
-            renderer.capture_phase.is_some() || !renderer.jobs.is_empty(),
-            Ordering::Release,
-        );
-        self.active.store(true, Ordering::Release);
+        let has_work = renderer.capture_phase.is_some() || !renderer.jobs.is_empty();
+        self.live_work.store(has_work, Ordering::Release);
+        if renderer.should_be_active() {
+            self.active.store(true, Ordering::Release);
+        }
     }
 
     fn set_viewport(&self, scale: f32, size_factor: f32) {
@@ -511,15 +580,24 @@ impl SharedRenderer {
         if let Ok(mut renderer) = self.renderer.try_lock() {
             renderer.set_viewport(scale, size_factor);
         }
+        if let Ok(gpu) = self.gpu.try_lock() {
+            gpu.set_viewport(scale, size_factor);
+        }
     }
 
     fn draw(&self) {
         if !self.active.load(Ordering::Acquire) {
             return;
         }
-        let mut renderer = self.renderer.lock().unwrap();
-        let keep_rendering = renderer.draw();
-        self.publish_notice(&renderer);
+        let (uniforms, keep_rendering) = {
+            let mut renderer = self.renderer.lock().unwrap();
+            let step = renderer.step_frame(Instant::now());
+            self.publish_notice(&renderer);
+            step
+        };
+        if let Ok(gpu) = self.gpu.lock() {
+            gpu.draw_with(&uniforms, |layer| layer.next_drawable());
+        }
         if !keep_rendering {
             self.active.store(false, Ordering::Release);
         }
@@ -671,9 +749,7 @@ fn recording_width(average: f32) -> f32 {
 }
 
 struct MetalRenderer {
-    layer: MetalLayer,
-    command_queue: CommandQueue,
-    pipeline: RenderPipelineState,
+    gpu: Option<MetalGpu>,
     phase: Phase,
     capture_phase: Option<CapturePhase>,
     preparing: f32,
@@ -759,9 +835,11 @@ impl MetalRenderer {
             .map_err(|error| format!("could not create indicator pipeline: {error}"))?;
         let now = Instant::now();
         Ok(Self {
-            command_queue: device.new_command_queue(),
-            layer,
-            pipeline,
+            gpu: Some(MetalGpu {
+                command_queue: device.new_command_queue(),
+                layer,
+                pipeline,
+            }),
             phase: Phase::Hidden,
             capture_phase: None,
             preparing: 0.0,
@@ -1046,15 +1124,22 @@ impl MetalRenderer {
         }
         self.scale = scale;
         self.size_factor = size_factor;
-        self.layer.set_contents_scale(f64::from(scale));
-        self.layer.set_drawable_size(CGSize::new(
-            f64::from(WINDOW_WIDTH * scale * size_factor),
-            f64::from(WINDOW_HEIGHT * scale * size_factor),
-        ));
+        if let Some(gpu) = &self.gpu {
+            gpu.set_viewport(scale, size_factor);
+        }
     }
 
-    fn draw(&mut self) -> bool {
-        self.draw_with(Instant::now(), |layer| layer.next_drawable())
+    #[cfg(test)]
+    fn draw_with(
+        &mut self,
+        now: Instant,
+        next_drawable: impl FnOnce(&metal::MetalLayerRef) -> Option<&metal::MetalDrawableRef>,
+    ) -> bool {
+        let (uniforms, keep_rendering) = self.step_frame(now);
+        if let Some(gpu) = &self.gpu {
+            gpu.draw_with(&uniforms, |layer| next_drawable(layer.as_ref()));
+        }
+        keep_rendering
     }
 
     fn recording_meter(&self, now: Instant, enabled: bool) -> (f32, f32) {
@@ -1071,11 +1156,7 @@ impl MetalRenderer {
         }
     }
 
-    fn draw_with(
-        &mut self,
-        now: Instant,
-        next_drawable: impl FnOnce(&metal::MetalLayerRef) -> Option<&metal::MetalDrawableRef>,
-    ) -> bool {
+    fn step_frame(&mut self, now: Instant) -> (Uniforms, bool) {
         // A microphone that stops delivering samples also needs the notice.
         self.update_live_notice(now);
         if self.completion_pending
@@ -1164,20 +1245,6 @@ impl MetalRenderer {
             || !self
                 .softness
                 .is_settled(HIDDEN_SOFTNESS, 0.02, EXIT_ANGULAR_FREQUENCY);
-        let Some(drawable) = next_drawable(&self.layer) else {
-            // GPU availability must not extend a finished/cancelled lifecycle.
-            return keep_rendering;
-        };
-        let descriptor = RenderPassDescriptor::new();
-        let attachment = descriptor.color_attachments().object_at(0).unwrap();
-        attachment.set_texture(Some(drawable.texture()));
-        attachment.set_load_action(MTLLoadAction::Clear);
-        attachment.set_clear_color(metal::MTLClearColor::new(0.0, 0.0, 0.0, 0.0));
-        attachment.set_store_action(MTLStoreAction::Store);
-
-        let command_buffer = self.command_queue.new_command_buffer();
-        let encoder = command_buffer.new_render_command_encoder(descriptor);
-        encoder.set_render_pipeline_state(&self.pipeline);
         let [recording_hue_shift, transcription_hue_shift] = preferences.hue_shifts();
         let uniforms = Uniforms {
             resolution: [
@@ -1239,17 +1306,12 @@ impl MetalRenderer {
             },
             silenced: self.notice_ease(now).map_or(0.0, |(_, ease)| ease),
         };
-        encoder.set_fragment_bytes(
-            0,
-            std::mem::size_of::<Uniforms>() as u64,
-            (&raw const uniforms).cast::<c_void>(),
-        );
-        encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, 3);
-        encoder.end_encoding();
-        command_buffer.present_drawable(drawable);
-        command_buffer.commit();
+        (uniforms, keep_rendering)
+    }
 
-        keep_rendering
+    fn should_be_active(&self) -> bool {
+        !matches!(self.phase, Phase::Hidden)
+            || !self.opacity.is_settled(0.0, 0.002, EXIT_ANGULAR_FREQUENCY)
     }
 }
 

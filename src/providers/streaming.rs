@@ -98,7 +98,26 @@ fn pcm16_rms(pcm: &[u8]) -> f64 {
     (energy / samples as f64).sqrt()
 }
 const MAX_SESSIONS: usize = 4;
+const MAX_DNS_IN_FLIGHT: usize = 16;
 static SESSION_COUNT: LazyLock<Arc<AtomicUsize>> = LazyLock::new(|| Arc::new(AtomicUsize::new(0)));
+static DNS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+struct DnsPermit;
+impl DnsPermit {
+    fn acquire() -> Option<Self> {
+        DNS_IN_FLIGHT
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_DNS_IN_FLIGHT).then_some(count + 1)
+            })
+            .ok()?;
+        Some(Self)
+    }
+}
+impl Drop for DnsPermit {
+    fn drop(&mut self) {
+        DNS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 struct SessionPermit(Arc<AtomicUsize>);
 impl SessionPermit {
     fn acquire(pool: Arc<AtomicUsize>) -> Option<Self> {
@@ -256,11 +275,12 @@ fn handshake_failure<S: Read + Write>(
     let (status, keywords_rejected, keyword_count, error_kind) = match &error {
         tungstenite::HandshakeError::Failure(tungstenite::Error::Http(response)) => {
             let status = response.status().as_u16();
-            let rejected = matches!(status, 400 | 422)
-                && response
-                    .body()
-                    .as_ref()
-                    .is_some_and(|body| rejected_keywords(&String::from_utf8_lossy(body)));
+            let rejected = (status == 414 && query_keyword_count > 0)
+                || (matches!(status, 400 | 422)
+                    && response
+                        .body()
+                        .as_ref()
+                        .is_some_and(|body| rejected_keywords(&String::from_utf8_lossy(body))));
             // Every HTTP response confirms receipt of the request query, even
             // when upgrade is rejected for auth, rate limits or a redirect.
             // DNS/TCP/TLS and local credential failures do not prove delivery.
@@ -575,17 +595,24 @@ impl LiveCapture {
             let tail = &samples[self.queued..];
             if tail.len() > MAX_TAIL {
                 self.invalidate("Streaming audio fell behind; using the complete recording.");
-            } else if self
-                .seal
-                .try_send(Seal {
+            } else {
+                match self.seal.try_send(Seal {
                     queued: self.queued,
                     total: samples.len(),
                     tail: tail.to_vec(),
                     at: Instant::now(),
-                })
-                .is_err()
-            {
-                self.invalidate("Streaming transcription stopped before Finish.");
+                }) {
+                    Ok(()) => {}
+                    // The worker already exited with its own typed result (for
+                    // example 401/429/keywords_rejected); keep that instead of
+                    // masking it with a generic sealing error.
+                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                        self.worker_ended = true;
+                    }
+                    Err(mpsc::TrySendError::Full(_)) => {
+                        self.invalidate("Streaming transcription stopped before Finish.");
+                    }
+                }
             }
         }
         PendingLive {
@@ -658,6 +685,9 @@ impl PendingLive {
     pub fn sent_samples_counter(&self) -> Arc<AtomicUsize> {
         self.control.sent_samples.clone()
     }
+    pub fn sent_keyword_count(&self) -> usize {
+        self.control.sent_keyword_count.load(Ordering::Acquire)
+    }
     pub fn model_id(&self) -> &str {
         &self.config.transcription.models[0]
     }
@@ -720,7 +750,7 @@ pub fn transcribe_completed(
             for chunk in samples.chunks(BLOCK) {
                 control.check(deadline)?;
                 connection.audio(chunk, deadline)?;
-                connection.poll(deadline, &control)?;
+                connection.poll_nonblocking(deadline, &control)?;
             }
         }
         connection.finish(deadline)?;
@@ -781,7 +811,7 @@ fn run_live(
                 for chunk in end.tail.chunks(BLOCK) {
                     control.check(end.at + attempt)?;
                     connection.audio(chunk, end.at + attempt)?;
-                    connection.poll(end.at + attempt, control)?;
+                    connection.poll_nonblocking(end.at + attempt, control)?;
                 }
                 connection.finish(end.at + attempt)?;
                 let text = connection.complete(end.at + attempt, control)?;
@@ -812,7 +842,7 @@ fn run_live(
         let deadline = ending
             .as_ref()
             .map_or(lifetime, |end| (end.at + attempt).min(lifetime));
-        connection.poll(deadline, control)?;
+        connection.poll_nonblocking(deadline, control)?;
         connection.keep_alive()?;
     }
 }
@@ -942,8 +972,45 @@ fn session_update(model: &str, options: &ModelOptions, keywords: &[String]) -> V
     }}}})
 }
 
+/// Cap query-string keyword payloads by their URL-encoded length so WebSocket
+/// upgrade requests stay comfortably below proxy/edge URI limits (~8 KiB).
+const MAX_QUERY_KEYWORDS_ENCODED_BYTES: usize = 3_072;
+
 fn streaming_keywords(model: ModelRef<'_>, vocabulary: &Snapshot) -> Vec<String> {
-    super::batch::keywords(model, vocabulary)
+    let mut terms = super::batch::keywords(model, vocabulary);
+    if !query_keywords(model.provider) || terms.is_empty() {
+        return terms;
+    }
+    let param_overhead = match model.provider {
+        Provider::ElevenLabs => "&keyterms=".len(),
+        Provider::Deepgram | Provider::Grok => "&keyterm=".len(),
+        _ => 0,
+    };
+    let mut encoded_bytes = 0usize;
+    let mut keep = 0usize;
+    for term in &terms {
+        let term_bytes = url_encoded_len(term) + param_overhead;
+        if encoded_bytes + term_bytes > MAX_QUERY_KEYWORDS_ENCODED_BYTES {
+            break;
+        }
+        encoded_bytes += term_bytes;
+        keep += 1;
+    }
+    terms.truncate(keep);
+    terms
+}
+
+fn url_encoded_len(value: &str) -> usize {
+    value
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'*' | b' ') {
+                1
+            } else {
+                3
+            }
+        })
+        .sum()
 }
 
 fn google_setup(model: &str, options: &ModelOptions, keywords: &[String]) -> Value {
@@ -1200,6 +1267,7 @@ struct Protocol {
     commit_item: Option<String>,
     completed_items: BTreeMap<String, String>,
     segments: BTreeMap<(u64, u64), String>,
+    segment_bytes: usize,
     grok: GrokFinals,
     /// ElevenLabs: commits sent before Finish, audio since the last one,
     /// whether Finish needed no commit of its own, and segments received.
@@ -1223,6 +1291,7 @@ impl Protocol {
             commit_item: None,
             completed_items: BTreeMap::new(),
             segments: BTreeMap::new(),
+            segment_bytes: 0,
             grok: GrokFinals::default(),
             elevenlabs_commits: 0,
             elevenlabs_pending: 0,
@@ -1274,17 +1343,19 @@ impl Protocol {
                 .and_then(Value::as_u64)
                 .and_then(|n| u16::try_from(n).ok())
                 .filter(|status| (100..=599).contains(status))
-                .or_else(|| {
-                    if self.provider != Provider::Meta {
-                        return None;
+                .or_else(|| match kind {
+                    "auth_error" => Some(401),
+                    "rate_limited" => Some(429),
+                    _ if self.provider == Provider::Meta => {
+                        // Voice errorType uses the documented Model API taxonomy.
+                        match event["errorType"].as_str() {
+                            Some("authentication_error") => Some(401),
+                            Some("rate_limit_error") => Some(429),
+                            Some("server_error") => Some(500),
+                            _ => None,
+                        }
                     }
-                    // Voice errorType uses the documented Model API taxonomy.
-                    match event["errorType"].as_str() {
-                        Some("authentication_error") => Some(401),
-                        Some("rate_limit_error") => Some(429),
-                        Some("server_error") => Some(500),
-                        _ => None,
-                    }
+                    _ => None,
                 });
             return Err(LiveError {
                 status,
@@ -1389,29 +1460,31 @@ impl Protocol {
                         .as_f64()
                         .filter(|n| n.is_finite() && *n >= 0.0)
                         .ok_or_else(|| failure("Streaming response had invalid timing."))?;
+                    let start_samples = start * 16_000.0;
+                    let duration_samples = duration * 16_000.0;
+                    if !start_samples.is_finite()
+                        || !duration_samples.is_finite()
+                        || start_samples > (u64::MAX as f64)
+                        || duration_samples > (u64::MAX as f64)
+                    {
+                        return Err(failure("Streaming response had invalid timing."));
+                    }
                     if text.len() > MAX_TEXT || self.segments.len() >= 10_000 {
                         return Err(failure("Streaming response exceeded its limit."));
                     }
-                    let previous = self
-                        .segments
-                        .get(&(
-                            (start * 16_000.0).round() as u64,
-                            (duration * 16_000.0).round() as u64,
-                        ))
-                        .map_or(0, String::len);
-                    let retained = self.segments.values().map(String::len).sum::<usize>();
-                    if retained.saturating_sub(previous).saturating_add(text.len()) > MAX_TEXT {
-                        return Err(failure("Streaming response exceeded its limit."));
-                    }
                     let segment = (
-                        (start * 16_000.0).round() as u64,
-                        (duration * 16_000.0).round() as u64,
+                        start_samples.round() as u64,
+                        duration_samples.round() as u64,
                     );
-                    let retained: usize = self.segments.values().map(String::len).sum();
                     let replaced = self.segments.get(&segment).map_or(0, String::len);
-                    if retained.saturating_sub(replaced).saturating_add(text.len()) > MAX_TEXT {
+                    let next_bytes = self
+                        .segment_bytes
+                        .saturating_sub(replaced)
+                        .saturating_add(text.len());
+                    if next_bytes > MAX_TEXT {
                         return Err(failure("Streaming response exceeded its limit."));
                     }
+                    self.segment_bytes = next_bytes;
                     self.segments.insert(segment, text.to_owned());
                 }
                 if kind == "Metadata" && self.finishing {
@@ -1546,6 +1619,16 @@ struct SocketIo {
     control: Arc<SessionControl>,
     deadline: Instant,
     read_interval: Duration,
+    nonblocking: bool,
+}
+impl SocketIo {
+    fn set_nonblocking(&mut self, nonblocking: bool) -> io::Result<()> {
+        if self.nonblocking != nonblocking {
+            self.tcp.set_nonblocking(nonblocking)?;
+            self.nonblocking = nonblocking;
+        }
+        Ok(())
+    }
 }
 impl std::fmt::Debug for SocketIo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1571,16 +1654,16 @@ fn io_budget(
 }
 impl Read for SocketIo {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        self.tcp.set_read_timeout(Some(io_budget(
-            &self.control,
-            self.deadline,
-            self.read_interval,
-        )?))?;
+        let budget = io_budget(&self.control, self.deadline, self.read_interval)?;
+        if !self.nonblocking {
+            self.tcp.set_read_timeout(Some(budget))?;
+        }
         self.tcp.read(bytes)
     }
 }
 impl Write for SocketIo {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.set_nonblocking(false)?;
         self.tcp.set_write_timeout(Some(io_budget(
             &self.control,
             self.deadline,
@@ -1589,6 +1672,7 @@ impl Write for SocketIo {
         self.tcp.write(bytes)
     }
     fn flush(&mut self) -> io::Result<()> {
+        self.set_nonblocking(false)?;
         io_budget(&self.control, self.deadline, Duration::from_secs(1))?;
         self.tcp.flush()
     }
@@ -1644,7 +1728,6 @@ impl Connection {
             )
         })?;
         control.check(deadline)?;
-        control.check(deadline)?;
         let mut request = url
             .as_str()
             .into_client_request()
@@ -1658,21 +1741,31 @@ impl Connection {
             .ok_or_else(|| failure("Invalid streaming endpoint."))?
             .to_owned();
         let port = url.port_or_known_default().unwrap_or(443);
-        // Resolver calls cannot block capture or the caller past its deadline.
+        // Resolver calls cannot block capture or the caller past its deadline,
+        // and must not retain the SessionPermit if DNS stalls after cancellation.
+        let dns_permit =
+            DnsPermit::acquire().ok_or_else(|| failure("Streaming DNS lookup limit reached."))?;
         let (tx, rx) = mpsc::sync_channel(1);
-        let dns_control = control.clone();
         std::thread::spawn(move || {
-            let _permit = dns_control;
+            let _permit = dns_permit;
             let _ = tx.send(
                 (host.as_str(), port)
                     .to_socket_addrs()
                     .map(|addresses| addresses.take(8).collect::<Vec<_>>()),
             );
         });
-        let addresses = rx
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .map_err(|_| failure_kind("Streaming DNS lookup timed out.", ErrorKind::Timeout))?
-            .map_err(|_| failure("Streaming DNS lookup failed."))?;
+        let addresses = loop {
+            control.check(deadline)?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(POLL.min(remaining)) {
+                Ok(result) => break result.map_err(|_| failure("Streaming DNS lookup failed."))?,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(failure("Streaming DNS lookup failed."));
+                }
+            }
+        };
+        let addresses = interleave_address_families(addresses);
         let mut connected = None;
         let mut last_connect_error = ErrorKind::Network;
         for address in addresses {
@@ -1700,6 +1793,7 @@ impl Connection {
             control: control.clone(),
             deadline,
             read_interval: Duration::from_secs(1),
+            nonblocking: false,
         };
         let (mut socket, _) = tungstenite::client_tls_with_config(
             request,
@@ -1731,7 +1825,7 @@ impl Connection {
             MaybeTlsStream::Rustls(stream) => &mut stream.sock,
             _ => return Err(failure("Unsupported streaming transport.")),
         };
-        stream.read_interval = Duration::from_millis(1);
+        stream.read_interval = POLL;
         let mut connection = Self {
             socket,
             protocol: Protocol::new(model.provider),
@@ -1793,6 +1887,17 @@ impl Connection {
         }
         Ok(())
     }
+    fn set_socket_mode(&mut self, deadline: Instant, nonblocking: bool) -> Result<()> {
+        let stream = match self.socket.get_mut() {
+            MaybeTlsStream::Plain(stream) => stream,
+            MaybeTlsStream::Rustls(stream) => &mut stream.sock,
+            _ => return Ok(()),
+        };
+        stream.deadline = deadline;
+        stream
+            .set_nonblocking(nonblocking)
+            .map_err(|_| failure("Streaming socket configuration failed."))
+    }
     fn set_deadline(&mut self, deadline: Instant) {
         match self.socket.get_mut() {
             MaybeTlsStream::Plain(stream) => stream.deadline = deadline,
@@ -1813,7 +1918,7 @@ impl Connection {
                 + Duration::from_secs_f64(self.wire_frames as f64 / 16_000.0);
             let control = self.control.clone();
             while Instant::now() < target {
-                self.poll(deadline, &control)?;
+                self.poll_nonblocking(deadline, &control)?;
                 std::thread::sleep(POLL.min(target.saturating_duration_since(Instant::now())));
             }
         }
@@ -1894,21 +1999,46 @@ impl Connection {
         }
         Ok(())
     }
+    /// Opportunistically drains all currently buffered incoming frames without
+    /// blocking audio transmission.
+    fn poll_nonblocking(&mut self, deadline: Instant, control: &SessionControl) -> Result<()> {
+        self.set_socket_mode(deadline, true)?;
+        let result = (|| {
+            for _ in 0..64 {
+                control.check(deadline)?;
+                if !self.read_one_frame()? {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+        let _ = self.set_socket_mode(deadline, false);
+        result
+    }
+    /// Waits up to `POLL` for the next incoming frame, then drains any
+    /// additional frames already buffered.
     fn poll(&mut self, deadline: Instant, control: &SessionControl) -> Result<()> {
         control.check(deadline)?;
-        self.set_deadline(deadline);
-        let result = match self.socket.read() {
+        self.set_socket_mode(deadline, false)?;
+        if self.read_one_frame()? && self.completed.is_none() {
+            self.poll_nonblocking(deadline, control)?;
+        }
+        Ok(())
+    }
+    fn read_one_frame(&mut self) -> Result<bool> {
+        let (had_frame, result) = match self.socket.read() {
             Ok(Message::Text(text)) => {
                 let value: Value = serde_json::from_str(&text)
                     .map_err(|_| failure("Invalid streaming response."))?;
-                self.protocol.event(&value)
+                (true, self.protocol.event(&value))
             }
             Ok(Message::Binary(bytes)) if self.protocol.provider == Provider::Google => {
                 let value: Value = serde_json::from_slice(&bytes)
                     .map_err(|_| failure("Invalid Google streaming response."))?;
-                self.protocol.event(&value)
+                (true, self.protocol.event(&value))
             }
-            Ok(Message::Close(frame)) => {
+            Ok(Message::Close(frame)) => (
+                true,
                 if self.protocol.provider == Provider::Meta {
                     self.protocol
                         .meta_closed(frame.map(|frame| frame.code.into()))
@@ -1921,24 +2051,25 @@ impl Connection {
                         ));
                     }
                     self.protocol.closed()
-                }
-            }
-            Err(tungstenite::Error::ConnectionClosed) => self.protocol.closed(),
+                },
+            ),
+            Err(tungstenite::Error::ConnectionClosed) => (true, self.protocol.closed()),
             Err(tungstenite::Error::Io(error))
                 if matches!(
                     error.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
-                Ok(None)
+                return Ok(false);
             }
-            Err(error) => Err(websocket_failure("Streaming read failed.", &error)),
-            _ => Ok(None),
-        }?;
-        if result.is_some() {
-            self.completed = result;
+            Err(error) => return Err(websocket_failure("Streaming read failed.", &error)),
+            Ok(_) => (true, Ok(None)),
+        };
+        let completed = result?;
+        if completed.is_some() {
+            self.completed = completed;
         }
-        Ok(())
+        Ok(had_frame)
     }
     /// Sends a completed clip segment by segment, committing in pauses and
     /// waiting for each committed transcript before the next segment, so no
@@ -1972,7 +2103,7 @@ impl Connection {
             control.check(deadline)?;
             self.planned_commit = Some(commit && index + 1 == count);
             self.audio(chunk, deadline)?;
-            self.poll(deadline, control)?;
+            self.poll_nonblocking(deadline, control)?;
         }
         Ok(())
     }
@@ -1993,6 +2124,31 @@ impl Connection {
             latency_ms: started.elapsed().as_millis() as u64,
         }
     }
+}
+
+/// Interleaves IPv4 and IPv6 addresses (starting with IPv4 when present) so a
+/// broken-IPv6 network does not burn multiple sequential 2-second timeouts
+/// before trying IPv4.
+fn interleave_address_families(addresses: Vec<std::net::SocketAddr>) -> Vec<std::net::SocketAddr> {
+    let mut v4 = std::collections::VecDeque::new();
+    let mut v6 = std::collections::VecDeque::new();
+    for address in addresses {
+        if address.is_ipv4() {
+            v4.push_back(address);
+        } else {
+            v6.push_back(address);
+        }
+    }
+    let mut ordered = Vec::with_capacity(v4.len() + v6.len());
+    while !v4.is_empty() || !v6.is_empty() {
+        if let Some(addr) = v4.pop_front() {
+            ordered.push(addr);
+        }
+        if let Some(addr) = v6.pop_front() {
+            ordered.push(addr);
+        }
+    }
+    ordered
 }
 
 /// Stateful 16 -> 24 kHz conversion for OpenAI; never restarts at packet edges.

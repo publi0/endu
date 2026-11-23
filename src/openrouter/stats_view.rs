@@ -1487,7 +1487,8 @@ fn overview_cost(totals: &Totals) -> (Option<(f64, bool)>, String) {
             ),
         };
         if totals.dictations.saturating_add(totals.failed_dictations) > totals.details.dictations {
-            coverage.push_str(" · older records excluded");
+            coverage.push_str(" · ");
+            coverage.push_str(t("older records excluded"));
         }
         let total = (measured.reported_cost_usd + measured.estimated_cost_usd).min(f64::MAX);
         return (Some((total, measured.cost_estimates > 0)), coverage);

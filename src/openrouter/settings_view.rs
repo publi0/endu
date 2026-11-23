@@ -28,13 +28,21 @@ const NARROW_INPUT: f32 = crate::desktop_ui::NUMBER_INPUT_WIDTH;
 const WIDE_INPUT: f32 = crate::desktop_ui::SETTINGS_CONTROL_WIDTH;
 const PICKER_WIDTH: f32 = crate::desktop_ui::SETTINGS_CONTROL_WIDTH;
 
-pub fn new<V: 'static>(preview: bool, cx: &mut Context<V>) -> Entity<OpenRouterSettings> {
-    cx.new(|cx| OpenRouterSettings::new(false, preview, cx))
+pub fn new_with_config<V: 'static>(
+    preview: bool,
+    loaded: Result<Config, String>,
+    cx: &mut Context<V>,
+) -> Entity<OpenRouterSettings> {
+    cx.new(|cx| OpenRouterSettings::with_loaded_mode(ViewMode::Models, preview, loaded, cx))
 }
 
 /// Just the API key row, for the first-run setup sheet.
-pub fn new_key_setup<V: 'static>(preview: bool, cx: &mut Context<V>) -> Entity<OpenRouterSettings> {
-    cx.new(|cx| OpenRouterSettings::new(true, preview, cx))
+pub fn new_key_setup_with_config<V: 'static>(
+    preview: bool,
+    loaded: Result<Config, String>,
+    cx: &mut Context<V>,
+) -> Entity<OpenRouterSettings> {
+    cx.new(|cx| OpenRouterSettings::with_loaded_mode(ViewMode::Setup, preview, loaded, cx))
 }
 
 pub struct KeyChanged(pub KeyStatus);
@@ -50,15 +58,17 @@ enum ViewMode {
 pub fn new_provider_key<V: 'static>(
     provider: Provider,
     preview: bool,
+    loaded: Result<Config, String>,
     cx: &mut Context<V>,
 ) -> Entity<OpenRouterSettings> {
-    cx.new(|cx| OpenRouterSettings::with_mode(ViewMode::Key(provider), preview, cx))
+    cx.new(|cx| OpenRouterSettings::with_loaded_mode(ViewMode::Key(provider), preview, loaded, cx))
 }
 pub fn new_global_options<V: 'static>(
     preview: bool,
+    loaded: Result<Config, String>,
     cx: &mut Context<V>,
 ) -> Entity<OpenRouterSettings> {
-    cx.new(|cx| OpenRouterSettings::with_mode(ViewMode::Global, preview, cx))
+    cx.new(|cx| OpenRouterSettings::with_loaded_mode(ViewMode::Global, preview, loaded, cx))
 }
 
 /// Where the last action's outcome is shown.
@@ -138,7 +148,6 @@ struct AdvancedInputs {
     total_timeout: Entity<TextInput>,
     chunk_seconds: Entity<TextInput>,
     rate_limit_wait: Entity<TextInput>,
-    temperature: Entity<TextInput>,
 }
 
 pub struct OpenRouterSettings {
@@ -150,7 +159,7 @@ pub struct OpenRouterSettings {
     key_revision: u64,
     key_editing: bool,
     key_remove_armed: bool,
-    key_input: Entity<TextInput>,
+    key_input: Option<Entity<TextInput>>,
     available_providers: Vec<Provider>,
     catalog: CatalogState,
     catalog_revision: u64,
@@ -158,7 +167,7 @@ pub struct OpenRouterSettings {
     model_focus: [FocusHandle; MODEL_SLOTS],
     advanced_open: bool,
     advanced_focus: FocusHandle,
-    advanced: AdvancedInputs,
+    advanced: Option<AdvancedInputs>,
     advanced_saved: AdvancedForm,
     advanced_dirty: bool,
     key_operation: Option<KeyOperation>,
@@ -180,6 +189,7 @@ impl OpenRouterSettings {
         self.catalog.models()
     }
 
+    #[cfg(test)]
     fn new(key_only: bool, preview: bool, cx: &mut Context<Self>) -> Self {
         Self::with_mode(
             if key_only {
@@ -191,15 +201,26 @@ impl OpenRouterSettings {
             cx,
         )
     }
+
+    #[cfg(test)]
     fn with_mode(mode: ViewMode, preview: bool, cx: &mut Context<Self>) -> Self {
-        let key_provider = match mode {
-            ViewMode::Key(provider) => provider,
-            _ => Provider::OpenRouter,
-        };
         let loaded = if preview {
             Ok(Config::default())
         } else {
-            super::load_config()
+            super::load_config().map_err(|error| format!("{error:#}"))
+        };
+        Self::with_loaded_mode(mode, preview, loaded, cx)
+    }
+
+    fn with_loaded_mode(
+        mode: ViewMode,
+        preview: bool,
+        loaded: Result<Config, String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let key_provider = match mode {
+            ViewMode::Key(provider) => provider,
+            _ => Provider::OpenRouter,
         };
         let (config, message) = match loaded {
             Ok(config) => (config, None),
@@ -210,65 +231,73 @@ impl OpenRouterSettings {
                     false,
                     tf!(
                         "{error}. Fix the file before saving settings.",
-                        error = format!("{error:#}")
+                        error = error
                     ),
                 )),
             ),
         };
         let mut subscriptions = Vec::new();
-        let key_input = cx.new(|cx| {
-            TextInput::new(cx, "", "")
-                .localized_placeholder(|| t("Paste API key"))
-                .commit_on_blur()
-        });
-        subscriptions.push(cx.subscribe(&key_input, |this, _, _: &Submitted, cx| {
-            this.save_key(cx);
-        }));
-        subscriptions.push(cx.subscribe(&key_input, |this, _, _: &EditFinished, cx| {
-            if (this.key_editing || matches!(this.key_status, Some(KeyStatus::Missing)))
-                && !this.key_input.read(cx).text().trim().is_empty()
-            {
-                this.save_key(cx);
-            }
-        }));
-        subscriptions.push(cx.subscribe(&key_input, |this, _, _: &Dismissed, cx| {
-            this.cancel_key_replacement(cx);
-        }));
-        let form = AdvancedForm::from_config(&config);
-        let mut field = |placeholder: fn() -> &'static str, value: &str, cx: &mut Context<Self>| {
-            let value = value.to_owned();
-            let entity = cx.new(|cx| {
-                TextInput::new(cx, "", &value)
-                    .localized_placeholder(placeholder)
+        let key_input = matches!(mode, ViewMode::Key(_) | ViewMode::Setup).then(|| {
+            let key_input = cx.new(|cx| {
+                TextInput::new(cx, "", "")
+                    .localized_placeholder(|| t("Paste API key"))
                     .commit_on_blur()
             });
-            subscriptions.push(cx.subscribe(&entity, |this, _, _: &Changed, cx| {
-                this.advanced_dirty = true;
-                this.clear_message(Scope::Advanced);
-                cx.notify();
+            subscriptions.push(cx.subscribe(&key_input, |this, _, _: &Submitted, cx| {
+                this.save_key(cx);
             }));
-            subscriptions.push(cx.subscribe(&entity, |this, _, _: &Submitted, cx| {
-                this.save_advanced(cx);
+            subscriptions.push(cx.subscribe(&key_input, |this, _, _: &EditFinished, cx| {
+                if (this.key_editing || matches!(this.key_status, Some(KeyStatus::Missing)))
+                    && this
+                        .key_input
+                        .as_ref()
+                        .is_some_and(|input| !input.read(cx).text().trim().is_empty())
+                {
+                    this.save_key(cx);
+                }
             }));
-            subscriptions.push(cx.subscribe(&entity, |this, _, _: &EditFinished, cx| {
-                this.save_advanced(cx);
+            subscriptions.push(cx.subscribe(&key_input, |this, _, _: &Dismissed, cx| {
+                this.cancel_key_replacement(cx);
             }));
-            subscriptions.push(cx.subscribe(&entity, |this, _, _: &Dismissed, cx| {
-                this.load_advanced(&this.advanced_saved.clone(), cx);
-                this.advanced_dirty = false;
-                this.clear_message(Scope::Advanced);
-                cx.notify();
-            }));
-            entity
-        };
-        let advanced = AdvancedInputs {
-            base_url: field(|| "https://openrouter.ai/api/v1", &form.base_url, cx),
-            attempt_timeout: field(|| "30", &form.attempt_timeout_seconds, cx),
-            total_timeout: field(|| "90", &form.total_timeout_seconds, cx),
-            chunk_seconds: field(|| "120", &form.chunk_seconds, cx),
-            rate_limit_wait: field(|| "2000", &form.rate_limit_retry_max_wait_ms, cx),
-            temperature: field(|| t("provider default"), &form.temperature, cx),
-        };
+            key_input
+        });
+        let form = AdvancedForm::from_config(&config);
+        let advanced = (mode == ViewMode::Global).then(|| {
+            let mut field =
+                |placeholder: fn() -> &'static str, value: &str, cx: &mut Context<Self>| {
+                    let value = value.to_owned();
+                    let entity = cx.new(|cx| {
+                        TextInput::new(cx, "", &value)
+                            .localized_placeholder(placeholder)
+                            .commit_on_blur()
+                    });
+                    subscriptions.push(cx.subscribe(&entity, |this, _, _: &Changed, cx| {
+                        this.advanced_dirty = true;
+                        this.clear_message(Scope::Advanced);
+                        cx.notify();
+                    }));
+                    subscriptions.push(cx.subscribe(&entity, |this, _, _: &Submitted, cx| {
+                        this.save_advanced(cx);
+                    }));
+                    subscriptions.push(cx.subscribe(&entity, |this, _, _: &EditFinished, cx| {
+                        this.save_advanced(cx);
+                    }));
+                    subscriptions.push(cx.subscribe(&entity, |this, _, _: &Dismissed, cx| {
+                        this.load_advanced(&this.advanced_saved.clone(), cx);
+                        this.advanced_dirty = false;
+                        this.clear_message(Scope::Advanced);
+                        cx.notify();
+                    }));
+                    entity
+                };
+            AdvancedInputs {
+                base_url: field(|| "https://openrouter.ai/api/v1", &form.base_url, cx),
+                attempt_timeout: field(|| "30", &form.attempt_timeout_seconds, cx),
+                total_timeout: field(|| "90", &form.total_timeout_seconds, cx),
+                chunk_seconds: field(|| "120", &form.chunk_seconds, cx),
+                rate_limit_wait: field(|| "2000", &form.rate_limit_retry_max_wait_ms, cx),
+            }
+        });
         let mut view = Self {
             mode,
             key_provider,
@@ -406,10 +435,12 @@ impl OpenRouterSettings {
 
     #[cfg(test)]
     pub(crate) fn stage_attempt_timeout_draft(&mut self, value: &str, cx: &mut Context<Self>) {
-        self.advanced.attempt_timeout.update(cx, |input, cx| {
-            input.set_text(value, cx);
-            cx.emit(Changed);
-        });
+        if let Some(advanced) = &self.advanced {
+            advanced.attempt_timeout.update(cx, |input, cx| {
+                input.set_text(value, cx);
+                cx.emit(Changed);
+            });
+        }
     }
 
     pub(crate) fn finish_editing(&mut self, cx: &mut Context<Self>) {
@@ -417,8 +448,10 @@ impl OpenRouterSettings {
             self.save_advanced(cx);
         }
         if matches!(self.mode, ViewMode::Key(_) | ViewMode::Setup)
-            && self.key_input.read(cx).has_pending_edit()
-            && !self.key_input.read(cx).text().trim().is_empty()
+            && self.key_input.as_ref().is_some_and(|input| {
+                let input = input.read(cx);
+                input.has_pending_edit() && !input.text().trim().is_empty()
+            })
             && (self.key_editing || matches!(self.key_status, Some(KeyStatus::Missing)))
         {
             self.save_key(cx);
@@ -461,8 +494,9 @@ impl OpenRouterSettings {
         self.key_editing = matches!(status, KeyStatus::Missing);
         self.key_remove_armed = false;
         self.key_status = Some(status);
-        self.key_input
-            .update(cx, |input, cx| input.set_text("", cx));
+        if let Some(key_input) = &self.key_input {
+            key_input.update(cx, |input, cx| input.set_text("", cx));
+        }
         cx.notify();
     }
 
@@ -498,9 +532,10 @@ impl OpenRouterSettings {
         self.key_editing = true;
         self.key_remove_armed = false;
         self.clear_message(Scope::Key);
-        self.key_input
-            .update(cx, |input, cx| input.set_text("", cx));
-        self.key_input.focus_handle(cx).focus(window);
+        if let Some(key_input) = &self.key_input {
+            key_input.update(cx, |input, cx| input.set_text("", cx));
+            key_input.focus_handle(cx).focus(window);
+        }
         cx.notify();
     }
 
@@ -509,8 +544,9 @@ impl OpenRouterSettings {
             return;
         }
         self.key_editing = matches!(self.key_status, Some(KeyStatus::Missing) | None);
-        self.key_input
-            .update(cx, |input, cx| input.set_text("", cx));
+        if let Some(key_input) = &self.key_input {
+            key_input.update(cx, |input, cx| input.set_text("", cx));
+        }
         self.clear_message(Scope::Key);
         cx.notify();
     }
@@ -519,7 +555,10 @@ impl OpenRouterSettings {
         if self.busy() {
             return;
         }
-        let key = self.key_input.read(cx).text().trim().to_owned();
+        let Some(key_input) = &self.key_input else {
+            return;
+        };
+        let key = key_input.read(cx).text().trim().to_owned();
         if let Err(error) = keys::validate_key(self.key_provider, &key) {
             self.report(Scope::Key, Err(error.to_string()));
             cx.notify();
@@ -634,7 +673,7 @@ impl OpenRouterSettings {
             KeyOperation::Move,
             move || {
                 let key = super::load_config()?.api_key.ok_or_else(|| {
-                    color_eyre::eyre::eyre!("The file no longer contains an API key.")
+                    color_eyre::eyre::eyre!(t("The file no longer contains an API key."))
                 })?;
                 keys::store_keychain_key(provider, &key)?;
                 let config = super::update_config(|latest| {
@@ -978,39 +1017,36 @@ impl OpenRouterSettings {
     // ---- Advanced --------------------------------------------------------
 
     fn advanced_form(&self, cx: &App) -> AdvancedForm {
+        let Some(advanced) = &self.advanced else {
+            return self.advanced_saved.clone();
+        };
         let text = |input: &Entity<TextInput>| input.read(cx).text().to_owned();
         AdvancedForm {
-            base_url: text(&self.advanced.base_url),
-            attempt_timeout_seconds: text(&self.advanced.attempt_timeout),
-            total_timeout_seconds: text(&self.advanced.total_timeout),
-            chunk_seconds: text(&self.advanced.chunk_seconds),
-            rate_limit_retry_max_wait_ms: text(&self.advanced.rate_limit_wait),
-            temperature: text(&self.advanced.temperature),
+            base_url: text(&advanced.base_url),
+            attempt_timeout_seconds: text(&advanced.attempt_timeout),
+            total_timeout_seconds: text(&advanced.total_timeout),
+            chunk_seconds: text(&advanced.chunk_seconds),
+            rate_limit_retry_max_wait_ms: text(&advanced.rate_limit_wait),
+            temperature: self.advanced_saved.temperature.clone(),
         }
     }
 
     fn load_advanced(&mut self, form: &AdvancedForm, cx: &mut Context<Self>) {
+        let Some(advanced) = &self.advanced else {
+            return;
+        };
         let set = |input: &Entity<TextInput>, value: &str, cx: &mut Context<Self>| {
             input.update(cx, |input, cx| input.set_text(value, cx));
         };
-        set(&self.advanced.base_url, &form.base_url, cx);
+        set(&advanced.base_url, &form.base_url, cx);
+        set(&advanced.attempt_timeout, &form.attempt_timeout_seconds, cx);
+        set(&advanced.total_timeout, &form.total_timeout_seconds, cx);
+        set(&advanced.chunk_seconds, &form.chunk_seconds, cx);
         set(
-            &self.advanced.attempt_timeout,
-            &form.attempt_timeout_seconds,
-            cx,
-        );
-        set(
-            &self.advanced.total_timeout,
-            &form.total_timeout_seconds,
-            cx,
-        );
-        set(&self.advanced.chunk_seconds, &form.chunk_seconds, cx);
-        set(
-            &self.advanced.rate_limit_wait,
+            &advanced.rate_limit_wait,
             &form.rate_limit_retry_max_wait_ms,
             cx,
         );
-        set(&self.advanced.temperature, &form.temperature, cx);
     }
 
     fn save_advanced(&mut self, cx: &mut Context<Self>) {
@@ -1163,7 +1199,9 @@ impl OpenRouterSettings {
                 .flex()
                 .flex_col()
                 .gap_2()
-                .when(!self.busy(), |column| column.child(self.key_input.clone()))
+                .when(!self.busy(), |column| {
+                    column.children(self.key_input.clone())
+                })
                 .when(self.busy(), |column| {
                     column.child(
                         div()
@@ -1562,8 +1600,10 @@ impl OpenRouterSettings {
                     .into_any_element(),
             ),
             CatalogState::Loaded(_) if choices.is_empty() => Some(
-                picker_note("No models match. Paste a full id such as provider/model.")
-                    .into_any_element(),
+                picker_note(t(
+                    "No models match. Paste a full id such as provider/model.",
+                ))
+                .into_any_element(),
             ),
             CatalogState::Loaded(_) => None,
         }
@@ -1890,6 +1930,9 @@ impl OpenRouterSettings {
                             ),
                     ),
             );
+        let Some(advanced) = &self.advanced else {
+            return div().into_any_element();
+        };
         div()
             .child(header)
             .child(collapsed_feedback)
@@ -1898,27 +1941,27 @@ impl OpenRouterSettings {
                     .child(settings_row(
                         t("Attempt timeout (s)"),
                         t("Deadline for one request to one model"),
-                        narrow(&self.advanced.attempt_timeout),
+                        narrow(&advanced.attempt_timeout),
                     ))
                     .child(settings_row(
                         t("Total timeout (s)"),
                         t("Deadline for the whole fallback chain"),
-                        narrow(&self.advanced.total_timeout),
+                        narrow(&advanced.total_timeout),
                     ))
                     .child(settings_row(
                         t("Chunk length (s)"),
                         t("Long recordings are split at a quiet point, from 10 to 200"),
-                        narrow(&self.advanced.chunk_seconds),
+                        narrow(&advanced.chunk_seconds),
                     ))
                     .child(settings_row(
                         t("Rate-limit retry (ms)"),
                         t("A 429 asking to wait at most this long is retried once on the same model; 0 falls back at once"),
-                        narrow(&self.advanced.rate_limit_wait),
+                        narrow(&advanced.rate_limit_wait),
                     ))
                     .child(settings_row(
                         t("OpenRouter API URL"),
                         t("Used only by models routed through OpenRouter"),
-                        sized(&self.advanced.base_url, WIDE_INPUT),
+                        sized(&advanced.base_url, WIDE_INPUT),
                     ))
                     .child(footer),
             )
@@ -2274,6 +2317,8 @@ mod tests {
         cx.update(|window, cx| {
             view.read(cx)
                 .advanced
+                .as_ref()
+                .unwrap()
                 .attempt_timeout
                 .focus_handle(cx)
                 .focus(window)
@@ -2281,10 +2326,21 @@ mod tests {
         cx.simulate_keystrokes("cmd-a");
         cx.simulate_input("45");
         cx.update(|_, cx| {
-            assert_eq!(view.read(cx).advanced.attempt_timeout.read(cx).text(), "45");
+            assert_eq!(
+                view.read(cx)
+                    .advanced
+                    .as_ref()
+                    .unwrap()
+                    .attempt_timeout
+                    .read(cx)
+                    .text(),
+                "45"
+            );
             assert!(
                 view.read(cx)
                     .advanced
+                    .as_ref()
+                    .unwrap()
                     .attempt_timeout
                     .read(cx)
                     .has_pending_edit()
@@ -2305,6 +2361,8 @@ mod tests {
         cx.update(|window, cx| {
             view.read(cx)
                 .advanced
+                .as_ref()
+                .unwrap()
                 .attempt_timeout
                 .focus_handle(cx)
                 .focus(window)
@@ -2323,12 +2381,25 @@ mod tests {
         cx.update(|window, cx| {
             view.read(cx)
                 .advanced
+                .as_ref()
+                .unwrap()
                 .attempt_timeout
                 .focus_handle(cx)
                 .focus(window)
         });
         cx.simulate_keystrokes("escape");
-        cx.update(|_, cx| assert_eq!(view.read(cx).advanced.attempt_timeout.read(cx).text(), "45"));
+        cx.update(|_, cx| {
+            assert_eq!(
+                view.read(cx)
+                    .advanced
+                    .as_ref()
+                    .unwrap()
+                    .attempt_timeout
+                    .read(cx)
+                    .text(),
+                "45"
+            )
+        });
     }
 
     #[gpui::test]
@@ -2339,10 +2410,24 @@ mod tests {
         });
         cx.update(|window, _| window.activate_window());
         cx.run_until_parked();
-        cx.update(|window, cx| view.read(cx).key_input.focus_handle(cx).focus(window));
+        cx.update(|window, cx| {
+            view.read(cx)
+                .key_input
+                .as_ref()
+                .unwrap()
+                .focus_handle(cx)
+                .focus(window)
+        });
         cx.simulate_input("preview-key-0123456789");
         cx.update(|_, cx| {
-            assert!(view.read(cx).key_input.read(cx).has_pending_edit());
+            assert!(
+                view.read(cx)
+                    .key_input
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .has_pending_edit()
+            );
             assert_eq!(view.read(cx).key_status(), Some(&KeyStatus::Missing));
         });
         cx.update(|window, _| window.blur());
@@ -2359,7 +2444,15 @@ mod tests {
         cx.run_until_parked();
         cx.update(|_, cx| {
             assert!(!view.read(cx).key_editing);
-            assert!(view.read(cx).key_input.read(cx).text().is_empty());
+            assert!(
+                view.read(cx)
+                    .key_input
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .text()
+                    .is_empty()
+            );
         });
     }
 
@@ -2367,33 +2460,61 @@ mod tests {
     fn importing_models_replaces_advanced_drafts_without_touching_key_edits(
         cx: &mut gpui::TestAppContext,
     ) {
-        let (view, cx) = cx.add_window_view(|_, cx| OpenRouterSettings::new(false, true, cx));
+        let (global_view, cx) =
+            cx.add_window_view(|_, cx| OpenRouterSettings::with_mode(ViewMode::Global, true, cx));
+        let key_view = cx.update(|_, cx| {
+            cx.new(|cx| {
+                OpenRouterSettings::with_mode(ViewMode::Key(Provider::OpenRouter), true, cx)
+            })
+        });
         cx.update(|_, cx| {
-            view.update(cx, |view, cx| {
-                view.advanced
+            global_view.update(cx, |view, cx| {
+                let advanced = view.advanced.as_ref().unwrap();
+                advanced
                     .attempt_timeout
                     .update(cx, |input, cx| input.set_text("invalid", cx));
                 view.advanced_dirty = true;
-                view.key_input
-                    .update(cx, |input, cx| input.set_text("fixture-unsaved-key", cx));
-                let status = view.key_status.clone();
                 let mut imported = view.config.clone();
                 imported.transcription.models = vec!["fixture/imported".into()];
                 imported.transcription.language = "pt".into();
                 imported.transcription.attempt_timeout_seconds = 45;
                 view.apply_imported_config(imported.clone(), cx);
                 assert!(!view.advanced_dirty);
-                assert_eq!(view.advanced.attempt_timeout.read(cx).text(), "45");
-                assert_eq!(view.key_input.read(cx).text(), "fixture-unsaved-key");
-                assert_eq!(view.key_status, status);
+                assert_eq!(
+                    view.advanced
+                        .as_ref()
+                        .unwrap()
+                        .attempt_timeout
+                        .read(cx)
+                        .text(),
+                    "45"
+                );
                 view.advanced
-                    .temperature
-                    .update(cx, |input, cx| input.set_text("0.5", cx));
+                    .as_ref()
+                    .unwrap()
+                    .total_timeout
+                    .update(cx, |input, cx| input.set_text("120", cx));
                 view.advanced_dirty = true;
                 view.save_advanced(cx);
-                imported.transcription.temperature = Some(0.5);
+                imported.transcription.total_timeout_seconds = 120;
                 assert_eq!(view.config, imported);
                 assert!(view.render_message(Scope::Advanced).is_none());
+            });
+            key_view.update(cx, |view, cx| {
+                view.key_input
+                    .as_ref()
+                    .unwrap()
+                    .update(cx, |input, cx| input.set_text("fixture-unsaved-key", cx));
+                let status = view.key_status.clone();
+                let mut imported = view.config.clone();
+                imported.transcription.models = vec!["fixture/imported".into()];
+                imported.transcription.language = "pt".into();
+                view.apply_imported_config(imported, cx);
+                assert_eq!(
+                    view.key_input.as_ref().unwrap().read(cx).text(),
+                    "fixture-unsaved-key"
+                );
+                assert_eq!(view.key_status, status);
             });
         });
     }
@@ -2487,10 +2608,12 @@ mod tests {
 
     #[gpui::test]
     fn pending_key_operations_cannot_replace_or_clear_the_editor(cx: &mut gpui::TestAppContext) {
-        let (view, cx) = cx.add_window_view(|_, cx| OpenRouterSettings::new(false, true, cx));
+        let (view, cx) = cx.add_window_view(|_, cx| OpenRouterSettings::new(true, true, cx));
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.key_input
+                    .as_ref()
+                    .unwrap()
                     .update(cx, |input, cx| input.set_text("sk-or-v1-fixture", cx));
                 view.key_editing = true;
                 view.key_operation = Some(KeyOperation::Save);
@@ -2498,7 +2621,10 @@ mod tests {
                 view.cancel_key_replacement(cx);
                 view.remove_key(cx);
                 view.test_key(cx);
-                assert_eq!(view.key_input.read(cx).text(), "sk-or-v1-fixture");
+                assert_eq!(
+                    view.key_input.as_ref().unwrap().read(cx).text(),
+                    "sk-or-v1-fixture"
+                );
                 assert!(view.key_editing);
                 assert!(!view.key_remove_armed);
                 assert_eq!(
@@ -2513,6 +2639,7 @@ mod tests {
     #[gpui::test]
     fn preview_edits_and_key_actions_stay_in_memory(cx: &mut gpui::TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, cx| OpenRouterSettings::new(false, true, cx));
+        let key_view = cx.update(|_, cx| cx.new(|cx| OpenRouterSettings::new(true, true, cx)));
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
                 assert_eq!(view.config, Config::default());
@@ -2521,12 +2648,16 @@ mod tests {
                 assert_eq!(view.config.transcription.models[0], "preview/model");
                 view.ensure_catalog(cx);
                 assert!(!view.catalog.models().is_empty());
+            });
+            key_view.update(cx, |view, cx| {
                 view.key_input
+                    .as_ref()
+                    .unwrap()
                     .update(cx, |input, cx| input.set_text("preview-key-0123456789", cx));
                 view.save_key(cx);
                 assert_eq!(view.key_status(), Some(&KeyStatus::Keychain("demo".into())));
                 assert!(!view.key_editing);
-                assert!(view.key_input.read(cx).text().is_empty());
+                assert!(view.key_input.as_ref().unwrap().read(cx).text().is_empty());
                 view.test_key(cx);
                 assert!(
                     view.render_message(Scope::Key).is_some(),

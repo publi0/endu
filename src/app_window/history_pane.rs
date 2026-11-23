@@ -84,7 +84,7 @@ impl AppWindow {
             return;
         };
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-        self.mark_copied(HistoryItem::Recovery(id.to_owned()));
+        self.mark_copied(HistoryItem::Recovery(id.to_owned()), cx);
         self.recovery_error = None;
         cx.notify();
     }
@@ -275,7 +275,7 @@ impl AppWindow {
         )
     }
 
-    pub(super) fn reload_history(&mut self, cx: &App) {
+    pub(super) fn reload_history(&mut self, cx: &mut Context<Self>) {
         // Read revisions first: a change landing during the reload is picked up next poll.
         self.history_loaded = Some(self.history_revisions());
         let query = self.history_search.read(cx).text().to_string();
@@ -308,23 +308,22 @@ impl AppWindow {
         }
     }
 
-    fn mark_copied(&mut self, item: HistoryItem) {
+    fn mark_copied(&mut self, item: HistoryItem, cx: &mut Context<Self>) {
         self.history_copied = Some(item);
-        self.history_copied_at = Some(Instant::now());
+        let copied_at = Instant::now();
+        self.history_copied_at = Some(copied_at);
         self.history_copied_count += 1;
-    }
-
-    /// Returns the copy check to the copy symbol after a moment, from any pane.
-    pub(super) fn poll_history_feedback(&mut self) -> bool {
-        if self
-            .history_copied_at
-            .is_some_and(|copied| copied.elapsed() >= HISTORY_COPIED_FOR)
-        {
-            self.history_copied_at = None;
-            self.history_copied = None;
-            return true;
-        }
-        false
+        cx.spawn(async move |window, cx| {
+            gpui::Timer::after(HISTORY_COPIED_FOR).await;
+            let _ = window.update(cx, |this, cx| {
+                if this.history_copied_at == Some(copied_at) {
+                    this.history_copied_at = None;
+                    this.history_copied = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Whether `id` was just recovered, so its row eases in its text.
@@ -336,7 +335,7 @@ impl AppWindow {
 
     /// Finishes "Retry & copy": copies the recovered text once, or gives up
     /// when the retry fails. Never pastes.
-    fn resolve_recovery_copy(&mut self, cx: &App) {
+    fn resolve_recovery_copy(&mut self, cx: &mut Context<Self>) {
         let (Some(id), Some(store)) = (&self.recovery_copy_pending, &self.recovery) else {
             return;
         };
@@ -346,7 +345,7 @@ impl AppWindow {
                 self.history_recovered = Some((entry.id.clone(), Instant::now()));
                 if let Some(text) = entry.text {
                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-                    self.mark_copied(HistoryItem::Recovery(entry.id));
+                    self.mark_copied(HistoryItem::Recovery(entry.id), cx);
                 }
                 self.recovery_copy_pending = None;
             }
@@ -356,7 +355,7 @@ impl AppWindow {
     }
 
     /// Keeps the visible list current while the pane is open.
-    pub(super) fn poll_history(&mut self, cx: &App) -> bool {
+    pub(super) fn poll_history(&mut self, cx: &mut Context<Self>) -> bool {
         if self.preview && self.recovery.is_none()
             || self.pane != Pane::History
             || self.history.is_none() && self.recovery.is_none()
@@ -459,7 +458,7 @@ impl AppWindow {
             .and_then(|mut clipboard| clipboard.set_text(entry.text.clone()))
         {
             Ok(()) => {
-                self.mark_copied(HistoryItem::Dictation(id));
+                self.mark_copied(HistoryItem::Dictation(id), cx);
                 self.history_error = None;
             }
             Err(error) => self.history_error = Some(error.to_string()),
@@ -1501,7 +1500,7 @@ pub(super) fn history_timing_tile(entry: &HistoryEntry) -> AnyElement {
     } else if entry.inference_ms > 0 {
         (
             duration_label(entry.inference_ms),
-            Some("transcribing".to_owned()),
+            Some(t("transcribing").to_owned()),
         )
     } else {
         (t("Not recorded").to_owned(), None)

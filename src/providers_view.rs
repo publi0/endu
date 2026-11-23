@@ -27,20 +27,30 @@ pub struct ProvidersView {
 impl EventEmitter<ProvidersChanged> for ProvidersView {}
 
 impl ProvidersView {
+    #[cfg(test)]
     pub fn new(preview: bool, cx: &mut Context<Self>) -> Self {
         let loaded = if preview {
             Ok(Config::default())
         } else {
-            crate::openrouter::load_config()
+            crate::openrouter::load_config().map_err(|error| format!("{error:#}"))
         };
+        Self::with_config(preview, loaded, cx)
+    }
+
+    pub fn with_config(
+        preview: bool,
+        loaded: Result<Config, String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let (config, error) = match loaded {
             Ok(config) => (config, None),
-            Err(error) => (Config::default(), Some(format!("{error:#}"))),
+            Err(error) => (Config::default(), Some(error)),
         };
         let keys: Vec<_> = Provider::ALL
             .into_iter()
             .map(|provider| {
-                let key = settings_view::new_provider_key(provider, preview, cx);
+                let key =
+                    settings_view::new_provider_key(provider, preview, Ok(config.clone()), cx);
                 if preview {
                     key.update(cx, |view, cx| {
                         view.sync_key_status(KeyStatus::Keychain("demo".into()), cx)
@@ -49,11 +59,7 @@ impl ProvidersView {
                 (provider, key)
             })
             .collect();
-        let global = settings_view::new_global_options(preview, cx);
-        global.update(cx, |view, cx| view.refresh_config(config.clone(), cx));
-        for (_, key) in &keys {
-            key.update(cx, |view, cx| view.refresh_config(config.clone(), cx));
-        }
+        let global = settings_view::new_global_options(preview, Ok(config.clone()), cx);
         let mut subscriptions = Vec::new();
         for (_, key) in &keys {
             subscriptions.push(cx.observe(key, |this, _, cx| {

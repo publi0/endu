@@ -136,13 +136,31 @@ pub fn decimal(text: String) -> String {
     }
 }
 
-/// Replaces each `{name}` in a translated template with its value.
+/// Replaces each `{name}` in a translated template with its value in a single
+/// pass, so an interpolated runtime value containing `{other}` is never
+/// expanded by a later placeholder.
 pub fn fill(template: &str, values: &[(&str, String)]) -> String {
-    let mut text = template.to_owned();
-    for (name, value) in values {
-        text = text.replace(&format!("{{{name}}}"), value);
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('}') else {
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        let key = &after_open[..close];
+        if let Some((_, value)) = values.iter().find(|(name, _)| *name == key) {
+            out.push_str(value);
+        } else {
+            out.push('{');
+            out.push_str(key);
+            out.push('}');
+        }
+        rest = &after_open[close + 1..];
     }
-    text
+    out.push_str(rest);
+    out
 }
 
 /// Translates a template, then fills its named `{placeholders}`:
@@ -289,6 +307,13 @@ mod tests {
         assert_eq!(
             fill("Endu {version} is ready", &[("version", "4.0.0".into())]),
             "Endu 4.0.0 is ready"
+        );
+        assert_eq!(
+            fill(
+                "{first} then {second}",
+                &[("first", "{second}".into()), ("second", "expanded".into()),],
+            ),
+            "{second} then expanded"
         );
     }
 }

@@ -617,7 +617,7 @@ pub struct AppWindow {
     hotkey_side_animations: [ToggleSpring; 2],
     hotkey_side_selection_springs: [ToggleSpring; 2],
     window_focus: FocusHandle,
-    hotkey_focus: FocusHandle,
+    hotkey_focus: [FocusHandle; 2],
     hotkey_reset_focus: [FocusHandle; 2],
     clipboard_fallback_focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -676,7 +676,6 @@ impl AppWindow {
                     let changed = window.poll_setup(false)
                         | window.poll_login_item()
                         | window.poll_history(cx)
-                        | window.poll_history_feedback()
                         | window.poll_microphone();
                     if changed {
                         cx.notify();
@@ -710,7 +709,7 @@ impl AppWindow {
         crate::desktop_ui::sync_appearance(native_window.appearance());
         let window_focus = cx.focus_handle();
         window_focus.focus(native_window);
-        let hotkey_focus = cx.focus_handle();
+        let hotkey_focus = std::array::from_fn(|_| cx.focus_handle().tab_stop(true));
         let closing = cx.weak_entity();
         native_window.on_window_should_close(cx, move |_, cx| {
             let _ = closing.update(cx, |this, cx| this.finish_editing(cx));
@@ -734,13 +733,18 @@ impl AppWindow {
                 this.finish_editing(cx);
                 async {}
             }),
-            cx.on_blur(&hotkey_focus, native_window, |this, _, cx| {
+            cx.on_blur(&hotkey_focus[0], native_window, |this, _, cx| {
+                this.cancel_hotkey_capture(cx)
+            }),
+            cx.on_blur(&hotkey_focus[1], native_window, |this, _, cx| {
                 this.cancel_hotkey_capture(cx)
             }),
             cx.observe_window_activation(native_window, |this, window, cx| {
                 if window.is_window_active() {
                     this.permission_refresh_at = Instant::now();
-                    if this.poll_setup(true) {
+                    let mut changed = this.poll_setup(true);
+                    changed |= this.request_login_item(LoginItemRequest::Status);
+                    if changed {
                         cx.notify();
                     }
                     if this.pane == Pane::Statistics {
@@ -853,9 +857,28 @@ impl AppWindow {
         let side = |binding: Option<&HotkeyBinding>| binding.and_then(standalone_modifier_side);
         let dictation_side = side(Some(&settings.dictation_hotkey));
         let paste_side = side(settings.paste_last_hotkey.as_ref());
-        let openrouter_settings = crate::openrouter::settings_view::new(preview_mode, cx);
-        let openrouter_setup = crate::openrouter::settings_view::new_key_setup(preview_mode, cx);
-        let providers = cx.new(|cx| crate::providers_view::ProvidersView::new(preview_mode, cx));
+        let loaded_models_config = if preview_mode {
+            Ok(crate::openrouter::Config::default())
+        } else {
+            crate::openrouter::load_config().map_err(|error| format!("{error:#}"))
+        };
+        let openrouter_settings = crate::openrouter::settings_view::new_with_config(
+            preview_mode,
+            loaded_models_config.clone(),
+            cx,
+        );
+        let openrouter_setup = crate::openrouter::settings_view::new_key_setup_with_config(
+            preview_mode,
+            loaded_models_config.clone(),
+            cx,
+        );
+        let providers = cx.new(|cx| {
+            crate::providers_view::ProvidersView::with_config(
+                preview_mode,
+                loaded_models_config,
+                cx,
+            )
+        });
         let config = openrouter_settings.read(cx).config_snapshot();
         if preview_mode {
             // Keep the chain fixture in Providers; no real credential is read.
@@ -1256,8 +1279,11 @@ impl AppWindow {
                 view.refresh();
                 cx.notify();
             }),
-            Pane::Settings
-            | Pane::Microphone
+            Pane::Settings => {
+                self.permission_refresh_at = Instant::now();
+                let _ = self.request_login_item(LoginItemRequest::Status);
+            }
+            Pane::Microphone
             | Pane::Models
             | Pane::Providers
             | Pane::PostProcessing
@@ -1372,7 +1398,15 @@ impl AppWindow {
                 return true;
             }
         };
-        let request_changed = self.request_login_item(LoginItemRequest::Status);
+        // Only poll SMAppService periodically while waiting for the user to
+        // approve the login item in System Settings; normal refreshes happen
+        // on window open, window activation, and entering Settings.
+        let request_changed =
+            if self.launch_at_login_status == Some(LoginItemStatus::RequiresApproval) {
+                self.request_login_item(LoginItemRequest::Status)
+            } else {
+                false
+            };
         changed || request_changed
     }
 

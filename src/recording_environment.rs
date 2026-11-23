@@ -4,7 +4,9 @@ use std::mem::size_of;
 use std::process::Command;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Sender};
+#[cfg(test)]
+use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -152,13 +154,15 @@ enum EnvironmentCommand {
     Start,
     Stop,
     #[cfg(test)]
-    Barrier(Sender<()>),
+    Barrier(SyncSender<()>),
 }
+
+const ENVIRONMENT_QUEUE_CAPACITY: usize = 32;
 
 #[derive(Clone)]
 pub struct RecordingEnvironmentController {
     // Senders drop before the last worker owner joins, closing its receiver.
-    commands: Sender<EnvironmentCommand>,
+    commands: SyncSender<EnvironmentCommand>,
     worker: Arc<EnvironmentWorker>,
 }
 
@@ -190,7 +194,7 @@ impl RecordingEnvironmentController {
     }
 
     fn with_environment<E: EnvironmentState>(start: impl Fn() -> E + Send + 'static) -> Self {
-        let (commands, receiver) = mpsc::channel();
+        let (commands, receiver) = mpsc::sync_channel(ENVIRONMENT_QUEUE_CAPACITY);
         let worker = thread::spawn(move || {
             let mut sessions = 0_u32;
             let mut environment: Option<E> = None;
@@ -253,7 +257,9 @@ impl RecordingEnvironmentController {
     }
 
     pub fn begin(&self) -> RecordingEnvironmentSession {
-        let _ = self.commands.send(EnvironmentCommand::Start);
+        if let Err(error) = self.commands.try_send(EnvironmentCommand::Start) {
+            tracing::warn!(%error, "could not enqueue recording environment start");
+        }
         RecordingEnvironmentSession {
             commands: self.commands.clone(),
             _worker: self.worker.clone(),
@@ -262,13 +268,15 @@ impl RecordingEnvironmentController {
 }
 
 pub struct RecordingEnvironmentSession {
-    commands: Sender<EnvironmentCommand>,
+    commands: SyncSender<EnvironmentCommand>,
     _worker: Arc<EnvironmentWorker>,
 }
 
 impl Drop for RecordingEnvironmentSession {
     fn drop(&mut self) {
-        let _ = self.commands.send(EnvironmentCommand::Stop);
+        if let Err(error) = self.commands.try_send(EnvironmentCommand::Stop) {
+            tracing::warn!(%error, "could not enqueue recording environment stop");
+        }
     }
 }
 
@@ -492,15 +500,67 @@ fn volume_address() -> AudioObjectPropertyAddress {
     }
 }
 
+const OSASCRIPT_TIMEOUT: Duration = Duration::from_millis(1500);
+
+fn run_osascript(script: &str) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = Command::new("/usr/bin/osascript")
+        .args(["-e", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stdout_pipe {
+            let _ = pipe.take(64 * 1024).read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stderr_pipe {
+            let _ = pipe.take(64 * 1024).read_to_end(&mut buf);
+        }
+        buf
+    });
+    let deadline = Instant::now() + OSASCRIPT_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline || crate::SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "osascript timed out",
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 fn pause_media() -> Vec<MediaPlayer> {
     let running = running_media_players();
     if running.is_empty() {
         return Vec::new();
     }
     let script = pause_media_script(&running);
-    let output = Command::new("/usr/bin/osascript")
-        .args(["-e", &script])
-        .output();
+    let output = run_osascript(&script);
     let Ok(output) = output else {
         return Vec::new();
     };
@@ -529,10 +589,7 @@ fn resume_media(players: &[MediaPlayer]) {
     if script.is_empty() {
         return;
     }
-    match Command::new("/usr/bin/osascript")
-        .args(["-e", &script])
-        .output()
-    {
+    match run_osascript(&script) {
         Ok(output) if output.status.success() => {
             tracing::info!(?players, "resumed media after dictation")
         }
@@ -598,11 +655,11 @@ mod tests {
     }
 
     fn assert_events(
-        commands: &Sender<EnvironmentCommand>,
+        commands: &SyncSender<EnvironmentCommand>,
         events: &Receiver<Event>,
         expected: &[Event],
     ) {
-        let (reply, response) = mpsc::channel();
+        let (reply, response) = mpsc::sync_channel(1);
         commands.send(EnvironmentCommand::Barrier(reply)).unwrap();
         response.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(events.try_iter().collect::<Vec<_>>(), expected);
@@ -610,7 +667,7 @@ mod tests {
 
     #[test]
     fn sessions_are_harmless_after_the_environment_worker_disconnects() {
-        let (commands, receiver) = mpsc::channel();
+        let (commands, receiver) = mpsc::sync_channel(1);
         drop(receiver);
         let controller = RecordingEnvironmentController {
             commands,
@@ -701,7 +758,7 @@ mod tests {
             }
         });
         let check = |expected: &[Transition]| {
-            let (reply, response) = mpsc::channel();
+            let (reply, response) = mpsc::sync_channel(1);
             controller
                 .commands
                 .send(EnvironmentCommand::Barrier(reply))

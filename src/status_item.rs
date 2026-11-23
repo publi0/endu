@@ -632,6 +632,7 @@ pub fn animate() {
     STATUS_ITEM.with(|controller| {
         if let Some(controller) = controller.borrow_mut().as_mut()
             && controller.phase != IconPhase::Idle
+            && !controller.reduce_motion
         {
             controller.update_icon(mtm, Instant::now());
         }
@@ -641,10 +642,9 @@ pub fn animate() {
 /// Whether the glyph still animates and needs the UI loop's frame ticks.
 pub fn is_animating() -> bool {
     STATUS_ITEM.with(|controller| {
-        controller
-            .borrow()
-            .as_ref()
-            .is_some_and(|controller| controller.phase != IconPhase::Idle)
+        controller.borrow().as_ref().is_some_and(|controller| {
+            controller.phase != IconPhase::Idle && !controller.reduce_motion
+        })
     })
 }
 

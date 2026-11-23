@@ -698,6 +698,9 @@ fn capture_clipboard(clipboard: &NSPasteboard) -> Result<ClipboardSnapshot> {
                     tracing::debug!(%data_type, "skipping synthesized clipboard format");
                     return Ok(None);
                 }
+                if Instant::now() >= capture_deadline {
+                    return Err(eyre!("clipboard snapshot exceeded its deadline"));
+                }
                 let mut data = ptr::null();
                 let flavor_started = Instant::now();
                 let status =
@@ -714,17 +717,18 @@ fn capture_clipboard(clipboard: &NSPasteboard) -> Result<ClipboardSnapshot> {
                 if data.is_null() {
                     return Err(eyre!("clipboard format data was unavailable"));
                 }
-                let bytes = cf_data(data)?;
-                unsafe { CFRelease(data) };
-                snapshot_bytes += bytes.len();
-                if bytes.len() > MAX_FLAVOR_BYTES || snapshot_bytes > MAX_SNAPSHOT_BYTES {
+                let data = CfDataHandle(data);
+                let length = cf_data_len(data.0)?;
+                let Some(next_total) = try_reserve_snapshot_bytes(snapshot_bytes, length) else {
                     tracing::warn!(
                         %data_type,
-                        bytes = bytes.len(),
+                        bytes = length,
                         "clipboard format exceeded the preservation cap"
                     );
                     return Ok(None);
-                }
+                };
+                let bytes = cf_data_bytes(data.0, length)?;
+                snapshot_bytes = next_total;
                 if Instant::now() >= capture_deadline {
                     return Err(eyre!("clipboard snapshot exceeded its deadline"));
                 }
@@ -865,11 +869,33 @@ fn cf_string(value: CfStringRef) -> Result<String> {
     String::from_utf8(bytes[..length].to_vec()).map_err(Into::into)
 }
 
-fn cf_data(value: CfDataRef) -> Result<Vec<u8>> {
+struct CfDataHandle(CfDataRef);
+
+impl Drop for CfDataHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { CFRelease(self.0) };
+        }
+    }
+}
+
+fn try_reserve_snapshot_bytes(current: usize, flavor_len: usize) -> Option<usize> {
+    if flavor_len > MAX_FLAVOR_BYTES {
+        return None;
+    }
+    let next = current.checked_add(flavor_len)?;
+    (next <= MAX_SNAPSHOT_BYTES).then_some(next)
+}
+
+fn cf_data_len(value: CfDataRef) -> Result<usize> {
     let length = unsafe { CFDataGetLength(value) };
     if length < 0 {
         return Err(eyre!("clipboard format had an invalid length"));
     }
+    Ok(length as usize)
+}
+
+fn cf_data_bytes(value: CfDataRef, length: usize) -> Result<Vec<u8>> {
     if length == 0 {
         return Ok(Vec::new());
     }
@@ -877,7 +903,7 @@ fn cf_data(value: CfDataRef) -> Result<Vec<u8>> {
     if bytes.is_null() {
         return Err(eyre!("clipboard format data was unavailable"));
     }
-    Ok(unsafe { std::slice::from_raw_parts(bytes, length as usize) }.to_vec())
+    Ok(unsafe { std::slice::from_raw_parts(bytes, length) }.to_vec())
 }
 
 #[cfg(test)]
@@ -1656,5 +1682,27 @@ mod tests {
         clipboard.clearContents();
         restore_clipboard(&clipboard, &snapshot).unwrap();
         assert_eq!(capture_clipboard(&clipboard).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn oversized_flavor_does_not_poison_snapshot_budget() {
+        let mut total = 0usize;
+        // Oversized flavor is rejected and leaves `total` unchanged.
+        assert_eq!(
+            try_reserve_snapshot_bytes(total, MAX_FLAVOR_BYTES + 1),
+            None
+        );
+        // A normal flavor right after still fits cleanly.
+        total = try_reserve_snapshot_bytes(total, 128).unwrap();
+        assert_eq!(total, 128);
+        // Overflowing the snapshot total is also rejected without poisoning.
+        assert_eq!(
+            try_reserve_snapshot_bytes(MAX_SNAPSHOT_BYTES - 64, 128),
+            None
+        );
+        assert_eq!(
+            try_reserve_snapshot_bytes(MAX_SNAPSHOT_BYTES - 64, 64),
+            Some(MAX_SNAPSHOT_BYTES)
+        );
     }
 }

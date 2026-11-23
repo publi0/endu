@@ -108,6 +108,33 @@ pub struct RecordingRecovery {
 
 impl gpui::Global for RecordingRecovery {}
 
+/// Completes post-transcription disk cleanup (`Resolved` metadata + WAV/JSON
+/// removal) after the caller has already handed a successful transcript to the
+/// output worker, keeping recovery `fsync` barriers off the paste critical path.
+pub struct PendingResolution {
+    store: RecordingRecovery,
+    entry: Option<RecoveryEntry>,
+    _active: ActiveAttempt,
+}
+
+impl PendingResolution {
+    pub fn finish(mut self) {
+        self.run();
+    }
+
+    fn run(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            self.store.resolve_entry(entry);
+        }
+    }
+}
+
+impl Drop for PendingResolution {
+    fn drop(&mut self) {
+        self.run();
+    }
+}
+
 impl RecordingRecovery {
     pub fn open_default() -> color_eyre::Result<Self> {
         let directory = crate::app_paths::support_dir()?.join("recording-recovery");
@@ -378,6 +405,31 @@ impl RecordingRecovery {
         state.revision += 1;
     }
 
+    fn resolve_entry(&self, mut entry: RecoveryEntry) {
+        if entry.volatile {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.entries.remove(&entry.id);
+            state.volatile.remove(&entry.id);
+            state.revision += 1;
+            return;
+        }
+        // A terminal marker prevents an orphan WAV from being presented
+        // again if cleanup stops between its two removals.
+        entry.status = RecoveryStatus::Resolved;
+        if self.save_metadata(&entry).is_ok() {
+            let _ = remove_recording_files(&self.directory, &entry.id);
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.entries.remove(&entry.id);
+            state.volatile.remove(&entry.id);
+            state.revision += 1;
+        } else {
+            self.finish_failure(
+                entry,
+                t("Transcription completed, but cleanup failed. Audio retained."),
+            );
+        }
+    }
+
     /// Run on the transcription worker, never on the capture callback. A failed
     /// remote attempt leaves both the original samples and its recovery entry.
     /// Format with the accepted job's preferences before resolving recovery;
@@ -389,8 +441,34 @@ impl RecordingRecovery {
         preferences: crate::post_processing::Preferences,
         transcribe: impl FnOnce(&[f32]) -> color_eyre::Result<Transcription>,
     ) -> color_eyre::Result<Transcription> {
-        let mut entry = self.begin(samples, application);
-        let _active = ActiveAttempt {
+        let (result, pending) = self.transcribe_original_cancellable(
+            samples,
+            application,
+            preferences,
+            None,
+            transcribe,
+        );
+        if let Some(pending) = pending {
+            pending.finish();
+        }
+        result
+    }
+
+    /// Like [`Self::transcribe_original`], but treats an explicit user
+    /// cancellation as resolved (removing temporary audio instead of leaving a
+    /// failed recovery entry) and returns non-volatile post-success disk
+    /// cleanup as [`PendingResolution`] so the caller can hand the transcript
+    /// to paste before flushing `Resolved` metadata to disk.
+    pub fn transcribe_original_cancellable(
+        &self,
+        samples: &[f32],
+        application: Option<&str>,
+        preferences: crate::post_processing::Preferences,
+        user_cancelled: Option<&std::sync::atomic::AtomicBool>,
+        transcribe: impl FnOnce(&[f32]) -> color_eyre::Result<Transcription>,
+    ) -> (color_eyre::Result<Transcription>, Option<PendingResolution>) {
+        let entry = self.begin(samples, application);
+        let active = ActiveAttempt {
             store: self.clone(),
             id: entry.id.clone(),
             retry: false,
@@ -418,30 +496,37 @@ impl RecordingRecovery {
                 .downcast_ref::<crate::openrouter::transcribe::NoSpeech>()
                 .is_some()
         });
+        let cancelled =
+            user_cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
         match &result {
-            // Silence has nothing to recover, so it resolves like a success.
-            Err(error) if !no_speech => {
-                self.finish_failure(entry, &transcription_failure_reason(error));
-            }
-            _ => {
-                // A terminal marker prevents an orphan WAV from being presented
-                // again if cleanup stops between its two removals.
-                entry.status = RecoveryStatus::Resolved;
-                if self.save_metadata(&entry).is_ok() {
-                    let _ = remove_recording_files(&self.directory, &entry.id);
-                    let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    state.entries.remove(&entry.id);
-                    state.volatile.remove(&entry.id);
-                    state.revision += 1;
+            Ok(_) => {
+                if entry.volatile {
+                    self.resolve_entry(entry);
+                    drop(active);
+                    (result, None)
                 } else {
-                    self.finish_failure(
-                        entry,
-                        t("Transcription completed, but cleanup failed. Audio retained."),
-                    );
+                    (
+                        result,
+                        Some(PendingResolution {
+                            store: self.clone(),
+                            entry: Some(entry),
+                            _active: active,
+                        }),
+                    )
                 }
             }
+            // Silence and explicit user cancellation have nothing to recover.
+            Err(_) if no_speech || cancelled => {
+                self.resolve_entry(entry);
+                drop(active);
+                (result, None)
+            }
+            Err(error) => {
+                self.finish_failure(entry, &transcription_failure_reason(error));
+                drop(active);
+                (result, None)
+            }
         }
-        result
     }
 
     /// Keeps accepted audio that can no longer be transcribed, such as a
@@ -654,10 +739,12 @@ impl RecordingRecovery {
                 "Wait for the transcription to finish before deleting it",
             )));
         }
-        if !state.entries.contains_key(id) {
+        let Some(entry) = state.entries.get(id) else {
             return Err(io::Error::other(t("Recording no longer exists")));
+        };
+        if !entry.volatile {
+            remove_recording_files(&self.directory, id)?;
         }
-        remove_recording_files(&self.directory, id)?;
         state.entries.remove(id);
         state.volatile.remove(id);
         state.revision += 1;
@@ -1487,5 +1574,66 @@ mod tests {
         );
         assert!(store.entries("").is_empty());
         assert!(fs::read_dir(&fixture.0).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn user_cancelled_transcription_is_not_kept_in_recovery() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let (result, pending) = store.transcribe_original_cancellable(
+            &[0.1; 160],
+            Some("Notes"),
+            crate::post_processing::Preferences::default(),
+            Some(&cancelled),
+            |_| {
+                cancelled.store(true, std::sync::atomic::Ordering::Release);
+                Err(color_eyre::eyre::eyre!("Transcription was cancelled."))
+            },
+        );
+        assert!(result.is_err());
+        assert!(pending.is_none());
+        assert!(store.entries("").is_empty());
+        assert!(fs::read_dir(&fixture.0).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn volatile_entry_cleans_up_in_memory_on_success_and_delete() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        fs::remove_dir(&fixture.0).unwrap();
+        fs::write(&fixture.0, "block directory creation").unwrap();
+        // Success cleans up volatile state without recording a false failure.
+        let ok = store
+            .transcribe_original(
+                &[0.1; 160],
+                Some("Notes"),
+                crate::post_processing::Preferences::default(),
+                |_| {
+                    Ok(Transcription {
+                        text: "hello".into(),
+                        report: None,
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(ok.text, "hello");
+        assert!(store.entries("").is_empty());
+        assert!(store.state.lock().unwrap().volatile.is_empty());
+
+        // Failed volatile entry can be deleted without failing on unwritable directory.
+        let _ = store.transcribe_original(
+            &[0.1; 160],
+            Some("Notes"),
+            crate::post_processing::Preferences::default(),
+            |_| Err(color_eyre::eyre::eyre!("offline")),
+        );
+        let entries = store.entries("");
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].volatile);
+        store.delete(&entries[0].id).unwrap();
+        assert!(store.entries("").is_empty());
+        assert!(store.state.lock().unwrap().volatile.is_empty());
+        let _ = fs::remove_file(&fixture.0);
     }
 }

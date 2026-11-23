@@ -5,10 +5,10 @@
 //! Capture never waits on this pipeline. Its queues are bounded, accepted
 //! jobs keep their order, and a cancelled job never pastes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
 
@@ -118,15 +118,89 @@ impl OutputJob {
     }
 }
 
-#[derive(Default)]
+const TRANSCRIPTION_QUEUE_CAPACITY: usize = 4;
+
+struct TranscriptionQueue {
+    inner: Mutex<(VecDeque<TranscriptionJob>, bool)>,
+    available: Condvar,
+}
+
+impl TranscriptionQueue {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new((VecDeque::with_capacity(TRANSCRIPTION_QUEUE_CAPACITY), false)),
+            available: Condvar::new(),
+        }
+    }
+
+    fn try_push(&self, job: TranscriptionJob) -> Result<(), &'static str> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.1 {
+            return Err("dictation worker is unavailable");
+        }
+        if guard.0.len() >= TRANSCRIPTION_QUEUE_CAPACITY {
+            return Err("dictation queue is full");
+        }
+        guard.0.push_back(job);
+        self.available.notify_one();
+        Ok(())
+    }
+
+    fn pop(&self) -> Option<TranscriptionJob> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(job) = guard.0.pop_front() {
+                return Some(job);
+            }
+            if guard.1 {
+                return None;
+            }
+            guard = self
+                .available
+                .wait(guard)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn close_and_drain(&self) -> Vec<TranscriptionJob> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.1 = true;
+        let drained = guard.0.drain(..).collect();
+        self.available.notify_all();
+        drained
+    }
+}
+
 struct JobControl {
     cancelled: AtomicBool,
+    user_cancelled: AtomicBool,
     output_started: Mutex<bool>,
-    stream_cancel: Option<Arc<AtomicBool>>,
+    cancel_flag: Arc<AtomicBool>,
+}
+
+impl Default for JobControl {
+    fn default() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            user_cancelled: AtomicBool::new(false),
+            output_started: Mutex::new(false),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 impl JobControl {
-    /// Cancel unless output already began. Returns whether this call cancelled.
+    fn with_cancel_flag(cancel_flag: Arc<AtomicBool>) -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            user_cancelled: AtomicBool::new(false),
+            output_started: Mutex::new(false),
+            cancel_flag,
+        }
+    }
+
+    /// Cancel due to explicit user Escape unless output already began.
+    /// Returns whether this call cancelled.
     fn cancel(&self) -> bool {
         let output_started = self
             .output_started
@@ -135,14 +209,31 @@ impl JobControl {
         if *output_started {
             return false;
         }
-        if let Some(cancel) = &self.stream_cancel {
-            cancel.store(true, Ordering::Release);
-        }
+        self.user_cancelled.store(true, Ordering::Release);
+        self.cancel_flag.store(true, Ordering::Release);
         !self.cancelled.swap(true, Ordering::AcqRel)
+    }
+
+    /// Cancel during app shutdown without marking the job as user-cancelled,
+    /// so queued/in-flight audio is preserved in Recording Recovery.
+    fn cancel_for_shutdown(&self) {
+        let output_started = self
+            .output_started
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if *output_started {
+            return;
+        }
+        self.cancel_flag.store(true, Ordering::Release);
+        self.cancelled.store(true, Ordering::Release);
     }
 
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn is_user_cancelled(&self) -> bool {
+        self.user_cancelled.load(Ordering::Acquire)
     }
 
     /// Commit to output; refused once cancelled.
@@ -182,10 +273,11 @@ impl OrderedOutputs {
 }
 
 pub struct DictationWorker {
-    transcription_jobs: Option<SyncSender<TranscriptionJob>>,
+    transcription_jobs: Arc<TranscriptionQueue>,
     output_jobs: Option<SyncSender<OutputJob>>,
     events: Receiver<WorkerEvent>,
     state: Arc<Mutex<WorkerState>>,
+    recovery: Option<crate::recording_recovery::RecordingRecovery>,
     transcription_worker: Option<thread::JoinHandle<()>>,
     output_worker: Option<thread::JoinHandle<()>>,
 }
@@ -242,15 +334,26 @@ impl DictationWorker {
         recovery: crate::recording_recovery::RecordingRecovery,
         wake: Arc<Doorbell>,
     ) -> Self {
-        Self::start_with(
+        let shutdown_recovery = recovery.clone();
+        Self::start_with_recovery(
             wake,
             history,
-            move |samples, context, vocabulary, live, preferences| {
-                recovery.transcribe_original(
+            Some(shutdown_recovery),
+            move |samples, context, vocabulary, live, preferences, control| {
+                let cancel_flag = control.cancel_flag.clone();
+                recovery.transcribe_original_cancellable(
                     samples,
                     context.application.as_deref(),
                     preferences,
-                    |samples| crate::providers::batch::transcribe(samples, vocabulary, live),
+                    Some(&control.user_cancelled),
+                    |samples| {
+                        crate::providers::batch::transcribe_cancellable(
+                            samples,
+                            vocabulary,
+                            live,
+                            Some(cancel_flag),
+                        )
+                    },
                 )
             },
             move || {
@@ -267,10 +370,11 @@ impl DictationWorker {
         )
     }
 
+    #[cfg(test)]
     fn start_with(
         wake: Arc<Doorbell>,
         history: Option<History>,
-        transcribe: impl FnMut(
+        mut transcribe: impl FnMut(
             &[f32],
             &ContextSnapshot,
             &crate::vocabulary::Snapshot,
@@ -281,8 +385,39 @@ impl DictationWorker {
         + 'static,
         create_paste: impl FnOnce() -> Box<PasteFn<'static>> + Send + 'static,
     ) -> Self {
-        let (transcription_jobs, transcription_receiver) =
-            mpsc::sync_channel::<TranscriptionJob>(4);
+        Self::start_with_recovery(
+            wake,
+            history,
+            None,
+            move |samples, context, vocabulary, live, preferences, _control| {
+                (
+                    transcribe(samples, context, vocabulary, live, preferences),
+                    None,
+                )
+            },
+            create_paste,
+        )
+    }
+
+    fn start_with_recovery(
+        wake: Arc<Doorbell>,
+        history: Option<History>,
+        recovery: Option<crate::recording_recovery::RecordingRecovery>,
+        transcribe: impl FnMut(
+            &[f32],
+            &ContextSnapshot,
+            &crate::vocabulary::Snapshot,
+            Option<crate::providers::streaming::PendingLive>,
+            crate::post_processing::Preferences,
+            &JobControl,
+        ) -> (
+            Result<crate::openrouter::transcribe::Transcription>,
+            Option<crate::recording_recovery::PendingResolution>,
+        ) + Send
+        + 'static,
+        create_paste: impl FnOnce() -> Box<PasteFn<'static>> + Send + 'static,
+    ) -> Self {
+        let transcription_jobs = Arc::new(TranscriptionQueue::new());
         let (output_jobs, output_receiver) = mpsc::sync_channel::<OutputJob>(8);
         let (event_sender, events) = mpsc::channel();
         let event_sender = WorkerEvents {
@@ -301,24 +436,20 @@ impl DictationWorker {
         });
 
         let transcription_worker = thread::spawn({
+            let jobs = transcription_jobs.clone();
             let output = output_jobs.clone();
             let state = state.clone();
             move || {
-                run_transcription_worker(
-                    transcription_receiver,
-                    &output,
-                    &event_sender,
-                    &state,
-                    transcribe,
-                )
+                run_transcription_queue(jobs, &output, &event_sender, &state, transcribe);
             }
         });
 
         Self {
-            transcription_jobs: Some(transcription_jobs),
+            transcription_jobs,
             output_jobs: Some(output_jobs),
             events,
             state,
+            recovery,
             transcription_worker: Some(transcription_worker),
             output_worker: Some(output_worker),
         }
@@ -358,9 +489,9 @@ impl DictationWorker {
     ) -> Result<DictationJobId, &'static str> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let job_id = DictationJobId(state.next_output_sequence()?);
-        let control = Arc::new(JobControl {
-            stream_cancel: clip.live.as_ref().map(|live| live.cancellation_flag()),
-            ..Default::default()
+        let control = Arc::new(match clip.live.as_ref() {
+            Some(live) => JobControl::with_cancel_flag(live.cancellation_flag()),
+            None => JobControl::default(),
         });
         let vocabulary = clip
             .live
@@ -369,9 +500,7 @@ impl DictationWorker {
                 live.vocabulary.clone()
             });
         self.transcription_jobs
-            .as_ref()
-            .ok_or("dictation worker is unavailable")?
-            .try_send(TranscriptionJob {
+            .try_push(TranscriptionJob {
                 job_id,
                 control: control.clone(),
                 submitted_at: Instant::now(),
@@ -389,7 +518,6 @@ impl DictationWorker {
                 state.jobs.insert(job_id, control);
                 job_id
             })
-            .map_err(queue_error)
     }
 
     /// Capture the clipboard ahead of the first paste while nothing is queued.
@@ -453,12 +581,20 @@ impl DictationWorker {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             state.shutting_down = true;
             for control in state.jobs.values() {
-                control.cancel();
+                control.cancel_for_shutdown();
             }
             state.jobs.clear();
             state.pending_pastes = 0;
         }
-        self.transcription_jobs.take();
+        let queued = self.transcription_jobs.close_and_drain();
+        if let Some(recovery) = &self.recovery {
+            for job in queued {
+                if !job.control.is_user_cancelled() {
+                    let samples = job.clip.into_transcription_samples();
+                    recovery.save_untranscribed(&samples, job.context.application.as_deref());
+                }
+            }
+        }
         // A detached transcription worker can keep its sender alive, so the
         // output worker would not see a disconnect. If the queue is full, the
         // worker is not waiting and checks shutdown after its next job.
@@ -482,6 +618,7 @@ impl Drop for DictationWorker {
     }
 }
 
+#[cfg(test)]
 fn run_transcription_worker(
     jobs: Receiver<TranscriptionJob>,
     output: &SyncSender<OutputJob>,
@@ -495,8 +632,47 @@ fn run_transcription_worker(
         crate::post_processing::Preferences,
     ) -> Result<crate::openrouter::transcribe::Transcription>,
 ) {
+    let queue = Arc::new(TranscriptionQueue::new());
+    while let Ok(job) = jobs.recv() {
+        let _ = queue.try_push(job);
+    }
+    {
+        let mut guard = queue.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.1 = true;
+    }
+    run_transcription_queue(
+        queue,
+        output,
+        events,
+        state,
+        move |samples, context, vocabulary, live, preferences, _control| {
+            (
+                transcribe(samples, context, vocabulary, live, preferences),
+                None,
+            )
+        },
+    );
+}
+
+fn run_transcription_queue(
+    jobs: Arc<TranscriptionQueue>,
+    output: &SyncSender<OutputJob>,
+    events: &WorkerEvents,
+    state: &Mutex<WorkerState>,
+    mut transcribe: impl FnMut(
+        &[f32],
+        &ContextSnapshot,
+        &crate::vocabulary::Snapshot,
+        Option<crate::providers::streaming::PendingLive>,
+        crate::post_processing::Preferences,
+        &JobControl,
+    ) -> (
+        Result<crate::openrouter::transcribe::Transcription>,
+        Option<crate::recording_recovery::PendingResolution>,
+    ),
+) {
     prioritize_transcription_thread();
-    while let Ok(mut job) = jobs.recv() {
+    while let Some(mut job) = jobs.pop() {
         if is_shutting_down(state) {
             break;
         }
@@ -514,14 +690,18 @@ fn run_transcription_worker(
             let _ = events.send(WorkerEvent::Quiet { job_id: job.job_id });
         }
         let started = Instant::now();
-        let result = transcribe(
+        let (result, pending_cleanup) = transcribe(
             &samples,
             &job.context,
             &job.vocabulary,
             live,
             job.options.post_processing,
+            &job.control,
         );
         if is_shutting_down(state) {
+            if let Some(pending) = pending_cleanup {
+                pending.finish();
+            }
             break;
         }
         let timings = JobTimings {
@@ -546,14 +726,17 @@ fn run_transcription_worker(
                 }
             })
             .map_err(|error| format!("{error:#}"));
-        if output
-            .send(OutputJob::Completed {
-                job_id: job.job_id,
-                control: job.control,
-                result: Box::new(result),
-            })
-            .is_err()
-        {
+        let sent = output.send(OutputJob::Completed {
+            job_id: job.job_id,
+            control: job.control,
+            result: Box::new(result),
+        });
+        // Run recovery Resolved metadata fsync + WAV cleanup after handing the
+        // transcript to output_worker so paste begins immediately.
+        if let Some(pending) = pending_cleanup {
+            pending.finish();
+        }
+        if sent.is_err() {
             break;
         }
     }
@@ -1139,17 +1322,11 @@ mod tests {
     #[test]
     fn job_cancellation_closes_its_stream_and_output_commit_keeps_its_existing_contract() {
         let stream = Arc::new(AtomicBool::new(false));
-        let control = JobControl {
-            stream_cancel: Some(stream.clone()),
-            ..Default::default()
-        };
+        let control = JobControl::with_cancel_flag(stream.clone());
         assert!(control.cancel());
         assert!(stream.load(Ordering::Acquire));
         let stream = Arc::new(AtomicBool::new(false));
-        let control = JobControl {
-            stream_cancel: Some(stream.clone()),
-            ..Default::default()
-        };
+        let control = JobControl::with_cancel_flag(stream.clone());
         assert!(control.begin_output());
         assert!(!control.cancel());
         assert!(!stream.load(Ordering::Acquire));

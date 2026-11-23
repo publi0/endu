@@ -38,9 +38,11 @@ export HEX_APPLICATION_SUPPORT_DIR="$test_support"
 unset OPENROUTER_API_KEY OPENAI_API_KEY DEEPGRAM_API_KEY ELEVENLABS_API_KEY
 unset XAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY
 unset MODEL_API_KEY
+unset HEX_SKIP_SHADER_BUILD
 
 run_step "Formatting" cargo fmt --all --check
 run_step "Shell syntax" sh -n scripts/build-app.sh scripts/write-cask.sh
+run_step "Bash syntax" bash -n scripts/check-local.sh
 run_step "Release and signing automation tests" python3 -m unittest discover -s scripts -p 'test_*.py' -v
 run_step "Whitespace" git diff --check
 run_step "Metal compiler" xcrun metal --version
