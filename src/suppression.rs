@@ -20,6 +20,8 @@ use crate::interaction_settings::DoubleTapSensitivity;
 const ESCAPE_KEY_CODE: u16 = 53;
 const RETURN_KEY_CODE: u16 = 36;
 const KEYPAD_ENTER_KEY_CODE: u16 = 76;
+/// The key code the Globe (Fn) key reports in its own key events.
+const GLOBE_KEY_CODE: u16 = 179;
 
 const EVENT_LEFT_MOUSE_DOWN: u32 = 1;
 const EVENT_RIGHT_MOUSE_DOWN: u32 = 3;
@@ -584,7 +586,10 @@ unsafe extern "C" fn event_callback(
         context.escape_cancels.load(Ordering::Acquire),
         submit_epoch.is_some(),
     );
-    context.activity.observe(input, suppress);
+    let own_globe = matches!(input, InputEvent::Key { code, .. }
+        if is_own_globe_key(code, hotkeys.dictation));
+    context.activity.observe(input, suppress || own_globe);
+
     if suppress { ptr::null_mut() } else { event }
 }
 
@@ -1068,6 +1073,11 @@ impl DictationHotkey {
 
     // Suspended shortcut matching must still observe releases of previously held keys.
     pub fn track_key_state(&mut self, event: InputEvent, at: CaptureInstant) -> Option<bool> {
+        if let InputEvent::Key { code, .. } = event
+            && is_own_globe_key(code, self.binding)
+        {
+            return None;
+        }
         self.stale_keys_neutral_since = None;
         if let InputEvent::Flags(flags) = event
             && at >= self.function_modifier.0
@@ -1309,6 +1319,14 @@ impl DictationHotkey {
             }
         }
     }
+}
+
+/// The Globe key's own key event, which some keyboards and remappers
+/// (Karabiner-Elements) send beside the Fn modifier change. For a binding
+/// that holds Fn it is the shortcut itself: never a chord, a tracked key or
+/// typing.
+fn is_own_globe_key(code: u16, binding: RuntimeHotkey) -> bool {
+    code == GLOBE_KEY_CODE && binding.modifiers.function && binding.key_code != Some(code)
 }
 
 /// Whether a key the shortcut machine tracks still reads as held. Combined-
@@ -2187,6 +2205,68 @@ mod tests {
         assert_eq!(
             hotkey.process(InputEvent::Flags(NO_FLAGS), now + Duration::from_secs(1)),
             Some(HotkeyAction::Finish)
+        );
+    }
+
+    #[test]
+    fn globe_key_events_are_not_a_chord_with_the_function_shortcut() {
+        let now = capture_time();
+        let globe = |down| InputEvent::Key {
+            code: GLOBE_KEY_CODE,
+            down,
+            flags: FUNCTION_KEY_MASK,
+        };
+        let mut hotkey = tap_mode(function_binding());
+        let ms = |millis| now + Duration::from_millis(millis);
+        for (at, event, expected) in [
+            (ms(0), globe(true), None),
+            (
+                ms(0),
+                InputEvent::Flags(FUNCTION_KEY_MASK),
+                Some(HotkeyAction::Start),
+            ),
+            (ms(60), globe(false), None),
+            (ms(90), InputEvent::Flags(NO_FLAGS), None),
+            (ms(1_000), globe(true), None),
+            (
+                ms(1_000),
+                InputEvent::Flags(FUNCTION_KEY_MASK),
+                Some(HotkeyAction::Finish),
+            ),
+        ] {
+            assert_eq!(hotkey.process(event, at), expected);
+        }
+        assert!(hotkey.pressed_keys.is_empty());
+
+        // A Fn hold is not discarded by the Globe key event inside the threshold.
+        let mut hotkey = DictationHotkey::with_binding(false, now, false, function_binding());
+        assert_eq!(
+            hotkey.process(InputEvent::Flags(FUNCTION_KEY_MASK), ms(0)),
+            Some(HotkeyAction::Start)
+        );
+        assert_eq!(hotkey.process(globe(true), ms(40)), None);
+        assert!(hotkey.is_recording());
+
+        // Another key held with Fn is still a chord, and Globe is an ordinary
+        // key for a shortcut without Fn.
+        assert!(is_own_globe_key(GLOBE_KEY_CODE, function_binding()));
+        assert!(!is_own_globe_key(0, function_binding()));
+        assert!(!is_own_globe_key(GLOBE_KEY_CODE, option_binding()));
+        let mut hotkey = DictationHotkey::with_binding(false, now, false, option_binding());
+        assert_eq!(
+            hotkey.process(InputEvent::Flags(OPTION_KEY_MASK), ms(0)),
+            Some(HotkeyAction::Start)
+        );
+        assert_eq!(
+            hotkey.process(
+                InputEvent::Key {
+                    code: GLOBE_KEY_CODE,
+                    down: true,
+                    flags: OPTION_KEY_MASK,
+                },
+                ms(40)
+            ),
+            Some(HotkeyAction::Discard)
         );
     }
 
