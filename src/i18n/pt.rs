@@ -791,6 +791,7 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
         "Preview: no network request was made.",
         "Prévia: nenhuma requisição de rede foi feita.",
     ),
+    ("Primary", "Principal"),
     ("Primary model", "Modelo principal"),
     ("Provider", "Provedor"),
     (

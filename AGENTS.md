@@ -172,8 +172,9 @@ Only modules whose name does not say enough:
   the clipboard. Posted shortcuts send modifiers as flags-changed events,
   spaced apart, from the output worker only.
 - Completed clips are persisted privately before the remote attempt. Failed
-  clips stay until recovered or explicitly deleted, untouched by History
-  retention or Clear. Persist recovered text before removing audio. Retry never
+  clips stay until recovered, explicitly deleted, or past the timed History
+  retention window (`Off` and Clear never remove failed clips). Persist
+  recovered text before removing audio. Retry never
   auto-pastes, is single-flight, uses current Models settings and keeps the
   originating application. Persist safe error categories and statuses only,
   never raw payloads or credentials. A disk failure keeps the audio in memory

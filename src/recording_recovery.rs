@@ -91,6 +91,7 @@ struct State {
     entries: BTreeMap<String, RecoveryEntry>,
     active: HashSet<String>,
     retrying: bool,
+    retention: crate::history::HistoryRetention,
     // If the disk cannot accept a recording, keep its samples for this session
     // and explicitly warn the user. No implementation can survive a crash
     // without writable storage, so never label this fallback as durable.
@@ -275,16 +276,29 @@ impl Drop for RecoveryPlayback {
 }
 
 impl RecordingRecovery {
-    pub fn open_default() -> color_eyre::Result<Self> {
+    pub fn open_default(retention: crate::history::HistoryRetention) -> color_eyre::Result<Self> {
         let directory = crate::app_paths::support_dir()?.join("recording-recovery");
-        Ok(Self::open(directory.clone()).unwrap_or_else(|error| {
+        Ok(Self::open_with_retention(directory.clone(), retention).unwrap_or_else(|error| {
             tracing::warn!(%error, "recording recovery storage could not be opened");
-            Self { directory: Arc::new(directory), state: Arc::new(Mutex::new(State::default())),
-                load_warning: Some(t("Saved audio could not be loaded. New recordings may remain only in memory; keep Endu open and check disk space and permissions.").into()) }
+            Self {
+                directory: Arc::new(directory),
+                state: Arc::new(Mutex::new(State {
+                    retention,
+                    ..State::default()
+                })),
+                load_warning: Some(t("Saved audio could not be loaded. New recordings may remain only in memory; keep Endu open and check disk space and permissions.").into()),
+            }
         }))
     }
 
     pub fn open(directory: PathBuf) -> io::Result<Self> {
+        Self::open_with_retention(directory, crate::history::HistoryRetention::Forever)
+    }
+
+    pub fn open_with_retention(
+        directory: PathBuf,
+        retention: crate::history::HistoryRetention,
+    ) -> io::Result<Self> {
         private_directory(&directory)?;
         let mut entries = BTreeMap::new();
         let mut audio = Vec::new();
@@ -341,12 +355,18 @@ impl RecordingRecovery {
                 continue;
             }
             if let Ok(reader) = hound::WavReader::open(&path) {
+                let timestamp_ms = fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or_else(crate::history::now_ms);
                 entries.insert(
                     id.clone(),
                     RecoveryEntry {
                         version: VERSION,
                         id,
-                        timestamp_ms: crate::history::now_ms(),
+                        timestamp_ms,
                         audio_ms: u64::from(reader.duration()) * 1000
                             / u64::from(reader.spec().sample_rate.max(1)),
                         application: None,
@@ -362,28 +382,100 @@ impl RecordingRecovery {
                 );
             }
         }
-        Ok(Self {
+        let store = Self {
             directory: Arc::new(directory),
             state: Arc::new(Mutex::new(State {
                 entries,
+                retention,
                 ..State::default()
             })),
             load_warning: None,
-        })
+        };
+        store.prune_expired_at(crate::history::now_ms());
+        Ok(store)
     }
 
     pub fn load_warning(&self) -> Option<&str> {
         self.load_warning.as_deref()
     }
 
-    pub fn revision(&self) -> u64 {
-        self.state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .revision
+    pub fn set_retention(&self, retention: crate::history::HistoryRetention) {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.retention == retention {
+                return;
+            }
+            state.retention = retention;
+        }
+        self.prune_expired_at(crate::history::now_ms());
+    }
+
+    /// Removes non-active failed and recovered entries older than the timed
+    /// retention window (`Day`, `Week`, `Month`). `Off` and `Forever` keep
+    /// recovery entries until manually handled.
+    pub fn prune_expired_at(&self, now_ms: u64) -> usize {
+        let expired: Vec<(String, bool)> = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(max_age) = state.retention.max_age_ms() else {
+                return 0;
+            };
+            let cutoff = now_ms.saturating_sub(max_age);
+            state
+                .entries
+                .values()
+                .filter(|entry| entry.timestamp_ms < cutoff && !state.active.contains(&entry.id))
+                .map(|entry| (entry.id.clone(), entry.volatile))
+                .collect()
+        };
+        if expired.is_empty() {
+            return 0;
+        }
+        let mut removed = Vec::with_capacity(expired.len());
+        for (id, volatile) in expired {
+            if !volatile && let Err(error) = remove_recording_files(&self.directory, &id) {
+                tracing::warn!(%error, "could not remove expired recovery recording");
+                continue;
+            }
+            removed.push(id);
+        }
+        if removed.is_empty() {
+            return 0;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut count = 0;
+        for id in removed {
+            if !state.active.contains(&id) && state.entries.remove(&id).is_some() {
+                state.volatile.remove(&id);
+                count += 1;
+            }
+        }
+        if count > 0 {
+            state.revision += 1;
+        }
+        count
+    }
+
+    /// Changes whenever entries change or an entry crosses the retention window.
+    pub fn view_key(&self) -> (u64, usize) {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let visible = match state.retention.max_age_ms() {
+            Some(max_age) => {
+                let cutoff = crate::history::now_ms().saturating_sub(max_age);
+                state
+                    .entries
+                    .values()
+                    .filter(|entry| {
+                        entry.timestamp_ms >= cutoff || state.active.contains(&entry.id)
+                    })
+                    .count()
+            }
+            None => state.entries.len(),
+        };
+        (state.revision, visible)
     }
 
     pub fn entries(&self, query: &str) -> Vec<RecoveryEntry> {
+        self.prune_expired_at(crate::history::now_ms());
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let needle = query.trim().to_lowercase();
         let mut entries: Vec<_> = state
@@ -1818,5 +1910,59 @@ mod tests {
         assert!(playback.is_playing(&id));
         stop_active_playback();
         assert!(!playback.is_playing(&id));
+    }
+
+    #[test]
+    fn failed_recordings_respect_timed_history_retention_and_keep_active_or_off() {
+        use crate::history::HistoryRetention;
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let old_id = failed(&store);
+        let fresh_id = failed(&store);
+        let now = crate::history::now_ms();
+        let week_ms = HistoryRetention::Week.max_age_ms().unwrap();
+
+        // Backdate old_id to 10 days ago on disk and in memory.
+        {
+            let mut state = store.state.lock().unwrap();
+            let entry = state.entries.get_mut(&old_id).unwrap();
+            entry.timestamp_ms = now.saturating_sub(week_ms + 3 * 24 * 60 * 60 * 1_000);
+            let clone = entry.clone();
+            drop(state);
+            store.save_metadata(&clone).unwrap();
+        }
+
+        // Off and Forever keep all failed entries.
+        store.set_retention(HistoryRetention::Off);
+        assert_eq!(store.entries("").len(), 2);
+        store.set_retention(HistoryRetention::Forever);
+        assert_eq!(store.entries("").len(), 2);
+
+        // Active attempts are never pruned even past retention.
+        store.state.lock().unwrap().active.insert(old_id.clone());
+        store.set_retention(HistoryRetention::Week);
+        assert_eq!(store.entries("").len(), 2);
+        store.state.lock().unwrap().active.remove(&old_id);
+
+        // Once inactive, Week retention removes the 10-day-old failure and its files,
+        // while keeping the fresh failure intact.
+        assert_eq!(store.prune_expired_at(now), 1);
+        let remaining = store.entries("");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, fresh_id);
+        assert!(!fixture.0.join(format!("{old_id}.wav")).exists());
+        assert!(!fixture.0.join(format!("{old_id}.json")).exists());
+        assert!(fixture.0.join(format!("{fresh_id}.wav")).exists());
+
+        // Reopening with Day retention prunes entries older than 24 hours on startup.
+        let reopened =
+            RecordingRecovery::open_with_retention(fixture.0.clone(), HistoryRetention::Day)
+                .unwrap();
+        assert_eq!(reopened.entries("").len(), 1);
+        assert_eq!(
+            reopened.prune_expired_at(now + HistoryRetention::Day.max_age_ms().unwrap() + 1_000),
+            1
+        );
+        assert!(reopened.entries("").is_empty());
     }
 }

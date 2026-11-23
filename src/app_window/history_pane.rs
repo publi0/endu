@@ -382,12 +382,12 @@ impl AppWindow {
             }))
             .into_any_element()
     }
-    pub(super) fn history_revisions(&self) -> ((u64, usize), u64) {
+    pub(super) fn history_revisions(&self) -> ((u64, usize), (u64, usize)) {
         (
             self.history.as_ref().map_or((0, 0), History::view_key),
             self.recovery
                 .as_ref()
-                .map_or(0, RecordingRecovery::revision),
+                .map_or((0, 0), RecordingRecovery::view_key),
         )
     }
 
@@ -504,6 +504,9 @@ impl AppWindow {
             && let Err(error) = history.set_retention(retention)
         {
             self.history_error = Some(error.to_string());
+        }
+        if let Some(recovery) = &self.recovery {
+            recovery.set_retention(retention);
         }
         self.reload_history(cx);
         cx.notify();

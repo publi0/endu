@@ -624,7 +624,7 @@ pub struct AppWindow {
     history_search: Entity<TextInput>,
     history_entries: Vec<HistoryEntry>,
     /// Store revisions behind the loaded lists; polling reloads only when they move.
-    history_loaded: Option<((u64, usize), u64)>,
+    history_loaded: Option<((u64, usize), (u64, usize))>,
     recovery: Option<RecordingRecovery>,
     recovery_entries: Vec<RecoveryEntry>,
     selected_recovery: Option<String>,

@@ -159,7 +159,9 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
     });
     let recovery = listener
         .as_ref()
-        .map(|_| crate::recording_recovery::RecordingRecovery::open_default())
+        .map(|_| {
+            crate::recording_recovery::RecordingRecovery::open_default(settings.history_retention)
+        })
         .transpose()?;
     let (indicator_sender, indicator_receiver) = dictation_indicator::channel();
     if notice_preview {

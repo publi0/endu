@@ -53,7 +53,7 @@ impl HistoryRetention {
         matches!(self, Self::Off)
     }
 
-    const fn max_age_ms(self) -> Option<u64> {
+    pub const fn max_age_ms(self) -> Option<u64> {
         const HOUR_MS: u64 = 60 * 60 * 1_000;
         match self {
             Self::Off | Self::Forever => None,

@@ -2,17 +2,18 @@
 //! the chain, and every edit rebases its one field onto the latest config.
 
 use crate::desktop_ui::{
-    ACCENT, LINE, NEGATIVE, NUMBER_INPUT_WIDTH, PickerState, SETTINGS_CONTROL_WIDTH, SURFACE,
-    SURFACE_HOVER, SURFACE_SELECTED, TEXT_SOFT, disclosure_button, picker_open_key, picker_popup,
-    rgb, settings_panel, settings_row, settings_section_label, toggle,
+    ACCENT, ACCENT_SOFT, DIVIDER, FAINT, LINE, MUTED, NEGATIVE, NUMBER_INPUT_WIDTH, PickerState,
+    SETTINGS_CONTROL_WIDTH, SURFACE, SURFACE_HOVER, SURFACE_SELECTED, TEXT, TEXT_SOFT, ThemeColor,
+    disclosure_button, layout_item, picker_open_key, picker_popup, rgb, settings_panel,
+    settings_row, settings_section_label, toggle,
 };
 use crate::i18n::t;
 use crate::openrouter::{Config, LANGUAGES, catalog, settings_view::ConfigChanged};
 use crate::providers::{self, ModelOptions, ModelRef};
 use crate::text_input::{Changed, Dismissed, EditFinished, Submitted, TextInput};
 use gpui::{
-    AnyElement, Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyDownEvent,
-    MouseDownEvent, Render, Subscription, Window, div, prelude::*, px,
+    AnyElement, Context, Entity, EventEmitter, FocusHandle, FontWeight, IntoElement, KeyDownEvent,
+    MouseDownEvent, Render, Subscription, Window, div, prelude::*, px, rgba,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -46,10 +47,9 @@ pub struct ModelOptionsView {
     temperature: Entity<TextInput>,
     dirty: [bool; 2],
     error: Option<(Field, String)>,
-    model_picker: PickerState,
+    model_tabs: [FocusHandle; 2],
     language_picker: PickerState,
     open: Option<Field>,
-    model_open: bool,
     toggles: [FocusHandle; 5],
     _subscriptions: Vec<Subscription>,
 }
@@ -114,10 +114,9 @@ impl ModelOptionsView {
             temperature,
             dirty: [false; 2],
             error: None,
-            model_picker: PickerState::new(cx),
+            model_tabs: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             language_picker: PickerState::new(cx),
             open: None,
-            model_open: false,
             toggles: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             _subscriptions: subscriptions,
         }
@@ -211,7 +210,6 @@ impl ModelOptionsView {
         self.refresh(config, cx);
     }
     pub fn close_pickers(&mut self, cx: &mut Context<Self>) {
-        self.model_open = false;
         self.open = None;
         cx.notify();
     }
@@ -294,59 +292,57 @@ impl ModelOptionsView {
             }
         }
     }
-    fn toggle_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.available_models().is_empty() || !self.finish_editing(cx) {
-            return;
-        }
-        self.open = None;
-        self.model_open = !self.model_open;
-        if self.model_open {
-            let available = self.available_models();
-            let index = available
-                .iter()
-                .position(|id| Some(id) == self.selected.as_ref())
-                .unwrap_or(0);
-            self.model_picker.open(index, available.len(), window);
-        } else {
-            self.model_picker.trigger.focus(window);
-        }
-        cx.notify();
-    }
     fn choose_model(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if !self.finish_editing(cx) {
             return;
         }
-        let Some(id) = self.available_models().get(index).cloned() else {
+        let available = self.available_models();
+        let Some(id) = available.get(index).cloned() else {
             return;
         };
         self.selected = Some(id.clone());
         self.saved = providers::options(&self.config, &id);
         self.dirty = [false; 2];
         self.error = None;
+        self.open = None;
         self.load_fields(cx);
-        self.model_open = false;
-        self.model_picker.trigger.focus(window);
+        if available.len() > 1
+            && let Some(handle) = self.model_tabs.get(index)
+        {
+            handle.focus(window);
+        }
         cx.notify();
     }
-    fn model_keys(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let key = event.keystroke.key.as_str();
-        if self
-            .model_picker
-            .navigate(key, self.available_models().len())
+    fn model_tab_keys(
+        &mut self,
+        index: usize,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.modifiers.platform
+            || event.keystroke.modifiers.control
+            || event.keystroke.modifiers.alt
         {
-        } else if matches!(key, "enter" | "space") {
-            self.choose_model(self.model_picker.highlight, window, cx);
-        } else if matches!(key, "escape" | "tab") {
-            self.model_open = false;
-            self.model_picker.close(event, window);
-        } else {
             return;
         }
+        let count = self.available_models().len().min(self.model_tabs.len());
+        if count <= 1 {
+            return;
+        }
+        let last = count - 1;
+        let next = match event.keystroke.key.as_str() {
+            "left" | "up" => index.saturating_sub(1),
+            "right" | "down" => (index + 1).min(last),
+            "home" => 0,
+            "end" => last,
+            "enter" | "space" => index,
+            _ => return,
+        };
+        self.choose_model(next, window, cx);
         cx.stop_propagation();
-        cx.notify();
     }
     fn toggle_language(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.model_open = false;
         if self.open == Some(Field::Language) {
             self.open = None;
             self.language_picker.trigger.focus(window);
@@ -466,67 +462,174 @@ impl ModelOptionsView {
             .into_any_element();
         self.row(field, title, detail, control)
     }
-    fn render_model_selector(&self, cx: &mut Context<Self>) -> AnyElement {
-        let label = self
-            .selected
-            .as_deref()
-            .map(|id| catalog::selector_label(id, &self.catalog))
-            .unwrap_or_else(|| t("No model with a configured provider").into());
-        let menu =
-            self.model_open.then(|| {
-                menu_frame("provider-options-model-menu")
-                    .track_focus(&self.model_picker.menu)
-                    .on_key_down(cx.listener(Self::model_keys))
-                    .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                        this.model_open = false;
-                        cx.notify();
-                    }))
+    fn render_model_header(&self, cx: &mut Context<Self>) -> AnyElement {
+        let available = self.available_models();
+        let note = || {
+            div()
+                .w_full()
+                .min_w_0()
+                .whitespace_normal()
+                .text_size(px(11.0))
+                .text_color(rgb(MUTED))
+                .child(t(
+                    "Options are remembered for each model, including after removal from the chain.",
+                ))
+        };
+        match available.as_slice() {
+            [] => div()
+                .w_full()
+                .px_4()
+                .py_3()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(TEXT_SOFT))
+                        .child(t("No model with a configured provider")),
+                )
+                .child(note())
+                .into_any_element(),
+            [only] => {
+                let role = slot_label(&self.config, only);
+                div()
+                    .debug_selector(|| "model-options-solo-header".into())
+                    .w_full()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(rgb(DIVIDER))
                     .child(
                         div()
-                            .id("provider-model-choices")
-                            .max_h(px(240.0))
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.model_picker.scroll)
-                            .children(self.available_models().iter().enumerate().map(
-                                |(index, id)| {
-                                    choice(
-                                        catalog::selector_label(id, &self.catalog),
-                                        index == self.model_picker.highlight,
-                                    )
-                                    .id(("provider-model-choice", index))
-                                    .on_click(cx.listener(
-                                        move |this, _, window, cx| {
-                                            this.choose_model(index, window, cx)
-                                        },
-                                    ))
-                                },
-                            )),
+                            .w_full()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .px_2()
+                                    .py(px(2.0))
+                                    .rounded(px(4.0))
+                                    .bg(rgb(ACCENT_SOFT))
+                                    .text_size(px(10.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(ACCENT))
+                                    .child(role),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(13.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(TEXT))
+                                    .child(catalog::selector_label(only, &self.catalog)),
+                            ),
                     )
+                    .child(note())
                     .into_any_element()
-            });
-        div()
-            .relative()
-            .flex_none()
-            .child(
-                disclosure_button(label)
-                    .id("provider-options-model")
-                    .track_focus(&self.model_picker.trigger)
-                    .focus(|style| style.border_color(rgb(ACCENT)))
-                    .on_click(cx.listener(|this, event, window, cx| {
-                        if matches!(event, gpui::ClickEvent::Mouse(_)) {
-                            this.toggle_model_picker(window, cx);
-                        }
-                    }))
-                    .on_key_down(cx.listener(|this, event, window, cx| {
-                        if picker_open_key(event) {
-                            this.toggle_model_picker(window, cx);
-                            cx.stop_propagation();
-                        }
-                    })),
-            )
-            .children(menu.map(picker_popup))
-            .into_any_element()
+            }
+            many => {
+                let tabs =
+                    many.iter()
+                        .take(self.model_tabs.len())
+                        .enumerate()
+                        .map(|(index, id)| {
+                            let active = self.selected.as_deref() == Some(id.as_str());
+                            let role = slot_label(&self.config, id);
+                            let name = catalog::label(id, &self.catalog);
+                            layout_item(div())
+                                .id(("model-options-tab", index))
+                                .debug_selector(move || format!("model-options-tab-{index}"))
+                                .track_focus(&self.model_tabs[index].clone().tab_stop(active))
+                                .flex_1()
+                                .min_w_0()
+                                .h(px(crate::desktop_ui::CONTROL_HEIGHT))
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .gap_2()
+                                .rounded(px(5.0))
+                                .border_1()
+                                .border_color(rgba(0x00000000))
+                                .cursor_pointer()
+                                .when(active, |tab| tab.bg(rgb(ACCENT_SOFT)))
+                                .when(!active, |tab| {
+                                    tab.hover(|tab| tab.bg(rgb(ThemeColor::SegmentedItemHover)))
+                                })
+                                .focus(|tab| tab.border_color(rgb(ACCENT)))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(10.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(if active { rgb(ACCENT) } else { rgb(MUTED) })
+                                        .child(role),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(FAINT))
+                                        .child("·"),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(12.0))
+                                        .font_weight(if active {
+                                            FontWeight::SEMIBOLD
+                                        } else {
+                                            FontWeight::MEDIUM
+                                        })
+                                        .text_color(if active { rgb(TEXT) } else { rgb(TEXT_SOFT) })
+                                        .child(name),
+                                )
+                                .on_click(cx.listener(move |this, event, window, cx| {
+                                    if matches!(event, gpui::ClickEvent::Mouse(_)) {
+                                        this.choose_model(index, window, cx);
+                                    }
+                                }))
+                                .on_key_down(cx.listener(move |this, event, window, cx| {
+                                    this.model_tab_keys(index, event, window, cx);
+                                }))
+                        });
+                div()
+                    .debug_selector(|| "model-options-switcher".into())
+                    .w_full()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(rgb(DIVIDER))
+                    .child(
+                        div()
+                            .w_full()
+                            .p(px(3.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(3.0))
+                            .rounded(px(7.0))
+                            .border_1()
+                            .border_color(rgb(ThemeColor::Track))
+                            .bg(rgb(ThemeColor::Track))
+                            .children(tabs),
+                    )
+                    .child(note())
+                    .into_any_element()
+            }
+        }
     }
     fn render_language(&self, cx: &mut Context<Self>) -> AnyElement {
         let menu = (self.open == Some(Field::Language)).then(|| {
@@ -582,11 +685,7 @@ impl ModelOptionsView {
 
 impl Render for ModelOptionsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut panel = settings_panel().child(settings_row(
-            t("Model"),
-            t("Options are remembered for each model, including after removal from the chain."),
-            self.render_model_selector(cx),
-        ));
+        let mut panel = settings_panel().child(self.render_model_header(cx));
         if let Some(id) = &self.selected {
             let caps = ModelRef::parse(id).capabilities();
             panel = panel.child(self.row(
@@ -705,6 +804,18 @@ impl Render for ModelOptionsView {
             })
             .child(settings_section_label(t("Model options")))
             .child(panel)
+    }
+}
+
+fn slot_label(config: &Config, id: &str) -> &'static str {
+    match config
+        .transcription
+        .models
+        .iter()
+        .position(|model| model == id)
+    {
+        Some(0) => t("Primary"),
+        _ => t("Fallback"),
     }
 }
 
@@ -1051,7 +1162,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn escaping_a_numeric_draft_cancels_it_and_picker_key_up_does_not_reopen(
+    fn escaping_a_numeric_draft_cancels_it_and_tabs_switch_models_by_keyboard(
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(|cx| cx.bind_keys(crate::text_input::key_bindings()));
@@ -1063,17 +1174,44 @@ mod tests {
         cx.update(|window, cx| {
             assert_eq!(view.read(cx).temperature.read(cx).text(), "0.2");
             assert_eq!(view.read(cx).saved.temperature, Some(0.2));
-            view.read(cx).model_picker.trigger.focus(window);
+            view.read(cx).model_tabs[0].focus(window);
         });
-        cx.simulate_keystrokes("enter down enter");
-        cx.simulate_event(gpui::KeyUpEvent {
-            keystroke: gpui::Keystroke::parse("enter").unwrap(),
-        });
+        cx.simulate_keystrokes("right");
         cx.update(|window, cx| {
             assert_eq!(view.read(cx).selected.as_deref(), Some("deepgram::nova-3"));
-            assert!(!view.read(cx).model_open);
-            assert!(view.read(cx).model_picker.trigger.is_focused(window));
+            assert!(view.read(cx).model_tabs[1].is_focused(window));
         });
+        cx.simulate_keystrokes("left");
+        cx.update(|window, cx| {
+            assert_eq!(
+                view.read(cx).selected.as_deref(),
+                Some("openai::gpt-transcribe")
+            );
+            assert!(view.read(cx).model_tabs[0].is_focused(window));
+        });
+    }
+
+    #[gpui::test]
+    fn segmented_switcher_renders_for_two_models_and_hides_for_one(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| ModelOptionsView::new(fixture(), true, cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("model-options-switcher").is_some());
+        assert!(cx.debug_bounds("model-options-tab-0").is_some());
+        assert!(cx.debug_bounds("model-options-tab-1").is_some());
+        assert!(cx.debug_bounds("model-options-solo-header").is_none());
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let mut config = view.config_snapshot();
+                config.transcription.models.truncate(1);
+                view.refresh(config, cx);
+            });
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("model-options-solo-header").is_some());
+        assert!(cx.debug_bounds("model-options-switcher").is_none());
+        assert!(cx.debug_bounds("model-options-tab-0").is_none());
+        assert!(cx.debug_bounds("model-options-tab-1").is_none());
     }
 
     #[gpui::test]
