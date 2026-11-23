@@ -88,6 +88,8 @@ struct CompletedTranscript {
 struct LastTranscript {
     completed: CompletedTranscript,
     has_pasted: bool,
+    /// History's recovery copy of a transcript that was not pasted.
+    recovered: Option<crate::recording_recovery::RecoveredText>,
 }
 
 enum OutputJob {
@@ -98,6 +100,9 @@ enum OutputJob {
         job_id: DictationJobId,
         control: Arc<JobControl>,
         result: Box<Result<CompletedTranscript, String>>,
+        /// Saved-audio cleanup, settled once the output outcome is known.
+        /// Dropping it resolves the recording.
+        recovery: Option<crate::recording_recovery::PendingResolution>,
     },
     Cancelled {
         job_id: DictationJobId,
@@ -744,16 +749,14 @@ fn run_transcription_queue(
                 }
             })
             .map_err(|error| format!("{error:#}"));
+        // The output worker settles recovery after pasting, so its fsync never
+        // delays the paste, and an unpasted transcript stays in History.
         let sent = output.send(OutputJob::Completed {
             job_id: job.job_id,
             control: job.control,
             result: Box::new(result),
+            recovery: pending_cleanup,
         });
-        // Run recovery Resolved metadata fsync + WAV cleanup after handing the
-        // transcript to output_worker so paste begins immediately.
-        if let Some(pending) = pending_cleanup {
-            pending.finish();
-        }
         if sent.is_err() {
             break;
         }
@@ -858,6 +861,7 @@ fn finish_output(
             job_id,
             control,
             result,
+            recovery,
         } if !control.is_cancelled() => {
             let completed = match *result {
                 Ok(completed) => completed,
@@ -901,10 +905,14 @@ fn finish_output(
                         total_ms = completed.timings.total_started.elapsed().as_millis(),
                         "dictation pipeline completed"
                     );
+                    if let Some(recovery) = recovery {
+                        recovery.finish();
+                    }
                     let text = completed.text.clone();
                     *last_transcript = Some(LastTranscript {
                         completed,
                         has_pasted: true,
+                        recovered: None,
                     });
                     WorkerEvent::Completed {
                         job_id,
@@ -914,9 +922,11 @@ fn finish_output(
                 Ok(PasteOutcome::CopiedToClipboard) => {
                     // The clipboard write already passed the output commit gate.
                     // A later shutdown must not relabel that completed copy as cancelled.
+                    let recovered = recovery.and_then(|r| r.keep_unpasted(&completed.text));
                     *last_transcript = Some(LastTranscript {
                         completed,
                         has_pasted: false,
+                        recovered,
                     });
                     WorkerEvent::ReadyToPaste {
                         job_id: Some(job_id),
@@ -929,9 +939,11 @@ fn finish_output(
                     if !commit() {
                         return WorkerEvent::Cancelled { job_id };
                     }
+                    let recovered = recovery.and_then(|r| r.keep_unpasted(&completed.text));
                     *last_transcript = Some(LastTranscript {
                         completed,
                         has_pasted: false,
+                        recovered,
                     });
                     match outcome {
                         Ok(PasteOutcome::Deferred) => WorkerEvent::ReadyToPaste {
@@ -978,6 +990,9 @@ fn finish_output(
                         last.completed.context = target;
                         if let Some(history) = history {
                             record_history(history, &last.completed);
+                        }
+                        if let Some(recovered) = last.recovered.take() {
+                            recovered.discard();
                         }
                         last.has_pasted = true;
                     }
@@ -1063,6 +1078,7 @@ mod tests {
                 },
                 report: None,
             })),
+            recovery: None,
         }
     }
 
@@ -1743,6 +1759,146 @@ mod tests {
             crate::recording_recovery::RecordingRecovery::open(directory.join("recovery")).unwrap();
         assert_eq!(reloaded.entries("").len(), 1);
         assert_eq!(reloaded.entries("")[0].id, entry.id);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn unpasted_output_stays_recovered_in_history_until_paste_last_delivers_it() {
+        let directory = std::env::temp_dir().join(format!(
+            "hex-unpasted-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let recovery =
+            crate::recording_recovery::RecordingRecovery::open(directory.join("recovery")).unwrap();
+        let history = History::new(crate::history::HistoryStore::open(
+            directory.join("history.json"),
+            crate::history::HistoryRetention::Week,
+            crate::history::now_ms(),
+        ));
+        let state = Mutex::new(WorkerState::default());
+        let job = |text: &str| {
+            let (result, pending) = recovery.transcribe_original_cancellable(
+                &[0.1; 1_600],
+                Some("Notes"),
+                crate::post_processing::Preferences::default(),
+                None,
+                |_| Ok(test_transcription(text)),
+            );
+            assert!(pending.is_some());
+            let mut job = completed(0, &result.unwrap().text);
+            if let OutputJob::Completed { recovery, .. } = &mut job {
+                *recovery = pending;
+            }
+            job
+        };
+        let wavs = || {
+            std::fs::read_dir(directory.join("recovery"))
+                .unwrap()
+                .filter(|item| {
+                    item.as_ref()
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "wav")
+                })
+                .count()
+        };
+
+        // Pasted: resolved, nothing left in recovery.
+        let mut last = None;
+        finish_output(
+            job("pasted"),
+            &mut |_, _, _, commit| {
+                assert!(commit());
+                Ok(PasteOutcome::Pasted)
+            },
+            &mut last,
+            Some(&history),
+            &state,
+        );
+        assert!(recovery.entries("").is_empty());
+        assert_eq!(history.search("").len(), 1);
+
+        // Cancelled while pasting: resolved, never kept.
+        let cancelled = job("cancelled");
+        let OutputJob::Completed { control, .. } = &cancelled else {
+            unreachable!()
+        };
+        let control = control.clone();
+        finish_output(
+            cancelled,
+            &mut |_, _, _, commit| {
+                assert!(control.cancel());
+                assert!(!commit());
+                Ok(PasteOutcome::Deferred)
+            },
+            &mut last,
+            Some(&history),
+            &state,
+        );
+        assert!(recovery.entries("").is_empty());
+
+        // Copied, deferred or failed paste: kept as recovered text, audio dropped.
+        for outcome in ["copied", "deferred", "failed"] {
+            let mut last = None;
+            let event = finish_output(
+                job(outcome),
+                &mut |_, _, _, commit| {
+                    assert!(commit());
+                    match outcome {
+                        "copied" => Ok(PasteOutcome::CopiedToClipboard),
+                        "deferred" => Ok(PasteOutcome::Deferred),
+                        _ => Err(color_eyre::eyre::eyre!("paste failed")),
+                    }
+                },
+                &mut last,
+                Some(&history),
+                &state,
+            );
+            assert!(!matches!(event, WorkerEvent::Cancelled { .. }));
+            let entries = recovery.entries("");
+            assert_eq!(entries.len(), 1, "{outcome}");
+            assert_eq!(
+                entries[0].status,
+                crate::recording_recovery::RecoveryStatus::Recovered
+            );
+            assert_eq!(entries[0].text.as_deref(), Some(outcome));
+            assert!(!entries[0].busy);
+            assert_eq!(wavs(), 0, "recovered text replaces the audio");
+            let reloaded =
+                crate::recording_recovery::RecordingRecovery::open(directory.join("recovery"))
+                    .unwrap();
+            assert_eq!(reloaded.entries("")[0].text.as_deref(), Some(outcome));
+            assert_eq!(
+                history.search("").len(),
+                1,
+                "History records pasted text only"
+            );
+
+            // Paste Last delivers it: History records it once, recovery drops it.
+            finish_output(
+                OutputJob::PasteLast {
+                    sequence: 1,
+                    target: ContextSnapshot::default(),
+                },
+                &mut |text, _, _, commit| {
+                    assert_eq!(text, outcome);
+                    assert!(commit());
+                    Ok(PasteOutcome::Pasted)
+                },
+                &mut last,
+                Some(&history),
+                &state,
+            );
+            assert!(recovery.entries("").is_empty());
+            assert_eq!(history.search("")[0].text, outcome);
+            history.delete(history.search("")[0].id).unwrap();
+        }
         std::fs::remove_dir_all(directory).unwrap();
     }
 

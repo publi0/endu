@@ -180,7 +180,10 @@ Only modules whose name does not say enough:
   never raw payloads or credentials. A disk failure keeps the audio in memory
   with a visible warning, never a false durability claim.
 - History records only successful pasted output, bounded and retained per its
-  setting. It stores counts and outcomes, never keyword or prompt contents.
+  setting. A transcript that was copied, deferred or failed to paste instead
+  stays as a Recovered recording entry (text kept, audio dropped) until it is
+  deleted, expires, or Paste Last delivers it into History; cancelled output
+  never stays. It stores counts and outcomes, never keyword or prompt contents.
 
 ### Statistics and privacy
 

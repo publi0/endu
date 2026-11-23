@@ -128,20 +128,14 @@ impl PendingResolution {
     /// saves it as `Recovered` before removing audio; otherwise keeps the WAV
     /// intact for later retry.
     pub fn preserve_for_shutdown(mut self, text: Option<String>) {
-        let Some(mut entry) = self.entry.take() else {
+        let Some(entry) = self.entry.take() else {
             return;
         };
-        if let Some(text) = text.filter(|value| !value.trim().is_empty()) {
-            entry.status = RecoveryStatus::Recovered;
-            entry.message = None;
-            entry.text = Some(text);
-            if !entry.volatile && self.store.save_metadata(&entry).is_ok() {
-                let _ = remove_recording_files(&self.store.directory, &entry.id);
-                let mut state = self.store.state.lock().unwrap_or_else(|e| e.into_inner());
-                state.entries.insert(entry.id.clone(), entry);
-                state.revision += 1;
-                return;
-            }
+        if let Some(text) = text.filter(|value| !value.trim().is_empty())
+            && !entry.volatile
+            && self.store.keep_recovered(entry.clone(), text)
+        {
+            return;
         }
         self.store.finish_failure(
             entry,
@@ -149,10 +143,48 @@ impl PendingResolution {
         );
     }
 
+    /// Keeps a successful transcript that was not pasted (copied, deferred or
+    /// failed to paste) as a `Recovered` entry, so it stays in History until
+    /// deleted, expired, or pasted with Paste Last. Empty text resolves.
+    pub fn keep_unpasted(mut self, text: &str) -> Option<RecoveredText> {
+        let entry = self.entry.take()?;
+        let text = text.trim();
+        if text.is_empty() {
+            self.store.resolve_entry(entry);
+            return None;
+        }
+        let id = entry.id.clone();
+        if self.store.keep_recovered(entry.clone(), text.to_owned()) {
+            return Some(RecoveredText {
+                store: self.store.clone(),
+                id,
+            });
+        }
+        self.store.finish_failure(
+            entry,
+            t("Could not save the recovered text. Audio retained; keep Endu open."),
+        );
+        None
+    }
+
     fn run(&mut self) {
         if let Some(entry) = self.entry.take() {
             self.store.resolve_entry(entry);
         }
+    }
+}
+
+/// A transcript kept as `Recovered` because it was not pasted.
+pub struct RecoveredText {
+    store: RecordingRecovery,
+    id: String,
+}
+
+impl RecoveredText {
+    /// Paste Last delivered the text and History now records it: drop the
+    /// recovery copy so it is not listed twice.
+    pub fn discard(self) {
+        let _ = self.store.delete(&self.id);
     }
 }
 
@@ -634,6 +666,30 @@ impl RecordingRecovery {
         // Retry to start before the original guard drops and clears the new owner.
         state.entries.insert(entry.id.clone(), entry);
         state.revision += 1;
+    }
+
+    /// Commits `text` as `Recovered` before removing the audio. In-memory
+    /// entries whose metadata cannot be written stay recovered in memory.
+    /// Returns false, with nothing changed, when saved audio would lose its
+    /// only durable companion.
+    fn keep_recovered(&self, mut entry: RecoveryEntry, text: String) -> bool {
+        entry.status = RecoveryStatus::Recovered;
+        entry.message = None;
+        entry.text = Some(text);
+        if self.save_metadata(&entry).is_ok() {
+            if !entry.volatile {
+                let _ =
+                    fs::remove_file(self.audio_path(&entry.id).expect("validated recording id"));
+            }
+            entry.volatile = false;
+        } else if !entry.volatile {
+            return false;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.volatile.remove(&entry.id);
+        state.entries.insert(entry.id.clone(), entry);
+        state.revision += 1;
+        true
     }
 
     fn resolve_entry(&self, mut entry: RecoveryEntry) {
