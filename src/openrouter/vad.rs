@@ -4,6 +4,11 @@
 //!
 //! The threshold adapts to each recording's noise floor. Margins and the
 //! minimum kept pause err toward keeping audio, so speech is not clipped.
+//!
+//! A clip with nothing above [`ABSOLUTE_FLOOR`] still keeps its speech when it
+//! holds one sustained run well above its own noise floor: a quiet built-in
+//! microphone can record real speech below that floor while its room noise
+//! sits far lower.
 
 use std::ops::Range;
 
@@ -25,6 +30,18 @@ const ABOVE_NOISE: f32 = 3.16;
 /// But never require more than this fraction of the loudest frame (-14 dB),
 /// so a recording that is speech throughout keeps its quieter syllables.
 const BELOW_PEAK: f32 = 0.2;
+/// The quiet-microphone path: a frame must be this far above the clip's own
+/// noise floor (12 dB) to count as speech there.
+const QUIET_ABOVE_NOISE: f32 = 3.98;
+/// About -66 dBFS: the quiet path never accepts anything quieter, however
+/// quiet the floor, so dither and a barely moving microphone stay silent.
+const QUIET_FLOOR: f32 = 0.0005;
+/// The quiet path needs one contiguous run this long above its threshold, so
+/// scattered clicks never add up to speech.
+const QUIET_SUSTAINED_FRAMES: usize = 9; // 180 ms
+/// About -120 dBFS: frames at or below this are digital silence or a constant
+/// offset (a device warming up) and never define the noise floor.
+const DIGITAL_SILENCE: f32 = 1e-6;
 
 #[derive(Debug, PartialEq)]
 pub enum Trimmed {
@@ -39,9 +56,15 @@ pub fn trim(samples: &[f32]) -> Trimmed {
         return Trimmed::Silent;
     }
     let threshold = threshold(&energies);
-    let speech = speech_frames(&energies, threshold);
-    if speech.iter().filter(|frame| **frame).count() < MIN_TOTAL_SPEECH_FRAMES {
-        return Trimmed::Silent;
+    let mut speech = speech_frames(&energies, threshold);
+    if !enough_speech(&speech) {
+        match quiet_threshold(&energies) {
+            Some(quiet) if quiet < threshold => speech = speech_frames(&energies, quiet),
+            _ => return Trimmed::Silent,
+        }
+        if !enough_speech(&speech) {
+            return Trimmed::Silent;
+        }
     }
     let regions = regions(&speech);
     let mut output = Vec::with_capacity(samples.len());
@@ -93,6 +116,47 @@ fn threshold(energies: &[f32]) -> f32 {
     (noise_floor * ABOVE_NOISE)
         .min(peak * BELOW_PEAK)
         .max(ABSOLUTE_FLOOR)
+}
+
+fn enough_speech(speech: &[bool]) -> bool {
+    speech.iter().filter(|frame| **frame).count() >= MIN_TOTAL_SPEECH_FRAMES
+}
+
+/// The quiet-microphone threshold: 12 dB over the clip's own noise floor (its
+/// 10th-percentile frame, ignoring digital silence), never below
+/// [`QUIET_FLOOR`]. `None` unless one sustained run clears it.
+fn quiet_threshold(energies: &[f32]) -> Option<f32> {
+    let mut audible: Vec<f32> = energies
+        .iter()
+        .copied()
+        .filter(|energy| *energy > DIGITAL_SILENCE)
+        .collect();
+    if audible.is_empty() {
+        return None;
+    }
+    audible.sort_by(f32::total_cmp);
+    let noise_floor = audible[(audible.len() - 1) / 10];
+    let threshold = (noise_floor * QUIET_ABOVE_NOISE).max(QUIET_FLOOR);
+    (longest_run(energies, threshold) >= QUIET_SUSTAINED_FRAMES).then_some(threshold)
+}
+
+/// The most frames above `threshold` in one run. A single quieter frame
+/// between loud ones is bridged but not counted; two in a row end the run.
+fn longest_run(energies: &[f32], threshold: f32) -> usize {
+    let (mut run, mut longest, mut bridged) = (0, 0, false);
+    for energy in energies {
+        if *energy > threshold {
+            run += 1;
+            longest = longest.max(run);
+            bridged = false;
+        } else if run > 0 && !bridged {
+            bridged = true;
+        } else {
+            run = 0;
+            bridged = false;
+        }
+    }
+    longest
 }
 
 /// Frames above the threshold, ignoring runs too short to be speech.
@@ -155,6 +219,27 @@ mod tests {
                 (state as f32 / u32::MAX as f32 * 2.0 - 1.0) * amplitude
             })
             .collect()
+    }
+
+    fn amplitude(dbfs: f32) -> f32 {
+        10.0_f32.powf(dbfs / 20.0)
+    }
+
+    /// DC-free noise whose every frame measures `dbfs` RMS.
+    fn hum(seconds: f32, dbfs: f32) -> Vec<f32> {
+        let level = amplitude(dbfs);
+        (0..(seconds * SECOND as f32) as usize)
+            .map(|index| if index % 2 == 0 { level } else { -level })
+            .collect()
+    }
+
+    /// A tone whose RMS is `dbfs`.
+    fn speech_at(seconds: f32, dbfs: f32) -> Vec<f32> {
+        tone(seconds, 2.0_f32.sqrt() * amplitude(dbfs))
+    }
+
+    fn frames(count: usize) -> f32 {
+        (count * FRAME) as f32 / SECOND as f32
     }
 
     fn concat(parts: &[Vec<f32>]) -> Vec<f32> {
@@ -271,5 +356,85 @@ mod tests {
             "{}",
             seconds(&trimmed)
         );
+    }
+
+    #[test]
+    fn quiet_microphone_speech_above_its_own_noise_floor_is_kept() {
+        // A built-in microphone records speech at -58 dBFS, under the
+        // absolute floor, over room noise at -76 dBFS.
+        assert!(amplitude(-58.0) < ABSOLUTE_FLOOR);
+        let samples = concat(&[hum(2.0, -76.0), speech_at(1.0, -58.0), hum(2.0, -76.0)]);
+        let Trimmed::Speech(trimmed) = trim(&samples) else {
+            panic!("quiet speech expected");
+        };
+        // The speech plus its margins; the surrounding noise is still cut.
+        assert!(
+            (seconds(&trimmed) - 1.4).abs() < 0.05,
+            "{}",
+            seconds(&trimmed)
+        );
+    }
+
+    #[test]
+    fn quiet_path_keeps_digital_silence_and_constant_floors_silent() {
+        assert_eq!(trim(&vec![0.0; 3 * SECOND]), Trimmed::Silent);
+        assert_eq!(trim(&hum(3.0, -60.0)), Trimmed::Silent);
+        assert_eq!(trim(&noise(3.0, 0.0005)), Trimmed::Silent);
+        // A device that warms up with exact zeros must not set a floor that
+        // makes the room noise after it look like speech.
+        let samples = concat(&[vec![0.0; SECOND / 2], hum(2.0, -62.0)]);
+        assert_eq!(trim(&samples), Trimmed::Silent);
+        let samples = concat(&[vec![0.0; SECOND / 2], noise(2.0, 0.0012)]);
+        assert_eq!(trim(&samples), Trimmed::Silent);
+    }
+
+    #[test]
+    fn quiet_path_never_accepts_anything_below_minus_66_dbfs() {
+        // 12 dB over a -82 dBFS floor, but under the clamp.
+        let too_quiet = concat(&[hum(1.0, -82.0), speech_at(1.0, -70.0), hum(1.0, -82.0)]);
+        assert_eq!(trim(&too_quiet), Trimmed::Silent);
+        // The same floor with speech at -62 dBFS clears it.
+        let audible = concat(&[hum(1.0, -82.0), speech_at(1.0, -62.0), hum(1.0, -82.0)]);
+        assert!(matches!(trim(&audible), Trimmed::Speech(_)));
+    }
+
+    #[test]
+    fn quiet_path_needs_one_sustained_run() {
+        // Bursts of 100 ms each, far apart, would add up to enough speech but
+        // never form a 180 ms run.
+        let mut parts = vec![hum(1.0, -76.0)];
+        for _ in 0..4 {
+            parts.push(speech_at(frames(5), -58.0));
+            parts.push(hum(0.5, -76.0));
+        }
+        assert_eq!(trim(&concat(&parts)), Trimmed::Silent);
+
+        for (count, kept) in [
+            (QUIET_SUSTAINED_FRAMES - 1, false),
+            (QUIET_SUSTAINED_FRAMES, true),
+        ] {
+            let samples = concat(&[
+                hum(1.0, -76.0),
+                speech_at(frames(count), -58.0),
+                hum(1.0, -76.0),
+            ]);
+            assert_eq!(
+                matches!(trim(&samples), Trimmed::Speech(_)),
+                kept,
+                "{count} frames"
+            );
+        }
+    }
+
+    #[test]
+    fn quiet_path_bridges_one_quiet_frame_but_not_two() {
+        let loud = [1.0; 5];
+        let gap = |frames: usize| vec![0.0; frames];
+        let one = [&loud[..], &gap(1), &loud[..]].concat();
+        assert_eq!(longest_run(&one, 0.5), 10);
+        let two = [&loud[..], &gap(2), &loud[..]].concat();
+        assert_eq!(longest_run(&two, 0.5), 5);
+        let leading = [&gap(1), &loud[..], &gap(1), &loud[..]].concat();
+        assert_eq!(longest_run(&leading, 0.5), 10);
     }
 }
