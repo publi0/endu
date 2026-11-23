@@ -630,6 +630,11 @@ impl Owner {
                         }
                     }
                 };
+                if let Finish::Transcribe(clip) = &finish
+                    && clip.is_digital_silence()
+                {
+                    self.reopen_silent_stream();
+                }
                 self.keep_open = keep_open && self.input.is_open();
                 self.state.recording.store(false, Ordering::Release);
                 let _ = reply.send(finish);
@@ -911,6 +916,23 @@ impl Owner {
             self.input.request_recovery();
             self.state.recovering.store(true, Ordering::Release);
         }
+    }
+
+    /// A finished dictation's audio was exactly zero: the stream runs but
+    /// delivers digital silence, as after some call apps release the device,
+    /// and stays that way until reopened. Reopen it now, as after a stream
+    /// failure; the clip itself is untouched. A microphone released while
+    /// idle closes anyway and opens fresh for the next press.
+    fn reopen_silent_stream(&mut self) {
+        if self.release_while_idle || !self.input.is_open() || self.input.is_recovering() {
+            return;
+        }
+        tracing::warn!(
+            device = %self.input.device_name(),
+            "dictation audio was digital silence; reopening the microphone"
+        );
+        self.input.request_recovery();
+        self.state.recovering.store(true, Ordering::Release);
     }
 
     fn close_input(&mut self) {
@@ -1704,6 +1726,41 @@ mod tests {
             captured_through: at + Duration::from_millis(40),
         });
         assert!(input.try_recv_event().is_none());
+    }
+
+    #[test]
+    fn a_dictation_of_digital_silence_reopens_the_microphone() {
+        for (value, reopens) in [(0.0, true), (0.25, false)] {
+            let (mut owner, input, _samples) = owner_for_test(true);
+            let at = capture_time();
+            owner.handle_input(RecoveringAudioInputEvent::Chunk {
+                samples: vec![value; 480],
+                captured_through: at,
+            });
+            start(&mut owner, at);
+            let released = at + Duration::from_millis(400);
+            owner.handle_input(RecoveringAudioInputEvent::Chunk {
+                samples: vec![value; 19_200],
+                captured_through: released,
+            });
+            control(&mut owner, |reply| Command::BecomeIntentional {
+                at: at + crate::dictation::MINIMUM_HOLD_DURATION,
+                reply,
+            });
+            let Finish::Transcribe(clip) = control(&mut owner, |reply| Command::Finish {
+                at: released,
+                keep_open: false,
+                reply,
+            }) else {
+                panic!("expected transcription");
+            };
+            // Detection only reads the clip, which still goes on to be
+            // transcribed (and trimmed as silence) as before.
+            assert_eq!(clip.is_digital_silence(), reopens, "{value}");
+            assert!(!clip.into_transcription_samples().is_empty());
+            assert_eq!(owner.input.is_recovering(), reopens, "{value}");
+            assert_eq!(input.is_recovering(), reopens, "{value}");
+        }
     }
 
     #[test]
