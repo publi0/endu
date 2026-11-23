@@ -1,13 +1,24 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
-use std::ptr;
+use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SendError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use block2::RcBlock;
 use color_eyre::eyre::{Result, eyre};
+use objc2::Message;
+use objc2::rc::{Retained, autoreleasepool};
+use objc2::runtime::{NSObjectProtocol, ProtocolObject};
+use objc2_app_kit::{
+    NSWorkspace, NSWorkspaceDidActivateApplicationNotification, NSWorkspaceDidWakeNotification,
+    NSWorkspaceScreensDidWakeNotification, NSWorkspaceSessionDidBecomeActiveNotification,
+};
+use objc2_foundation::{
+    NSDistributedNotificationCenter, NSNotification, NSNotificationCenter, NSString,
+};
 
 #[cfg(test)]
 use crate::app_settings::HotkeyBinding;
@@ -72,6 +83,7 @@ unsafe extern "C" {
         user_info: *mut c_void,
     ) -> *mut c_void;
     fn CGEventTapEnable(tap: *mut c_void, enable: bool);
+    fn CGEventTapIsEnabled(tap: *mut c_void) -> bool;
     fn CGEventGetFlags(event: EventRef) -> u64;
     fn CGEventGetTimestamp(event: EventRef) -> u64;
     fn CGEventGetIntegerValueField(event: EventRef, field: u32) -> i64;
@@ -89,8 +101,33 @@ unsafe extern "C" {
     fn CFRunLoopGetCurrent() -> *mut c_void;
     fn CFRunLoopRun();
     fn CFRunLoopStop(run_loop: *mut c_void);
+    fn CFRunLoopWakeUp(run_loop: *mut c_void);
+    fn CFRunLoopSourceCreate(
+        allocator: *const c_void,
+        order: isize,
+        context: *mut RunLoopSourceContext,
+    ) -> *mut c_void;
+    fn CFRunLoopSourceSignal(source: *mut c_void);
+    fn CFRunLoopSourceInvalidate(source: *mut c_void);
+    fn CFMachPortIsValid(port: *mut c_void) -> u8;
+    fn CFMachPortInvalidate(port: *mut c_void);
     fn CFRelease(value: *const c_void);
     static kCFRunLoopCommonModes: *const c_void;
+}
+
+/// `CFRunLoopSourceContext`, version 0.
+#[repr(C)]
+struct RunLoopSourceContext {
+    version: isize,
+    info: *mut c_void,
+    retain: Option<unsafe extern "C" fn(*const c_void) -> *const c_void>,
+    release: Option<unsafe extern "C" fn(*const c_void)>,
+    copy_description: Option<unsafe extern "C" fn(*const c_void) -> *const c_void>,
+    equal: Option<unsafe extern "C" fn(*const c_void, *const c_void) -> u8>,
+    hash: Option<unsafe extern "C" fn(*const c_void) -> usize>,
+    schedule: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void)>,
+    cancel: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void)>,
+    perform: Option<unsafe extern "C" fn(*mut c_void)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -341,6 +378,9 @@ struct EventTapContext {
     submit_guard_state: Arc<AtomicU64>,
     key_tap: AtomicPtr<c_void>,
     observation_tap: AtomicPtr<c_void>,
+    health_source: AtomicPtr<c_void>,
+    // Boot-clock nanoseconds of the last input-driven tap check request.
+    last_health_request: AtomicU64,
     shortcut_suppression: Mutex<ShortcutSuppression>,
     pending: PendingInputEvents,
     next_sequence: AtomicU64,
@@ -355,132 +395,510 @@ fn run_event_tap(
     run_loop: Arc<AtomicPtr<c_void>>,
     ready: SyncSender<Result<()>>,
 ) {
-    let context = Box::into_raw(Box::new(EventTapContext {
+    // Declared before every tap, source and observer so it outlives them all.
+    let mut context = Box::new(EventTapContext {
         sender,
         activity,
         escape_cancels,
         submit_guard_state,
         key_tap: AtomicPtr::new(ptr::null_mut()),
         observation_tap: AtomicPtr::new(ptr::null_mut()),
+        health_source: AtomicPtr::new(ptr::null_mut()),
+        last_health_request: AtomicU64::new(0),
         shortcut_suppression: Mutex::new(ShortcutSuppression::default()),
         pending,
         next_sequence: AtomicU64::new(0),
-    }));
-    let key_mask = [EVENT_KEY_DOWN, EVENT_KEY_UP]
-        .into_iter()
-        .fold(0, |mask, event| mask | 1_u64 << event);
-    let observation_mask = [
-        EVENT_LEFT_MOUSE_DOWN,
-        EVENT_RIGHT_MOUSE_DOWN,
-        EVENT_FLAGS_CHANGED,
-        EVENT_OTHER_MOUSE_DOWN,
-        // Scroll wheels and trackpad gestures can move the pointer or change
-        // the focused field before Hex submits Return, so they advance the
-        // interaction revision like any other user input.
-        EVENT_SCROLL_WHEEL,
-        EVENT_GESTURE_STARTED,
-        EVENT_GESTURE_ENDED,
-    ]
-    .into_iter()
-    .fold(0, |mask, event| mask | 1_u64 << event);
-    // SAFETY: The callback context remains allocated until this run loop stops.
-    let key_tap = unsafe {
-        CGEventTapCreate(
-            ANNOTATED_SESSION_EVENT_TAP,
-            HEAD_INSERT_EVENT_TAP,
-            DEFAULT_EVENT_TAP,
-            key_mask,
-            event_callback,
-            context.cast(),
-        )
-    };
-    if key_tap.is_null() {
-        // SAFETY: No callback can run because tap creation failed.
-        unsafe { drop(Box::from_raw(context)) };
-        let _ = ready.send(Err(eyre!(
-            "could not create keyboard event tap; grant Input Monitoring and Accessibility permissions"
-        )));
-        return;
-    }
-    // A modifying tap disrupts Finder's Option-driven alternate menu items even when it returns
-    // flagsChanged events unchanged. Observe modifiers and mouse clicks with a passive tap.
-    let observation_tap = unsafe {
-        CGEventTapCreate(
-            ANNOTATED_SESSION_EVENT_TAP,
-            HEAD_INSERT_EVENT_TAP,
-            LISTEN_ONLY_EVENT_TAP,
-            observation_mask,
-            event_callback,
-            context.cast(),
-        )
-    };
-    if observation_tap.is_null() {
-        // SAFETY: The observation tap was not created, so no callback can use the context.
-        unsafe {
-            CGEventTapEnable(key_tap, false);
-            CFRelease(key_tap.cast_const());
-            drop(Box::from_raw(context));
-        }
-        let _ = ready.send(Err(eyre!("could not create input observation event tap")));
-        return;
-    }
-    // SAFETY: `context` remains owned by this event-tap thread.
-    unsafe {
-        (*context).key_tap.store(key_tap, Ordering::Release);
-        (*context)
-            .observation_tap
-            .store(observation_tap, Ordering::Release);
-    }
-    // SAFETY: Both taps are valid CFMachPorts returned above.
-    let key_source = unsafe { CFMachPortCreateRunLoopSource(ptr::null(), key_tap, 0) };
-    let observation_source =
-        unsafe { CFMachPortCreateRunLoopSource(ptr::null(), observation_tap, 0) };
-    if key_source.is_null() || observation_source.is_null() {
-        // SAFETY: Neither source has been attached to the run loop yet.
-        unsafe {
-            if !key_source.is_null() {
-                CFRelease(key_source.cast_const());
-            }
-            if !observation_source.is_null() {
-                CFRelease(observation_source.cast_const());
-            }
-            CGEventTapEnable(key_tap, false);
-            CGEventTapEnable(observation_tap, false);
-            CFRelease(key_tap.cast_const());
-            CFRelease(observation_tap.cast_const());
-            drop(Box::from_raw(context));
-        }
-        let _ = ready.send(Err(eyre!("could not create input run-loop sources")));
-        return;
-    }
+    });
+    let context_ptr = &raw mut *context;
     // SAFETY: This is the dedicated event-tap thread's current run loop.
     let current_run_loop = unsafe { CFRunLoopGetCurrent() };
-    run_loop.store(current_run_loop, Ordering::Release);
-    // SAFETY: All values belong to this thread and remain alive while the run loop runs.
-    unsafe {
-        CFRunLoopAddSource(current_run_loop, key_source, kCFRunLoopCommonModes);
-        CFRunLoopAddSource(current_run_loop, observation_source, kCFRunLoopCommonModes);
-        CGEventTapEnable(key_tap, true);
-        CGEventTapEnable(observation_tap, true);
+    let mut taps = Box::new(TapSet::new(NativeTaps {
+        context: context_ptr,
+        run_loop: current_run_loop,
+    }));
+    for kind in TapKind::ALL {
+        if let Err(message) = taps.attach(kind) {
+            let message = match kind {
+                TapKind::Key => {
+                    "could not create keyboard event tap; grant Input Monitoring and Accessibility permissions"
+                }
+                TapKind::Observation => message,
+            };
+            let _ = ready.send(Err(eyre!(message)));
+            return;
+        }
     }
+    // SAFETY: `taps` outlives the source, which is declared after it and
+    // invalidated on drop; both live on this run loop's thread.
+    let Some(health) = (unsafe { HealthSource::start(&raw mut *taps, current_run_loop) }) else {
+        let _ = ready.send(Err(eyre!("could not create input run-loop sources")));
+        return;
+    };
+    // SAFETY: Callbacks share the context through `context_ptr`; atomics only.
+    let shared = unsafe { &*context_ptr };
+    shared.health_source.store(health.source, Ordering::Release);
+    let _observers = TapHealthObservers::register(health.request.clone());
+    run_loop.store(current_run_loop, Ordering::Release);
     let _ = ready.send(Ok(()));
     // SAFETY: This dedicated thread exists solely to dispatch the event tap.
     unsafe { CFRunLoopRun() };
-    // SAFETY: Disable the tap before releasing its callback context.
-    unsafe {
-        CGEventTapEnable(key_tap, false);
-        CGEventTapEnable(observation_tap, false);
-        CFRunLoopRemoveSource(current_run_loop, key_source, kCFRunLoopCommonModes);
-        CFRunLoopRemoveSource(current_run_loop, observation_source, kCFRunLoopCommonModes);
-    }
     run_loop.store(ptr::null_mut(), Ordering::Release);
-    // SAFETY: The source is detached and the tap is disabled, so no callback can use context.
-    unsafe {
-        CFRelease(key_source.cast_const());
-        CFRelease(observation_source.cast_const());
-        CFRelease(key_tap.cast_const());
-        CFRelease(observation_tap.cast_const());
-        drop(Box::from_raw(context));
+    shared
+        .health_source
+        .store(ptr::null_mut(), Ordering::Release);
+    // Drop order: observers, then the health source, then the taps, then the
+    // context they all point to.
+}
+
+/// Which of the two session taps a [`TapSet`] slot holds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TapKind {
+    Key,
+    Observation,
+}
+
+impl TapKind {
+    const ALL: [Self; 2] = [Self::Key, Self::Observation];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Key => "key",
+            Self::Observation => "observation",
+        }
+    }
+
+    fn slot(self, context: &EventTapContext) -> &AtomicPtr<c_void> {
+        match self {
+            Self::Key => &context.key_tap,
+            Self::Observation => &context.observation_tap,
+        }
+    }
+}
+
+/// Creates and inspects taps for a [`TapSet`]; native in the app, fake in
+/// tests, so the repair rules run without macOS disabling a real tap.
+trait TapBackend {
+    type Tap;
+    fn create(&mut self, kind: TapKind) -> Result<Self::Tap, &'static str>;
+    fn is_valid(&self, tap: &Self::Tap) -> bool;
+    fn is_enabled(&self, tap: &Self::Tap) -> bool;
+    fn enable(&self, tap: &Self::Tap);
+}
+
+struct ManagedTap<T> {
+    kind: TapKind,
+    attached: Option<T>,
+    /// Creation failed and was logged; log again only once it recovers.
+    failing: bool,
+}
+
+/// The key and observation taps on the event-tap thread.
+struct TapSet<B: TapBackend> {
+    backend: B,
+    taps: [ManagedTap<B::Tap>; 2],
+}
+
+impl<B: TapBackend> TapSet<B> {
+    fn new(backend: B) -> Self {
+        Self {
+            backend,
+            taps: TapKind::ALL.map(|kind| ManagedTap {
+                kind,
+                attached: None,
+                failing: false,
+            }),
+        }
+    }
+
+    fn attach(&mut self, kind: TapKind) -> Result<(), &'static str> {
+        let tap = self.backend.create(kind)?;
+        self.taps[kind as usize].attached = Some(tap);
+        Ok(())
+    }
+
+    /// Re-enables a tap macOS disabled without notice and recreates an
+    /// invalidated or missing one. Returns whether input may have been missed,
+    /// so the shortcut history must be treated as interrupted.
+    fn check(&mut self) -> bool {
+        let mut interrupted = false;
+        for index in 0..self.taps.len() {
+            let tap = &self.taps[index];
+            let kind = tap.kind.as_str();
+            let recreate = match &tap.attached {
+                None => true,
+                Some(attached) if !self.backend.is_valid(attached) => {
+                    tracing::warn!(tap = kind, "event tap was invalidated; recreating it");
+                    true
+                }
+                Some(attached) if !self.backend.is_enabled(attached) => {
+                    self.backend.enable(attached);
+                    let enabled = self.backend.is_enabled(attached);
+                    tracing::warn!(
+                        tap = kind,
+                        reenabled = enabled,
+                        "event tap was disabled without notice; re-enabled it"
+                    );
+                    interrupted = true;
+                    !enabled
+                }
+                Some(_) => false,
+            };
+            if !recreate {
+                continue;
+            }
+            let tap = &mut self.taps[index];
+            // Release the dead tap before creating its replacement.
+            let was_attached = tap.attached.take().is_some();
+            interrupted |= was_attached;
+            match self.backend.create(tap.kind) {
+                Ok(created) => {
+                    if was_attached || tap.failing {
+                        tracing::warn!(tap = kind, "recreated event tap");
+                    }
+                    tap.attached = Some(created);
+                    tap.failing = false;
+                }
+                Err(message) => {
+                    if !tap.failing {
+                        tracing::error!(
+                            tap = kind,
+                            error = message,
+                            "could not recreate event tap"
+                        );
+                    }
+                    tap.failing = true;
+                }
+            }
+        }
+        interrupted
+    }
+}
+
+struct NativeTaps {
+    context: *mut EventTapContext,
+    run_loop: *mut c_void,
+}
+
+impl TapBackend for NativeTaps {
+    type Tap = AttachedTap;
+
+    fn create(&mut self, kind: TapKind) -> Result<AttachedTap, &'static str> {
+        // SAFETY: `run_event_tap` keeps the context and run loop alive for
+        // as long as the tap set, which owns every attached tap.
+        unsafe { AttachedTap::create(kind, self.context, self.run_loop) }
+    }
+
+    fn is_valid(&self, tap: &AttachedTap) -> bool {
+        // SAFETY: `tap.tap` is a live CFMachPort owned by `AttachedTap`.
+        unsafe { CFMachPortIsValid(tap.tap) != 0 }
+    }
+
+    fn is_enabled(&self, tap: &AttachedTap) -> bool {
+        // SAFETY: as above.
+        unsafe { CGEventTapIsEnabled(tap.tap) }
+    }
+
+    fn enable(&self, tap: &AttachedTap) {
+        // SAFETY: as above.
+        unsafe { CGEventTapEnable(tap.tap, true) };
+    }
+}
+
+/// One event tap and its run-loop source on the event-tap thread.
+struct AttachedTap {
+    tap: *mut c_void,
+    source: *mut c_void,
+    run_loop: *mut c_void,
+    slot: *const AtomicPtr<c_void>,
+}
+
+impl AttachedTap {
+    /// # Safety
+    /// `context` and `run_loop` must outlive the returned tap, and this must
+    /// run on `run_loop`'s thread.
+    unsafe fn create(
+        kind: TapKind,
+        context: *mut EventTapContext,
+        run_loop: *mut c_void,
+    ) -> Result<Self, &'static str> {
+        let (options, mask) = match kind {
+            TapKind::Key => (
+                DEFAULT_EVENT_TAP,
+                [EVENT_KEY_DOWN, EVENT_KEY_UP]
+                    .into_iter()
+                    .fold(0, |mask, event| mask | 1_u64 << event),
+            ),
+            // A modifying tap disrupts Finder's Option-driven alternate menu
+            // items even when it returns flagsChanged events unchanged. Observe
+            // modifiers and mouse clicks with a passive tap.
+            TapKind::Observation => (
+                LISTEN_ONLY_EVENT_TAP,
+                [
+                    EVENT_LEFT_MOUSE_DOWN,
+                    EVENT_RIGHT_MOUSE_DOWN,
+                    EVENT_FLAGS_CHANGED,
+                    EVENT_OTHER_MOUSE_DOWN,
+                    // Scroll wheels and trackpad gestures can move the pointer or
+                    // change the focused field before Endu submits Return, so they
+                    // advance the interaction revision like any other user input.
+                    EVENT_SCROLL_WHEEL,
+                    EVENT_GESTURE_STARTED,
+                    EVENT_GESTURE_ENDED,
+                ]
+                .into_iter()
+                .fold(0, |mask, event| mask | 1_u64 << event),
+            ),
+        };
+        // SAFETY: The callback context outlives the tap (see above).
+        let tap = unsafe {
+            CGEventTapCreate(
+                ANNOTATED_SESSION_EVENT_TAP,
+                HEAD_INSERT_EVENT_TAP,
+                options,
+                mask,
+                event_callback,
+                context.cast(),
+            )
+        };
+        if tap.is_null() {
+            return Err(match kind {
+                TapKind::Key => "could not create keyboard event tap",
+                TapKind::Observation => "could not create input observation event tap",
+            });
+        }
+        // SAFETY: `tap` is a valid CFMachPort returned above.
+        let source = unsafe { CFMachPortCreateRunLoopSource(ptr::null(), tap, 0) };
+        if source.is_null() {
+            // SAFETY: The tap was never enabled or attached.
+            unsafe {
+                CFMachPortInvalidate(tap);
+                CFRelease(tap.cast_const());
+            }
+            return Err("could not create input run-loop sources");
+        }
+        // SAFETY: The caller keeps `context` alive; the slot lives in it.
+        let slot = kind.slot(unsafe { &*context });
+        slot.store(tap, Ordering::Release);
+        // SAFETY: Both values belong to this thread's run loop.
+        unsafe {
+            CFRunLoopAddSource(run_loop, source, kCFRunLoopCommonModes);
+            CGEventTapEnable(tap, true);
+        }
+        Ok(Self {
+            tap,
+            source,
+            run_loop,
+            slot,
+        })
+    }
+}
+
+impl Drop for AttachedTap {
+    fn drop(&mut self) {
+        // SAFETY: The slot lives in the context, which outlives every tap.
+        let slot = unsafe { &*self.slot };
+        let _ = slot.compare_exchange(
+            self.tap,
+            ptr::null_mut(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        // SAFETY: Disable and detach the tap before releasing it, so no
+        // callback can run once it is gone.
+        unsafe {
+            CGEventTapEnable(self.tap, false);
+            CFRunLoopRemoveSource(self.run_loop, self.source, kCFRunLoopCommonModes);
+            CFMachPortInvalidate(self.tap);
+            CFRelease(self.source.cast_const());
+            CFRelease(self.tap.cast_const());
+        }
+    }
+}
+
+/// Input arriving through either tap asks for a tap check at most this
+/// often, so a tap macOS disabled silently while the other kept running
+/// recovers on the user's next click, modifier or key, without a timer.
+const TAP_CHECK_SPACING: Duration = Duration::from_secs(10);
+
+fn tap_check_due(last_request_nanos: u64, at: CaptureInstant) -> bool {
+    at.as_nanos()
+        .checked_sub(last_request_nanos)
+        .is_some_and(|elapsed| elapsed >= TAP_CHECK_SPACING.as_nanos() as u64)
+}
+
+/// Asks the event-tap thread to run [`TapSet::check`]; safe from any thread.
+///
+/// macOS can disable or invalidate a tap without delivering a disable event
+/// (sleep, secure input, an Accessibility change). Upstream Hex checks every
+/// 5 s; Endu's idle loops block instead of polling, so the check runs only
+/// when something happens that can follow such a loss: wake from sleep, the
+/// screens waking, the session becoming active or the screen unlocking, an
+/// application activating, an Accessibility trust change, a disable event,
+/// and input through either tap (rate-limited by `TAP_CHECK_SPACING`). If
+/// every tap died and none of those follows, the next application switch,
+/// which a user who finds the shortcut dead almost always makes, repairs it.
+struct TapHealthRequest {
+    // The source and its run loop, cleared before the source is released.
+    target: Mutex<Option<(usize, usize)>>,
+}
+
+impl TapHealthRequest {
+    fn signal(&self) {
+        let target = self
+            .target
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some((source, run_loop)) = *target {
+            // SAFETY: The source stays valid while it is stored here, and
+            // both calls are documented as safe from any thread.
+            unsafe {
+                CFRunLoopSourceSignal(source as *mut c_void);
+                CFRunLoopWakeUp(run_loop as *mut c_void);
+            }
+        }
+    }
+
+    fn clear(&self) {
+        *self
+            .target
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+}
+
+/// The run-loop source whose perform callback checks the taps.
+struct HealthSource {
+    source: *mut c_void,
+    request: Arc<TapHealthRequest>,
+}
+
+impl HealthSource {
+    /// # Safety
+    /// `taps` must outlive the returned source, and `run_loop` must be the
+    /// current thread's run loop.
+    unsafe fn start(taps: *mut TapSet<NativeTaps>, run_loop: *mut c_void) -> Option<Self> {
+        let mut context = RunLoopSourceContext {
+            version: 0,
+            info: taps.cast(),
+            retain: None,
+            release: None,
+            copy_description: None,
+            equal: None,
+            hash: None,
+            schedule: None,
+            cancel: None,
+            perform: Some(check_tap_health),
+        };
+        // SAFETY: CoreFoundation copies the context; `info` outlives the source.
+        let source = unsafe { CFRunLoopSourceCreate(ptr::null(), 0, &raw mut context) };
+        if source.is_null() {
+            return None;
+        }
+        // SAFETY: `source` is a valid version-0 source for this run loop.
+        unsafe { CFRunLoopAddSource(run_loop, source, kCFRunLoopCommonModes) };
+        Some(Self {
+            source,
+            request: Arc::new(TapHealthRequest {
+                target: Mutex::new(Some((source as usize, run_loop as usize))),
+            }),
+        })
+    }
+}
+
+impl Drop for HealthSource {
+    fn drop(&mut self) {
+        self.request.clear();
+        // SAFETY: The source was created by `HealthSource::start` and is owned here.
+        unsafe {
+            CFRunLoopSourceInvalidate(self.source);
+            CFRelease(self.source.cast_const());
+        }
+    }
+}
+
+unsafe extern "C" fn check_tap_health(info: *mut c_void) {
+    // SAFETY: `info` is the tap set that outlives this source, used only on
+    // the event-tap thread, so no other reference is live during the call.
+    let taps = unsafe { &mut *info.cast::<TapSet<NativeTaps>>() };
+    if taps.check() {
+        // SAFETY: The context outlives the tap set.
+        let context = unsafe { &*taps.backend.context };
+        context.activity.invalidate();
+        send_input(context, InputEvent::TapDisabled, CaptureInstant::ZERO);
+    }
+}
+
+/// Signals the tap thread's health source; safe from the tap callback.
+fn request_tap_check(context: &EventTapContext) {
+    let source = context.health_source.load(Ordering::Acquire);
+    if !source.is_null() {
+        // SAFETY: The source is cleared before it is released, and the
+        // callback runs on the thread that owns it.
+        unsafe { CFRunLoopSourceSignal(source) };
+    }
+}
+
+/// System notifications after which a tap may have been lost silently.
+struct TapHealthObservers {
+    observers: Vec<(Retained<NSNotificationCenter>, ObserverToken)>,
+}
+
+type ObserverToken = Retained<ProtocolObject<dyn NSObjectProtocol>>;
+
+impl TapHealthObservers {
+    fn register(request: Arc<TapHealthRequest>) -> Self {
+        autoreleasepool(|_| {
+            let workspace = NSWorkspace::sharedWorkspace().notificationCenter();
+            let distributed: Retained<NSNotificationCenter> =
+                Retained::into_super(NSDistributedNotificationCenter::defaultCenter());
+            let mut observers = Vec::new();
+            // SAFETY: AppKit's notification names are immutable statics.
+            let workspace_names = unsafe {
+                [
+                    NSWorkspaceDidWakeNotification,
+                    NSWorkspaceScreensDidWakeNotification,
+                    NSWorkspaceSessionDidBecomeActiveNotification,
+                    NSWorkspaceDidActivateApplicationNotification,
+                ]
+            };
+            let distributed_names = [
+                NSString::from_str("com.apple.screenIsUnlocked"),
+                NSString::from_str("com.apple.accessibility.api"),
+            ];
+            let names = workspace_names
+                .into_iter()
+                .map(|name| (&workspace, name.retain()))
+                .chain(
+                    distributed_names
+                        .into_iter()
+                        .map(|name| (&distributed, name)),
+                );
+            for (center, name) in names {
+                let request = request.clone();
+                // Notifications can arrive on any thread; only signal here.
+                let callback = RcBlock::new(move |_: NonNull<NSNotification>| request.signal());
+                // SAFETY: The block only signals a thread-safe run-loop source.
+                let token = unsafe {
+                    center.addObserverForName_object_queue_usingBlock(
+                        Some(&name),
+                        None,
+                        None,
+                        &callback,
+                    )
+                };
+                observers.push((center.clone(), token));
+            }
+            Self { observers }
+        })
+    }
+}
+
+impl Drop for TapHealthObservers {
+    fn drop(&mut self) {
+        for (center, token) in &self.observers {
+            // SAFETY: Each token came from this center's addObserver call.
+            unsafe { center.removeObserver((**token).as_ref()) };
+        }
     }
 }
 
@@ -499,13 +917,23 @@ unsafe extern "C" fn event_callback(
         event_type,
         EVENT_TAP_DISABLED_BY_TIMEOUT | EVENT_TAP_DISABLED_BY_USER_INPUT
     ) {
-        for tap in [&context.key_tap, &context.observation_tap] {
-            let tap = tap.load(Ordering::Acquire);
+        for kind in TapKind::ALL {
+            let tap = kind.slot(context).load(Ordering::Acquire);
             if !tap.is_null() {
                 // SAFETY: `tap` is a CFMachPort returned by `CGEventTapCreate`.
                 unsafe { CGEventTapEnable(tap, true) };
             }
         }
+        tracing::warn!(
+            reason = if event_type == EVENT_TAP_DISABLED_BY_TIMEOUT {
+                "timeout"
+            } else {
+                "user input"
+            },
+            "macOS disabled the event tap; re-enabled it"
+        );
+        // Confirm the re-enable took, and recreate a tap it could not revive.
+        request_tap_check(context);
         context.activity.invalidate();
         send_input(context, InputEvent::TapDisabled, CaptureInstant::ZERO);
         return event;
@@ -541,6 +969,20 @@ unsafe extern "C" fn event_callback(
     // Physical HID events used raw Mach ticks on the tested Apple Silicon system.
     // SAFETY: CoreGraphics supplied a valid event to this callback.
     let capture_at = CaptureInstant::from_nanos(unsafe { CGEventGetTimestamp(event) });
+    let last_request = context.last_health_request.load(Ordering::Relaxed);
+    if tap_check_due(last_request, capture_at)
+        && context
+            .last_health_request
+            .compare_exchange(
+                last_request,
+                capture_at.as_nanos(),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    {
+        request_tap_check(context);
+    }
     // Holding Enter is still one explicit request; its autorepeat must not
     // invalidate the request while also being suppressed as part of that press.
     let autorepeat = event_type == EVENT_KEY_DOWN
@@ -1609,6 +2051,8 @@ mod tests {
     use crate::app_settings::{
         COMMAND_KEY_MASK, CONTROL_KEY_MASK, FUNCTION_KEY_MASK, OPTION_KEY_MASK, SHIFT_KEY_MASK,
     };
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     #[link(name = "ApplicationServices", kind = "framework")]
     unsafe extern "C" {
@@ -2049,6 +2493,9 @@ mod tests {
             submit_guard_state: Arc::new(AtomicU64::new(0)),
             key_tap: AtomicPtr::new(ptr::null_mut()),
             observation_tap: AtomicPtr::new(ptr::null_mut()),
+            // No source: the callback's tap-check request is a no-op here.
+            health_source: AtomicPtr::new(ptr::null_mut()),
+            last_health_request: AtomicU64::new(0),
             shortcut_suppression: Mutex::new(ShortcutSuppression::default()),
             pending: PendingInputEvents::default(),
             next_sequence: AtomicU64::new(0),
@@ -2090,6 +2537,122 @@ mod tests {
             }
         }
         receiver.try_iter().collect()
+    }
+
+    /// A tap macOS can disable, invalidate or refuse to create.
+    #[derive(Default)]
+    struct FakeTaps {
+        created: Vec<TapKind>,
+        refuse: bool,
+        state: Rc<RefCell<HashMap<usize, (bool, bool)>>>,
+        next: usize,
+    }
+
+    impl TapBackend for FakeTaps {
+        type Tap = usize;
+
+        fn create(&mut self, kind: TapKind) -> Result<usize, &'static str> {
+            if self.refuse {
+                return Err("refused");
+            }
+            self.created.push(kind);
+            self.next += 1;
+            self.state.borrow_mut().insert(self.next, (true, true));
+            Ok(self.next)
+        }
+
+        fn is_valid(&self, tap: &usize) -> bool {
+            self.state.borrow()[tap].0
+        }
+
+        fn is_enabled(&self, tap: &usize) -> bool {
+            self.state.borrow()[tap].1
+        }
+
+        fn enable(&self, tap: &usize) {
+            let mut state = self.state.borrow_mut();
+            let entry = state.get_mut(tap).unwrap();
+            // An invalidated port cannot be re-enabled.
+            entry.1 = entry.0;
+        }
+    }
+
+    fn fake_tap_set() -> TapSet<FakeTaps> {
+        let mut taps = TapSet::new(FakeTaps::default());
+        for kind in TapKind::ALL {
+            taps.attach(kind).unwrap();
+        }
+        taps
+    }
+
+    fn set_tap(taps: &TapSet<FakeTaps>, kind: TapKind, valid: bool, enabled: bool) {
+        let id = taps.taps[kind as usize].attached.unwrap();
+        taps.backend.state.borrow_mut().insert(id, (valid, enabled));
+    }
+
+    #[test]
+    fn healthy_taps_are_left_alone() {
+        let mut taps = fake_tap_set();
+        assert!(!taps.check());
+        assert!(!taps.check());
+        assert_eq!(taps.backend.created, TapKind::ALL);
+    }
+
+    #[test]
+    fn a_tap_disabled_without_notice_is_reenabled_and_interrupts_tracking() {
+        for kind in TapKind::ALL {
+            let mut taps = fake_tap_set();
+            let before = taps.taps[kind as usize].attached;
+            set_tap(&taps, kind, true, false);
+            assert!(taps.check());
+            assert_eq!(taps.taps[kind as usize].attached, before);
+            assert_eq!(taps.backend.created.len(), 2);
+            assert!(!taps.check());
+        }
+    }
+
+    #[test]
+    fn an_invalidated_tap_is_recreated() {
+        for (valid, enabled) in [(false, true), (false, false)] {
+            let mut taps = fake_tap_set();
+            set_tap(&taps, TapKind::Key, valid, enabled);
+            assert!(taps.check());
+            assert_eq!(
+                taps.backend.created,
+                [TapKind::Key, TapKind::Observation, TapKind::Key]
+            );
+            assert!(!taps.check());
+        }
+    }
+
+    #[test]
+    fn a_tap_that_cannot_be_recreated_is_retried_on_the_next_check() {
+        let mut taps = fake_tap_set();
+        set_tap(&taps, TapKind::Observation, false, false);
+        taps.backend.refuse = true;
+        // Accessibility was revoked: the dead tap is released, not kept.
+        assert!(taps.check());
+        assert!(taps.taps[TapKind::Observation as usize].attached.is_none());
+        assert!(taps.taps[TapKind::Observation as usize].failing);
+        // Still refused: nothing more was missed, so no second interruption.
+        assert!(!taps.check());
+        taps.backend.refuse = false;
+        assert!(!taps.check());
+        assert!(taps.taps[TapKind::Observation as usize].attached.is_some());
+        assert!(!taps.taps[TapKind::Observation as usize].failing);
+        assert_eq!(taps.backend.created.last(), Some(&TapKind::Observation));
+    }
+
+    #[test]
+    fn input_asks_for_a_tap_check_only_after_the_spacing() {
+        let at = |nanos| CaptureInstant::from_nanos(nanos);
+        let spacing = TAP_CHECK_SPACING.as_nanos() as u64;
+        assert!(tap_check_due(0, at(spacing)));
+        assert!(!tap_check_due(spacing, at(spacing)));
+        assert!(!tap_check_due(spacing, at(2 * spacing - 1)));
+        assert!(tap_check_due(spacing, at(2 * spacing)));
+        // A delayed older event never asks.
+        assert!(!tap_check_due(2 * spacing, at(spacing)));
     }
 
     #[test]
