@@ -118,6 +118,8 @@ enum Command {
         preferences: Vec<DevicePreference>,
     },
     SetReleaseWhileIdle(bool),
+    /// A shortcut press while the microphone is recovering: try it now.
+    RetryMicrophone,
     Shutdown,
     InvalidateRecognition {
         reply: SyncSender<u64>,
@@ -344,6 +346,12 @@ impl DictationAudio {
         let _ = self.commands.send(Command::SetReleaseWhileIdle(release));
     }
 
+    /// Asks a recovering microphone to reopen now instead of waiting out its
+    /// backoff. The press itself still does not record.
+    pub fn retry_microphone(&self) {
+        let _ = self.commands.send(Command::RetryMicrophone);
+    }
+
     pub fn recognition_generation(&self) -> u64 {
         self.state.recognition_generation.load(Ordering::Acquire)
     }
@@ -492,6 +500,23 @@ impl Owner {
                     Err(_) => break,
                 }
             }
+            // A failed microphone backing off has nothing to read: sleep until
+            // its next attempt or a command, not in 10 ms turns.
+            if let Some(wait) = self.input.retry_wait(Instant::now())
+                && !wait.is_zero()
+            {
+                match self.commands.recv_timeout(wait) {
+                    Ok(command) => {
+                        if !self.handle(command) {
+                            break;
+                        }
+                        self.reconcile_input();
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
             let can_reconfigure = self.can_reconfigure_input();
             let event = self
                 .input
@@ -511,6 +536,10 @@ impl Owner {
                     self.drain_through(at);
                 }
                 if self.input.is_recovering() {
+                    // A failing stream waits out a growing backoff; the press
+                    // asks for the microphone now, though it still cannot
+                    // capture until the stream opens.
+                    self.input.retry_now();
                     let _ = reply.send(CaptureStart::Rejected);
                     return true;
                 }
@@ -627,6 +656,7 @@ impl Owner {
             Command::SetReleaseWhileIdle(release) => {
                 self.release_while_idle = release;
             }
+            Command::RetryMicrophone => self.input.retry_now(),
             Command::InvalidateRecognition { reply } => {
                 let _ = reply.send(self.next_recognition_generation());
             }
@@ -1674,6 +1704,43 @@ mod tests {
             captured_through: at + Duration::from_millis(40),
         });
         assert!(input.try_recv_event().is_none());
+    }
+
+    #[test]
+    fn a_press_retries_a_backing_off_microphone_now() {
+        let (mut owner, input, samples) = owner_for_test(true);
+        // The warm stream fails before it ever delivered steadily.
+        drop(samples);
+        let event = owner.input.recv_timeout(Duration::ZERO, true);
+        owner.handle_input(event);
+        assert!(matches!(
+            input.try_recv_event(),
+            Some(DictationAudioEvent::Interrupted { .. })
+        ));
+        let _ = owner.input.recv_timeout(Duration::ZERO, true);
+        let wait = owner.input.retry_wait(Instant::now()).unwrap();
+        assert!(!wait.is_zero(), "it backs off instead of reopening at once");
+
+        assert_eq!(
+            control(&mut owner, |reply| Command::Start {
+                at: capture_time(),
+                reply,
+            }),
+            CaptureStart::Rejected
+        );
+        assert_eq!(owner.input.retry_wait(Instant::now()), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn a_retry_command_asks_a_backing_off_microphone_now() {
+        let (mut owner, _input, samples) = owner_for_test(true);
+        drop(samples);
+        let event = owner.input.recv_timeout(Duration::ZERO, true);
+        owner.handle_input(event);
+        let _ = owner.input.recv_timeout(Duration::ZERO, true);
+        assert!(!owner.input.retry_wait(Instant::now()).unwrap().is_zero());
+        assert!(owner.handle(Command::RetryMicrophone));
+        assert_eq!(owner.input.retry_wait(Instant::now()), Some(Duration::ZERO));
     }
 
     #[test]
