@@ -128,6 +128,10 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
     };
     shutdown.store(false, Ordering::Relaxed);
     crate::keyboard::initialize_layout()?;
+    if listener.is_some() {
+        // Lid changes re-resolve the microphone; previews never observe it.
+        crate::clamshell::watch();
+    }
     let settings = if listener.is_some() {
         AppSettings::load()?
     } else {

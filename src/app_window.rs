@@ -589,6 +589,8 @@ pub struct AppWindow {
     microphone_description: Option<crate::microphone::InputDescription>,
     microphone_description_error: Option<String>,
     microphone_refresh_at: Instant,
+    /// The lid generation the description was last resolved for.
+    microphone_lid_generation: u64,
     microphone_diagnostic: Option<crate::microphone::RecordingDiagnostic>,
     launch_at_login_status: Option<LoginItemStatus>,
     login_item_worker: Option<LoginItemWorker>,
@@ -1110,6 +1112,7 @@ impl AppWindow {
             microphone_description,
             microphone_description_error,
             microphone_refresh_at: Instant::now() + Duration::from_secs(5),
+            microphone_lid_generation: crate::clamshell::generation(),
             microphone_diagnostic: preview_mode
                 .then(crate::microphone::RecordingDiagnostic::for_preview),
             launch_at_login_status,

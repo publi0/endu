@@ -12,6 +12,8 @@ mod appearance;
 #[cfg(target_os = "macos")]
 mod audio;
 #[cfg(target_os = "macos")]
+mod clamshell;
+#[cfg(target_os = "macos")]
 mod context;
 #[cfg(target_os = "macos")]
 mod desktop;

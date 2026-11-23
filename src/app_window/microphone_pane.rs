@@ -120,6 +120,12 @@ impl AppWindow {
             &self.microphone_description,
             &self.microphone_description_error,
         ) {
+            (Some(description), _) if description.fallback_lid_closed => tf!(
+                "{previous} is off while the lid is closed. Current: {microphone} — {channel}",
+                previous = description.fallback_from.as_deref().unwrap_or_default(),
+                microphone = description.name,
+                channel = description.channel_label()
+            ),
             (Some(description), _) => {
                 let mode = if self.settings.microphone.is_some() {
                     t("Fixed")
@@ -133,8 +139,18 @@ impl AppWindow {
                     mode = mode
                 )
             }
-            (None, Some(error)) => tf!("Microphone unavailable: {error}", error = error),
+            (None, Some(error)) => Self::microphone_error_text(error),
             (None, None) => t("Checking the available microphones…").to_string(),
+        }
+    }
+
+    /// A closed lid with no other microphone gets its own explanation; the
+    /// error itself is compared untranslated.
+    fn microphone_error_text(error: &str) -> String {
+        if error == crate::clamshell::LID_CLOSED_ERROR {
+            t("The built-in microphone is off while the lid is closed. Connect another microphone or open the lid.").into()
+        } else {
+            tf!("Microphone unavailable: {error}", error = error)
         }
     }
 
@@ -164,6 +180,7 @@ impl AppWindow {
             }
         }
         self.microphone_refresh_at = Instant::now() + Duration::from_secs(5);
+        self.microphone_lid_generation = crate::clamshell::generation();
         let changed = previous
             != (
                 self.microphone_description.clone(),
@@ -182,7 +199,10 @@ impl AppWindow {
         let latest = crate::microphone::latest();
         let mut changed = self.microphone_diagnostic != latest;
         self.microphone_diagnostic = latest;
-        if Instant::now() >= self.microphone_refresh_at {
+        // A lid change is announced by IOKit; resolve again without waiting.
+        if Instant::now() >= self.microphone_refresh_at
+            || self.microphone_lid_generation != crate::clamshell::generation()
+        {
             changed |= self.refresh_microphone_description();
         }
         changed
@@ -299,9 +319,13 @@ impl AppWindow {
                 .setting_row(
                     SettingControl::Channel,
                     t("Input channel"),
-                    self.microphone_description_error
-                        .clone()
-                        .unwrap_or_else(|| t("Input metadata is unavailable").into()),
+                    match self.microphone_description_error.as_deref() {
+                        Some(error) if error == crate::clamshell::LID_CLOSED_ERROR => {
+                            Self::microphone_error_text(error)
+                        }
+                        Some(error) => error.to_owned(),
+                        None => t("Input metadata is unavailable").into(),
+                    },
                     div()
                         .text_size(px(11.0))
                         .text_color(rgb(MUTED))
@@ -313,6 +337,16 @@ impl AppWindow {
             tf!(
                 "{microphone}: saved channel unavailable; using the existing mix",
                 microphone = description.name
+            )
+        } else if let Some(previous) = description
+            .fallback_from
+            .as_ref()
+            .filter(|_| description.fallback_lid_closed)
+        {
+            tf!(
+                "Using {microphone} because {previous} is off while the lid is closed",
+                microphone = description.name,
+                previous = previous
             )
         } else if let Some(previous) = &description.fallback_from {
             tf!(
@@ -729,4 +763,22 @@ pub(super) fn level_meter(
                 .child(values),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppWindow;
+
+    #[test]
+    fn a_closed_lid_explains_why_no_microphone_is_available() {
+        crate::i18n::set_test_language(Some(crate::i18n::Language::English));
+        let lid = AppWindow::microphone_error_text(crate::clamshell::LID_CLOSED_ERROR);
+        assert!(lid.contains("open the lid"), "{lid}");
+        assert!(!lid.starts_with("Microphone unavailable"), "{lid}");
+        assert_eq!(
+            AppWindow::microphone_error_text("no input"),
+            "Microphone unavailable: no input"
+        );
+        crate::i18n::set_test_language(None);
+    }
 }
