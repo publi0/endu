@@ -259,7 +259,7 @@ impl AudioInput {
 
     fn open_automatic(preferences: &[DevicePreference]) -> Result<Self> {
         try_input_candidates(automatic_devices(preferences)?, |device| {
-            let name = device.to_string();
+            let name = device_name(&device).unwrap_or_default();
             Self::open_device(device).wrap_err_with(|| format!("could not open microphone {name}"))
         })
     }
@@ -269,13 +269,14 @@ impl AudioInput {
         let device = host
             .input_devices()
             .wrap_err("could not enumerate input devices")?
-            .find(|device| device.to_string() == name)
+            .find(|device| device_name(device).as_deref() == Some(name))
             .ok_or_else(|| eyre!("microphone is unavailable: {name}"))?;
         Self::open_device(device)
     }
 
     fn open_device(device: Device) -> Result<Self> {
-        let device_name = device.to_string();
+        let device_name =
+            device_name(&device).ok_or_else(|| eyre!("microphone name cannot be read"))?;
         let supported = device
             .default_input_config()
             .wrap_err("could not read the input device configuration")?;
@@ -809,6 +810,28 @@ fn try_input_candidates<D, T>(
     ))
 }
 
+/// The device's name, or `None` when it cannot be read. cpal's `Display` for
+/// `Device` returns `fmt::Error` then (CoreAudio's placeholder when no input
+/// exists, or a device that vanished mid-enumeration), which makes
+/// `to_string` panic, so the description is read directly instead.
+fn device_name(device: &Device) -> Option<String> {
+    description_name(device.description())
+}
+
+fn description_name<E: std::fmt::Display>(
+    description: std::result::Result<cpal::DeviceDescription, E>,
+) -> Option<String> {
+    match description {
+        Ok(description) => Some(description.name().to_owned()),
+        Err(error) => {
+            tracing::debug!(%error, "skipping an input device whose name cannot be read");
+            None
+        }
+    }
+}
+
+/// An unnamed device gets an empty name: it can be neither selected nor
+/// opened, and enumeration leaves it out.
 fn device_identity(device: &Device) -> DevicePreference {
     DevicePreference {
         id: device
@@ -816,16 +839,23 @@ fn device_identity(device: &Device) -> DevicePreference {
             .ok()
             .map(|id| id.id().to_owned())
             .filter(|id| !id.is_empty()),
-        name: device.to_string(),
+        name: device_name(device).unwrap_or_default(),
     }
+}
+
+/// The input devices whose names can be read.
+fn named_input_devices(host: &cpal::Host) -> Result<impl Iterator<Item = Device>> {
+    Ok(host
+        .input_devices()
+        .wrap_err("could not enumerate input devices")?
+        .filter(|device| device_name(device).is_some()))
 }
 
 /// Available inputs, retaining distinct devices even when names collide.
 pub fn input_device_catalog() -> Result<Vec<DevicePreference>> {
-    let mut devices = cpal::default_host()
-        .input_devices()
-        .wrap_err("could not enumerate input devices")?
+    let mut devices = named_input_devices(&cpal::default_host())?
         .map(|device| device_identity(&device))
+        .filter(|device| !device.name.is_empty())
         .collect::<Vec<_>>();
     devices.sort_by(|left, right| {
         left.name
@@ -842,7 +872,7 @@ pub fn input_device_names() -> Result<Vec<String>> {
     let mut names = host
         .input_devices()
         .wrap_err("could not enumerate input devices")?
-        .map(|device| device.to_string())
+        .filter_map(|device| device_name(&device))
         .collect::<Vec<_>>();
     names.sort_by_key(|name| name.to_lowercase());
     names.dedup();
@@ -850,11 +880,14 @@ pub fn input_device_names() -> Result<Vec<String>> {
 }
 
 fn describe_device(device: &Device, channels: u16) -> InputDescription {
-    let device_id = device_identity(device).id;
+    let DevicePreference {
+        id: device_id,
+        name,
+    } = device_identity(device);
     let requested_channel = crate::app_settings::microphone_channel(device_id.as_deref());
     InputDescription {
         device_id,
-        name: device.to_string(),
+        name,
         channels,
         channel: resolve_channel(requested_channel, channels),
         requested_channel,
@@ -881,7 +914,7 @@ pub fn input_description(
         |name| {
             let device = cpal::default_host()
                 .input_devices()?
-                .find(|device| device.to_string() == name)
+                .find(|device| device_name(device).as_deref() == Some(name))
                 .ok_or_else(|| eyre!("microphone is unavailable: {name}"))?;
             describe(device)
         },
@@ -922,21 +955,21 @@ fn automatic_device_indices(
 
 fn automatic_devices(preferences: &[DevicePreference]) -> Result<Vec<Device>> {
     let host = cpal::default_host();
-    let mut devices: Vec<_> = host
-        .input_devices()
-        .wrap_err("could not enumerate input devices")?
-        .collect();
-    let fallback = host.default_input_device().map(|default| {
-        let default = avoid_bluetooth_input(default, &devices);
-        let identity = device_identity(&default);
-        devices
-            .iter()
-            .position(|device| identity.matches(&device_identity(device)))
-            .unwrap_or_else(|| {
-                devices.push(default);
-                devices.len() - 1
-            })
-    });
+    let mut devices: Vec<_> = named_input_devices(&host)?.collect();
+    let fallback = host
+        .default_input_device()
+        .filter(|default| device_name(default).is_some())
+        .map(|default| {
+            let default = avoid_bluetooth_input(default, &devices);
+            let identity = device_identity(&default);
+            devices
+                .iter()
+                .position(|device| identity.matches(&device_identity(device)))
+                .unwrap_or_else(|| {
+                    devices.push(default);
+                    devices.len() - 1
+                })
+        });
     let identities = devices.iter().map(device_identity).collect::<Vec<_>>();
     Ok(automatic_device_indices(&identities, preferences, fallback)
         .into_iter()
@@ -978,8 +1011,8 @@ fn avoid_bluetooth_input(default: Device, devices: &[Device]) -> Device {
     let index = automatic_input_index(default_index, &transports);
     if index != default_index {
         tracing::info!(
-            bluetooth = %devices[default_index],
-            selected = %devices[index],
+            bluetooth = %device_identity(&devices[default_index]).name,
+            selected = %device_identity(&devices[index]).name,
             "automatic microphone selection skipped a Bluetooth headset"
         );
     }
@@ -1491,6 +1524,22 @@ mod tests {
         report_stream_error(&sender, "Device sample rate changed".into());
 
         assert_eq!(errors.try_recv().unwrap(), "Device sample rate changed");
+    }
+
+    #[test]
+    fn an_unreadable_device_name_is_skipped_instead_of_panicking() {
+        let unreadable: std::result::Result<cpal::DeviceDescription, cpal::Error> =
+            Err(cpal::ErrorKind::DeviceNotAvailable.into());
+        assert_eq!(description_name(unreadable), None);
+        let readable: std::result::Result<_, cpal::Error> = Ok(
+            cpal::DeviceDescriptionBuilder::new("MacBook Pro Microphone")
+                .manufacturer("Apple Inc.")
+                .build(),
+        );
+        assert_eq!(
+            description_name(readable).as_deref(),
+            Some("MacBook Pro Microphone")
+        );
     }
 
     #[test]
