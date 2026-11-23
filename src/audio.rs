@@ -1,8 +1,6 @@
 use std::ops::Add;
-use std::sync::Arc;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::mpsc::Sender;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
@@ -126,20 +124,27 @@ const CHUNK_QUEUE_CAPACITY: usize = 512;
 /// error (seen after a burst of overloads) and is reopened. The owner checks
 /// it on the turns it already takes while the stream is open.
 const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(4);
+/// How long a just-opened stream may take to deliver its first chunk. A
+/// Bluetooth headset switching to its call profile can take several seconds,
+/// and failing it early would only restart that switch on every reopen.
+const STREAM_FIRST_DELIVERY_TIMEOUT: Duration = Duration::from_secs(12);
 
 pub struct AudioInput {
     // Tests can deliver PCM through channels without opening a native microphone.
     _stream: Option<Stream>,
-    chunks: Receiver<(Vec<f32>, CaptureInstant)>,
-    /// The end of the newest chunk the callback dropped on a full queue, in
-    /// capture nanoseconds; zero means none is pending.
-    dropped_through: Arc<AtomicU64>,
+    /// Each chunk carries whether the callback dropped audio right before
+    /// it, so every hole is reported exactly where it is in the timeline.
+    chunks: Receiver<(Vec<f32>, CaptureInstant, bool)>,
     /// The chunk right after a dropped one, held back for one turn so the
     /// owner hears of the hole before the audio that follows it.
     after_drop: Option<(Vec<f32>, CaptureInstant)>,
     /// How long the stream may go without delivering audio before it counts
     /// as failed; `None` for test inputs fed by hand.
     stall_after: Option<Duration>,
+    /// The same limit before the first chunk arrives.
+    first_delivery_after: Duration,
+    /// Whether the stream has delivered any chunk yet.
+    delivered: bool,
     /// When the stream opened or last delivered a chunk.
     last_delivery: Instant,
     pub sample_rate: u32,
@@ -349,16 +354,18 @@ impl MicrophoneRecovery {
 
 impl AudioInput {
     #[cfg(test)]
-    pub fn channel_for_test() -> (Self, Sender<(Vec<f32>, CaptureInstant)>) {
+    pub fn channel_for_test() -> (Self, TestChunkSender) {
         let (sender, chunks) = mpsc::channel();
+        let sender = TestChunkSender(sender);
         let (_, stream_errors) = mpsc::channel();
         (
             Self {
                 _stream: None,
                 chunks,
-                dropped_through: Arc::default(),
                 after_drop: None,
                 stall_after: None,
+                first_delivery_after: STREAM_FIRST_DELIVERY_TIMEOUT,
+                delivered: false,
                 last_delivery: Instant::now(),
                 stream_errors,
                 sample_rate: 48_000,
@@ -410,10 +417,9 @@ impl AudioInput {
         let description = describe_device(&device, config.channels);
         let selected_channel = description.channel;
         let (sender, chunks) = mpsc::sync_channel(CHUNK_QUEUE_CAPACITY);
-        let dropped_through = Arc::new(AtomicU64::new(0));
         let sink = ChunkSink {
             sender,
-            dropped_through: dropped_through.clone(),
+            pending_drop: false,
         };
         let (error_sender, stream_errors) = mpsc::sync_channel(1);
 
@@ -454,9 +460,10 @@ impl AudioInput {
         Ok(Self {
             _stream: Some(stream),
             chunks,
-            dropped_through,
             after_drop: None,
             stall_after: Some(STREAM_STALL_TIMEOUT),
+            first_delivery_after: STREAM_FIRST_DELIVERY_TIMEOUT,
+            delivered: false,
             last_delivery: Instant::now(),
             sample_rate,
             device_name,
@@ -486,13 +493,14 @@ impl AudioInput {
         }
         if received.is_ok() {
             self.last_delivery = Instant::now();
+            self.delivered = true;
         }
         match received {
-            Ok((samples, captured_through)) if self.follows_drop(captured_through) => {
+            Ok((samples, captured_through, true)) => {
                 self.after_drop = Some((samples, captured_through));
                 AudioInputEvent::Dropped
             }
-            Ok((samples, captured_through)) => AudioInputEvent::Chunk {
+            Ok((samples, captured_through, false)) => AudioInputEvent::Chunk {
                 samples,
                 captured_through,
             },
@@ -507,32 +515,21 @@ impl AudioInput {
     }
 
     fn stalled(&self, now: Instant) -> bool {
-        self.stall_after
-            .is_some_and(|after| now.saturating_duration_since(self.last_delivery) >= after)
+        self.stall_after.is_some_and(|after| {
+            let limit = if self.delivered {
+                after
+            } else {
+                self.first_delivery_after
+            };
+            now.saturating_duration_since(self.last_delivery) >= limit
+        })
     }
 
     #[cfg(test)]
     fn watch_stalls_for_test(&mut self, after: Duration) {
         self.stall_after = Some(after);
+        self.first_delivery_after = after;
         self.last_delivery = Instant::now();
-    }
-
-    /// Whether a chunk ending at `captured_through` is newer than audio the
-    /// callback dropped: chunks queued before the drop are older and arrive
-    /// first, so the hole is reported exactly where it is in the timeline.
-    fn follows_drop(&self, captured_through: CaptureInstant) -> bool {
-        let dropped_through = self.dropped_through.load(Ordering::Acquire);
-        if dropped_through == 0 || captured_through.as_nanos() <= dropped_through {
-            return false;
-        }
-        // A newer drop since the load keeps its own mark for a later chunk.
-        let _ = self.dropped_through.compare_exchange(
-            dropped_through,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        true
     }
 }
 
@@ -840,6 +837,11 @@ impl RecoveringAudioInput {
                     self.recovery.recovered();
                     return Some(RecoveringAudioInputEvent::OpenFailed(error));
                 }
+                // Only a lid change can bring the closed internal microphone
+                // back, so do not retry it every few seconds meanwhile.
+                if error.contains(crate::clamshell::LID_CLOSED_ERROR) {
+                    self.recovery.stream_stall = true;
+                }
                 self.recovery.failed(now);
                 if self.retry_warning.as_ref() != Some(&error) {
                     tracing::warn!(%error, "could not reopen dictation microphone; retrying");
@@ -946,6 +948,17 @@ impl RecoveringAudioInput {
     /// is only consumed between clips, and normal generation checks still
     /// govern the replacement stream. CLI overrides are never rerouted.
     fn maintain_routing(&mut self, now: Instant, capture_idle: bool) {
+        // A microphone that failed because the lid closed waits out the long
+        // backoff; opening the lid is the change it waits for.
+        let lid_generation = crate::clamshell::generation();
+        if lid_generation != self.lid_generation
+            && self.recovery.blocks_audio()
+            && self.replacement.is_none()
+        {
+            self.lid_generation = lid_generation;
+            self.recovery.retry_now(now);
+            return;
+        }
         if !capture_idle
             || self.device_override.is_some()
             || self.input.is_none()
@@ -1494,19 +1507,39 @@ fn mono<T>(
 
 /// The capture callback's end of the bounded chunk queue.
 struct ChunkSink {
-    sender: SyncSender<(Vec<f32>, CaptureInstant)>,
-    dropped_through: Arc<AtomicU64>,
+    sender: SyncSender<(Vec<f32>, CaptureInstant, bool)>,
+    /// Audio was dropped since the last chunk the queue took; the next one
+    /// that fits carries the mark, so no hole goes unreported.
+    pending_drop: bool,
 }
 
 impl ChunkSink {
-    /// Runs on the capture callback: never blocks. A chunk the full queue
-    /// cannot take is dropped and its end marked, so the owner reports the
-    /// hole.
-    fn send(&self, chunk: Vec<f32>, captured_through: CaptureInstant) {
-        if let Err(TrySendError::Full(_)) = self.sender.try_send((chunk, captured_through)) {
-            self.dropped_through
-                .fetch_max(captured_through.as_nanos().max(1), Ordering::AcqRel);
+    /// Runs on the capture callback: never blocks, locks or touches shared
+    /// state. A chunk the full queue cannot take is dropped, and the next
+    /// chunk the queue accepts tells the owner a hole precedes it.
+    fn send(&mut self, chunk: Vec<f32>, captured_through: CaptureInstant) {
+        match self
+            .sender
+            .try_send((chunk, captured_through, self.pending_drop))
+        {
+            Ok(()) => self.pending_drop = false,
+            Err(TrySendError::Full(_)) => self.pending_drop = true,
+            Err(TrySendError::Disconnected(_)) => {}
         }
+    }
+}
+
+/// Feeds a test input as the capture callback would, without drops.
+#[cfg(test)]
+pub struct TestChunkSender(Sender<(Vec<f32>, CaptureInstant, bool)>);
+
+#[cfg(test)]
+impl TestChunkSender {
+    pub fn send(
+        &self,
+        (samples, captured_through): (Vec<f32>, CaptureInstant),
+    ) -> std::result::Result<(), mpsc::SendError<(Vec<f32>, CaptureInstant, bool)>> {
+        self.0.send((samples, captured_through, false))
     }
 }
 
@@ -1532,7 +1565,7 @@ fn build_stream<T: SizedSample>(
     config: &StreamConfig,
     channels: usize,
     selected_channel: Option<u16>,
-    sink: ChunkSink,
+    mut sink: ChunkSink,
     error_sender: SyncSender<String>,
     convert: impl Fn(T) -> f32 + Send + 'static,
 ) -> Result<Stream> {
@@ -1575,7 +1608,7 @@ mod tests {
         }
     }
 
-    fn test_input(id: &str, name: &str) -> (AudioInput, Sender<(Vec<f32>, CaptureInstant)>) {
+    fn test_input(id: &str, name: &str) -> (AudioInput, crate::audio::TestChunkSender) {
         let (mut input, samples) = AudioInput::channel_for_test();
         input.device_name = name.into();
         input.description.device_id = Some(id.into());
@@ -2020,9 +2053,9 @@ mod tests {
         let (mut input, _samples) = AudioInput::channel_for_test();
         let (sender, chunks) = mpsc::sync_channel(2);
         input.chunks = chunks;
-        let sink = ChunkSink {
+        let mut sink = ChunkSink {
             sender,
-            dropped_through: input.dropped_through.clone(),
+            pending_drop: false,
         };
         let at = |ms: u64| CaptureInstant::from_nanos(60_000_000_000 + ms * 1_000_000);
         // The queue holds two chunks; the third is dropped without blocking.
@@ -2047,6 +2080,37 @@ mod tests {
         assert_eq!(chunk_at(input.recv_timeout(Duration::ZERO)), Some(at(40)));
         sink.send(vec![0.25; 480], at(50));
         assert_eq!(chunk_at(input.recv_timeout(Duration::ZERO)), Some(at(50)));
+    }
+
+    #[test]
+    fn every_hole_is_reported_while_drops_alternate_with_queued_chunks() {
+        let (mut input, _samples) = AudioInput::channel_for_test();
+        let (sender, chunks) = mpsc::sync_channel(1);
+        input.chunks = chunks;
+        let mut sink = ChunkSink {
+            sender,
+            pending_drop: false,
+        };
+        let at = |ms: u64| CaptureInstant::from_nanos(60_000_000_000 + ms * 1_000_000);
+        let next = |input: &mut AudioInput| match input.recv_timeout(Duration::ZERO) {
+            AudioInputEvent::Chunk {
+                captured_through, ..
+            } => Some(captured_through),
+            AudioInputEvent::Dropped => None,
+            _ => panic!("unexpected event"),
+        };
+        sink.send(vec![0.25; 480], at(10));
+        sink.send(vec![0.25; 480], at(20)); // dropped
+        assert_eq!(next(&mut input), Some(at(10)));
+        sink.send(vec![0.25; 480], at(30)); // follows the first hole
+        sink.send(vec![0.25; 480], at(40)); // dropped while 30 waits
+        assert_eq!(next(&mut input), None);
+        assert_eq!(next(&mut input), Some(at(30)));
+        sink.send(vec![0.25; 480], at(50)); // follows the second hole
+        assert_eq!(next(&mut input), None);
+        assert_eq!(next(&mut input), Some(at(50)));
+        sink.send(vec![0.25; 480], at(60));
+        assert_eq!(next(&mut input), Some(at(60)));
     }
 
     #[test]
@@ -2327,6 +2391,52 @@ mod tests {
         assert_eq!(input.active_revision, 4);
         assert_eq!(input.selected_device.as_deref(), Some("Next microphone"));
         assert!(input.replacement.is_none());
+    }
+
+    #[test]
+    fn a_closed_lid_backs_off_until_the_lid_changes() {
+        let mut input = RecoveringAudioInput::closed(None, 3, Some("Built-in microphone"), &[]);
+        let started = Instant::now();
+        input.finish_initial_open(Err(eyre!("device unavailable")), started);
+        assert!(input.is_recovering());
+        let (sender, receiver) = mpsc::channel();
+        input.replacement = Some(receiver);
+        sender
+            .send((3, Err(crate::clamshell::LID_CLOSED_ERROR.into())))
+            .unwrap();
+        assert!(matches!(
+            input.recv_timeout(Duration::ZERO, true),
+            RecoveringAudioInputEvent::Timeout
+        ));
+        // The lid-closed failure uses the long stall backoff, not the 5 s cap.
+        assert!(input.recovery.stream_stall);
+        let next_attempt = input.recovery.next_attempt.unwrap();
+        assert!(!input.recovery.should_attempt(Instant::now()));
+
+        // Opening the lid retries at once.
+        input.lid_generation = crate::clamshell::generation().wrapping_add(1);
+        let now = Instant::now();
+        input.maintain_routing(now, true);
+        assert_eq!(input.lid_generation, crate::clamshell::generation());
+        assert!(input.recovery.should_attempt(now));
+        assert!(input.recovery.next_attempt.unwrap() <= next_attempt);
+    }
+
+    #[test]
+    fn a_new_stream_gets_longer_to_deliver_its_first_chunk() {
+        let (mut input, samples) = AudioInput::channel_for_test();
+        input.stall_after = Some(STREAM_STALL_TIMEOUT);
+        let opened = input.last_delivery;
+        assert!(!input.stalled(opened + STREAM_STALL_TIMEOUT));
+        assert!(input.stalled(opened + STREAM_FIRST_DELIVERY_TIMEOUT));
+
+        let at = CaptureInstant::from_nanos(60_000_000_000);
+        samples.send((vec![0.25; 480], at)).unwrap();
+        assert!(matches!(
+            input.recv_timeout(Duration::ZERO),
+            AudioInputEvent::Chunk { .. }
+        ));
+        assert!(input.stalled(input.last_delivery + STREAM_STALL_TIMEOUT));
     }
 
     #[test]

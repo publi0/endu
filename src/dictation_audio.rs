@@ -281,7 +281,7 @@ impl DictationAudio {
     /// A running owner over a warm 48 kHz test microphone whose chunks the
     /// caller sends; it never opens a real device.
     #[cfg(test)]
-    pub fn for_test() -> (Self, Sender<(Vec<f32>, CaptureInstant)>) {
+    pub fn for_test() -> (Self, crate::audio::TestChunkSender) {
         let (mut input, opened) = RecoveringAudioInput::pending_for_test();
         let (replacement, samples) = crate::audio::AudioInput::channel_for_test();
         opened.send((0, Ok(replacement))).unwrap();
@@ -963,7 +963,7 @@ mod tests {
     }
 
     // Drive the real serialized owner without a worker so input/control ordering is exact.
-    fn owner_for_test(open: bool) -> (Owner, DictationAudio, Sender<(Vec<f32>, CaptureInstant)>) {
+    fn owner_for_test(open: bool) -> (Owner, DictationAudio, crate::audio::TestChunkSender) {
         let (mut input, opened) = RecoveringAudioInput::pending_for_test();
         let (replacement, samples) = crate::audio::AudioInput::channel_for_test();
         opened.send((0, Ok(replacement))).unwrap();
@@ -1373,7 +1373,7 @@ mod tests {
     ) -> (
         Owner,
         DictationAudio,
-        Sender<(Vec<f32>, CaptureInstant)>,
+        crate::audio::TestChunkSender,
         CaptureInstant,
     ) {
         let (mut owner, input, samples) = owner_for_test(true);
