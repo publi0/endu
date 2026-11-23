@@ -44,6 +44,21 @@ impl ForegroundApplication {
         })
     }
 
+    /// The application's bundle directory, for inspecting its embedded
+    /// frameworks. Reads only metadata macOS already holds.
+    pub fn bundle_path(&self) -> Option<std::path::PathBuf> {
+        match self {
+            Self::Native(application) => autoreleasepool(|_| {
+                application
+                    .bundleURL()?
+                    .path()
+                    .map(|path| path.to_string().into())
+            }),
+            #[cfg(test)]
+            Self::Test(_) => None,
+        }
+    }
+
     fn name(&self) -> Option<String> {
         match self {
             Self::Native(application) => application.localizedName().map(|name| name.to_string()),

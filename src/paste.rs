@@ -1,4 +1,7 @@
 use std::ffi::{c_char, c_void};
+use std::fs;
+use std::ops::RangeInclusive;
+use std::path::Path;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -125,6 +128,10 @@ const BAD_PASTEBOARD_FLAVOR: i32 = -25133;
 const DUPLICATE_PASTEBOARD_FLAVOR: i32 = -25134;
 const PASTE_SETTLE_DELAY: Duration = Duration::from_millis(100);
 const SYSTEM_TRANSLATED_FLAVOR: u32 = 1 << 8;
+/// Chromium 155 and 156 on macOS can drop a Command-V that races their own
+/// pasteboard change notification, however long Endu waits first. The bug
+/// arrived with Chromium CL 8217390 and is fixed by CL 8503629 in 157.
+const CLIPBOARD_RACE_CHROMIUM: RangeInclusive<u32> = 155..=156;
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
@@ -300,6 +307,46 @@ impl Paster {
                     )
                 },
             );
+        // The bundle is inspected here, on the output worker, never on the
+        // capture or shortcut threads.
+        if target
+            .target
+            .as_ref()
+            .and_then(crate::context::ForegroundApplication::bundle_path)
+            .is_some_and(|bundle| has_clipboard_race(&bundle))
+        {
+            tracing::debug!("typing instead of pasting into Chromium 155 or 156");
+            let delivered = deliver_typed(
+                &commit,
+                || verified_target(&self.activity, target, submit_after_paste),
+                |pid| keyboard::type_text_to_pid(&text, pid),
+                thread::sleep,
+                |pid| {
+                    submit_if_current(
+                        submit_after_paste,
+                        &commit,
+                        || self.activity.interaction_revision(),
+                        || {
+                            target
+                                .target
+                                .as_ref()
+                                .and_then(|target| target.current_process_id())
+                                == Some(pid)
+                        },
+                        || keyboard::post_return_to_pid(pid),
+                    )
+                },
+            )?;
+            let Some(submitted) = delivered else {
+                return Ok(PasteOutcome::Deferred);
+            };
+            self.continuation = (!submitted).then_some(Continuation {
+                revision,
+                target: target.target.clone(),
+                inserted: text,
+            });
+            return Ok(PasteOutcome::Pasted);
+        }
         let generation = commit_targeted_paste(
             || {
                 let restore = self
@@ -331,17 +378,7 @@ impl Paster {
                 Ok((restore, previous, previous_change_count))
             },
             &commit,
-            || {
-                if submit_after_paste
-                    .is_some_and(|expected| expected != self.activity.interaction_revision())
-                {
-                    return None;
-                }
-                target
-                    .target
-                    .as_ref()
-                    .and_then(|target| target.current_process_id())
-            },
+            || verified_target(&self.activity, target, submit_after_paste),
             |(mut restore, previous, previous_change_count), pid| {
                 if let Err(error) = write_clipboard_text(&self.clipboard, &text) {
                     if let Err(restore_error) = restore_clipboard(&self.clipboard, &previous) {
@@ -417,6 +454,82 @@ impl Paster {
             inserted: text,
         });
         Ok(PasteOutcome::Pasted)
+    }
+}
+
+/// The foreground-verified destination process, or None when the
+/// destination moved or input since the shortcut voided Enter-to-submit.
+fn verified_target(
+    activity: &InputActivity,
+    target: &crate::context::ContextSnapshot,
+    submit_after_paste: Option<u64>,
+) -> Option<i32> {
+    if submit_after_paste.is_some_and(|expected| expected != activity.interaction_revision()) {
+        return None;
+    }
+    target
+        .target
+        .as_ref()
+        .and_then(|target| target.current_process_id())
+}
+
+/// Typed output for apps with the Chromium clipboard race. It never reads,
+/// writes or restores the clipboard, so pending clipboard restores and the
+/// eager snapshot are left alone and a failed attempt has nothing to roll
+/// back. The rules match the clipboard path: commit first, then verify the
+/// foreground destination, type into that process only, and send Return
+/// only through `submit`, after the same settle delay. Returns None when the
+/// destination is not current (deferred), or whether Return was sent.
+fn deliver_typed(
+    commit: impl FnOnce() -> bool,
+    target: impl FnOnce() -> Option<i32>,
+    type_text: impl FnOnce(i32) -> Result<()>,
+    wait: impl FnOnce(Duration),
+    submit: impl FnOnce(i32) -> bool,
+) -> Result<Option<bool>> {
+    let Some(pid) = commit_targeted_paste(|| Ok(()), commit, target, |(), pid| Ok(pid))? else {
+        return Ok(None);
+    };
+    complete_paste_with_submit(|| type_text(pid), || {}, wait, || submit(pid)).map(Some)
+}
+
+/// Whether the app at `bundle` embeds a Chromium 155 or 156 framework. Every
+/// version found counts, so a browser that has staged an update before
+/// relaunching is covered whichever version is running; typing works in any
+/// version, so the wrong guess there costs nothing.
+fn has_clipboard_race(bundle: &Path) -> bool {
+    chromium_major_versions(bundle).any(|major| CLIPBOARD_RACE_CHROMIUM.contains(&major))
+}
+
+/// Chromium browsers (Chrome, Brave, Edge, Chromium itself and most forks)
+/// ship `Contents/Frameworks/<Name> Framework.framework/Versions/
+/// <major>.<minor>.<build>.<patch>/`. Electron's `Versions/A` has no version.
+fn chromium_major_versions(bundle: &Path) -> impl Iterator<Item = u32> {
+    fs::read_dir(bundle.join("Contents/Frameworks"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|framework| {
+            framework
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with("Framework.framework"))
+        })
+        .flat_map(|framework| fs::read_dir(framework.path().join("Versions")).into_iter())
+        .flatten()
+        .flatten()
+        .filter_map(|version| chromium_major_version(version.file_name().to_str()?))
+}
+
+fn chromium_major_version(version: &str) -> Option<u32> {
+    let components = version
+        .split('.')
+        .map(str::parse::<u32>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    match components[..] {
+        [major, _, _, _] => Some(major),
+        _ => None,
     }
 }
 
@@ -942,6 +1055,167 @@ mod tests {
     use objc2_foundation::NSData;
 
     static PASTEBOARD_TEST: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn detects_the_chromium_major_version_from_the_bundle_framework() {
+        let root = std::env::temp_dir().join(format!(
+            "endu-chromium-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let bundle = |name: &str, frameworks: &[(&str, &[&str])]| {
+            let bundle = root.join(name);
+            for (framework, versions) in frameworks {
+                for version in *versions {
+                    fs::create_dir_all(
+                        bundle
+                            .join("Contents/Frameworks")
+                            .join(framework)
+                            .join("Versions")
+                            .join(version),
+                    )
+                    .unwrap();
+                }
+            }
+            fs::create_dir_all(bundle.join("Contents")).unwrap();
+            bundle
+        };
+
+        let chrome = bundle(
+            "Google Chrome.app",
+            &[("Google Chrome Framework.framework", &["155.0.8059.40"])],
+        );
+        let helium = bundle(
+            "Helium.app",
+            &[("Helium Framework.framework", &["156.0.8078.48"])],
+        );
+        let staged = bundle(
+            "Brave Browser.app",
+            &[(
+                "Brave Browser Framework.framework",
+                &["156.1.88.10", "157.1.89.2"],
+            )],
+        );
+        let fixed = bundle(
+            "Microsoft Edge.app",
+            &[("Microsoft Edge Framework.framework", &["157.0.8103.15"])],
+        );
+        let older = bundle(
+            "Chromium.app",
+            &[("Chromium Framework.framework", &["154.0.7999.1"])],
+        );
+        let electron = bundle(
+            "Slack.app",
+            &[
+                ("Electron Framework.framework", &["A", "Current"]),
+                ("Squirrel.framework", &["155.0.0.0"]),
+            ],
+        );
+        let safari = bundle("Safari.app", &[]);
+
+        assert_eq!(chromium_major_versions(&chrome).collect::<Vec<_>>(), [155]);
+        let mut staged_versions = chromium_major_versions(&staged).collect::<Vec<_>>();
+        staged_versions.sort_unstable();
+        assert_eq!(staged_versions, [156, 157]);
+        for affected in [&chrome, &helium, &staged] {
+            assert!(has_clipboard_race(affected), "{}", affected.display());
+        }
+        for unaffected in [
+            &fixed,
+            &older,
+            &electron,
+            &safari,
+            &root.join("Missing.app"),
+        ] {
+            assert!(!has_clipboard_race(unaffected), "{}", unaffected.display());
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn chromium_versions_need_four_numeric_components() {
+        assert_eq!(chromium_major_version("155.0.8059.84"), Some(155));
+        assert_eq!(chromium_major_version("156.1.88.10"), Some(156));
+        for version in [
+            "A",
+            "Current",
+            "155",
+            "155.0.8059",
+            "155.0.8059.84.1",
+            "155.0.x.1",
+        ] {
+            assert_eq!(chromium_major_version(version), None, "{version}");
+        }
+    }
+
+    #[test]
+    fn typed_output_commits_then_verifies_the_destination_before_typing() {
+        let steps = RefCell::new(Vec::new());
+        let run = |committed: bool, target: Option<i32>, submit: bool| {
+            steps.borrow_mut().clear();
+            let result = deliver_typed(
+                || {
+                    steps.borrow_mut().push("commit".to_string());
+                    committed
+                },
+                || {
+                    steps.borrow_mut().push("verify".to_string());
+                    target
+                },
+                |pid| {
+                    steps.borrow_mut().push(format!("type {pid}"));
+                    Ok(())
+                },
+                |delay| {
+                    steps
+                        .borrow_mut()
+                        .push(format!("wait {}", delay.as_millis()))
+                },
+                |pid| {
+                    steps.borrow_mut().push(format!("submit {pid}"));
+                    submit
+                },
+            );
+            (result, steps.borrow().clone())
+        };
+
+        let (result, order) = run(true, Some(42), true);
+        assert_eq!(result.unwrap(), Some(true));
+        assert_eq!(
+            order,
+            ["commit", "verify", "type 42", "wait 100", "submit 42"]
+        );
+
+        let (result, _) = run(true, Some(42), false);
+        assert_eq!(result.unwrap(), Some(false));
+
+        // A changed foreground defers without typing or sending Return.
+        let (result, order) = run(true, None, true);
+        assert_eq!(result.unwrap(), None);
+        assert_eq!(order, ["commit", "verify"]);
+
+        // Cancellation wins before the destination is even checked.
+        let (result, order) = run(false, Some(42), true);
+        assert!(result.is_err());
+        assert_eq!(order, ["commit"]);
+    }
+
+    #[test]
+    fn failed_typing_never_sends_return() {
+        let submitted = Cell::new(false);
+        let result = deliver_typed(
+            || true,
+            || Some(7),
+            |_| Err(eyre!("could not create keyboard event")),
+            |_| {},
+            |_| {
+                submitted.set(true);
+                true
+            },
+        );
+        assert!(result.is_err());
+        assert!(!submitted.get());
+    }
 
     #[test]
     fn return_follows_a_successful_paste_and_its_consumption_window() {

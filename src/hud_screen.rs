@@ -19,6 +19,7 @@ pub struct MonitorChoice {
 }
 
 pub struct ResolvedScreen {
+    /// The screen's visible frame, its top kept below the notch.
     pub visible_frame: NSRect,
     pub backing_scale: f32,
 }
@@ -70,9 +71,30 @@ pub fn resolve(preferences: HudPreferences) -> Option<ResolvedScreen> {
     let index = select_screen(&geometry, NSEvent::mouseLocation(), active, preferences)?;
     let screen = screens.objectAtIndex(index);
     Some(ResolvedScreen {
-        visible_frame: screen.visibleFrame(),
+        visible_frame: below_safe_area(
+            screen.visibleFrame(),
+            screen.frame(),
+            screen.safeAreaInsets().top,
+        ),
         backing_scale: screen.backingScaleFactor() as f32,
     })
+}
+
+/// A fullscreen Space hides the menu bar, so `visibleFrame` reaches the top
+/// of a notched screen and a top HUD or notice would sit inside the notch.
+/// Clamp the visible top to the safe area; the bottom edge never moves.
+fn below_safe_area(visible: NSRect, frame: NSRect, safe_area_top: f64) -> NSRect {
+    let safe_area_top = if safe_area_top.is_finite() {
+        safe_area_top.max(0.0)
+    } else {
+        0.0
+    };
+    let visible_top = visible.origin.y + visible.size.height;
+    let top = visible_top.min(frame.origin.y + frame.size.height - safe_area_top);
+    NSRect::new(
+        visible.origin,
+        objc2_foundation::NSSize::new(visible.size.width, (top - visible.origin.y).max(0.0)),
+    )
 }
 
 fn select_screen(
@@ -283,6 +305,54 @@ mod tests {
             id: Some(MonitorId::from_bytes([id; 16])),
             frame: NSRect::new(NSPoint::new(x, y), NSSize::new(width, height)),
         }
+    }
+
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
+        NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
+    }
+
+    // Geometry measured on a 14" MacBook Air: frame height 956, menu bar
+    // bottom 923, 32 pt notch.
+    #[test]
+    fn top_edge_clears_the_notch_in_a_fullscreen_space() {
+        let frame = rect(0.0, 0.0, 1512.0, 956.0);
+        let clamped = below_safe_area(frame, frame, 32.0);
+        assert_eq!(clamped, rect(0.0, 0.0, 1512.0, 924.0));
+    }
+
+    #[test]
+    fn top_edge_stays_under_the_menu_bar_on_a_notched_screen() {
+        let frame = rect(0.0, 0.0, 1512.0, 956.0);
+        let visible = rect(0.0, 70.0, 1512.0, 853.0);
+        assert_eq!(below_safe_area(visible, frame, 32.0), visible);
+    }
+
+    #[test]
+    fn screens_without_a_notch_are_unchanged() {
+        let frame = rect(-1920.0, 200.0, 1920.0, 1080.0);
+        let visible = rect(-1920.0, 200.0, 1920.0, 1055.0);
+        assert_eq!(below_safe_area(visible, frame, 0.0), visible);
+        assert_eq!(below_safe_area(frame, frame, 0.0), frame);
+        assert_eq!(below_safe_area(frame, frame, f64::NAN), frame);
+        assert_eq!(below_safe_area(frame, frame, -10.0), frame);
+    }
+
+    /// Both the HUD and the paste notice place their top edge from the
+    /// clamped frame, so a fullscreen Space keeps them under the notch.
+    #[test]
+    fn top_position_uses_the_clamped_frame() {
+        use crate::hud_settings::HudPosition;
+        let frame = rect(0.0, 0.0, 1512.0, 956.0);
+        let clamped = below_safe_area(frame, frame, 32.0);
+        let top =
+            HudPosition::Top.window_top(clamped.origin.y, clamped.size.height, 60.0, 40.0, 8.0);
+        assert_eq!(top, 924.0 + 10.0 - 8.0);
+        let bottom =
+            HudPosition::Bottom.window_top(clamped.origin.y, clamped.size.height, 60.0, 40.0, 8.0);
+        assert_eq!(
+            bottom,
+            HudPosition::Bottom.window_top(frame.origin.y, frame.size.height, 60.0, 40.0, 8.0)
+        );
     }
 
     #[test]

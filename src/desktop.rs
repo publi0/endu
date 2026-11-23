@@ -113,9 +113,9 @@ fn should_open_app_on_launch(
 }
 
 pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
-    if objc2::MainThreadMarker::new().is_none() {
+    let Some(mtm) = objc2::MainThreadMarker::new() else {
         return Err(eyre!("desktop startup requires the main thread"));
-    }
+    };
     let notice_preview = matches!(&launch, Launch::PasteNoticePreview);
     let (listener, hud_preview, preview) = match launch {
         Launch::App(listener) => (Some(listener), false, None),
@@ -127,6 +127,9 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
         Launch::Shell(preview) => (None, false, Some(preview)),
     };
     shutdown.store(false, Ordering::Relaxed);
+    // Observing first means a source change during startup still rebuilds
+    // the snapshot.
+    crate::keyboard::observe_layout_changes(mtm);
     crate::keyboard::initialize_layout()?;
     if listener.is_some() {
         // Lid changes re-resolve the microphone; previews never observe it.

@@ -166,6 +166,11 @@ Only modules whose name does not say enough:
   never runs on cancellation or shutdown. Deferred output keeps only the
   latest result in memory; Paste Last captures a new destination and records
   History on its first successful paste only.
+- Into an app embedding Chromium 155/156 (`paste::has_clipboard_race`) the
+  output is typed as marked Unicode key events instead of pasted, under the
+  same commit, verification and Enter-to-submit rules; typing never touches
+  the clipboard. Posted shortcuts send modifiers as flags-changed events,
+  spaced apart, from the output worker only.
 - Completed clips are persisted privately before the remote attempt. Failed
   clips stay until recovered or explicitly deleted, untouched by History
   retention or Clear. Persist recovered text before removing audio. Retry never
