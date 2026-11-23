@@ -68,18 +68,21 @@ pub fn trim(samples: &[f32]) -> Trimmed {
     Trimmed::Speech(output)
 }
 
+/// The frame's RMS around its own mean, so a microphone's DC offset never
+/// reads as loudness and raises the noise floor above quiet speech. Only the
+/// measurement removes the offset; the samples sent on stay untouched.
 fn rms(frame: &[f32]) -> f32 {
-    let sum: f32 = frame
-        .iter()
-        .map(|sample| {
-            if sample.is_finite() {
-                sample * sample
-            } else {
-                0.0
-            }
-        })
+    let finite = || {
+        frame
+            .iter()
+            .map(|sample| if sample.is_finite() { *sample } else { 0.0 })
+    };
+    let count = frame.len().max(1) as f32;
+    let mean = finite().sum::<f32>() / count;
+    let sum: f32 = finite()
+        .map(|sample| (sample - mean) * (sample - mean))
         .sum();
-    (sum / frame.len().max(1) as f32).sqrt()
+    (sum / count).sqrt()
 }
 
 fn threshold(energies: &[f32]) -> f32 {
@@ -218,6 +221,34 @@ mod tests {
             panic!("quiet speech expected");
         };
         assert!(seconds(&trimmed) > 1.3, "{}", seconds(&trimmed));
+    }
+
+    #[test]
+    fn a_dc_offset_never_reads_as_speech_or_raises_the_noise_floor() {
+        // A constant offset alone is silence.
+        assert_eq!(trim(&vec![0.05; 3 * SECOND]), Trimmed::Silent);
+        assert!(rms(&[0.2; FRAME]) < 1e-6);
+        assert!((rms(&[0.7, -0.3]) - 0.5).abs() < 1e-6);
+
+        // Quiet speech riding on an offset far louder than itself is kept,
+        // and the trimmed audio is the original samples, offset included.
+        let offset = 0.05;
+        let samples: Vec<f32> = concat(&[noise(2.0, 0.0005), tone(1.0, 0.01), noise(2.0, 0.0005)])
+            .into_iter()
+            .map(|sample| sample + offset)
+            .collect();
+        let Trimmed::Speech(trimmed) = trim(&samples) else {
+            panic!("speech over a DC offset expected");
+        };
+        assert!(
+            (seconds(&trimmed) - 1.4).abs() < 0.05,
+            "{}",
+            seconds(&trimmed)
+        );
+        let start = samples
+            .windows(trimmed.len())
+            .position(|window| window == trimmed.as_slice());
+        assert!(start.is_some(), "trimming never alters samples");
     }
 
     #[test]
