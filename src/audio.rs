@@ -1,7 +1,11 @@
 use std::ops::Add;
+use std::sync::Arc;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::time::{Duration, Instant};
 
 use crate::microphone::{
@@ -111,10 +115,22 @@ impl Add<Duration> for CaptureInstant {
     }
 }
 
+/// Chunks the capture callback may queue for the audio owner. At CoreAudio's
+/// usual 512-frame period at 48 kHz this is about five seconds; the owner
+/// drains every few milliseconds, so only a stalled owner fills it. A chunk
+/// that does not fit is dropped and reported as a gap, never waited for.
+const CHUNK_QUEUE_CAPACITY: usize = 512;
+
 pub struct AudioInput {
     // Tests can deliver PCM through channels without opening a native microphone.
     _stream: Option<Stream>,
     chunks: Receiver<(Vec<f32>, CaptureInstant)>,
+    /// The end of the newest chunk the callback dropped on a full queue, in
+    /// capture nanoseconds; zero means none is pending.
+    dropped_through: Arc<AtomicU64>,
+    /// The chunk right after a dropped one, held back for one turn so the
+    /// owner hears of the hole before the audio that follows it.
+    after_drop: Option<(Vec<f32>, CaptureInstant)>,
     pub sample_rate: u32,
     pub device_name: String,
     pub description: InputDescription,
@@ -126,6 +142,9 @@ pub enum AudioInputEvent {
         samples: Vec<f32>,
         captured_through: CaptureInstant,
     },
+    /// The capture queue was full and dropped audio; the next chunk follows
+    /// a hole in the timeline.
+    Dropped,
     Timeout,
     StreamFailed(String),
 }
@@ -149,6 +168,8 @@ pub enum RecoveringAudioInputEvent {
         samples: Vec<f32>,
         captured_through: CaptureInstant,
     },
+    /// The next chunk follows audio the capture queue had to drop.
+    Dropped,
     Timeout,
     Interrupted,
     Reopened,
@@ -241,6 +262,8 @@ impl AudioInput {
             Self {
                 _stream: None,
                 chunks,
+                dropped_through: Arc::default(),
+                after_drop: None,
                 stream_errors,
                 sample_rate: 48_000,
                 device_name: "Test microphone".into(),
@@ -289,7 +312,12 @@ impl AudioInput {
         }
         let description = describe_device(&device, config.channels);
         let selected_channel = description.channel;
-        let (sender, chunks) = mpsc::channel();
+        let (sender, chunks) = mpsc::sync_channel(CHUNK_QUEUE_CAPACITY);
+        let dropped_through = Arc::new(AtomicU64::new(0));
+        let sink = ChunkSink {
+            sender,
+            dropped_through: dropped_through.clone(),
+        };
         let (error_sender, stream_errors) = mpsc::sync_channel(1);
 
         let stream = match sample_format {
@@ -298,7 +326,7 @@ impl AudioInput {
                 &config,
                 channels,
                 selected_channel,
-                sender,
+                sink,
                 error_sender,
                 |sample: f32| sample,
             )?,
@@ -307,7 +335,7 @@ impl AudioInput {
                 &config,
                 channels,
                 selected_channel,
-                sender,
+                sink,
                 error_sender,
                 |sample: i16| sample as f32 / i16::MAX as f32,
             )?,
@@ -316,7 +344,7 @@ impl AudioInput {
                 &config,
                 channels,
                 selected_channel,
-                sender,
+                sink,
                 error_sender,
                 |sample: u16| sample as f32 / 32768.0 - 1.0,
             )?,
@@ -329,6 +357,8 @@ impl AudioInput {
         Ok(Self {
             _stream: Some(stream),
             chunks,
+            dropped_through,
+            after_drop: None,
             sample_rate,
             device_name,
             description,
@@ -336,7 +366,7 @@ impl AudioInput {
         })
     }
 
-    pub fn recv_timeout(&self, timeout: Duration) -> AudioInputEvent {
+    pub fn recv_timeout(&mut self, timeout: Duration) -> AudioInputEvent {
         // The one place overloads reach the log: the error callback only
         // counts them.
         overloads::report();
@@ -345,11 +375,21 @@ impl AudioInput {
         if let Ok(error) = self.stream_errors.try_recv() {
             return AudioInputEvent::StreamFailed(error);
         }
+        if let Some((samples, captured_through)) = self.after_drop.take() {
+            return AudioInputEvent::Chunk {
+                samples,
+                captured_through,
+            };
+        }
         let received = self.chunks.recv_timeout(timeout);
         if let Ok(error) = self.stream_errors.try_recv() {
             return AudioInputEvent::StreamFailed(error);
         }
         match received {
+            Ok((samples, captured_through)) if self.follows_drop(captured_through) => {
+                self.after_drop = Some((samples, captured_through));
+                AudioInputEvent::Dropped
+            }
             Ok((samples, captured_through)) => AudioInputEvent::Chunk {
                 samples,
                 captured_through,
@@ -359,6 +399,24 @@ impl AudioInput {
                 AudioInputEvent::StreamFailed("microphone audio channel disconnected".into())
             }
         }
+    }
+
+    /// Whether a chunk ending at `captured_through` is newer than audio the
+    /// callback dropped: chunks queued before the drop are older and arrive
+    /// first, so the hole is reported exactly where it is in the timeline.
+    fn follows_drop(&self, captured_through: CaptureInstant) -> bool {
+        let dropped_through = self.dropped_through.load(Ordering::Acquire);
+        if dropped_through == 0 || captured_through.as_nanos() <= dropped_through {
+            return false;
+        }
+        // A newer drop since the load keeps its own mark for a later chunk.
+        let _ = self.dropped_through.compare_exchange(
+            dropped_through,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        true
     }
 }
 
@@ -535,7 +593,7 @@ impl RecoveringAudioInput {
         if self.recovery.blocks_audio() {
             return self.wait_for_replacement(timeout, capture_idle);
         }
-        let Some(input) = self.input.as_ref() else {
+        let Some(input) = self.input.as_mut() else {
             return self.wait_for_replacement(timeout, capture_idle);
         };
         match input.recv_timeout(timeout) {
@@ -546,6 +604,7 @@ impl RecoveringAudioInput {
                 samples,
                 captured_through,
             },
+            AudioInputEvent::Dropped => RecoveringAudioInputEvent::Dropped,
             AudioInputEvent::Timeout => RecoveringAudioInputEvent::Timeout,
             AudioInputEvent::StreamFailed(error) => {
                 tracing::warn!(%error, device = %input.device_name, "microphone stream stopped; reopening it");
@@ -1110,12 +1169,22 @@ fn mono<T>(
         .collect()
 }
 
-fn send(
-    sender: &Sender<(Vec<f32>, CaptureInstant)>,
-    chunk: Vec<f32>,
-    captured_through: CaptureInstant,
-) {
-    let _ = sender.send((chunk, captured_through));
+/// The capture callback's end of the bounded chunk queue.
+struct ChunkSink {
+    sender: SyncSender<(Vec<f32>, CaptureInstant)>,
+    dropped_through: Arc<AtomicU64>,
+}
+
+impl ChunkSink {
+    /// Runs on the capture callback: never blocks. A chunk the full queue
+    /// cannot take is dropped and its end marked, so the owner reports the
+    /// hole.
+    fn send(&self, chunk: Vec<f32>, captured_through: CaptureInstant) {
+        if let Err(TrySendError::Full(_)) = self.sender.try_send((chunk, captured_through)) {
+            self.dropped_through
+                .fetch_max(captured_through.as_nanos().max(1), Ordering::AcqRel);
+        }
+    }
 }
 
 /// Runs on the host's stream thread, CoreAudio's real-time thread included.
@@ -1140,7 +1209,7 @@ fn build_stream<T: SizedSample>(
     config: &StreamConfig,
     channels: usize,
     selected_channel: Option<u16>,
-    sender: Sender<(Vec<f32>, CaptureInstant)>,
+    sink: ChunkSink,
     error_sender: SyncSender<String>,
     convert: impl Fn(T) -> f32 + Send + 'static,
 ) -> Result<Stream> {
@@ -1150,8 +1219,7 @@ fn build_stream<T: SizedSample>(
             *config,
             move |data: &[T], info| {
                 let captured_through = captured_through(info, data.len() / channels, sample_rate);
-                send(
-                    &sender,
+                sink.send(
                     mono(data, channels, selected_channel, |sample| convert(*sample)),
                     captured_through,
                 )
@@ -1540,6 +1608,40 @@ mod tests {
             description_name(readable).as_deref(),
             Some("MacBook Pro Microphone")
         );
+    }
+
+    #[test]
+    fn a_dropped_chunk_is_reported_where_the_hole_is() {
+        let (mut input, _samples) = AudioInput::channel_for_test();
+        let (sender, chunks) = mpsc::sync_channel(2);
+        input.chunks = chunks;
+        let sink = ChunkSink {
+            sender,
+            dropped_through: input.dropped_through.clone(),
+        };
+        let at = |ms: u64| CaptureInstant::from_nanos(60_000_000_000 + ms * 1_000_000);
+        // The queue holds two chunks; the third is dropped without blocking.
+        for ms in [10, 20, 30] {
+            sink.send(vec![0.25; 480], at(ms));
+        }
+        let chunk_at = |event: AudioInputEvent| match event {
+            AudioInputEvent::Chunk {
+                captured_through, ..
+            } => Some(captured_through),
+            _ => None,
+        };
+        // Audio queued before the drop arrives first, uninterrupted.
+        assert_eq!(chunk_at(input.recv_timeout(Duration::ZERO)), Some(at(10)));
+        assert_eq!(chunk_at(input.recv_timeout(Duration::ZERO)), Some(at(20)));
+        sink.send(vec![0.25; 480], at(40));
+        // The hole is reported right before the audio that follows it.
+        assert!(matches!(
+            input.recv_timeout(Duration::ZERO),
+            AudioInputEvent::Dropped
+        ));
+        assert_eq!(chunk_at(input.recv_timeout(Duration::ZERO)), Some(at(40)));
+        sink.send(vec![0.25; 480], at(50));
+        assert_eq!(chunk_at(input.recv_timeout(Duration::ZERO)), Some(at(50)));
     }
 
     #[test]

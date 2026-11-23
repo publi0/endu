@@ -138,6 +138,9 @@ struct Owner {
     recognition_overflowed: bool,
     pending_input: PendingInputEvents,
     last_captured_through: Option<CaptureInstant>,
+    /// The capture queue dropped audio before the next chunk: that chunk
+    /// follows a hole however short, so it is a gap.
+    chunk_dropped: bool,
     /// A released clip whose tail was cut short by a capture gap or a device
     /// interruption. It is accepted work: the next Finish returns it, ending
     /// at the release edge or its last audio, whichever is later.
@@ -258,6 +261,7 @@ impl DictationAudio {
                     recognition_overflowed: false,
                     pending_input,
                     last_captured_through: None,
+                    chunk_dropped: false,
                     released: None,
                     keep_open: false,
                 }
@@ -675,8 +679,10 @@ impl Owner {
                 let captured_from = captured_through
                     .checked_sub(Duration::from_nanos(chunk_nanos as u64))
                     .unwrap_or(captured_through);
+                let follows_drop = std::mem::take(&mut self.chunk_dropped);
                 if let Some(previous) = self.last_captured_through
-                    && captured_from.duration_since(previous) > Duration::from_millis(50)
+                    && (follows_drop
+                        || captured_from.duration_since(previous) > Duration::from_millis(50))
                 {
                     let gap = captured_from.duration_since(previous);
                     let was_recording = !self.set_aside_released() && self.capture.is_recording();
@@ -705,9 +711,11 @@ impl Owner {
                     self.forward_recognition(samples);
                 }
             }
+            RecoveringAudioInputEvent::Dropped => self.chunk_dropped = true,
             RecoveringAudioInputEvent::Timeout => {}
             RecoveringAudioInputEvent::Interrupted => {
                 self.last_captured_through = None;
+                self.chunk_dropped = false;
                 self.next_recognition_generation();
                 let was_recording = !self.set_aside_released() && self.capture.is_recording();
                 let capture_generation = self.state.capture_generation.load(Ordering::Acquire);
@@ -724,6 +732,7 @@ impl Owner {
             }
             RecoveringAudioInputEvent::Reopened => {
                 self.last_captured_through = None;
+                self.chunk_dropped = false;
                 self.next_recognition_generation();
                 let sample_rate = self.input.sample_rate();
                 self.capture = new_capture(sample_rate, &self.recording_environment);
@@ -877,6 +886,7 @@ impl Owner {
     fn close_input(&mut self) {
         self.input.close();
         self.last_captured_through = None;
+        self.chunk_dropped = false;
         self.next_recognition_generation();
         self.state.captured_through.store(0, Ordering::Release);
         self.state.recovering.store(false, Ordering::Release);
@@ -939,6 +949,7 @@ mod tests {
             recognition_overflowed: false,
             pending_input: PendingInputEvents::default(),
             last_captured_through: None,
+            chunk_dropped: false,
             released: None,
             keep_open: false,
         };
@@ -1626,6 +1637,43 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn a_dropped_chunk_fails_the_capture_even_when_its_hole_is_short() {
+        let (mut owner, input, _samples) = owner_for_test(true);
+        let at = capture_time();
+        owner.handle_input(RecoveringAudioInputEvent::Chunk {
+            samples: vec![0.25; 480],
+            captured_through: at,
+        });
+        start(&mut owner, at);
+        owner.handle_input(RecoveringAudioInputEvent::Chunk {
+            samples: vec![0.25; 480],
+            captured_through: at + Duration::from_millis(10),
+        });
+        // A 10 ms hole is below the timestamp tolerance, but the queue said
+        // it dropped audio there.
+        owner.handle_input(RecoveringAudioInputEvent::Dropped);
+        owner.handle_input(RecoveringAudioInputEvent::Chunk {
+            samples: vec![0.25; 480],
+            captured_through: at + Duration::from_millis(30),
+        });
+        assert!(!input.is_recording());
+        assert!(matches!(
+            input.try_recv_event(),
+            Some(DictationAudioEvent::CaptureDiscontinuity {
+                was_recording: true,
+                gap_ms: 10,
+                ..
+            })
+        ));
+        // The mark is spent: the audio after it continues the timeline.
+        owner.handle_input(RecoveringAudioInputEvent::Chunk {
+            samples: vec![0.25; 480],
+            captured_through: at + Duration::from_millis(40),
+        });
+        assert!(input.try_recv_event().is_none());
     }
 
     #[test]
