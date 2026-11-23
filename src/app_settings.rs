@@ -1,8 +1,9 @@
 use crate::i18n::t;
+use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{LazyLock, Mutex, OnceLock, RwLock};
 
 use color_eyre::eyre::{Result, eyre};
 use objc2::MainThreadMarker;
@@ -25,6 +26,11 @@ static PASTE_KEY_CODE: OnceLock<u16> = OnceLock::new();
 static HOTKEY_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SETTINGS_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static MICROPHONE_SELECTION: OnceLock<RwLock<RuntimeMicrophoneSelection>> = OnceLock::new();
+/// Settings files this process failed to load. Its settings are defaults in
+/// memory, so every save to such a path is refused until Endu restarts, even
+/// once the file is fixed: saving would replace the user's choices with
+/// defaults. Keyed by path so tests in one process do not interfere.
+static UNLOADED: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Default::default);
 
 #[derive(Default)]
 struct RuntimeMicrophoneSelection {
@@ -576,44 +582,88 @@ impl AppSettings {
         Ok(settings)
     }
 
-    fn load_from(path: &std::path::Path) -> Result<Self> {
-        match fs::read(path) {
-            Ok(data) => {
-                let mut settings: Self = serde_json::from_slice(&data)?;
-                settings
-                    .vocabulary
-                    .validate()
-                    .map_err(|message| eyre!(message))?;
-                let loaded = serde_json::to_value(&settings)?;
-                let raw: serde_json::Value = serde_json::from_slice(&data)?;
-                if raw.get("dictation_mode").is_none() {
-                    // The former default becomes tap-or-hold; keep explicit hold-only
-                    // and double-tap-only choices made in older versions.
-                    settings.dictation_mode = if raw
-                        .get("double_tap_lock")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(false)
-                    {
-                        DictationMode::Hold
-                    } else if settings.double_tap_only {
-                        DictationMode::DoubleTap
-                    } else {
-                        DictationMode::TapOrHold
-                    };
-                }
-                settings.normalize_double_tap_settings();
-                settings.lower_volume_percent = settings.lower_volume_percent.min(100);
-                settings.release_tail_ms = settings.release_tail().millis();
-                if serde_json::to_value(&settings)? != loaded
-                    && let Err(error) = settings.write_to(path)
-                {
-                    tracing::warn!(%error, "could not persist normalized settings");
-                }
-                Ok(settings)
+    /// Launch never fails on settings: a file that cannot be read or decoded
+    /// leaves defaults in memory, untouched on disk, with the message to show.
+    pub fn load_for_launch() -> (Self, Option<String>) {
+        match Self::load() {
+            Ok(settings) => (settings, None),
+            Err(error) => {
+                // The error names only a position or an I/O reason, never
+                // the file's contents.
+                tracing::error!(
+                    error = format!("{error:#}"),
+                    "could not load settings; using defaults without changing the file"
+                );
+                let settings = Self::default();
+                settings.apply_runtime();
+                let message = tf!(
+                    "Endu couldn't load its settings and is using defaults. Your settings file was left unchanged; changes made here won't be saved until you fix or remove it and restart Endu. {error}",
+                    error = format!("{error:#}")
+                );
+                (settings, Some(message))
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(error.into()),
         }
+    }
+
+    fn load_from(path: &Path) -> Result<Self> {
+        let result = Self::read_from(path);
+        if result.is_err() {
+            UNLOADED
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(path.to_path_buf());
+        }
+        result
+    }
+
+    fn read_from(path: &Path) -> Result<Self> {
+        let data = match fs::read(path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => {
+                return Err(eyre!(tf!(
+                    "Could not read settings.json: {error}",
+                    error = error.to_string()
+                )));
+            }
+        };
+        let raw: serde_json::Value = serde_json::from_slice(&data).map_err(decode_error)?;
+        // Serde would read a list as a settings struct; only an object is one.
+        if !raw.is_object() {
+            return Err(eyre!(t("settings.json doesn't hold a settings object.")));
+        }
+        let mut settings: Self = serde_json::from_slice(&data).map_err(decode_error)?;
+        settings
+            .vocabulary
+            .validate()
+            .map_err(|message| eyre!(message))?;
+        let loaded = serde_json::to_value(&settings)?;
+        if raw.get("dictation_mode").is_none() {
+            // The former default becomes tap-or-hold; keep explicit hold-only
+            // and double-tap-only choices made in older versions.
+            settings.dictation_mode = if raw
+                .get("double_tap_lock")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            {
+                DictationMode::Hold
+            } else if settings.double_tap_only {
+                DictationMode::DoubleTap
+            } else {
+                DictationMode::TapOrHold
+            };
+        }
+        settings.normalize_double_tap_settings();
+        settings.lower_volume_percent = settings.lower_volume_percent.min(100);
+        settings.release_tail_ms = settings.release_tail().millis();
+        if serde_json::to_value(&settings)? != loaded
+            && let Err(error) = settings.write_to(path)
+        {
+            tracing::warn!(%error, "could not persist normalized settings");
+        }
+        Ok(settings)
     }
 
     pub fn save(&self) -> Result<()> {
@@ -631,7 +681,7 @@ impl AppSettings {
             .parent()
             .ok_or_else(|| eyre!("settings path has no parent"))?;
         fs::create_dir_all(parent)?;
-        if !path.exists() {
+        if !check_replaceable(path)? {
             // Saving new preferences does not imply onboarding completion.
             crate::onboarding::record_pending_at(parent)?;
         }
@@ -709,6 +759,58 @@ impl AppSettings {
             paste_last: self.paste_last_hotkey.as_ref().map(HotkeyBinding::runtime),
         }
     }
+}
+
+/// Whether a save may replace `path`: never after this process failed to
+/// load it, and never over a file that cannot be read or is not a settings
+/// object (it may be the user's choices with a typo, edited after launch).
+/// Returns whether the file exists.
+pub(crate) fn check_replaceable(path: &Path) -> Result<bool> {
+    if UNLOADED
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains(path)
+    {
+        return Err(eyre!(t(
+            "Endu couldn't load settings.json when it started, so nothing was saved. Fix or remove the file, then restart Endu."
+        )));
+    }
+    match fs::read(path) {
+        Ok(original) => {
+            if serde_json::from_slice::<serde_json::Value>(&original)
+                .is_ok_and(|value| value.is_object())
+            {
+                Ok(true)
+            } else {
+                Err(eyre!(t(
+                    "settings.json is not valid, so nothing was saved. Fix or remove the file, then restart Endu."
+                )))
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(eyre!(tf!(
+            "Could not read settings.json: {error}",
+            error = error.to_string()
+        ))),
+    }
+}
+
+/// A decoding failure by position only: serde's own text can quote values
+/// from the file, such as vocabulary names.
+fn decode_error(error: serde_json::Error) -> color_eyre::eyre::Report {
+    let (line, column) = (error.line().to_string(), error.column().to_string());
+    eyre!(match error.classify() {
+        serde_json::error::Category::Data => tf!(
+            "settings.json has a value Endu can't use (line {line}, column {column}).",
+            line = line,
+            column = column
+        ),
+        _ => tf!(
+            "settings.json isn't valid JSON (line {line}, column {column}).",
+            line = line,
+            column = column
+        ),
+    })
 }
 
 fn settings_temporary_path(path: &std::path::Path) -> PathBuf {
@@ -1089,6 +1191,95 @@ mod tests {
         drop(reloaded);
         AppSettings::load_from(&path).unwrap();
         assert!(completion_recorded_at(&directory));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn settings_directory(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "endu-settings-{name}-{}-{}",
+            std::process::id(),
+            SETTINGS_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn invalid_settings_load_as_an_error_and_are_never_replaced() {
+        for (name, original) in [
+            ("syntax", &br#"{"sound_effects": tru"#[..]),
+            (
+                "field",
+                br#"{"dictation_mode":"Telepathy","vocabulary":{"terms":["Ada"]}}"#,
+            ),
+            ("array", b"[]"),
+        ] {
+            let directory = settings_directory(name);
+            let path = directory.join("settings.json");
+            fs::write(&path, original).unwrap();
+
+            let error = format!("{:#}", AppSettings::load_from(&path).unwrap_err());
+            assert!(
+                error.contains("line 1") || name == "array",
+                "{name}: {error}"
+            );
+            assert!(
+                !error.contains("Ada") && !error.contains("Telepathy"),
+                "{error}"
+            );
+            // Defaults in memory, plus an edit, must not reach the file.
+            let edited = AppSettings {
+                sound_effects: false,
+                ..AppSettings::default()
+            };
+            assert!(edited.write_to(&path).is_err(), "{name}");
+            assert_eq!(fs::read(&path).unwrap(), original, "{name}");
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn saves_stay_refused_after_a_failed_load_even_once_the_file_is_fixed() {
+        let directory = settings_directory("fixed");
+        let path = directory.join("settings.json");
+        fs::write(&path, b"{ not json").unwrap();
+        assert!(AppSettings::load_from(&path).is_err());
+
+        // The user fixes the file while Endu runs with defaults in memory.
+        let fixed = br#"{"sound_effects":false}"#;
+        fs::write(&path, fixed).unwrap();
+        assert!(AppSettings::default().write_to(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), fixed);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_file_broken_after_launch_is_not_replaced() {
+        let directory = settings_directory("broken-later");
+        let path = directory.join("settings.json");
+        fs::write(&path, br#"{"sound_effects":false}"#).unwrap();
+        let settings = AppSettings::load_from(&path).unwrap();
+        assert!(!settings.sound_effects);
+        fs::write(&path, b"{ half edited").unwrap();
+        assert!(settings.write_to(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"{ half edited");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_settings_file_is_never_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = settings_directory("unreadable");
+        let path = directory.join("settings.json");
+        fs::write(&path, br#"{"sound_effects":false}"#).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&path).is_err() {
+            assert!(AppSettings::load_from(&path).is_err());
+            assert!(AppSettings::default().write_to(&path).is_err());
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), br#"{"sound_effects":false}"#);
         fs::remove_dir_all(directory).unwrap();
     }
 

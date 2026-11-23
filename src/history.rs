@@ -192,6 +192,9 @@ pub struct HistoryStore {
     prune_error_reported: bool,
     /// Bumped on every change to `entries`, so readers can skip unchanged polls.
     revision: u64,
+    /// The file on disk could not be read, or a malformed one could not be
+    /// moved aside: writing would replace entries this store never loaded.
+    read_only: bool,
 }
 
 impl HistoryStore {
@@ -207,6 +210,7 @@ impl HistoryStore {
             prune_pending: false,
             prune_error_reported: false,
             revision: 0,
+            read_only: false,
         };
         match fs::read(&store.path) {
             Ok(bytes) => match serde_json::from_slice::<LoadedHistory>(&bytes) {
@@ -229,7 +233,8 @@ impl HistoryStore {
             },
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => {
-                tracing::warn!(%error, path = %store.path.display(), "could not read history");
+                tracing::warn!(%error, path = %store.path.display(), "could not read history; leaving it unchanged");
+                store.read_only = true;
             }
         }
         store.expire(now_ms);
@@ -393,6 +398,11 @@ impl HistoryStore {
     }
 
     fn persist(&mut self) -> io::Result<()> {
+        if self.read_only {
+            return Err(io::Error::other(t(
+                "History couldn't be read when Endu started, so it was left unchanged. Restart Endu once the file can be read.",
+            )));
+        }
         let saved = SavedHistory {
             version: VERSION,
             next_id: self.next_id,
@@ -415,10 +425,11 @@ impl HistoryStore {
         Ok(())
     }
 
-    fn preserve_corrupt(&self) {
+    fn preserve_corrupt(&mut self) {
         let backup = self.path.with_extension("json.corrupt");
         if let Err(error) = fs::rename(&self.path, &backup) {
-            tracing::warn!(%error, "could not preserve the malformed history file");
+            tracing::warn!(%error, "could not preserve the malformed history file; leaving it unchanged");
+            self.read_only = true;
         }
     }
 }
@@ -883,6 +894,26 @@ mod tests {
         store.record(draft("fresh"), 1_000).unwrap();
         let reopened = HistoryStore::open(path, HistoryRetention::Week, 2_000);
         assert_eq!(reopened.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_history_file_is_never_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_path("unreadable");
+        fs::write(&path, br#"{"version":1,"next_id":2,"entries":[]}"#).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&path).is_ok() {
+            // Running with privileges that ignore file modes; nothing to test.
+            return;
+        }
+        let mut store = HistoryStore::open(path.clone(), HistoryRetention::Week, 0);
+        assert!(store.record(draft("new"), 1_000).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            br#"{"version":1,"next_id":2,"entries":[]}"#
+        );
     }
 
     #[cfg(unix)]
