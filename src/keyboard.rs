@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use color_eyre::eyre::{Result, eyre};
 
@@ -13,7 +13,7 @@ const COMMAND_KEY_CODE: u16 = 55;
 const COMMAND_FLAG: u64 = 1 << 20;
 const EVENT_SOURCE_USER_DATA: u32 = 42;
 pub const SYNTHETIC_EVENT_MARKER: i64 = 0x0056_4f49_4345;
-static KEY_CODES: OnceLock<HashMap<char, u16>> = OnceLock::new();
+static KEY_CODES: LayoutSnapshot = LayoutSnapshot::new();
 static LAYOUT_ACCESS: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 pub(crate) static INPUT_SOURCE_QUERIES: std::sync::atomic::AtomicUsize =
@@ -41,12 +41,28 @@ unsafe extern "C" {
         output: *mut u16,
     ) -> i32;
     fn LMGetKbdType() -> u8;
+    static kTISNotifySelectedKeyboardInputSourceChanged: *const c_void;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFDataGetBytePtr(data: *const c_void) -> *const u8;
     fn CFRelease(value: *const c_void);
+    fn CFNotificationCenterGetDistributedCenter() -> *const c_void;
+    fn CFNotificationCenterAddObserver(
+        center: *const c_void,
+        observer: *const c_void,
+        callback: unsafe extern "C" fn(
+            *const c_void,
+            *mut c_void,
+            *const c_void,
+            *const c_void,
+            *const c_void,
+        ),
+        name: *const c_void,
+        object: *const c_void,
+        suspension_behavior: isize,
+    );
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -55,6 +71,34 @@ unsafe extern "C" {
     fn CGEventSetFlags(event: EventRef, flags: u64);
     fn CGEventSetIntegerValueField(event: EventRef, field: u32, value: i64);
     fn CGEventPostToPid(pid: i32, event: EventRef);
+}
+
+/// The published layout codes. The main thread replaces them whole when the
+/// selected input source changes; any thread reads the current ones without
+/// touching TIS, and sees either the old codes or the new, never a mix.
+struct LayoutSnapshot(RwLock<Option<Arc<HashMap<char, u16>>>>);
+
+impl LayoutSnapshot {
+    const fn new() -> Self {
+        Self(RwLock::new(None))
+    }
+
+    fn get(&self) -> Option<Arc<HashMap<char, u16>>> {
+        self.0
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// Publishes `codes`; returns whether they differ from the current ones.
+    fn publish(&self, codes: HashMap<char, u16>) -> bool {
+        let mut current = self.0.write().unwrap_or_else(|error| error.into_inner());
+        if current.as_deref() == Some(&codes) {
+            return false;
+        }
+        *current = Some(Arc::new(codes));
+        true
+    }
 }
 
 pub fn key_code_for(character: char) -> Result<u16> {
@@ -97,8 +141,10 @@ pub fn key_code_for(character: char) -> Result<u16> {
     ))
 }
 
-/// GUI startup must build this snapshot on the main thread before starting workers.
-/// Later lookups, including misses, never re-enter TIS/TSM from a worker thread.
+/// GUI startup must build this snapshot on the main thread before starting
+/// workers; [`refresh_layout`] rebuilds it there when the selected input
+/// source changes. Lookups, including misses, never re-enter TIS/TSM from a
+/// worker thread.
 pub fn initialize_layout() -> Result<()> {
     if KEY_CODES.get().is_some() {
         return Ok(());
@@ -106,9 +152,80 @@ pub fn initialize_layout() -> Result<()> {
     let _access = LAYOUT_ACCESS
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if KEY_CODES.get().is_some() {
-        return Ok(());
+    if KEY_CODES.get().is_none() {
+        KEY_CODES.publish(read_layout()?);
     }
+    Ok(())
+}
+
+/// Rebuilds the snapshot from the now-selected input source, on the main
+/// thread, and publishes it whole. Returns whether any key moved. Saved
+/// shortcuts are physical key codes, so they need no re-resolution; only
+/// character lookups such as the posted Command-V change.
+pub fn refresh_layout(_mtm: objc2::MainThreadMarker) -> Result<bool> {
+    let _access = LAYOUT_ACCESS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    Ok(KEY_CODES.publish(read_layout()?))
+}
+
+/// Observes input-source changes for the app's life, from GUI startup on the
+/// main thread; later calls do nothing. Each change rebuilds the snapshot on
+/// the main thread, so a switch made after launch (Dvorak to U.S., say) never
+/// leaves Command-V on a stale key. Call it before [`initialize_layout`] so a
+/// switch during startup still rebuilds. The observer delivers immediately,
+/// including while Endu is in the background, and never polls.
+pub fn observe_layout_changes(_mtm: objc2::MainThreadMarker) {
+    static OBSERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if OBSERVING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    // SAFETY: The callback ignores its observer pointer, so a null observer
+    // is valid; the registration lives for the process and is never removed.
+    // 4 = DeliverImmediately, so delivery does not wait for activation.
+    unsafe {
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDistributedCenter(),
+            std::ptr::null(),
+            input_source_changed,
+            kTISNotifySelectedKeyboardInputSourceChanged,
+            std::ptr::null(),
+            4,
+        );
+    }
+}
+
+unsafe extern "C" fn input_source_changed(
+    _center: *const c_void,
+    _observer: *mut c_void,
+    _name: *const c_void,
+    _object: *const c_void,
+    _user_info: *const c_void,
+) {
+    // The distributed center delivers on the registering (main) thread's run
+    // loop; hop there explicitly should it ever arrive elsewhere, because TIS
+    // must only be read on the main thread.
+    if let Some(mtm) = objc2::MainThreadMarker::new() {
+        refresh_after_input_source_change(mtm);
+        return;
+    }
+    let block = block2::RcBlock::new(|| {
+        if let Some(mtm) = objc2::MainThreadMarker::new() {
+            refresh_after_input_source_change(mtm);
+        }
+    });
+    // SAFETY: The block captures nothing and is therefore sendable.
+    unsafe { objc2_foundation::NSOperationQueue::mainQueue().addOperationWithBlock(&block) };
+}
+
+fn refresh_after_input_source_change(mtm: objc2::MainThreadMarker) {
+    match refresh_layout(mtm) {
+        Ok(changed) => tracing::info!(changed, "rebuilt keyboard layout after input source change"),
+        Err(error) => tracing::warn!(%error, "could not rebuild keyboard layout"),
+    }
+}
+
+fn read_layout() -> Result<HashMap<char, u16>> {
     let source = LayoutSource::current()?;
     let layout = source.layout_bytes()?;
     let codes = collect_key_codes((0..128).filter_map(|key_code| {
@@ -127,12 +244,12 @@ pub fn initialize_layout() -> Result<()> {
     {
         fill_missing_ascii_letters(&mut codes, ascii_codes);
     }
-    let _ = KEY_CODES.set(codes);
-    Ok(())
+    Ok(codes)
 }
 
 fn ascii_capable_key_codes() -> Option<HashMap<char, u16>> {
-    // Called only while LAYOUT_ACCESS is held, before the GUI snapshot is published.
+    // Called only while LAYOUT_ACCESS is held: on the main thread for the GUI
+    // snapshot, or by a headless caller without one.
     let source = LayoutSource::ascii_capable()?;
     let layout = source.layout_bytes().ok()?;
     Some(collect_key_codes((0..128).filter_map(|key_code| {
@@ -337,6 +454,63 @@ mod tests {
         fill_missing_ascii_letters(&mut non_latin, collect_key_codes([('v', 9)]));
         assert_eq!(non_latin.get(&'v'), Some(&9));
         assert_eq!(non_latin.get(&'מ'), Some(&9));
+    }
+
+    fn dvorak() -> HashMap<char, u16> {
+        collect_key_codes([('v', 47), ('.', 9)])
+    }
+
+    fn us() -> HashMap<char, u16> {
+        collect_key_codes([('v', 9), ('.', 47)])
+    }
+
+    /// Launched on Dvorak, then switched to U.S.: Command-V must post the U.S.
+    /// V key once the main thread publishes the new layout.
+    #[test]
+    fn a_published_layout_replaces_the_one_before() {
+        let snapshot = LayoutSnapshot::new();
+        assert!(snapshot.get().is_none());
+        assert!(snapshot.publish(dvorak()));
+        assert_eq!(snapshot.get().unwrap().get(&'v'), Some(&47));
+        assert!(
+            !snapshot.publish(dvorak()),
+            "the same layout changes nothing"
+        );
+        assert!(snapshot.publish(us()));
+        assert_eq!(snapshot.get().unwrap().get(&'v'), Some(&9));
+        assert!(snapshot.publish(dvorak()));
+        assert_eq!(snapshot.get().unwrap().get(&'v'), Some(&47));
+    }
+
+    /// Workers read while the main thread publishes: each read is the old
+    /// layout or the new one, never a mix of the two.
+    #[test]
+    fn readers_see_a_whole_layout_while_it_is_replaced() {
+        let snapshot = Arc::new(LayoutSnapshot::new());
+        snapshot.publish(dvorak());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers = (0..4)
+            .map(|_| {
+                let snapshot = snapshot.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let (dvorak, us) = (dvorak(), us());
+                    let mut reads = 0_u64;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) || reads == 0 {
+                        let codes = snapshot.get().expect("published before reading");
+                        assert!(*codes == dvorak || *codes == us, "torn layout: {codes:?}");
+                        reads += 1;
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for round in 0..2_000 {
+            snapshot.publish(if round % 2 == 0 { us() } else { dvorak() });
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for reader in readers {
+            reader.join().unwrap();
+        }
     }
 
     #[test]
