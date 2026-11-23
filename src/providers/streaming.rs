@@ -1025,6 +1025,12 @@ fn url_encoded_len(value: &str) -> usize {
         .sum()
 }
 
+/// SMART mode sends the whole transcript so far in every `inputTranscription`;
+/// VERBATIM sends deltas.
+fn google_cumulative(options: &ModelOptions) -> bool {
+    options.smart_format
+}
+
 fn google_setup(model: &str, options: &ModelOptions, keywords: &[String]) -> Value {
     let language = if options.language == "zh" {
         Some("cmn-Hans-CN")
@@ -1032,7 +1038,12 @@ fn google_setup(model: &str, options: &ModelOptions, keywords: &[String]) -> Val
         super::bcp47_language(&options.language)
     };
     let languages: Vec<_> = language.into_iter().collect();
-    let mut transcription = json!({"languageCodes":languages,"mode":if options.smart_format {"SMART"} else {"VERBATIM"}});
+    let mode = if google_cumulative(options) {
+        "SMART"
+    } else {
+        "VERBATIM"
+    };
+    let mut transcription = json!({"languageCodes":languages,"mode":mode});
     if !keywords.is_empty() {
         transcription["customVocabulary"] = json!(keywords);
     }
@@ -1273,8 +1284,12 @@ struct Protocol {
     ready: bool,
     finishing: bool,
     google_text: String,
-    google_finished: bool,
-    google_turn_complete: bool,
+    /// SMART mode: each `inputTranscription` replaces the text instead of
+    /// extending it.
+    google_cumulative: bool,
+    google_complete: bool,
+    /// Any interim or final input transcription arrived.
+    google_heard: bool,
     meta_final: Option<String>,
     commit_item: Option<String>,
     completed_items: BTreeMap<String, String>,
@@ -1297,8 +1312,9 @@ impl Protocol {
             ready: provider == Provider::Deepgram,
             finishing: false,
             google_text: String::new(),
-            google_finished: false,
-            google_turn_complete: false,
+            google_cumulative: false,
+            google_complete: false,
+            google_heard: false,
             meta_final: None,
             commit_item: None,
             completed_items: BTreeMap::new(),
@@ -1529,12 +1545,28 @@ impl Protocol {
                         "Google live session is ending; using the complete recording.",
                     ));
                 }
+                // Audio without speech gets neither a transcription nor
+                // generationComplete, only the end of the manual activity.
+                // That is the terminal acknowledgement of an empty clip, but
+                // never of one where Google transcribed anything.
+                if event["voiceActivity"]["type"].as_str() == Some("ACTIVITY_END")
+                    && self.finishing
+                    && !self.google_heard
+                    && !self.google_complete
+                {
+                    self.google_complete = true;
+                    return Ok(Some(String::new()));
+                }
                 if let Some(content) = event.get("serverContent") {
+                    if content.get("interimInputTranscription").is_some() {
+                        self.google_heard = true;
+                    }
                     if content["interrupted"].as_bool() == Some(true) {
                         return Err(failure("Google live transcription was interrupted."));
                     }
                     if let Some(transcript) = content.get("inputTranscription") {
-                        if self.google_finished {
+                        self.google_heard = true;
+                        if self.google_complete {
                             return Err(failure(
                                 "Google sent audio transcription after its final marker.",
                             ));
@@ -1543,30 +1575,32 @@ impl Protocol {
                             let text = text.as_str().ok_or_else(|| {
                                 failure("Google returned invalid transcription text.")
                             })?;
-                            if self.google_text.len().saturating_add(text.len()) > MAX_TEXT {
+                            let kept = if self.google_cumulative {
+                                0
+                            } else {
+                                self.google_text.len()
+                            };
+                            if kept.saturating_add(text.len()) > MAX_TEXT {
                                 return Err(failure("Streaming response exceeded its limit."));
+                            }
+                            if self.google_cumulative {
+                                self.google_text.clear();
                             }
                             self.google_text.push_str(text);
                         }
-                        if transcript["finished"].as_bool() == Some(true) {
-                            if !self.finishing {
-                                return Err(failure(
-                                    "Google finalized transcription before Finish.",
-                                ));
-                            }
-                            self.google_finished = true;
-                        }
                     }
-                    if content["turnComplete"].as_bool() == Some(true) {
+                    // With manual activity detection the transcription model
+                    // answers activityEnd with its final inputTranscription and
+                    // then generationComplete; it sends neither the SDK's
+                    // `finished` flag nor turnComplete. The latter is still
+                    // accepted as the same terminal acknowledgement.
+                    let terminal = content["generationComplete"].as_bool() == Some(true)
+                        || content["turnComplete"].as_bool() == Some(true);
+                    if terminal && !self.google_complete {
                         if !self.finishing {
                             return Err(failure("Google completed its turn before Finish."));
                         }
-                        self.google_turn_complete = true;
-                    }
-                    // The input transcription is independent of turnComplete.
-                    // The SDK's explicit finished flag avoids accepting the first
-                    // late fragment as a full result when turnComplete arrives first.
-                    if self.finishing && self.google_finished && self.google_turn_complete {
+                        self.google_complete = true;
                         return Ok(Some(std::mem::take(&mut self.google_text)));
                     }
                 }
@@ -1870,6 +1904,7 @@ impl Connection {
                     .store(keywords.len(), Ordering::Release);
             }
             Provider::Google => {
+                connection.protocol.google_cumulative = google_cumulative(&options);
                 connection.json(google_setup(model.model, &options, &keywords))?;
                 control
                     .sent_keyword_count
@@ -2786,61 +2821,108 @@ mod tests {
     }
 
     #[test]
-    fn google_waits_for_last_transcription_fragment_in_either_terminal_event_order() {
-        for turn_first in [false, true] {
+    fn google_completes_on_generation_complete_as_the_live_model_sends_it() {
+        // Frame order recorded from gemini-3.5-transcribe-live with manual
+        // activity detection: no `finished` flag and no turnComplete.
+        for (cumulative, fragments, expected) in [
+            (false, ["Hello", " world"], "Hello world"),
+            (true, ["Hello", "Hello world."], "Hello world."),
+        ] {
             let mut protocol = Protocol::new(Provider::Google);
+            protocol.google_cumulative = cumulative;
             protocol.event(&json!({"setupComplete":{}})).unwrap();
             assert!(protocol.ready);
-            assert!(protocol.event(&json!({"serverContent":{"inputTranscription":{"text":"Hello", "finished":false},"interimInputTranscription":{"text":"preview"},"modelTurn":{"parts":[{"text":"assistant must not paste"}]}}})).unwrap().is_none());
+            assert!(protocol.event(&json!({"serverContent":{"interimInputTranscription":{"text":"preview"},"modelTurn":{"parts":[{"text":"assistant must not paste"}]}}})).unwrap().is_none());
             protocol.finishing = true;
-            if turn_first {
+            assert!(
+                protocol
+                    .event(&json!({"serverContent":{},"voiceActivity":{"type":"ACTIVITY_START"}}))
+                    .unwrap()
+                    .is_none()
+            );
+            for fragment in fragments {
                 assert!(
                     protocol
-                        .event(&json!({"serverContent":{"turnComplete":true}}))
+                        .event(&json!({"serverContent":{"inputTranscription":{"text":fragment}}}))
                         .unwrap()
                         .is_none()
                 );
             }
-            assert!(protocol.event(&json!({"serverContent":{"inputTranscription":{"text":" world", "finished":false}}})).unwrap().is_none());
-            let result = protocol
-                .event(
-                    &json!({"serverContent":{"inputTranscription":{"text":"!", "finished":true}}}),
-                )
+            assert_eq!(
+                protocol
+                    .event(&json!({"serverContent":{"generationComplete":true}}))
+                    .unwrap(),
+                Some(expected.into())
+            );
+            assert!(
+                protocol
+                    .event(&json!({"serverContent":{"inputTranscription":{"text":"late"}}}))
+                    .is_err()
+            );
+        }
+        let mut protocol = Protocol::new(Provider::Google);
+        protocol.finishing = true;
+        protocol
+            .event(&json!({"serverContent":{"inputTranscription":{"text":"Hi"}}}))
+            .unwrap();
+        assert_eq!(
+            protocol
+                .event(&json!({"serverContent":{"turnComplete":true}}))
+                .unwrap(),
+            Some("Hi".into())
+        );
+    }
+
+    #[test]
+    fn google_completes_an_empty_clip_on_activity_end_but_never_cuts_off_speech() {
+        // Recorded for silence and room noise: only the activity markers.
+        let mut protocol = Protocol::new(Provider::Google);
+        protocol.event(&json!({"setupComplete":{}})).unwrap();
+        let end =
+            json!({"serverContent":{},"voiceActivity":{"type":"ACTIVITY_END","audioOffset":"2s"}});
+        assert!(
+            protocol.event(&end).unwrap().is_none(),
+            "never before Finish"
+        );
+        protocol.finishing = true;
+        assert!(protocol.event(&json!({"serverContent":{},"voiceActivity":{"type":"ACTIVITY_START","audioOffset":"0s"}})).unwrap().is_none());
+        assert_eq!(protocol.event(&end).unwrap(), Some(String::new()));
+        assert!(
+            protocol
+                .event(&json!({"serverContent":{"inputTranscription":{"text":"late"}}}))
+                .is_err()
+        );
+        for heard in ["interimInputTranscription", "inputTranscription"] {
+            let mut protocol = Protocol::new(Provider::Google);
+            protocol.finishing = true;
+            protocol
+                .event(&json!({"serverContent":{heard:{"text":"speech"}}}))
                 .unwrap();
-            if turn_first {
-                assert_eq!(result, Some("Hello world!".into()));
-            } else {
-                assert!(result.is_none());
-                assert_eq!(
-                    protocol
-                        .event(&json!({"serverContent":{"turnComplete":true}}))
-                        .unwrap(),
-                    Some("Hello world!".into())
-                );
-            }
+            assert!(
+                protocol.event(&end).unwrap().is_none(),
+                "activity end never cuts off transcribed speech"
+            );
         }
     }
 
     #[test]
-    fn google_rejects_early_finish_and_missing_terminal_marker_never_returns_partial_text() {
-        let mut protocol = Protocol::new(Provider::Google);
-        assert!(protocol.event(&json!({"serverContent":{"inputTranscription":{"text":"early","finished":true}}})).is_err());
-        let mut protocol = Protocol::new(Provider::Google);
-        assert!(
-            protocol
-                .event(&json!({"serverContent":{"turnComplete":true}}))
-                .is_err()
-        );
-        for marker in ["finished", "turnComplete"] {
+    fn google_rejects_early_completion_and_missing_terminal_marker_never_returns_partial_text() {
+        for marker in ["generationComplete", "turnComplete"] {
             let mut protocol = Protocol::new(Provider::Google);
-            protocol.finishing = true;
-            let text = json!({"serverContent":{"inputTranscription":{"text":"must not paste","finished": marker == "finished"},"turnComplete":marker == "turnComplete"}});
-            assert!(protocol.event(&text).unwrap().is_none());
             assert!(
-                protocol.closed().is_err(),
-                "a missing marker must fail into whole-clip fallback"
+                protocol
+                    .event(&json!({"serverContent":{marker:true}}))
+                    .is_err()
             );
         }
+        let mut protocol = Protocol::new(Provider::Google);
+        protocol.finishing = true;
+        let text = json!({"serverContent":{"inputTranscription":{"text":"must not paste","finished":true}}});
+        assert!(protocol.event(&text).unwrap().is_none());
+        assert!(
+            protocol.closed().is_err(),
+            "a missing terminal marker must fail into whole-clip fallback"
+        );
         let mut protocol = Protocol::new(Provider::Google);
         assert!(
             protocol
