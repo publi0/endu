@@ -178,6 +178,9 @@ pub struct RecoveringAudioInput {
     /// [`STREAM_PROVEN_UPTIME`]. Only a proven stream reopens at once after
     /// it fails; an unproven one waits out the stall backoff.
     proven: bool,
+    /// The reopen error last logged, so a microphone that stays gone (an
+    /// unplugged headset, a closed lid) logs once, not on every retry.
+    retry_warning: Option<String>,
 }
 
 pub enum RecoveringAudioInputEvent {
@@ -587,6 +590,7 @@ impl RecoveringAudioInput {
             next_routing_probe: Instant::now() + ROUTING_PROBE_INTERVAL,
             first_delivery: None,
             proven: false,
+            retry_warning: None,
         }
     }
 
@@ -596,6 +600,7 @@ impl RecoveringAudioInput {
         self.input = Some(input);
         self.first_delivery = None;
         self.proven = false;
+        self.retry_warning = None;
     }
 
     fn note_delivery(&mut self, now: Instant) {
@@ -658,6 +663,7 @@ impl RecoveringAudioInput {
 
     pub fn close(&mut self) {
         self.input = None;
+        self.retry_warning = None;
         self.replacement = None;
         self.routing_probe = None;
         self.next_routing_probe = Instant::now() + ROUTING_PROBE_INTERVAL;
@@ -832,10 +838,10 @@ impl RecoveringAudioInput {
                     return Some(RecoveringAudioInputEvent::OpenFailed(error));
                 }
                 self.recovery.failed(now);
-                tracing::warn!(
-                    %error,
-                    "could not reopen dictation microphone; retrying"
-                );
+                if self.retry_warning.as_ref() != Some(&error) {
+                    tracing::warn!(%error, "could not reopen dictation microphone; retrying");
+                    self.retry_warning = Some(error);
+                }
             }
         }
         None
@@ -1015,6 +1021,32 @@ fn open_configured_input(
     Ok(input)
 }
 
+/// A warning about one subject, written once until the subject changes or
+/// the condition clears.
+struct RepeatedWarning(std::sync::Mutex<Option<String>>);
+
+impl RepeatedWarning {
+    const fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+
+    /// Whether `subject` was not the last one warned about; it is from now.
+    fn is_new(&self, subject: &str) -> bool {
+        let mut last = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if last.as_deref() == Some(subject) {
+            return false;
+        }
+        *last = Some(subject.to_owned());
+        true
+    }
+
+    fn clear(&self) {
+        *self.0.lock().unwrap_or_else(|error| error.into_inner()) = None;
+    }
+}
+
+static UNAVAILABLE_SELECTION_WARNING: RepeatedWarning = RepeatedWarning::new();
+
 fn open_with_selection<T>(
     device_override: Option<&str>,
     selected_device: Option<&str>,
@@ -1026,13 +1058,21 @@ fn open_with_selection<T>(
         return named(device).map(|input| (input, None));
     }
     if let Some(device) = selected_device {
-        return named(device).map(|input| (input, None)).or_else(|error| {
-            if !fallback_from_selected {
-                return Err(error);
+        return match named(device) {
+            Ok(input) => {
+                UNAVAILABLE_SELECTION_WARNING.clear();
+                Ok((input, None))
             }
-            tracing::warn!(%error, device, "selected microphone is unavailable; using automatic selection");
-            automatic().map(|input| (input, Some(device.to_owned())))
-        });
+            Err(error) if !fallback_from_selected => Err(error),
+            Err(error) => {
+                // Opens and the periodic routing probe both land here while
+                // the saved microphone stays gone; say so once.
+                if UNAVAILABLE_SELECTION_WARNING.is_new(device) {
+                    tracing::warn!(%error, device, "selected microphone is unavailable; using automatic selection");
+                }
+                automatic().map(|input| (input, Some(device.to_owned())))
+            }
+        };
     }
     automatic().map(|input| (input, None))
 }
@@ -2060,6 +2100,41 @@ mod tests {
         let mut idle = MicrophoneRecovery::default();
         idle.retry_now(now);
         assert!(idle.next_attempt.is_none());
+    }
+
+    #[test]
+    fn a_warning_about_the_same_subject_is_written_once() {
+        let warning = RepeatedWarning::new();
+        assert!(warning.is_new("USB microphone"));
+        assert!(!warning.is_new("USB microphone"));
+        assert!(warning.is_new("Headset"));
+        warning.clear();
+        assert!(warning.is_new("Headset"));
+    }
+
+    #[test]
+    fn a_microphone_that_stays_gone_is_logged_once() {
+        let mut input = stall_test_input();
+        input.request_recovery();
+        let fail = |input: &mut RecoveringAudioInput, error: &str| {
+            let (sender, receiver) = mpsc::channel();
+            input.replacement = Some(receiver);
+            sender.send((0, Err(error.to_owned()))).unwrap();
+            assert!(matches!(
+                input.recv_timeout(Duration::ZERO, true),
+                RecoveringAudioInputEvent::Timeout
+            ));
+        };
+        fail(&mut input, "microphone is unavailable");
+        assert_eq!(
+            input.retry_warning.as_deref(),
+            Some("microphone is unavailable")
+        );
+        fail(&mut input, "microphone is unavailable");
+        fail(&mut input, "microphone is busy");
+        assert_eq!(input.retry_warning.as_deref(), Some("microphone is busy"));
+        reopen_with(&mut input, AudioInput::channel_for_test().0);
+        assert!(input.retry_warning.is_none());
     }
 
     #[test]
