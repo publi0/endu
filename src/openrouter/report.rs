@@ -6,6 +6,8 @@ use crate::i18n::t;
 
 /// Longest model label stored; model ids are short, this bounds bad config.
 const MAX_MODEL_CHARS: usize = 120;
+/// Longest per-request safe error summary stored in History/Recovery.
+const MAX_ERROR_CHARS: usize = 240;
 const MAX_FAILED_MODELS: usize = 8;
 const MAX_EXECUTIONS: usize = 64;
 
@@ -36,6 +38,10 @@ pub struct ExecutionReport {
     pub streaming: bool,
     pub keyword_count: usize,
     pub outcome: String,
+    /// Safe, bounded summary of why a failed request did not succeed.
+    /// Never stores provider payloads, URLs, headers or credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// Actual USD cost returned by this request, never inferred from a rate card.
     #[serde(
         default,
@@ -71,6 +77,15 @@ impl StepReport {
             execution.provider = bound(&execution.provider);
             execution.model = bound(&execution.model);
             execution.outcome = execution.outcome.chars().take(80).collect();
+            execution.error = execution.error.take().and_then(|error| {
+                let clean: String = error
+                    .chars()
+                    .filter(|ch| !ch.is_control())
+                    .take(MAX_ERROR_CHARS)
+                    .collect();
+                let trimmed = clean.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_owned())
+            });
             execution.keyword_count = execution.keyword_count.min(2000);
             execution.cost_usd = valid_cost(execution.cost_usd);
             execution.estimated_cost_usd = valid_cost(execution.estimated_cost_usd);
@@ -189,6 +204,7 @@ impl StepReport {
                         streaming: None,
                         keyword_count: None,
                         succeeded: request.succeeded,
+                        error: None,
                         step: AttemptStep::First,
                         cost: None,
                     }
@@ -203,6 +219,7 @@ impl StepReport {
                     streaming: Some(execution.streaming),
                     keyword_count: Some(execution.keyword_count),
                     succeeded: execution.outcome == "success",
+                    error: execution.error.clone(),
                     step: AttemptStep::First,
                     cost: show_cost.then(|| {
                         valid_cost(execution.cost_usd).map_or_else(
@@ -299,6 +316,98 @@ impl StepReport {
             (seconds(audio.sent_ms), trimmed)
         })
     }
+
+    /// Short model name(s) for a History list row. Uses the answering model
+    /// when available, otherwise the attempted models.
+    pub fn row_model_label(&self) -> Option<String> {
+        if let Some(model) = self.model.as_deref() {
+            let labels = short_model_labels(model.split(',').map(str::trim));
+            if !labels.is_empty() {
+                return Some(labels.join(", "));
+            }
+        }
+        if !self.failed.is_empty() {
+            let labels = short_model_labels(self.failed.iter().map(String::as_str));
+            if !labels.is_empty() {
+                return Some(labels.join(", "));
+            }
+        }
+        let labels = short_model_labels(self.executions.iter().map(|e| e.model.as_str()));
+        (!labels.is_empty()).then(|| labels.join(", "))
+    }
+
+    /// Human-readable model name(s) for a History detail view, matching the
+    /// names shown in [`Self::attempts`].
+    pub fn detail_model_label(&self) -> Option<String> {
+        let mut names = Vec::new();
+        if let Some(model) = self.model.as_deref() {
+            for part in model.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                let parsed = crate::providers::ModelRef::parse(part);
+                push_unique(&mut names, model_name(parsed.provider.id(), parsed.model));
+            }
+        }
+        if names.is_empty() {
+            for part in &self.failed {
+                let part = part.trim();
+                if !part.is_empty() {
+                    let parsed = crate::providers::ModelRef::parse(part);
+                    push_unique(&mut names, model_name(parsed.provider.id(), parsed.model));
+                }
+            }
+        }
+        if names.is_empty() {
+            for execution in &self.executions {
+                push_unique(
+                    &mut names,
+                    model_name(&execution.provider, &execution.model),
+                );
+            }
+        }
+        (!names.is_empty()).then(|| names.join(", "))
+    }
+
+    /// Whether at least one failed request in this report carries its own
+    /// per-request error reason.
+    pub fn has_failed_attempt_reasons(&self) -> bool {
+        self.executions
+            .iter()
+            .any(|execution| execution.outcome != "success" && execution.error.is_some())
+    }
+
+    /// Whether any model or provider recorded in this report matches `needle`
+    /// (already lowercased).
+    pub fn matches_model(&self, needle: &str) -> bool {
+        let contains = |value: &str| value.to_lowercase().contains(needle);
+        self.model.as_deref().is_some_and(contains)
+            || self.failed.iter().any(|model| contains(model))
+            || self
+                .executions
+                .iter()
+                .any(|execution| contains(&execution.model) || contains(&execution.provider))
+            || self.detail_model_label().as_deref().is_some_and(contains)
+    }
+}
+
+fn push_unique(names: &mut Vec<String>, name: String) {
+    if !name.is_empty() && !names.iter().any(|existing| existing == &name) {
+        names.push(name);
+    }
+}
+
+fn short_model_labels<'a>(models: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut labels = Vec::new();
+    for raw in models {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let parsed = crate::providers::ModelRef::parse(raw).model;
+        let short = parsed.rsplit('/').next().unwrap_or(parsed).trim();
+        if !short.is_empty() && !labels.iter().any(|existing| existing == short) {
+            labels.push(short.to_owned());
+        }
+    }
+    labels
 }
 
 #[derive(Clone, Copy)]
@@ -349,6 +458,8 @@ pub struct AttemptView {
     pub streaming: Option<bool>,
     pub keyword_count: Option<usize>,
     pub succeeded: bool,
+    /// Safe summary of why this request failed, when known.
+    pub error: Option<String>,
     pub step: AttemptStep,
     /// Shown per request only when the dictation made several.
     pub cost: Option<String>,
@@ -474,6 +585,7 @@ mod tests {
                     streaming: true,
                     keyword_count: 2,
                     outcome: "failed".into(),
+                    error: None,
                     cost_usd: None,
                     estimated_cost_usd: None,
                 },
@@ -483,6 +595,7 @@ mod tests {
                     streaming: false,
                     keyword_count: 2,
                     outcome: "success".into(),
+                    error: None,
                     cost_usd: Some(0.000_123),
                     estimated_cost_usd: None,
                 },
@@ -827,5 +940,77 @@ mod tests {
         let json = serde_json::to_string(&zero).unwrap();
         assert!(json.contains("\"cost_usd\":0.0"));
         assert_eq!(serde_json::from_str::<StepReport>(&json).unwrap(), zero);
+    }
+
+    #[test]
+    fn model_labels_cover_succeeded_and_failed_reports() {
+        let native = StepReport {
+            model: Some("deepgram::nova-3".into()),
+            ..StepReport::default()
+        };
+        assert_eq!(native.row_model_label().as_deref(), Some("nova-3"));
+        assert_eq!(native.detail_model_label().as_deref(), Some("Nova-3"));
+        assert!(native.matches_model("nova-3"));
+        assert!(native.matches_model("deepgram"));
+
+        let failed_only = StepReport {
+            failed: vec![
+                "google::gemini-3.5-transcribe-live".into(),
+                "openai/whisper-large-v3-turbo".into(),
+                "google::gemini-3.5-transcribe-live".into(),
+            ],
+            ..StepReport::default()
+        };
+        assert_eq!(
+            failed_only.row_model_label().as_deref(),
+            Some("gemini-3.5-transcribe-live, whisper-large-v3-turbo")
+        );
+        assert_eq!(
+            failed_only.detail_model_label().as_deref(),
+            Some("Gemini 3.5 Transcribe Live, openai/whisper-large-v3-turbo")
+        );
+        assert!(failed_only.matches_model("gemini 3.5 transcribe live"));
+        assert!(failed_only.matches_model("whisper-large-v3-turbo"));
+        assert!(!failed_only.matches_model("deepgram"));
+
+        assert_eq!(StepReport::default().row_model_label(), None);
+        assert_eq!(StepReport::default().detail_model_label(), None);
+    }
+
+    #[test]
+    fn per_request_failure_reasons_roundtrip_bound_and_expose_on_attempts() {
+        let noisy = format!("  HTTP 429\n\t{}  ", "x".repeat(400));
+        let report = StepReport {
+            executions: vec![
+                ExecutionReport {
+                    provider: "google".into(),
+                    model: "gemini-3.5-transcribe-live".into(),
+                    streaming: true,
+                    outcome: "failed".into(),
+                    error: Some(noisy),
+                    ..Default::default()
+                },
+                ExecutionReport {
+                    provider: "openrouter".into(),
+                    model: "openai/whisper-large-v3-turbo".into(),
+                    streaming: false,
+                    outcome: "success".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+        .bounded();
+        assert!(report.has_failed_attempt_reasons());
+        let attempts = report.attempts();
+        let error = attempts[0].error.as_deref().unwrap();
+        assert!(error.starts_with("HTTP 429"));
+        assert!(!error.chars().any(char::is_control));
+        assert!(error.chars().count() <= MAX_ERROR_CHARS);
+        assert_eq!(attempts[1].error, None);
+
+        let restored: StepReport =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        assert_eq!(restored, report);
     }
 }

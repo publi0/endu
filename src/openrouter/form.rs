@@ -223,11 +223,11 @@ mod tests {
             ..with_models(&["a/one", "b/two"])
         };
         let mut form = AdvancedForm::from_config(&base);
-        form.attempt_timeout_seconds = " 12 ".into();
+        form.attempt_timeout_seconds = " 18 ".into();
         form.temperature = "0,2".into();
         form.base_url = "https://proxy.test/api/v1/".into();
         let config = form.apply(&base).unwrap();
-        assert_eq!(config.transcription.attempt_timeout_seconds, 12);
+        assert_eq!(config.transcription.attempt_timeout_seconds, 18);
         assert_eq!(config.transcription.temperature, Some(0.2));
         assert_eq!(config.base_url, "https://proxy.test/api/v1");
         assert_eq!(config.api_key.as_deref(), Some("sk-from-file"));
@@ -241,12 +241,12 @@ mod tests {
         let mut latest = Config::default();
         let original = AdvancedForm::from_config(&latest);
         let mut edited = original.clone();
-        edited.attempt_timeout_seconds = "12".into();
+        edited.attempt_timeout_seconds = "18".into();
         latest.base_url = "https://proxy.test/v1".into();
         latest.transcription.temperature = None;
         latest.transcription.language = "pt".into();
         let saved = edited.apply_changes(&original, &latest).unwrap();
-        latest.transcription.attempt_timeout_seconds = 12;
+        latest.transcription.attempt_timeout_seconds = 18;
         assert_eq!(saved, latest);
     }
 

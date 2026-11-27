@@ -56,7 +56,7 @@ pub enum RecoveryStatus {
     Resolved,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RecoveryEntry {
     version: u32,
     pub id: String,
@@ -67,6 +67,8 @@ pub struct RecoveryEntry {
     pub status: RecoveryStatus,
     pub message: Option<String>,
     pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcription: Option<crate::openrouter::StepReport>,
     #[serde(skip)]
     pub busy: bool,
     #[serde(skip)]
@@ -79,6 +81,18 @@ impl RecoveryEntry {
             .as_deref()
             .filter(|name| !name.trim().is_empty())
             .unwrap_or(t("Unknown app"))
+    }
+
+    pub fn row_model_label(&self) -> Option<String> {
+        self.transcription
+            .as_ref()
+            .and_then(crate::openrouter::StepReport::row_model_label)
+    }
+
+    pub fn detail_model_label(&self) -> Option<String> {
+        self.transcription
+            .as_ref()
+            .and_then(crate::openrouter::StepReport::detail_model_label)
     }
 
     pub fn title(&self) -> &'static str {
@@ -123,7 +137,7 @@ impl gpui::Global for RecordingRecovery {}
 /// output worker, keeping recovery `fsync` barriers off the paste critical path.
 pub struct PendingResolution {
     store: RecordingRecovery,
-    entry: Option<RecoveryEntry>,
+    entry: Option<Box<RecoveryEntry>>,
     _active: ActiveAttempt,
 }
 
@@ -136,15 +150,24 @@ impl PendingResolution {
     /// when output could not be dispatched. If `text` is already available,
     /// saves it as `Recovered` before removing audio; otherwise keeps the WAV
     /// intact for later retry.
-    pub fn preserve_for_shutdown(mut self, text: Option<String>) {
-        let Some(entry) = self.entry.take() else {
+    pub fn preserve_for_shutdown(
+        mut self,
+        text: Option<String>,
+        report: Option<crate::openrouter::StepReport>,
+    ) {
+        let Some(mut entry) = self.entry.take().map(|entry| *entry) else {
             return;
         };
         if let Some(text) = text.filter(|value| !value.trim().is_empty())
             && !entry.volatile
-            && self.store.keep_recovered(entry.clone(), text)
+            && self
+                .store
+                .keep_recovered(entry.clone(), text, report.clone())
         {
             return;
+        }
+        if let Some(report) = report {
+            entry.transcription = Some(report.bounded());
         }
         self.store.finish_failure(
             entry,
@@ -156,26 +179,36 @@ impl PendingResolution {
     /// user from the HUD, keeping its audio ready for a manual Retry.
     pub fn preserve_stopped(mut self) {
         if let Some(entry) = self.entry.take() {
-            self.store.finish_stopped(entry);
+            self.store.finish_stopped(*entry);
         }
     }
 
     /// Keeps a successful transcript that was not pasted (copied, deferred or
     /// failed to paste) as a `Recovered` entry, so it stays in History until
     /// deleted, expired, or pasted with Paste Last. Empty text resolves.
-    pub fn keep_unpasted(mut self, text: &str) -> Option<RecoveredText> {
-        let entry = self.entry.take()?;
+    pub fn keep_unpasted(
+        mut self,
+        text: &str,
+        report: Option<crate::openrouter::StepReport>,
+    ) -> Option<RecoveredText> {
+        let mut entry = *self.entry.take()?;
         let text = text.trim();
         if text.is_empty() {
             self.store.resolve_entry(entry);
             return None;
         }
         let id = entry.id.clone();
-        if self.store.keep_recovered(entry.clone(), text.to_owned()) {
+        if self
+            .store
+            .keep_recovered(entry.clone(), text.to_owned(), report.clone())
+        {
             return Some(RecoveredText {
                 store: self.store.clone(),
                 id,
             });
+        }
+        if let Some(report) = report {
+            entry.transcription = Some(report.bounded());
         }
         self.store.finish_failure(
             entry,
@@ -186,7 +219,7 @@ impl PendingResolution {
 
     fn run(&mut self) {
         if let Some(entry) = self.entry.take() {
-            self.store.resolve_entry(entry);
+            self.store.resolve_entry(*entry);
         }
     }
 }
@@ -425,6 +458,7 @@ impl RecordingRecovery {
                                 .into(),
                         ),
                         text: None,
+                        transcription: None,
                         busy: false,
                         volatile: false,
                     },
@@ -546,6 +580,10 @@ impl RecordingRecovery {
                         .unwrap_or("")
                         .to_lowercase()
                         .contains(&needle)
+                    || entry
+                        .transcription
+                        .as_ref()
+                        .is_some_and(|report| report.matches_model(&needle))
             })
             .cloned()
             .map(|mut entry| {
@@ -637,6 +675,7 @@ impl RecordingRecovery {
             status: RecoveryStatus::Pending,
             message: None,
             text: None,
+            transcription: None,
             busy: false,
             volatile: false,
         };
@@ -710,10 +749,18 @@ impl RecordingRecovery {
     /// entries whose metadata cannot be written stay recovered in memory.
     /// Returns false, with nothing changed, when saved audio would lose its
     /// only durable companion.
-    fn keep_recovered(&self, mut entry: RecoveryEntry, text: String) -> bool {
+    fn keep_recovered(
+        &self,
+        mut entry: RecoveryEntry,
+        text: String,
+        report: Option<crate::openrouter::StepReport>,
+    ) -> bool {
         entry.status = RecoveryStatus::Recovered;
         entry.message = None;
         entry.text = Some(text);
+        entry.transcription = report
+            .map(crate::openrouter::StepReport::bounded)
+            .or(entry.transcription);
         if self.save_metadata(&entry).is_ok() {
             if !entry.volatile {
                 let _ =
@@ -818,17 +865,19 @@ impl RecordingRecovery {
         cancel_state: impl Fn() -> RecoveryCancel,
         transcribe: impl FnOnce(&[f32]) -> color_eyre::Result<Transcription>,
     ) -> (color_eyre::Result<Transcription>, Option<PendingResolution>) {
-        let entry = self.begin(samples, application);
+        let mut entry = self.begin(samples, application);
         let active = ActiveAttempt {
             store: self.clone(),
             id: entry.id.clone(),
             retry: false,
         };
+        let mut unusable_report = None;
         let result = transcribe(samples).and_then(|mut transcription| {
             // An empty local silence result is intentional. A remote result or
             // text removed by formatting must remain available for recovery.
             if transcription.text.trim().is_empty() {
                 if transcription.report.is_some() {
+                    unusable_report = transcription.report;
                     return Err(UnusableTranscript::EmptyResponse.into());
                 }
             } else {
@@ -837,6 +886,7 @@ impl RecordingRecovery {
                     .trim()
                     .to_owned();
                 if transcription.text.is_empty() {
+                    unusable_report = transcription.report;
                     return Err(UnusableTranscript::EmptyAfterFormatting.into());
                 }
             }
@@ -864,7 +914,7 @@ impl RecordingRecovery {
                         result,
                         Some(PendingResolution {
                             store: self.clone(),
-                            entry: Some(entry),
+                            entry: Some(Box::new(entry)),
                             _active: active,
                         }),
                     )
@@ -877,6 +927,9 @@ impl RecordingRecovery {
                 (result, None)
             }
             Err(error) => {
+                entry.transcription = unusable_report
+                    .map(crate::openrouter::StepReport::bounded)
+                    .or_else(|| failure_report(error));
                 self.finish_failure(entry, &transcription_failure_reason(error));
                 drop(active);
                 (result, None)
@@ -1093,13 +1146,20 @@ impl RecordingRecovery {
             Ok(transcription) if !transcription.text.trim().is_empty() => {
                 let formatted = preferences.process(transcription.text.trim());
                 let text = vocabulary.restore(formatted.trim()).text;
+                let report = transcription
+                    .report
+                    .map(crate::openrouter::StepReport::bounded);
                 if text.is_empty() {
+                    if report.is_some() {
+                        entry.transcription = report;
+                    }
                     self.finish_failure(entry, t("Post-processing removed all text. Change its settings before Retry; the saved audio was kept."));
                     return;
                 }
                 entry.status = RecoveryStatus::Recovered;
                 entry.text = Some(text);
                 entry.message = None;
+                entry.transcription = report;
                 // Commit recovered text before deleting audio, even with History
                 // disabled. It remains available here until explicitly deleted.
                 if self.save_metadata(&entry).is_err() {
@@ -1117,11 +1177,21 @@ impl RecordingRecovery {
                 state.entries.insert(entry.id.clone(), entry);
                 state.revision += 1;
             }
-            Ok(_) => self.finish_failure(
-                entry,
-                t("The transcription returned no text. The saved audio has been kept."),
-            ),
-            Err(error) => self.finish_failure(entry, &transcription_failure_reason(&error)),
+            Ok(transcription) => {
+                if let Some(report) = transcription.report {
+                    entry.transcription = Some(report.bounded());
+                }
+                self.finish_failure(
+                    entry,
+                    t("The transcription returned no text. The saved audio has been kept."),
+                );
+            }
+            Err(error) => {
+                if let Some(report) = failure_report(&error) {
+                    entry.transcription = Some(report);
+                }
+                self.finish_failure(entry, &transcription_failure_reason(&error));
+            }
         }
     }
 
@@ -1146,6 +1216,87 @@ impl RecordingRecovery {
     }
 }
 
+/// Bounded report of the models attempted before a chain failure. Never
+/// persists provider payloads, URLs, credentials or raw error strings.
+fn failure_report(error: &color_eyre::Report) -> Option<crate::openrouter::StepReport> {
+    let chain = error.downcast_ref::<crate::openrouter::transcribe::ChainFailure>()?;
+    let mut failed = Vec::new();
+    for failure in &chain.failures {
+        let model = failure.model.trim();
+        if !model.is_empty() && !failed.iter().any(|existing| existing == model) {
+            failed.push(model.to_owned());
+        }
+    }
+    let executions = if !chain.executions.is_empty() {
+        chain.executions.clone()
+    } else {
+        chain
+            .failures
+            .iter()
+            .filter_map(|failure| {
+                let model = failure.model.trim();
+                if model.is_empty() {
+                    return None;
+                }
+                let parsed = crate::providers::ModelRef::parse(model);
+                let status = parse_failure_status(&failure.model, &failure.detail);
+                let reason = failure_reason_for_attempt(failure.kind, status, &failure.detail);
+                Some(crate::openrouter::report::ExecutionReport {
+                    provider: parsed.provider.id().into(),
+                    model: parsed.model.into(),
+                    streaming: false,
+                    keyword_count: 0,
+                    outcome: "failed".into(),
+                    error: Some(reason),
+                    cost_usd: None,
+                    estimated_cost_usd: None,
+                })
+            })
+            .collect()
+    };
+    if failed.is_empty() && executions.is_empty() {
+        return None;
+    }
+    Some(
+        crate::openrouter::StepReport {
+            executions,
+            failed,
+            ..Default::default()
+        }
+        .bounded(),
+    )
+}
+
+fn parse_failure_status(model: &str, detail: &str) -> Option<u16> {
+    detail
+        .strip_prefix(&format!("{model}: HTTP "))
+        .or_else(|| detail.strip_prefix("HTTP "))
+        .and_then(|rest| rest.split(':').next())
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|value| (100..=599).contains(value))
+}
+
+/// Safe, sanitized reason for a single failed transcription attempt, shared
+/// between History request cards and Recovery failure summaries. Never echoes
+/// provider payloads, URLs, headers or credentials.
+pub(crate) fn failure_reason_for_attempt(
+    kind: crate::openrouter::stats::ErrorKind,
+    status: Option<u16>,
+    detail: &str,
+) -> String {
+    let lower = detail.to_lowercase();
+    if lower.contains("vocabulary parameter rejected") {
+        return t("Vocabulary hints were rejected by the provider; retried without hints.").into();
+    }
+    if lower.contains("compressed audio rejected") {
+        return t("Compressed audio was rejected by the provider; retried with WAV.").into();
+    }
+    if lower.contains("empty live transcription response") {
+        return t("Live transcription returned no text; retried with the recorded audio.").into();
+    }
+    attempt_reason(kind, status, detail)
+}
+
 /// Describe typed failures without persisting provider bodies, URLs, headers,
 /// credentials, or arbitrary strings from the transport. Only known categories
 /// and validated numeric status/timeout values reach the recovery metadata.
@@ -1158,13 +1309,8 @@ fn transcription_failure_reason(error: &color_eyre::Report) -> String {
         }
         let mut reasons = Vec::new();
         for failure in &chain.failures {
-            let status = failure
-                .detail
-                .strip_prefix(&format!("{}: HTTP ", failure.model))
-                .and_then(|rest| rest.split(':').next())
-                .and_then(|value| value.parse::<u16>().ok())
-                .filter(|value| (100..=599).contains(value));
-            let reason = attempt_reason(failure.kind, status, &failure.detail);
+            let status = parse_failure_status(&failure.model, &failure.detail);
+            let reason = failure_reason_for_attempt(failure.kind, status, &failure.detail);
             if !reasons.contains(&reason) && reasons.len() < 8 {
                 reasons.push(reason);
             }
@@ -1814,6 +1960,7 @@ mod tests {
                 kind,
                 detail: format!("test/model: {detail}"),
             }],
+            executions: Vec::new(),
         }
         .into()
     }
@@ -2184,5 +2331,138 @@ mod tests {
             1
         );
         assert!(reopened.entries("").is_empty());
+    }
+
+    #[test]
+    fn recovery_persists_model_report_across_failure_retry_and_shutdown_and_formats_list_error() {
+        use crate::openrouter::report::{ExecutionReport, StepReport};
+        use crate::openrouter::stats::{ErrorKind, Failure};
+        use crate::openrouter::transcribe::ChainFailure;
+
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        assert!(
+            store
+                .transcribe_original(
+                    &[0.1; 160],
+                    Some("T3 Code"),
+                    crate::post_processing::Preferences::default(),
+                    |_| {
+                        Err(ChainFailure {
+                            failures: vec![
+                                Failure {
+                                    model: "google::gemini-3.5-transcribe-live".into(),
+                                    kind: ErrorKind::Auth,
+                                    detail: "google::gemini-3.5-transcribe-live: HTTP 401: SECRET_PAYLOAD"
+                                        .into(),
+                                },
+                                Failure {
+                                    model: "openai/whisper-large-v3-turbo".into(),
+                                    kind: ErrorKind::Timeout,
+                                    detail: "openai/whisper-large-v3-turbo: Operation timed out after 30000 milliseconds".into(),
+                                },
+                            ],
+                            executions: vec![ExecutionReport {
+                                provider: "google".into(),
+                                model: "gemini-3.5-transcribe-live".into(),
+                                streaming: true,
+                                keyword_count: 2,
+                                outcome: "failed".into(),
+                                error: Some(
+                                    "The API rejected the key or its access permissions (HTTP 401). Check the key in Models."
+                                        .into(),
+                                ),
+                                cost_usd: None,
+                                estimated_cost_usd: None,
+                            }],
+                        }
+                        .into())
+                    }
+                )
+                .is_err()
+        );
+
+        let reloaded = fixture.store();
+        let entry = reloaded.entries("").remove(0);
+        assert_eq!(entry.status, RecoveryStatus::Failed);
+        assert_eq!(
+            entry.row_model_label().as_deref(),
+            Some("gemini-3.5-transcribe-live, whisper-large-v3-turbo")
+        );
+        assert_eq!(
+            entry.detail_model_label().as_deref(),
+            Some("Gemini 3.5 Transcribe Live, openai/whisper-large-v3-turbo")
+        );
+        assert_eq!(reloaded.entries("gemini").len(), 1);
+        assert_eq!(reloaded.entries("whisper-large-v3-turbo").len(), 1);
+        let attempts = entry.transcription.as_ref().unwrap().attempts();
+        assert!(attempts[0].error.as_deref().unwrap().contains("HTTP 401"));
+
+        let metadata = fs::read_to_string(fixture.0.join(format!("{}.json", entry.id))).unwrap();
+        assert!(!metadata.contains("SECRET_PAYLOAD"));
+
+        store
+            .retry_with(&entry.id, |_| {
+                Ok(Transcription {
+                    text: "Recovered with Deepgram".into(),
+                    report: Some(StepReport {
+                        model: Some("deepgram::nova-3".into()),
+                        executions: vec![ExecutionReport {
+                            provider: "deepgram".into(),
+                            model: "nova-3".into(),
+                            streaming: false,
+                            keyword_count: 0,
+                            outcome: "success".into(),
+                            error: None,
+                            cost_usd: None,
+                            estimated_cost_usd: Some(0.0002),
+                        }],
+                        ..StepReport::default()
+                    }),
+                })
+            })
+            .unwrap();
+        wait(&store);
+
+        let recovered = fixture.store().entries("").remove(0);
+        assert_eq!(recovered.status, RecoveryStatus::Recovered);
+        assert_eq!(recovered.row_model_label().as_deref(), Some("nova-3"));
+        assert_eq!(recovered.detail_model_label().as_deref(), Some("Nova-3"));
+        assert_eq!(fixture.store().entries("nova-3").len(), 1);
+
+        // Shutdown preservation keeps the model report on disk too.
+        let (_, pending) = store.transcribe_original_cancellable(
+            &[0.1; 160],
+            Some("Notes"),
+            crate::post_processing::Preferences::default(),
+            None,
+            |_| {
+                Ok(Transcription {
+                    text: "Saved at quit".into(),
+                    report: Some(StepReport {
+                        model: Some("openai::gpt-4o-transcribe".into()),
+                        ..StepReport::default()
+                    }),
+                })
+            },
+        );
+        pending.unwrap().preserve_for_shutdown(
+            Some("Saved at quit".into()),
+            Some(StepReport {
+                model: Some("openai::gpt-4o-transcribe".into()),
+                ..StepReport::default()
+            }),
+        );
+        let at_quit = fixture
+            .store()
+            .entries("gpt-4o-transcribe")
+            .into_iter()
+            .next()
+            .expect("shutdown entry should be searchable by model");
+        assert_eq!(at_quit.status, RecoveryStatus::Recovered);
+        assert_eq!(
+            at_quit.row_model_label().as_deref(),
+            Some("gpt-4o-transcribe")
+        );
     }
 }

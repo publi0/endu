@@ -2,6 +2,34 @@
 
 use super::*;
 use crate::i18n::t;
+use crate::text_input::{Changed, Dismissed, Navigate, Submitted, TextInput};
+
+/// Searchable model picker state for "Retry with" in a recovery detail view.
+pub(super) struct RecoveryModelPicker {
+    pub search: Entity<TextInput>,
+    pub highlight: usize,
+    pub scroll: gpui::ScrollHandle,
+    _subscriptions: Vec<gpui::Subscription>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum RecoveryModelChoice {
+    Current,
+    Model {
+        id: String,
+        name: String,
+        provider: String,
+    },
+}
+
+impl RecoveryModelChoice {
+    pub(super) fn model_id(&self) -> Option<&str> {
+        match self {
+            Self::Current => None,
+            Self::Model { id, .. } => Some(id.as_str()),
+        }
+    }
+}
 
 /// One History row: a recording to recover or a pasted dictation.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -46,7 +74,7 @@ impl AppWindow {
 
     pub(super) fn show_history_item(&mut self, item: HistoryItem, cx: &mut Context<Self>) {
         self.stop_recovery_playback();
-        self.recovery_model_picker_open = false;
+        self.recovery_model_picker = None;
         (self.selected_recovery, self.selected_history) = match item {
             HistoryItem::Recovery(id) => (Some(id), None),
             HistoryItem::Dictation(id) => (None, Some(id)),
@@ -109,65 +137,269 @@ impl AppWindow {
     }
 
     /// Batch-capable models from currently connected providers, prefixed by
-    /// `None` ("Current models"). Uses cached key availability only.
-    pub(super) fn recovery_retry_model_choices(&self, cx: &App) -> Vec<Option<String>> {
+    /// `Current` ("Current models") and filtered by `query`. Uses cached key
+    /// availability only.
+    pub(super) fn recovery_retry_model_choices(
+        &self,
+        query: &str,
+        cx: &App,
+    ) -> Vec<RecoveryModelChoice> {
         let settings = self.openrouter_settings.read(cx);
         let available = settings.available_providers_snapshot();
         let catalog = crate::openrouter::catalog::available_catalog(settings.catalog_models());
-        let mut choices: Vec<Option<String>> = vec![None];
+        let needle = query.trim().to_lowercase();
+        let mut choices = Vec::new();
+        if needle.is_empty()
+            || t("Current models").to_lowercase().contains(&needle)
+            || "current models".contains(&needle)
+            || "default".contains(&needle)
+        {
+            choices.push(RecoveryModelChoice::Current);
+        }
         for model in catalog {
             let parsed = crate::providers::ModelRef::parse(&model.id);
-            if available.contains(&parsed.provider)
-                && !crate::providers::is_realtime_only(&model.id)
+            if !available.contains(&parsed.provider)
+                || crate::providers::is_realtime_only(&model.id)
             {
-                choices.push(Some(model.id));
+                continue;
+            }
+            let provider = if model.provider.is_empty() {
+                parsed.provider.label().to_owned()
+            } else {
+                model.provider.clone()
+            };
+            if needle.is_empty()
+                || model.name.to_lowercase().contains(&needle)
+                || model.id.to_lowercase().contains(&needle)
+                || provider.to_lowercase().contains(&needle)
+                || parsed.provider.id().contains(&needle)
+            {
+                choices.push(RecoveryModelChoice::Model {
+                    id: model.id,
+                    name: model.name,
+                    provider,
+                });
             }
         }
         choices
     }
 
-    fn toggle_recovery_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.recovery_model_picker_open {
-            self.recovery_model_picker_open = false;
-            self.recovery_model_picker.trigger.focus(window);
-        } else {
-            let choices = self.recovery_retry_model_choices(cx);
-            self.recovery_model_picker.highlight = choices
-                .iter()
-                .position(|choice| choice == &self.recovery_retry_model)
-                .unwrap_or(0);
-            self.recovery_model_picker
-                .scroll
-                .scroll_to_item(self.recovery_model_picker.highlight);
-            self.recovery_model_picker_open = true;
-            self.recovery_model_picker.menu.focus(window);
-        }
+    fn open_recovery_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let search = cx.new(|cx| {
+            TextInput::picker(cx, "", "")
+                .localized_placeholder(|| t("Search name, provider or feature"))
+        });
+        let subscriptions = vec![
+            cx.subscribe(&search, |this, _, _: &Changed, cx| {
+                if let Some(picker) = &mut this.recovery_model_picker {
+                    picker.highlight = 0;
+                    picker.scroll.scroll_to_item(0);
+                }
+                cx.notify();
+            }),
+            cx.subscribe(&search, |this, _, Navigate(direction): &Navigate, cx| {
+                let query = this
+                    .recovery_model_picker
+                    .as_ref()
+                    .map(|picker| picker.search.read(cx).text().to_owned())
+                    .unwrap_or_default();
+                let count = this.recovery_retry_model_choices(&query, cx).len();
+                if let Some(picker) = &mut this.recovery_model_picker
+                    && count > 0
+                {
+                    picker.highlight = if *direction < 0 {
+                        picker.highlight.saturating_sub(1)
+                    } else {
+                        (picker.highlight + 1).min(count - 1)
+                    };
+                    picker.scroll.scroll_to_item(picker.highlight);
+                }
+                cx.notify();
+            }),
+            cx.subscribe_in(&search, window, |this, _, _: &Submitted, window, cx| {
+                let query = this
+                    .recovery_model_picker
+                    .as_ref()
+                    .map(|picker| picker.search.read(cx).text().to_owned())
+                    .unwrap_or_default();
+                let choices = this.recovery_retry_model_choices(&query, cx);
+                if let Some(picker) = &this.recovery_model_picker
+                    && let Some(choice) = choices.get(picker.highlight)
+                {
+                    let selected = choice.model_id().map(str::to_owned);
+                    this.select_recovery_model(selected, window, cx);
+                }
+            }),
+            cx.subscribe_in(&search, window, |this, _, _: &Dismissed, window, cx| {
+                this.close_recovery_model_picker(window, cx);
+            }),
+        ];
+        let choices = self.recovery_retry_model_choices("", cx);
+        let highlight = choices
+            .iter()
+            .position(|choice| choice.model_id() == self.recovery_retry_model.as_deref())
+            .unwrap_or(0);
+        let scroll = gpui::ScrollHandle::new();
+        scroll.scroll_to_item(highlight);
+        gpui::Focusable::focus_handle(search.read(cx), cx).focus(window);
+        self.recovery_model_picker = Some(RecoveryModelPicker {
+            search,
+            highlight,
+            scroll,
+            _subscriptions: subscriptions,
+        });
         cx.notify();
     }
 
-    fn recovery_model_picker_key(
+    pub(super) fn close_recovery_model_picker(
         &mut self,
-        event: &KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let choices = self.recovery_retry_model_choices(cx);
-        let key = event.keystroke.key.as_str();
-        if self.recovery_model_picker.navigate(key, choices.len()) {
-        } else if matches!(key, "enter" | "space") {
-            if let Some(choice) = choices.get(self.recovery_model_picker.highlight).cloned() {
-                self.recovery_retry_model = choice;
-                self.recovery_model_picker_open = false;
-                self.recovery_model_picker.trigger.focus(window);
-            }
-        } else if matches!(key, "escape" | "tab") {
-            self.recovery_model_picker_open = false;
-            self.recovery_model_picker.close(event, window);
-        } else {
-            return;
+        if self.recovery_model_picker.take().is_some() {
+            self.recovery_model_trigger.focus(window);
+            cx.notify();
         }
-        cx.stop_propagation();
+    }
+
+    pub(super) fn toggle_recovery_model_picker(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.recovery_model_picker.is_some() {
+            self.close_recovery_model_picker(window, cx);
+        } else {
+            self.open_recovery_model_picker(window, cx);
+        }
+    }
+
+    pub(super) fn select_recovery_model(
+        &mut self,
+        choice: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.recovery_retry_model = choice;
+        self.recovery_model_picker = None;
+        self.recovery_model_trigger.focus(window);
         cx.notify();
+    }
+
+    fn render_recovery_model_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let picker = self.recovery_model_picker.as_ref()?;
+        let query = picker.search.read(cx).text().to_owned();
+        let choices = self.recovery_retry_model_choices(&query, cx);
+        let highlight = picker.highlight.min(choices.len().saturating_sub(1));
+        let rows = choices.into_iter().enumerate().map(|(index, choice)| {
+            let selected = choice.model_id() == self.recovery_retry_model.as_deref();
+            let highlighted = index == highlight;
+            let (title, subtitle) = match &choice {
+                RecoveryModelChoice::Current => (
+                    t("Current models").to_owned(),
+                    t("Use your current Models settings").to_owned(),
+                ),
+                RecoveryModelChoice::Model { id, name, provider } => {
+                    (name.clone(), format!("{provider} · {id}"))
+                }
+            };
+            let selected_id = choice.model_id().map(str::to_owned);
+            div()
+                .id(("recovery-model-choice", index))
+                .w_full()
+                .flex_none()
+                .px_3()
+                .py(px(7.0))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .rounded_sm()
+                .when(highlighted, |row| row.bg(rgb(SURFACE_HOVER)))
+                .hover(|row| row.bg(rgb(SURFACE_HOVER)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(rgb(if selected { TEXT } else { TEXT_SOFT }))
+                                .truncate()
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(rgb(FAINT))
+                                .truncate()
+                                .child(subtitle),
+                        ),
+                )
+                .when(selected, |row| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.0))
+                            .text_color(rgb(ACCENT))
+                            .child("✓"),
+                    )
+                })
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.select_recovery_model(selected_id.clone(), window, cx);
+                }))
+        });
+        let rows: Vec<_> = rows.collect();
+        let empty = rows.is_empty();
+        Some(
+            div()
+                .id("recovery-model-picker")
+                .w(px(320.0))
+                .max_h(px(300.0))
+                .whitespace_normal()
+                .p_2()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(LINE))
+                .bg(rgb(SURFACE))
+                .shadow_lg()
+                .occlude()
+                .on_mouse_down_out(cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
+                    this.recovery_model_picker = None;
+                    cx.notify();
+                }))
+                .child(div().flex_none().child(picker.search.clone()))
+                .child(
+                    div()
+                        .id("recovery-model-picker-list")
+                        .flex_1()
+                        .min_h_0()
+                        .max_h(px(236.0))
+                        .overflow_y_scroll()
+                        .track_scroll(&picker.scroll)
+                        .flex()
+                        .flex_col()
+                        .when(empty, |list| {
+                            list.child(
+                                div()
+                                    .px_3()
+                                    .py_3()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(MUTED))
+                                    .child(t("No models match.")),
+                            )
+                        })
+                        .children(rows),
+                )
+                .into_any_element(),
+        )
     }
 
     fn recovery_error_for(&self, id: &str) -> Option<String> {
@@ -288,7 +520,7 @@ impl AppWindow {
     /// Returns to the list, keeping its search and scroll position.
     pub(super) fn close_history_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.stop_recovery_playback();
-        self.recovery_model_picker_open = false;
+        self.recovery_model_picker = None;
         if let Some(item) = self.open_history_item() {
             self.history_last_opened = Some(item);
         }
@@ -313,7 +545,7 @@ impl AppWindow {
             return false;
         };
         if self.history_retention_open
-            || self.recovery_model_picker_open
+            || self.recovery_model_picker.is_some()
             || modifiers.control
             || modifiers.alt
             || modifiers.platform
@@ -654,21 +886,39 @@ impl AppWindow {
 
     pub(super) fn retry_recovery(&mut self, id: &str, cx: &mut Context<Self>) {
         self.stop_recovery_playback();
-        self.recovery_model_picker_open = false;
+        self.recovery_model_picker = None;
         self.history_row_delete_armed = None;
         self.history_copied = None;
         self.recovery_copy_pending = Some(id.to_owned());
         let model_override = self.recovery_retry_model.clone();
         if let Some(store) = &self.recovery {
             self.recovery_error = (if self.preview {
+                let preview_model = model_override
+                    .clone()
+                    .unwrap_or_else(|| "openai/whisper-large-v3-turbo".into());
+                let parsed = crate::providers::ModelRef::parse(&preview_model);
+                let report = crate::openrouter::StepReport {
+                    executions: vec![crate::openrouter::report::ExecutionReport {
+                        provider: parsed.provider.id().into(),
+                        model: parsed.model.into(),
+                        streaming: false,
+                        keyword_count: 0,
+                        outcome: "success".into(),
+                        error: None,
+                        cost_usd: None,
+                        estimated_cost_usd: None,
+                    }],
+                    model: Some(preview_model),
+                    ..Default::default()
+                };
                 store.retry_with_processing(
                     id,
                     self.settings.post_processing,
                     crate::vocabulary::Snapshot::new(self.settings.vocabulary.clone()),
-                    |_| {
+                    move |_| {
                         Ok(crate::openrouter::transcribe::Transcription {
                             text: "Recovered preview dictation.".into(),
-                            report: None,
+                            report: Some(report),
                         })
                     },
                 )
@@ -704,6 +954,40 @@ impl AppWindow {
                     .as_ref()
                     .filter(|_| entry.status == RecoveryStatus::Recovered)
                     .map(|text| text.replace('\n', " "));
+                let mut meta = vec![entry.application_label().to_owned()];
+                if let Some(model) = entry.row_model_label() {
+                    meta.push(model);
+                }
+                meta.push(tf!(
+                    "{duration} audio",
+                    duration = crate::openrouter::report::seconds(entry.audio_ms)
+                ));
+                let meta = meta.join(" · ");
+                let primary_line = if let Some(text) = recovered_text {
+                    fade_in_if(
+                        just_recovered,
+                        ("recovered-text", index),
+                        0.0,
+                        div()
+                            .w_full()
+                            .text_size(px(12.0))
+                            .line_height(px(18.0))
+                            .truncate()
+                            .text_color(rgb(WARNING))
+                            // A recovered row reads like any dictation:
+                            // its text in warm amber, with full details inside.
+                            .child(text),
+                    )
+                } else {
+                    div()
+                        .w_full()
+                        .text_size(px(12.0))
+                        .line_height(px(18.0))
+                        .truncate()
+                        .text_color(rgb(if entry.busy { TEXT_SOFT } else { NEGATIVE }))
+                        .child(entry.title())
+                        .into_any_element()
+                };
                 let row = div()
                     .id(("recovery-entry", index))
                     .w_full()
@@ -726,39 +1010,14 @@ impl AppWindow {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(fade_in_if(
-                                just_recovered,
-                                ("recovered-text", index),
-                                0.0,
-                                div()
-                                    .text_size(px(12.0))
-                                    .line_height(px(18.0))
-                                    .truncate()
-                                    .text_color(rgb(if recovered_text.is_some() {
-                                        TEXT_SOFT
-                                    } else {
-                                        NEGATIVE
-                                    }))
-                                    // A recovered row reads like any dictation:
-                                    // its text, not a repeated status title.
-                                    .child(
-                                        recovered_text
-                                            .clone()
-                                            .unwrap_or_else(|| entry.title().into()),
-                                    ),
-                            ))
+                            .child(primary_line)
                             .child(
                                 div()
                                     .w_full()
                                     .truncate()
                                     .text_size(px(10.0))
                                     .text_color(rgb(FAINT))
-                                    .child(tf!(
-                                        "{app} · {duration} audio",
-                                        app = entry.application_label(),
-                                        duration =
-                                            crate::openrouter::report::seconds(entry.audio_ms)
-                                    )),
+                                    .child(meta),
                             )
                             .children(error.map(|error| {
                                 div()
@@ -771,24 +1030,9 @@ impl AppWindow {
                     .child(
                         div()
                             .flex_none()
-                            .flex()
-                            .flex_col()
-                            .items_end()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_size(px(10.0))
-                                    .text_color(rgb(FAINT))
-                                    .child(event_age(entry.timestamp_ms)),
-                            )
-                            .when(recovered_text.is_some(), |column| {
-                                column.child(fade_in_if(
-                                    just_recovered,
-                                    ("recovered-badge", index),
-                                    0.4,
-                                    div().child(history_badge(t("Recovered"))),
-                                ))
-                            }),
+                            .text_size(px(10.0))
+                            .text_color(rgb(FAINT))
+                            .child(event_age(entry.timestamp_ms)),
                     )
                     .child(self.recovery_row_actions(index, entry, cx))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -808,6 +1052,7 @@ impl AppWindow {
         let id = entry.id.clone();
         let play_id = id.clone();
         let delete_id = id.clone();
+        let copy_id = id.clone();
         let recovered = entry.status == RecoveryStatus::Recovered;
         let can_retry = self.can_retry_recovery(entry);
         let playing = self
@@ -815,10 +1060,26 @@ impl AppWindow {
             .as_ref()
             .is_some_and(|playback| playback.is_playing(&id));
         let copied = self.history_copied.as_ref() == Some(&HistoryItem::Recovery(id.clone()));
-        let copy_id = id.clone();
-        let mut actions = div().flex().flex_wrap().items_center().gap_2();
+        let report = entry.transcription.as_ref();
+        let subtitle = format!(
+            "{} · {} · {}",
+            entry.application_label(),
+            tf!(
+                "{duration} audio",
+                duration = crate::openrouter::report::seconds(entry.audio_ms)
+            ),
+            event_age(entry.timestamp_ms)
+        );
+        let title_color = if entry.busy {
+            TEXT
+        } else if recovered {
+            WARNING
+        } else {
+            NEGATIVE
+        };
+        let mut header_actions = div().flex().flex_wrap().items_center().gap_2();
         if entry.text.is_some() {
-            actions = actions.child(
+            header_actions = header_actions.child(
                 header_button(if copied { t("Copied") } else { t("Copy text") })
                     .id("recovery-copy")
                     .track_focus(&self.recovery_action_focus[0])
@@ -829,7 +1090,7 @@ impl AppWindow {
             );
         }
         if !recovered {
-            actions = actions.child(
+            header_actions = header_actions.child(
                 header_button(if playing { t("Stop") } else { t("Play") })
                     .id("recovery-play")
                     .track_focus(&self.recovery_action_focus[3])
@@ -838,24 +1099,8 @@ impl AppWindow {
                         this.toggle_recovery_playback(&play_id, cx);
                     })),
             );
-            actions = actions.child(
-                header_button(if entry.busy {
-                    t("Transcribing")
-                } else {
-                    t("Retry & copy")
-                })
-                .id("recovery-retry")
-                .track_focus(&self.recovery_action_focus[1].clone().tab_stop(can_retry))
-                .focus(|style| style.border_color(rgb(ACCENT)))
-                .when(!can_retry, |button| button.opacity(0.45))
-                .when(can_retry, |button| {
-                    button.on_click(cx.listener(move |this, _, _, cx| {
-                        this.retry_recovery(&id, cx);
-                    }))
-                }),
-            );
         }
-        actions = actions.child(
+        header_actions = header_actions.child(
             header_button(if self.recovery_delete_armed {
                 t("Delete permanently?")
             } else {
@@ -864,6 +1109,9 @@ impl AppWindow {
             .id("recovery-delete")
             .track_focus(&self.recovery_action_focus[2].clone().tab_stop(!entry.busy))
             .focus(|style| style.border_color(rgb(ACCENT)))
+            .when(self.recovery_delete_armed, |button| {
+                button.text_color(rgb(NEGATIVE)).border_color(rgb(NEGATIVE))
+            })
             .when(entry.busy, |button| button.opacity(0.45))
             .when(!entry.busy, |button| {
                 button.on_click(cx.listener(move |this, _, _, cx| {
@@ -885,96 +1133,223 @@ impl AppWindow {
                 }))
             }),
         );
-        let retry_model_row = (!recovered).then(|| {
-            let choices = self.recovery_retry_model_choices(cx);
+        let retry_bar = (!recovered).then(|| {
             let catalog = self.openrouter_settings.read(cx).catalog_models().to_vec();
             let active_label = self.recovery_retry_model.as_deref().map_or_else(
                 || t("Current models").to_owned(),
                 |model| crate::openrouter::catalog::selector_label(model, &catalog),
             );
-            let picker_menu = self.recovery_model_picker_open.then(|| {
-                let catalog_for_labels = catalog.clone();
-                selection_picker_menu(
-                    "recovery-model-picker",
-                    &self.recovery_model_picker,
-                    choices,
-                    self.recovery_retry_model.clone(),
-                    move |choice| match choice {
-                        None => t("Current models").to_owned(),
-                        Some(model) => {
-                            crate::openrouter::catalog::selector_label(model, &catalog_for_labels)
-                        }
-                    },
-                    None,
-                    (
-                        cx.listener(|this, choice: &Option<String>, window, cx| {
-                            this.recovery_retry_model = choice.clone();
-                            this.recovery_model_picker_open = false;
-                            this.recovery_model_picker.trigger.focus(window);
-                            cx.notify();
-                        }),
-                        cx.listener(|this, _, _, cx| {
-                            this.recovery_model_picker_open = false;
-                            cx.notify();
-                        }),
-                        cx.listener(Self::recovery_model_picker_key),
-                    ),
-                )
+            let picker_menu = self.render_recovery_model_picker(cx);
+            let retry_button = header_button(if entry.busy {
+                t("Transcribing")
+            } else {
+                t("Retry & copy")
+            })
+            .id("recovery-retry")
+            .track_focus(&self.recovery_action_focus[1].clone().tab_stop(can_retry))
+            .focus(|style| style.border_color(rgb(ACCENT)))
+            .when(can_retry, |button| {
+                button.border_color(rgb(ACCENT)).text_color(rgb(TEXT))
+            })
+            .when(!can_retry, |button| button.opacity(0.45))
+            .when(can_retry, |button| {
+                button.on_click(cx.listener(move |this, _, _, cx| {
+                    this.retry_recovery(&id, cx);
+                }))
             });
             div()
-                .mt_4()
+                .mt_5()
+                .pt_5()
+                .border_t_1()
+                .border_color(rgb(crate::desktop_ui::DIVIDER))
                 .flex()
-                .items_center()
-                .justify_between()
+                .flex_col()
                 .gap_3()
                 .child(
                     div()
-                        .text_size(px(12.0))
-                        .text_color(rgb(TEXT_SOFT))
-                        .child(t("Retry with")),
-                )
-                .child(
-                    div()
-                        .relative()
-                        .flex_none()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
                         .child(
-                            disclosure_button(active_label)
-                                .id("recovery-model-trigger")
-                                .track_focus(&self.recovery_model_picker.trigger)
-                                .focus(|style| style.border_color(rgb(ACCENT)))
-                                .on_click(cx.listener(|this, event, window, cx| {
-                                    if matches!(event, gpui::ClickEvent::Mouse(_)) {
-                                        this.toggle_recovery_model_picker(window, cx);
-                                    }
-                                }))
-                                .on_key_down(cx.listener(|this, event, window, cx| {
-                                    if picker_open_key(event) {
-                                        this.toggle_recovery_model_picker(window, cx);
-                                        cx.stop_propagation();
-                                    }
-                                })),
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(TEXT_SOFT))
+                                        .child(t("Retry with")),
+                                )
+                                .child(
+                                    div()
+                                        .relative()
+                                        .flex_none()
+                                        .child(
+                                            disclosure_button(active_label)
+                                                .id("recovery-model-trigger")
+                                                .track_focus(&self.recovery_model_trigger)
+                                                .focus(|style| style.border_color(rgb(ACCENT)))
+                                                .on_click(cx.listener(|this, event, window, cx| {
+                                                    if matches!(event, gpui::ClickEvent::Mouse(_)) {
+                                                        this.toggle_recovery_model_picker(
+                                                            window, cx,
+                                                        );
+                                                    }
+                                                }))
+                                                .on_key_down(cx.listener(
+                                                    |this, event, window, cx| {
+                                                        if picker_open_key(event) {
+                                                            this.toggle_recovery_model_picker(
+                                                                window, cx,
+                                                            );
+                                                            cx.stop_propagation();
+                                                        }
+                                                    },
+                                                )),
+                                        )
+                                        .children(picker_menu.map(picker_popup)),
+                                ),
                         )
-                        .children(picker_menu.map(picker_popup)),
+                        .child(retry_button),
                 )
+                .children(self.recovery_error_for(&entry.id).map(|error| {
+                    div()
+                        .text_size(px(12.0))
+                        .line_height(px(18.0))
+                        .text_color(rgb(NEGATIVE))
+                        .child(error)
+                }))
         });
-        div().id("recovery-detail").flex_1().min_h_0().overflow_y_scroll().px_6().pt_4().pb_6()
-            .child(div().text_size(px(18.0)).font_weight(FontWeight::SEMIBOLD).child(entry.title()))
-            .child(div().mt_2().text_size(px(11.0)).text_color(rgb(MUTED))
-                .child(tf!("{duration} audio · {age}", duration = crate::openrouter::report::seconds(entry.audio_ms), age = event_age(entry.timestamp_ms))))
-            .child(div().mt_3().child(detail_row(t("Application"), entry.application_label())))
-            // What happened comes before what to do about it.
-            .children(entry.message.clone().map(|message| div().mt_5()
-                .child(section_label(t("Failure reason")))
-                .child(div().pt_2().text_size(px(12.0)).line_height(px(18.0)).text_color(rgb(NEGATIVE)).child(message))))
-            .children(entry.text.clone().map(|text| div().mt_5().text_size(px(13.0)).line_height(px(20.0)).child(text)))
-            .children(retry_model_row)
-            .child(div().mt_5().child(actions))
-            .children(self.recovery_error_for(&entry.id).map(|error| div().mt_3()
-                .text_size(px(12.0)).text_color(rgb(NEGATIVE)).child(error)))
-            .child(div().mt_5().pt_4().border_t_1().border_color(rgb(LINE)).text_size(px(12.0)).text_color(rgb(TEXT_SOFT))
-                .child(if entry.volatile { t("This recording is only in memory. Keep Endu open until it is recovered.") }
-                    else if recovered { t("Recovered text is saved locally until you delete it. The temporary audio has been removed.") }
-                    else { t("Audio is saved on this Mac until recovery or deletion. Retry & copy uses your chosen model or current Models settings, saves the text here and copies it, without automatic paste.") }))
+        let recovered_tiles = recovered.then(|| {
+            let mut tiles = div()
+                .mt_5()
+                .pt_5()
+                .border_t_1()
+                .border_color(rgb(crate::desktop_ui::DIVIDER))
+                .flex()
+                .flex_wrap()
+                .gap_3()
+                .child(history_tile(
+                    t("Audio"),
+                    report
+                        .and_then(|report| report.audio_summary())
+                        .unwrap_or_else(|| {
+                            (crate::openrouter::report::seconds(entry.audio_ms), None)
+                        }),
+                ));
+            if let Some(model) = entry.detail_model_label() {
+                tiles = tiles.child(history_tile(t("Model"), (model, None)));
+            }
+            if let Some(report) = report {
+                tiles = tiles.child(history_tile(t("Cost (USD)"), report.cost_tile()));
+            }
+            tiles
+        });
+        // Show the standalone failure block only when the cause isn't already
+        // attached to a failed request card below (e.g. post-processing removed
+        // all text, Endu quit before transcribing, or legacy recovery files).
+        let unlinked_failure = entry.message.clone().filter(|_| {
+            !report.is_some_and(crate::openrouter::StepReport::has_failed_attempt_reasons)
+        });
+        div()
+            .id("recovery-detail")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px_6()
+            .pt_4()
+            .pb_6()
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_baseline()
+                                    .gap_x_3()
+                                    .child(
+                                        div()
+                                            .text_size(px(18.0))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(rgb(title_color))
+                                            .child(entry.title()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(rgb(FAINT))
+                                            .child(subtitle),
+                                    ),
+                            )
+                            .child(header_actions),
+                    )
+                    .children(entry.text.clone().map(|text| {
+                        div()
+                            .mt_5()
+                            .pt_5()
+                            .border_t_1()
+                            .border_color(rgb(crate::desktop_ui::DIVIDER))
+                            .child(section_label(t("Text")))
+                            .child(
+                                div()
+                                    .pt_3()
+                                    .text_size(px(13.0))
+                                    .line_height(px(20.0))
+                                    .text_color(rgb(TEXT))
+                                    .child(text),
+                            )
+                    }))
+                    .children(recovered_tiles)
+                    .children(retry_bar)
+                    .children(unlinked_failure.map(|message| {
+                        div()
+                            .mt_5()
+                            .pt_5()
+                            .border_t_1()
+                            .border_color(rgb(crate::desktop_ui::DIVIDER))
+                            .child(section_label(t("Failure reason")))
+                            .child(
+                                div()
+                                    .pt_2()
+                                    .text_size(px(12.0))
+                                    .line_height(px(18.0))
+                                    .text_color(rgb(NEGATIVE))
+                                    .child(message),
+                            )
+                    }))
+                    .children(report.and_then(render_requests_section))
+                    .child(
+                        div()
+                            .mt_5()
+                            .pt_4()
+                            .border_t_1()
+                            .border_color(rgb(crate::desktop_ui::DIVIDER))
+                            .text_size(px(11.0))
+                            .line_height(px(16.0))
+                            .text_color(rgb(if entry.volatile { NEGATIVE } else { MUTED }))
+                            .child(if entry.volatile {
+                                t("This recording is only in memory. Keep Endu open until it is recovered.")
+                            } else if recovered {
+                                t("Recovered text is saved locally until you delete it. The temporary audio has been removed.")
+                            } else {
+                                t("Audio is saved on this Mac until recovery or deletion. Retry & copy uses your chosen model or current Models settings, saves the text here and copies it, without automatic paste.")
+                            }),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -1057,14 +1432,17 @@ impl AppWindow {
                     let selected = self.history_last_opened.as_ref() == Some(&item);
                     let report = entry.transcription.as_ref();
                     let mut meta: Vec<String> = entry.application.iter().cloned().collect();
-                    if let Some(model) = report.and_then(|report| report.model.as_deref()) {
-                        let model = crate::providers::ModelRef::parse(model).model;
-                        meta.push(model.rsplit('/').next().unwrap_or(model).to_owned());
+                    if let Some(model) =
+                        report.and_then(crate::openrouter::StepReport::row_model_label)
+                    {
+                        meta.push(model);
                     }
                     if entry.total_ms > 0 {
                         meta.push(crate::openrouter::report::duration_label(entry.total_ms));
                     }
-                    let badge = report.and_then(crate::openrouter::StepReport::recovery_badge);
+                    let had_fallback_or_retry = report
+                        .and_then(crate::openrouter::StepReport::recovery_badge)
+                        .is_some();
                     let meta = meta.join(" · ");
                     let copied = self.history_copied.as_ref() == Some(&item);
                     let delete_armed = self.history_row_delete_armed.as_ref() == Some(&item);
@@ -1092,7 +1470,11 @@ impl AppWindow {
                                     div()
                                         .w_full()
                                         .text_size(px(12.0))
-                                        .text_color(rgb(TEXT_SOFT))
+                                        .text_color(rgb(if had_fallback_or_retry {
+                                            WARNING
+                                        } else {
+                                            TEXT_SOFT
+                                        }))
                                         .line_height(px(18.0))
                                         .truncate()
                                         .child(entry.text.replace('\n', " ")),
@@ -1108,17 +1490,9 @@ impl AppWindow {
                         .child(
                             div()
                                 .flex_none()
-                                .flex()
-                                .flex_col()
-                                .items_end()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .text_size(px(10.0))
-                                        .text_color(rgb(FAINT))
-                                        .child(event_age(entry.timestamp_ms)),
-                                )
-                                .children(badge.map(|badge| history_badge(t(badge)))),
+                                .text_size(px(10.0))
+                                .text_color(rgb(FAINT))
+                                .child(event_age(entry.timestamp_ms)),
                         )
                         .child(
                             div()
@@ -1176,7 +1550,7 @@ impl AppWindow {
                         HISTORY_FOLD_MS,
                         |row, progress| {
                             let rest = 1.0 - crate::desktop_ui::ease_out(progress);
-                            row.opacity(rest).max_h(px(96.0 * rest))
+                            row.opacity(rest).max_h(px(140.0 * rest))
                         },
                     )
                 } else {
@@ -1405,59 +1779,7 @@ impl AppWindow {
                                 ),
                             )),
                     )
-                    .children(
-                        report
-                            .map(|report| (report, report.attempts()))
-                            .filter(|(_, attempts)| !attempts.is_empty())
-                            .map(|(report, attempts)| {
-                                let count = attempts.len();
-                                div()
-                                    .mt_5()
-                                    .pt_5()
-                                    .border_t_1()
-                                    .border_color(rgb(crate::desktop_ui::DIVIDER))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .child(section_label(if count == 1 {
-                                                t("Request")
-                                            } else {
-                                                t("Requests")
-                                            }))
-                                            .when(count > 1, |title| {
-                                                title.child(
-                                                    div()
-                                                        .text_size(px(11.0))
-                                                        .text_color(rgb(FAINT))
-                                                        .child(count.to_string()),
-                                                )
-                                            }),
-                                    )
-                                    .child(div().mt_3().flex().flex_col().gap_2().children(
-                                        attempts.into_iter().enumerate().map(|(index, attempt)| {
-                                            history_attempt_row(index + 1, attempt)
-                                        }),
-                                    ))
-                                    .when_some(
-                                        Some(report.omitted_executions)
-                                            .filter(|omitted| *omitted > 0),
-                                        |section, omitted| {
-                                            section.child(
-                                                div()
-                                                    .mt_2()
-                                                    .text_size(px(11.0))
-                                                    .text_color(rgb(FAINT))
-                                                    .child(tf!(
-                                                        "{omitted} more not kept in History",
-                                                        omitted = omitted
-                                                    )),
-                                            )
-                                        },
-                                    )
-                            }),
-                    ),
+                    .children(report.and_then(render_requests_section)),
             )
             .into_any_element()
     }
@@ -1497,11 +1819,42 @@ pub(super) fn preview_recording_recovery() -> Option<RecordingRecovery> {
         .map(|index| (index as f32 * std::f32::consts::TAU * 220.0 / 16_000.0).sin() * 0.08)
         .collect();
     let _ = store.transcribe_original(&samples, Some("Codex"), crate::post_processing::Preferences::default(), |_| {
-        Err(crate::openrouter::transcribe::ChainFailure { failures: vec![crate::openrouter::stats::Failure {
-            model: "openai/whisper-large-v3-turbo".into(),
-            kind: crate::openrouter::stats::ErrorKind::Timeout,
-            detail: "openai/whisper-large-v3-turbo: network error (exit status: 28): curl: (28) Operation timed out after 30000 milliseconds with 0 bytes received".into(),
-        }] }.into())
+        Err(crate::openrouter::transcribe::ChainFailure {
+            failures: vec![
+                crate::openrouter::stats::Failure {
+                    model: "google::gemini-3.5-transcribe-live".into(),
+                    kind: crate::openrouter::stats::ErrorKind::Timeout,
+                    detail: "google::gemini-3.5-transcribe-live: network error (exit status: 28): curl: (28) Operation timed out after 30000 milliseconds with 0 bytes received".into(),
+                },
+                crate::openrouter::stats::Failure {
+                    model: "openai/whisper-large-v3-turbo".into(),
+                    kind: crate::openrouter::stats::ErrorKind::Server,
+                    detail: "openai/whisper-large-v3-turbo: HTTP 503: service unavailable".into(),
+                },
+            ],
+            executions: vec![
+                crate::openrouter::report::ExecutionReport {
+                    provider: "google".into(),
+                    model: "gemini-3.5-transcribe-live".into(),
+                    streaming: true,
+                    keyword_count: 2,
+                    outcome: "failed".into(),
+                    error: Some("The API request timed out after 30 seconds. No transcription was returned.".into()),
+                    cost_usd: None,
+                    estimated_cost_usd: None,
+                },
+                crate::openrouter::report::ExecutionReport {
+                    provider: "openrouter".into(),
+                    model: "openai/whisper-large-v3-turbo".into(),
+                    streaming: false,
+                    keyword_count: 0,
+                    outcome: "failed".into(),
+                    error: Some("The API returned a server error (HTTP 503). Retry when the service is available.".into()),
+                    cost_usd: None,
+                    estimated_cost_usd: None,
+                },
+            ],
+        }.into())
     });
     Some(store)
 }
@@ -1534,6 +1887,7 @@ pub(super) fn preview_history_in(directory: std::path::PathBuf) -> Option<Histor
                 streaming: true,
                 keyword_count: 3,
                 outcome: "success".into(),
+                error: None,
                 cost_usd: None,
                 // A native preview request shows its published-price estimate.
                 estimated_cost_usd: Some(0.000_32),
@@ -1548,6 +1902,10 @@ pub(super) fn preview_history_in(directory: std::path::PathBuf) -> Option<Histor
                     streaming: false,
                     keyword_count: 0,
                     outcome: "failed".into(),
+                    error: Some(
+                        t("The API rate limit was reached (HTTP 429). Wait before retrying.")
+                            .into(),
+                    ),
                     cost_usd: None,
                     estimated_cost_usd: None,
                 })
@@ -1558,6 +1916,7 @@ pub(super) fn preview_history_in(directory: std::path::PathBuf) -> Option<Histor
                         streaming: false,
                         keyword_count: 0,
                         outcome: "success".into(),
+                        error: None,
                         cost_usd: Some(0.000_123),
                         estimated_cost_usd: None,
                     },
@@ -1638,34 +1997,6 @@ pub(super) fn detail_placeholder(message: &'static str) -> AnyElement {
         .text_size(px(12.0))
         .text_color(rgb(FAINT))
         .child(message)
-        .into_any_element()
-}
-
-pub(super) fn detail_row(label: &'static str, value: impl Into<String>) -> AnyElement {
-    div()
-        .py_3()
-        .flex()
-        .items_start()
-        .gap_4()
-        .border_b_1()
-        .border_color(rgb(crate::desktop_ui::DIVIDER))
-        .child(
-            div()
-                .w(px(104.0))
-                .flex_none()
-                .text_size(px(11.0))
-                .text_color(rgb(FAINT))
-                .child(label),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .text_size(px(12.0))
-                .line_height(px(18.0))
-                .text_color(rgb(TEXT_SOFT))
-                .child(value.into()),
-        )
         .into_any_element()
 }
 
@@ -1818,6 +2149,61 @@ pub(super) fn history_badge(label: &'static str) -> AnyElement {
         .into_any_element()
 }
 
+fn render_requests_section(report: &crate::openrouter::StepReport) -> Option<AnyElement> {
+    let attempts = report.attempts();
+    if attempts.is_empty() {
+        return None;
+    }
+    let count = attempts.len();
+    Some(
+        div()
+            .mt_5()
+            .pt_5()
+            .border_t_1()
+            .border_color(rgb(crate::desktop_ui::DIVIDER))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(section_label(if count == 1 {
+                        t("Request")
+                    } else {
+                        t("Requests")
+                    }))
+                    .when(count > 1, |title| {
+                        title.child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(rgb(FAINT))
+                                .child(count.to_string()),
+                        )
+                    }),
+            )
+            .child(
+                div().mt_3().flex().flex_col().gap_2().children(
+                    attempts
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, attempt)| history_attempt_row(index + 1, attempt)),
+                ),
+            )
+            .when_some(
+                Some(report.omitted_executions).filter(|omitted| *omitted > 0),
+                |section, omitted| {
+                    section.child(
+                        div()
+                            .mt_2()
+                            .text_size(px(11.0))
+                            .text_color(rgb(FAINT))
+                            .child(tf!("{omitted} more not kept in History", omitted = omitted)),
+                    )
+                },
+            )
+            .into_any_element(),
+    )
+}
+
 /// One transcription request: what was asked, why, and how it ended.
 pub(super) fn history_attempt_row(
     number: usize,
@@ -1893,6 +2279,14 @@ pub(super) fn history_attempt_row(
                         .text_color(rgb(MUTED))
                         .child(attempt.details()),
                 )
+                .children(attempt.error.map(|error| {
+                    div()
+                        .mt(px(2.0))
+                        .text_size(px(11.0))
+                        .line_height(px(16.0))
+                        .text_color(rgb(NEGATIVE))
+                        .child(error)
+                }))
                 .children(
                     attempt
                         .cost

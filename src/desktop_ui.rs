@@ -257,6 +257,7 @@ pub(crate) enum ThemeColor {
     Muted,
     Faint,
     Negative,
+    Warning,
     Positive,
     PositiveBadge,
     PositiveBadgeHover,
@@ -294,6 +295,7 @@ impl ThemeColor {
             Self::Muted => (0x858585, 0x766e5e),
             Self::Faint => (0x626262, 0x9a917c),
             Self::Negative => (0xc98f89, 0xa8433a),
+            Self::Warning => (0xd4a36a, 0xa86518),
             Self::Positive => (0x8fbf98, 0x3f7d4e),
             Self::PositiveBadge => (0x17231a, 0xe3eedc),
             Self::PositiveBadgeHover => (0x1d2c21, 0xd8e7cf),
@@ -371,6 +373,7 @@ pub(crate) const TEXT_SOFT: ThemeColor = ThemeColor::TextSoft;
 pub(crate) const MUTED: ThemeColor = ThemeColor::Muted;
 pub(crate) const FAINT: ThemeColor = ThemeColor::Faint;
 pub(crate) const NEGATIVE: ThemeColor = ThemeColor::Negative;
+pub(crate) const WARNING: ThemeColor = ThemeColor::Warning;
 pub(crate) const POSITIVE: ThemeColor = ThemeColor::Positive;
 
 pub(crate) const CONTROL_HEIGHT: f32 = 32.0;

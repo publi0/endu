@@ -67,6 +67,7 @@ pub(crate) struct Success {
 #[derive(Debug)]
 pub(crate) struct ChainFailure {
     pub failures: Vec<Failure>,
+    pub executions: Vec<super::report::ExecutionReport>,
 }
 
 impl std::fmt::Display for ChainFailure {
@@ -276,7 +277,10 @@ fn chain_with_hints(
             break;
         }
     }
-    Err(ChainFailure { failures })
+    Err(ChainFailure {
+        failures,
+        executions: Vec::new(),
+    })
 }
 
 #[cfg(test)]

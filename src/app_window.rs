@@ -21,7 +21,7 @@ use crate::app_settings::{
 use crate::desktop_ui::{
     ACCENT, CANVAS, CONTROL_RADIUS, FAINT, LINE, MUTED, NEGATIVE, NavigationIcon,
     PANE_CONTENT_WIDTH, PANEL_RADIUS, POSITIVE, PickerState, SIDEBAR_WIDTH, SURFACE, SURFACE_HOVER,
-    SURFACE_SELECTED, TEXT, TEXT_SOFT, compact_button, compact_panel, disclosure_button,
+    SURFACE_SELECTED, TEXT, TEXT_SOFT, WARNING, compact_button, compact_panel, disclosure_button,
     error_message, header_button, hotkey_keycaps, mix_color, navigation_item, pane_body,
     pane_content, pane_header, pane_header_with_action, pane_list, picker_open_key, picker_popup,
     rgb, section_label, settings_copy, settings_panel, settings_row, settings_section_label,
@@ -635,8 +635,8 @@ pub struct AppWindow {
     recovery_copy_pending: Option<String>,
     recovery_playback: Option<crate::recording_recovery::RecoveryPlayback>,
     recovery_retry_model: Option<String>,
-    recovery_model_picker_open: bool,
-    recovery_model_picker: PickerState,
+    recovery_model_trigger: FocusHandle,
+    recovery_model_picker: Option<history_pane::RecoveryModelPicker>,
     recovery_action_focus: [FocusHandle; 4],
     selected_history: Option<u64>,
     /// The entry last opened, highlighted in the list after going back.
@@ -1208,8 +1208,8 @@ impl AppWindow {
             recovery_copy_pending: None,
             recovery_playback: None,
             recovery_retry_model: None,
-            recovery_model_picker_open: false,
-            recovery_model_picker: PickerState::new(cx),
+            recovery_model_trigger: cx.focus_handle().tab_stop(true),
+            recovery_model_picker: None,
             recovery_action_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             selected_history: None,
             history_last_opened: None,
@@ -1274,7 +1274,7 @@ impl AppWindow {
             // Copying long after leaving History would surprise; Copy remains.
             self.recovery_copy_pending = None;
             self.stop_recovery_playback();
-            self.recovery_model_picker_open = false;
+            self.recovery_model_picker = None;
             self.history_clear_armed = false;
             self.history_row_delete_armed = None;
             self.recovery_delete_armed = false;
@@ -3204,6 +3204,49 @@ mod tests {
         });
         drop(store);
         std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[gpui::test]
+    fn recovery_retry_model_picker_filters_by_search_and_selects(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(preview_fixture);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.recovery = preview_recording_recovery();
+                view.select_pane(Pane::History, cx);
+                view.reload_history(cx);
+                let id = view.recovery_entries[0].id.clone();
+                view.show_history_item(HistoryItem::Recovery(id), cx);
+                view.toggle_recovery_model_picker(window, cx);
+                assert!(view.recovery_model_picker.is_some());
+                let search = view.recovery_model_picker.as_ref().unwrap().search.clone();
+                search.update(cx, |input, cx| input.set_text("nova", cx));
+            })
+        });
+        cx.run_until_parked();
+        let chosen = cx.update(|_, cx| {
+            let view = view.read(cx);
+            let picker = view.recovery_model_picker.as_ref().unwrap();
+            let query = picker.search.read(cx).text();
+            let choices = view.recovery_retry_model_choices(query, cx);
+            assert!(
+                !choices.is_empty(),
+                "searching 'nova' should match Deepgram batch models"
+            );
+            assert!(
+                choices
+                    .iter()
+                    .all(|choice| choice.model_id().is_some_and(|id| id.contains("nova"))),
+                "filtered choices should match the query"
+            );
+            choices[0].model_id().map(str::to_owned)
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.select_recovery_model(chosen.clone(), window, cx);
+                assert!(view.recovery_model_picker.is_none());
+                assert_eq!(view.recovery_retry_model, chosen);
+            })
+        });
     }
 
     #[gpui::test]

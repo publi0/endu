@@ -297,8 +297,8 @@ impl OpenRouterSettings {
                 };
             AdvancedInputs {
                 base_url: field(|| "https://openrouter.ai/api/v1", &form.base_url, cx),
-                attempt_timeout: field(|| "30", &form.attempt_timeout_seconds, cx),
-                total_timeout: field(|| "90", &form.total_timeout_seconds, cx),
+                attempt_timeout: field(|| "12", &form.attempt_timeout_seconds, cx),
+                total_timeout: field(|| "30", &form.total_timeout_seconds, cx),
                 chunk_seconds: field(|| "120", &form.chunk_seconds, cx),
                 rate_limit_wait: field(|| "2000", &form.rate_limit_retry_max_wait_ms, cx),
             }
@@ -1960,7 +1960,7 @@ impl OpenRouterSettings {
                     ))
                     .child(settings_row(
                         t("Rate-limit retry (ms)"),
-                        t("A 429 asking to wait at most this long is retried once on the same model; 0 falls back at once"),
+                        t("A 429 asking to wait at most this long is retried once when no fallback is available; 0 disables it"),
                         narrow(&advanced.rate_limit_wait),
                     ))
                     .child(settings_row(
@@ -2352,7 +2352,7 @@ mod tests {
             );
             assert_eq!(
                 view.read(cx).config.transcription.attempt_timeout_seconds,
-                30
+                12
             );
         });
         cx.update(|window, _| window.blur());

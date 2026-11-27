@@ -105,7 +105,7 @@ pub struct TranscriptionConfig {
     /// the quietest point near the boundary.
     pub chunk_seconds: u64,
     /// A 429 whose Retry-After is at most this long is retried once on the
-    /// same model before falling back. Zero disables the retry.
+    /// same model when no fallback model follows it. Zero disables the retry.
     pub rate_limit_retry_max_wait_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
@@ -135,8 +135,8 @@ impl Default for TranscriptionConfig {
                 "microsoft/mai-transcribe-2".into(),
             ],
             language: AUTO_LANGUAGE.into(),
-            attempt_timeout_seconds: 30,
-            total_timeout_seconds: 90,
+            attempt_timeout_seconds: 12,
+            total_timeout_seconds: 30,
             chunk_seconds: 120,
             rate_limit_retry_max_wait_ms: 2_000,
             temperature: Some(0.0),
@@ -665,7 +665,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.transcription.models, ["a/b"]);
-        assert_eq!(config.transcription.attempt_timeout_seconds, 30);
+        assert_eq!(config.transcription.attempt_timeout_seconds, 12);
         assert_eq!(config.transcription.language, AUTO_LANGUAGE);
         assert!(config.transcription.trim_silence);
         assert_eq!(config.base_url, "https://openrouter.ai/api/v1");
@@ -760,7 +760,7 @@ mod tests {
                 .unwrap()
                 .transcription
                 .attempt_timeout_seconds,
-            38
+            Config::default().transcription.attempt_timeout_seconds + 8
         );
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         fs::remove_dir_all(dir).unwrap();

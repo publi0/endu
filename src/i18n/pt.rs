@@ -55,8 +55,8 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
     ("30 days", "30 dias"),
     ("7 days", "7 dias"),
     (
-        "A 429 asking to wait at most this long is retried once on the same model; 0 falls back at once",
-        "Um 429 que pede espera de até esse tempo ganha um retry no mesmo modelo; 0 passa direto para o fallback",
+        "A 429 asking to wait at most this long is retried once when no fallback is available; 0 disables it",
+        "Um 429 que pede espera de até esse tempo ganha um retry quando não há fallback; 0 desativa",
     ),
     (
         "A fallback could not be attempted because the transcription time limit was reached.",
@@ -1299,6 +1299,7 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
     ),
     ("{days}d ago", "há {days} d"),
     ("{day} · no measurement", "{day} · sem medição"),
+    ("{duration} audio", "{duration} de áudio"),
     ("{duration} audio · {age}", "{duration} de áudio · {age}"),
     ("{duration} transcribing", "{duration} transcrevendo"),
     (
@@ -1578,6 +1579,8 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
         "Os nomes {first} e {second} têm a mesma grafia normalizada.",
     ),
     ("Network error", "Erro de rede"),
+    ("Audio", "Áudio"),
+    ("No models match.", "Nenhum modelo encontrado."),
     ("No matching dictations.", "Nenhum ditado correspondente."),
     (
         "Only recorded-audio models can retry a saved recording.",
@@ -1608,6 +1611,22 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
     (
         "Transcription was stopped. The saved audio is ready to retry.",
         "A transcrição foi interrompida. O áudio salvo está pronto para tentar novamente.",
+    ),
+    (
+        "Use your current Models settings",
+        "Usa seus ajustes atuais de Modelos",
+    ),
+    (
+        "Vocabulary hints were rejected by the provider; retried without hints.",
+        "As dicas de vocabulário foram rejeitadas pelo provedor; tentativa refeita sem dicas.",
+    ),
+    (
+        "Compressed audio was rejected by the provider; retried with WAV.",
+        "O áudio comprimido foi rejeitado pelo provedor; tentativa refeita em WAV.",
+    ),
+    (
+        "Live transcription returned no text; retried with the recorded audio.",
+        "A transcrição ao vivo não retornou texto; tentativa refeita com o áudio gravado.",
     ),
     ("Use at most {max} names.", "Use no máximo {max} nomes."),
     (

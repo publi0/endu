@@ -789,12 +789,15 @@ fn run_transcription_queue(
                 } else if job.control.keep_for_recovery() {
                     pending.preserve_stopped();
                 } else {
-                    let recovered_text = result.ok().and_then(|transcription| {
-                        let restored = job.vocabulary.restore(transcription.text.trim());
-                        let text = restored.text.trim().to_owned();
-                        (!text.is_empty()).then_some(text)
-                    });
-                    pending.preserve_for_shutdown(recovered_text);
+                    let (recovered_text, report) = match result {
+                        Ok(transcription) => {
+                            let restored = job.vocabulary.restore(transcription.text.trim());
+                            let text = restored.text.trim().to_owned();
+                            ((!text.is_empty()).then_some(text), transcription.report)
+                        }
+                        Err(_) => (None, None),
+                    };
+                    pending.preserve_for_shutdown(recovered_text, report);
                 }
             }
             break;
@@ -1006,7 +1009,8 @@ fn finish_output(
                 Ok(PasteOutcome::CopiedToClipboard) => {
                     // The clipboard write already passed the output commit gate.
                     // A later shutdown must not relabel that completed copy as cancelled.
-                    let recovered = recovery.and_then(|r| r.keep_unpasted(&completed.text));
+                    let recovered = recovery
+                        .and_then(|r| r.keep_unpasted(&completed.text, completed.report.clone()));
                     *last_transcript = Some(LastTranscript {
                         completed,
                         has_pasted: false,
@@ -1023,7 +1027,8 @@ fn finish_output(
                     if !commit() {
                         return WorkerEvent::Cancelled { job_id };
                     }
-                    let recovered = recovery.and_then(|r| r.keep_unpasted(&completed.text));
+                    let recovered = recovery
+                        .and_then(|r| r.keep_unpasted(&completed.text, completed.report.clone()));
                     *last_transcript = Some(LastTranscript {
                         completed,
                         has_pasted: false,
@@ -1877,16 +1882,41 @@ mod tests {
         ));
         let state = Mutex::new(WorkerState::default());
         let job = |text: &str| {
+            let report = StepReport {
+                model: Some("google::gemini-3.5-transcribe-live".into()),
+                executions: vec![crate::openrouter::report::ExecutionReport {
+                    provider: "google".into(),
+                    model: "gemini-3.5-transcribe-live".into(),
+                    streaming: true,
+                    keyword_count: 0,
+                    outcome: "success".into(),
+                    error: None,
+                    cost_usd: None,
+                    estimated_cost_usd: None,
+                }],
+                ..StepReport::default()
+            };
             let (result, pending) = recovery.transcribe_original_cancellable(
                 &[0.1; 1_600],
                 Some("Notes"),
                 crate::post_processing::Preferences::default(),
                 None,
-                |_| Ok(test_transcription(text)),
+                |_| {
+                    Ok(crate::openrouter::transcribe::Transcription {
+                        text: text.into(),
+                        report: Some(report.clone()),
+                    })
+                },
             );
             assert!(pending.is_some());
             let mut job = completed(0, &result.unwrap().text);
-            if let OutputJob::Completed { recovery, .. } = &mut job {
+            if let OutputJob::Completed {
+                result, recovery, ..
+            } = &mut job
+            {
+                if let Ok(completed) = result.as_mut() {
+                    completed.report = Some(report);
+                }
                 *recovery = pending.map(Box::new);
             }
             job
@@ -1963,12 +1993,24 @@ mod tests {
                 crate::recording_recovery::RecoveryStatus::Recovered
             );
             assert_eq!(entries[0].text.as_deref(), Some(outcome));
+            assert_eq!(
+                entries[0].row_model_label().as_deref(),
+                Some("gemini-3.5-transcribe-live")
+            );
+            assert_eq!(
+                entries[0].detail_model_label().as_deref(),
+                Some("Gemini 3.5 Transcribe Live")
+            );
             assert!(!entries[0].busy);
             assert_eq!(wavs(), 0, "recovered text replaces the audio");
             let reloaded =
                 crate::recording_recovery::RecordingRecovery::open(directory.join("recovery"))
                     .unwrap();
             assert_eq!(reloaded.entries("")[0].text.as_deref(), Some(outcome));
+            assert_eq!(
+                reloaded.entries("")[0].row_model_label().as_deref(),
+                Some("gemini-3.5-transcribe-live")
+            );
             assert_eq!(
                 history.search("").len(),
                 1,

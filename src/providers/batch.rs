@@ -761,8 +761,15 @@ fn post_cancellable(
     if spawned.is_err() {
         return post(pool, request, header, authorization, timeout);
     }
+    let deadline = Instant::now() + timeout;
+    let keyword_count = request.keyword_count;
     loop {
-        match rx.recv_timeout(Duration::from_millis(25)) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            check_cancelled(Some(flag))?;
+            return Err(TransportFailure(ErrorKind::Timeout, keyword_count).into());
+        }
+        match rx.recv_timeout(Duration::from_millis(25).min(remaining)) {
             Ok(Ok((response, checkout))) => {
                 check_cancelled(Some(flag))?;
                 pool.used(&checkout, origin.as_deref());
@@ -774,10 +781,13 @@ fn post_cancellable(
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 check_cancelled(Some(flag))?;
+                if Instant::now() >= deadline {
+                    return Err(TransportFailure(ErrorKind::Timeout, keyword_count).into());
+                }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 check_cancelled(Some(flag))?;
-                return Err(TransportFailure(ErrorKind::Network, 0).into());
+                return Err(TransportFailure(ErrorKind::Network, keyword_count).into());
             }
         }
     }
@@ -1190,6 +1200,7 @@ impl Progress {
             streaming,
             keyword_count,
             outcome: if success { "success" } else { "failed" }.into(),
+            error: None,
             cost_usd,
             estimated_cost_usd: self.estimate(model, mode, keyword_count, success, cost_usd),
         });
@@ -1261,11 +1272,41 @@ impl Progress {
         // text a failed dictation already logs. Keep every attempt, including ones a
         // later fallback recovered, so intermittent provider failures stay diagnosable.
         tracing::warn!(model = id, kind = ?kind, "{detail}");
+        let status = detail
+            .strip_prefix("HTTP ")
+            .and_then(|rest| rest.split(':').next())
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|value| (100..=599).contains(value));
+        let reason = crate::recording_recovery::failure_reason_for_attempt(kind, status, detail);
+        let parsed = ModelRef::parse(id);
+        if let Some(last) = self.executions.last_mut()
+            && last.outcome != "success"
+            && last.error.is_none()
+            && last.provider == parsed.provider.id()
+            && last.model == parsed.model
+        {
+            last.error = Some(reason);
+        }
         self.failures.push(Failure {
             model: id.to_owned(),
             kind,
             detail: format!("{id}: {detail}"),
         });
+    }
+
+    fn note_rate_limit_retry(&mut self, model: ModelRef<'_>) {
+        if let Some(last) = self.executions.last_mut()
+            && last.outcome != "success"
+            && last.error.is_none()
+            && last.provider == model.provider.id()
+            && last.model == model.model
+        {
+            last.error = Some(crate::recording_recovery::failure_reason_for_attempt(
+                ErrorKind::RateLimited,
+                Some(429),
+                "",
+            ));
+        }
     }
 }
 
@@ -1289,10 +1330,33 @@ impl Chain<'_> {
             .saturating_sub(initial_spent.saturating_add(started.elapsed()).max(spent))
     }
 
+    #[cfg(test)]
     fn run(
         &self,
         samples: &[f32],
         initial_spent: Duration,
+        progress: &mut Progress,
+        send: &mut RequestSender<'_>,
+        completed: &mut CompletedSender<'_>,
+        sleep: &mut dyn FnMut(Duration),
+    ) -> Result<Success> {
+        self.run_inner(
+            samples,
+            initial_spent,
+            false,
+            progress,
+            send,
+            completed,
+            sleep,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_inner(
+        &self,
+        samples: &[f32],
+        initial_spent: Duration,
+        skip_primary: bool,
         progress: &mut Progress,
         send: &mut RequestSender<'_>,
         completed: &mut CompletedSender<'_>,
@@ -1303,15 +1367,21 @@ impl Chain<'_> {
         // Encode WAV and Opus lazily on first model that actually needs each format.
         let wav = std::cell::OnceCell::new();
         let opus = std::cell::OnceCell::new();
-        for (model_index, id) in self
+        let active_models: Vec<&str> = self
             .config
             .transcription
             .models
             .iter()
-            .enumerate()
-            .map(|(index, id)| (index, id.trim()))
-            .filter(|(_, id)| !id.is_empty())
-        {
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty())
+            .collect();
+        for (model_index, id) in active_models.iter().copied().enumerate() {
+            if skip_primary && model_index == 0 && active_models.len() > 1 {
+                continue;
+            }
+            // When a fallback model follows in the chain, move directly to it on
+            // failure or timeout instead of retrying the primary model.
+            let allow_same_model_retry = model_index + 1 >= active_models.len();
             let model = ModelRef::parse(id);
             let capability = model.capabilities();
             let options = super::options(self.config, id);
@@ -1429,8 +1499,11 @@ impl Chain<'_> {
                                     ErrorKind::Rejected,
                                     "vocabulary parameter rejected",
                                 );
-                                without_hints = true;
-                                continue;
+                                if allow_same_model_retry {
+                                    without_hints = true;
+                                    continue;
+                                }
+                                break;
                             }
                             let available = self.remaining(started, initial_spent, spent);
                             let retry_wait = live_error
@@ -1440,11 +1513,13 @@ impl Chain<'_> {
                             let max_wait = Duration::from_millis(
                                 self.config.transcription.rate_limit_retry_max_wait_ms,
                             );
-                            if status == Some(429)
+                            if allow_same_model_retry
+                                && status == Some(429)
                                 && !rate_retried
                                 && retry_wait <= max_wait
                                 && available > retry_wait
                             {
+                                progress.note_rate_limit_retry(model);
                                 sleep(retry_wait);
                                 spent = spent.saturating_add(retry_wait);
                                 rate_retried = true;
@@ -1588,7 +1663,11 @@ impl Chain<'_> {
                                 // returned text decodes it, so its empty
                                 // answer is the real outcome and is not
                                 // billed twice.
-                                if request.opus && !opus_retried && !opus_confirmed(id) {
+                                if allow_same_model_retry
+                                    && request.opus
+                                    && !opus_retried
+                                    && !opus_confirmed(id)
+                                {
                                     opus_retried = true;
                                     opus_unconfirmed = true;
                                     continue;
@@ -1621,8 +1700,11 @@ impl Chain<'_> {
                                 ErrorKind::from_status(response.status),
                                 &format!("HTTP {}: vocabulary parameter rejected", response.status),
                             );
-                            without_hints = true;
-                            continue;
+                            if allow_same_model_retry {
+                                without_hints = true;
+                                continue;
+                            }
+                            break;
                         }
                         if opus_rejected(&request, &response) {
                             progress.fail(
@@ -1631,12 +1713,16 @@ impl Chain<'_> {
                                 &format!("HTTP {}: compressed audio rejected", response.status),
                             );
                             remember_opus_rejection(id);
-                            opus_retried = true;
-                            continue;
+                            if allow_same_model_retry {
+                                opus_retried = true;
+                                continue;
+                            }
+                            break;
                         }
                         let wait = response.retry_after.unwrap_or(Duration::from_secs(1));
                         let available = self.remaining(started, initial_spent, spent);
-                        if response.status == 429
+                        if allow_same_model_retry
+                            && response.status == 429
                             && !rate_retried
                             && self.config.transcription.rate_limit_retry_max_wait_ms > 0
                             && wait
@@ -1645,6 +1731,7 @@ impl Chain<'_> {
                                 )
                             && wait < available
                         {
+                            progress.note_rate_limit_retry(model);
                             sleep(wait);
                             spent = spent.saturating_add(wait);
                             rate_retried = true;
@@ -1693,6 +1780,7 @@ impl Chain<'_> {
         }
         Err(ChainFailure {
             failures: progress.failures.clone(),
+            executions: progress.executions.clone(),
         }
         .into())
     }
@@ -1917,6 +2005,14 @@ fn transcribe_configured_with_cancel(
             report: None,
         });
     }
+    let has_fallback = config
+        .transcription
+        .models
+        .iter()
+        .filter(|id| !id.trim().is_empty())
+        .count()
+        > 1;
+    let mut live_failed_primary = false;
     if let Some(live) = live {
         let model_id = live.model_id().to_owned();
         let sent_samples = live.sent_samples_counter();
@@ -1951,6 +2047,7 @@ fn transcribe_configured_with_cancel(
             }
             Ok(result) => {
                 check_cancelled(cancelled.as_deref())?;
+                live_failed_primary = true;
                 progress.attempt(
                     ModelRef::parse(&model_id),
                     RequestMode::Live,
@@ -1968,16 +2065,22 @@ fn transcribe_configured_with_cancel(
                 );
                 tracing::warn!(
                     model = %model_id,
-                    "live transcription returned no text; recovering from the recorded clip"
+                    has_fallback,
+                    "live transcription returned no text"
                 );
                 progress.fail(
                     &model_id,
                     ErrorKind::InvalidResponse,
-                    "empty live transcription response; trying completed audio",
+                    if has_fallback {
+                        "empty live transcription response"
+                    } else {
+                        "empty live transcription response; trying completed audio"
+                    },
                 );
             }
             Err(error) => {
                 check_cancelled(cancelled.as_deref())?;
+                live_failed_primary = true;
                 let live_error = error.downcast_ref::<streaming::LiveError>();
                 let status = live_error.and_then(|error| error.status);
                 if status == Some(401)
@@ -1989,8 +2092,9 @@ fn transcribe_configured_with_cancel(
                 // provider payloads, so it is safe to keep for diagnosing fallbacks.
                 tracing::warn!(
                     model = %model_id,
+                    has_fallback,
                     reason = %live_error.map_or_else(|| "unclassified".to_owned(), ToString::to_string),
-                    "live transcription failed; recovering from the recorded clip"
+                    "live transcription failed"
                 );
                 if live_error.is_none_or(|error| error.attempted) {
                     progress.attempt(
@@ -2013,7 +2117,13 @@ fn transcribe_configured_with_cancel(
                     &model_id,
                     live_error.map_or(ErrorKind::Network, |error| error.error_kind),
                     &status.map_or_else(
-                        || "live transcription failed; trying completed audio".into(),
+                        || {
+                            if has_fallback {
+                                "live transcription failed".into()
+                            } else {
+                                "live transcription failed; trying completed audio".into()
+                            }
+                        },
                         |status| format!("HTTP {status}: live transcription failed"),
                     ),
                 );
@@ -2050,9 +2160,10 @@ fn transcribe_configured_with_cancel(
             } else {
                 Duration::ZERO
             };
-            let success = chain.run(
+            let success = chain.run_inner(
                 &samples[range],
                 initial_spent,
+                live_failed_primary && has_fallback,
                 &mut progress,
                 send,
                 completed,
@@ -2230,7 +2341,6 @@ mod tests {
                         r#"{"error":{"param":"keywords","message":"unsupported PRIVATE_MARKER"}}"#,
                         None,
                     ),
-                    (Provider::Meta, 0) => response(503, "PRIVATE_MARKER", None),
                     (Provider::OpenAi, 1) => response(200, r#"{"text":"done"}"#, None),
                     _ => panic!("unexpected attempt"),
                 };
@@ -2241,19 +2351,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(success.model, ids[1]);
-        assert_eq!(
-            calls,
-            [
-                (Provider::Meta, 1),
-                (Provider::Meta, 0),
-                (Provider::OpenAi, 1)
-            ]
-        );
+        assert_eq!(calls, [(Provider::Meta, 1), (Provider::OpenAi, 1)]);
         assert_eq!(progress.executions[0].provider, "meta");
         assert_eq!(progress.executions[0].keyword_count, 1);
         let telemetry = progress.telemetry(true);
-        assert!(telemetry.used_fallback && telemetry.retried);
-        assert_eq!(telemetry.attempts.len(), 3);
+        assert!(telemetry.used_fallback && !telemetry.retried);
+        assert_eq!(telemetry.attempts.len(), 2);
         assert_eq!(telemetry.attempts[0].mode, RequestMode::Recorded);
         assert!(
             progress
@@ -3024,7 +3127,7 @@ mod tests {
             &mut |request, _| {
                 sent.push((request.provider, request.body.clone()));
                 let status = match sent.len() {
-                    2 => 415,
+                    2 | 4 => 415,
                     5 => 200,
                     _ => 503,
                 };
@@ -3043,16 +3146,15 @@ mod tests {
             [
                 Provider::OpenAi,
                 Provider::Deepgram,
-                Provider::Deepgram,
                 Provider::ElevenLabs,
+                Provider::Grok,
                 Provider::Grok,
             ]
         );
         assert_eq!(sent[1].1, b"OggS_FAKE_1");
-        assert!(sent[2].1.starts_with(b"RIFF"));
-        for (_, body) in &sent[3..] {
-            assert!(contains(body, b"OggS_FAKE_1") && !contains(body, b"RIFF"));
-        }
+        assert!(contains(&sent[2].1, b"OggS_FAKE_1") && !contains(&sent[2].1, b"RIFF"));
+        assert!(contains(&sent[3].1, b"OggS_FAKE_1") && !contains(&sent[3].1, b"RIFF"));
+        assert!(contains(&sent[4].1, b"RIFF"));
     }
 
     #[test]
@@ -3381,7 +3483,6 @@ mod tests {
                 sent.push((request.provider, request.opus, request.body.clone()));
                 let status = match sent.len() {
                     1 => 415,
-                    2 => 503,
                     _ => 200,
                 };
                 (
@@ -3392,15 +3493,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(success.model, "elevenlabs::scribe_v2");
-        let [
-            (_, true, opus),
-            (_, false, wav),
-            (Provider::ElevenLabs, true, multipart),
-        ] = &sent[..]
-        else {
-            panic!("opus, wav, then opus to the fallback");
+        let [(_, true, opus), (Provider::ElevenLabs, true, multipart)] = &sent[..] else {
+            panic!("opus to primary, then straight to fallback with opus");
         };
-        assert!(opus.starts_with(b"OggS") && wav.starts_with(b"RIFF"));
+        assert!(opus.starts_with(b"OggS"));
         // The fallback reuses the clip's single encoding.
         assert!(contains(multipart, opus));
         assert!(opus_refused("deepgram::nova-3"));
@@ -3423,10 +3519,7 @@ mod tests {
                 sent.push((request.provider, request.opus, request.body.clone()));
                 let (status, body) = match sent.len() {
                     1 => (415, "{}"),
-                    2 => (
-                        200,
-                        r#"{"results":{"channels":[{"alternatives":[{"transcript":"one"}]}]}}"#,
-                    ),
+                    2 => (200, r#"{"text":"one"}"#),
                     3 => (503, "{}"),
                     _ => (200, r#"{"text":"two"}"#),
                 };
@@ -3441,12 +3534,14 @@ mod tests {
             .iter()
             .map(|(provider, opus, _)| (*provider, *opus))
             .collect();
-        // Chunk two goes to Deepgram as WAV at once; its fallback still gets Opus.
+        // Chunk one moves straight to Grok on 415 and remembers Deepgram's
+        // rejection; chunk two goes to Deepgram as WAV at once while its
+        // fallback still gets Opus.
         assert_eq!(
             summary,
             [
                 (Provider::Deepgram, true),
-                (Provider::Deepgram, false),
+                (Provider::Grok, true),
                 (Provider::Deepgram, false),
                 (Provider::Grok, true),
             ]
@@ -3454,7 +3549,8 @@ mod tests {
         // One encode per chunk, whatever the chunks' lengths.
         assert_eq!(opus_encodes(), 2);
         assert_eq!(sent[0].2, b"OggS_FAKE_1");
-        assert!(sent[1].2.starts_with(b"RIFF") && sent[2].2.starts_with(b"RIFF"));
+        assert!(contains(&sent[1].2, b"OggS_FAKE_1") && !contains(&sent[1].2, b"RIFF"));
+        assert!(sent[2].2.starts_with(b"RIFF"));
         assert!(contains(&sent[3].2, b"OggS_FAKE_2") && !contains(&sent[3].2, b"RIFF"));
         let samples = take_samples();
         assert_eq!(samples.len(), 1);
@@ -3464,7 +3560,7 @@ mod tests {
     #[test]
     fn cancellation_during_the_wav_resend_stops_the_chain() {
         use_encoder(true);
-        let config = config(&["deepgram::nova-3", "grok::grok-voice-transcribe-2.0"]);
+        let config = config(&["deepgram::nova-3"]);
         let cancelled = AtomicBool::new(false);
         let mut sent = Vec::new();
         let error = run_chain(
@@ -3496,13 +3592,14 @@ mod tests {
     #[test]
     fn empty_opus_transcript_resends_the_wav_once_and_remembers_only_on_success() {
         const EMPTY: &str = r#"{"results":{"channels":[{"alternatives":[{"transcript":" "}]}]}}"#;
-        // Opus heard as nothing, the WAV transcribes: a silent mis-decode.
+        // Opus heard as nothing, the WAV transcribes: a silent mis-decode on a
+        // single-model chain resends WAV once and remembers the rejection.
         use_encoder(true);
-        let config = config(&["deepgram::nova-3", "grok::grok-voice-transcribe-2.0"]);
+        let single = config(&["deepgram::nova-3"]);
         let mut progress = Progress::default();
         let mut sent = Vec::new();
         let success = run_chain(
-            &config,
+            &single,
             &vocabulary(&[]),
             None,
             &mut progress,
@@ -3535,35 +3632,50 @@ mod tests {
         assert_eq!(progress.executions.len(), 2);
         assert!(opus_refused("deepgram::nova-3"));
 
-        // Both empty, or the WAV resend failing: the clip may be silent, so
-        // nothing is remembered and the chain falls through as before.
+        // With a fallback configured, an empty Opus answer moves straight to
+        // the fallback without retrying WAV or falsely marking Opus refused.
+        let with_fallback = config(&["deepgram::nova-3", "grok::grok-voice-transcribe-2.0"]);
+        use_encoder(true);
+        let mut sent = Vec::new();
+        let success = run_chain(
+            &with_fallback,
+            &vocabulary(&[]),
+            None,
+            &mut Progress::default(),
+            &mut |request, _| {
+                sent.push((request.provider, request.opus));
+                let body = match request.provider {
+                    Provider::Grok => r#"{"text":"two"}"#,
+                    _ => EMPTY,
+                };
+                (Ok(response(200, body, None)), Duration::from_millis(10))
+            },
+        )
+        .unwrap();
+        assert_eq!(success.model, "grok::grok-voice-transcribe-2.0");
+        assert_eq!(sent, [(Provider::Deepgram, true), (Provider::Grok, true)]);
+        assert!(!opus_refused("deepgram::nova-3"));
+        assert_eq!(opus_encodes(), 1);
+
+        // Both empty, or the WAV resend failing on a single model: nothing is remembered.
         for wav_status in [200, 503] {
             use_encoder(true);
             let mut sent = Vec::new();
-            let success = run_chain(
-                &config,
+            let failure = run_chain(
+                &single,
                 &vocabulary(&[]),
                 None,
                 &mut Progress::default(),
                 &mut |request, _| {
                     sent.push((request.provider, request.opus));
-                    let (status, body) = match (request.provider, request.opus) {
-                        (Provider::Grok, _) => (200, r#"{"text":"two"}"#),
-                        (_, true) => (200, EMPTY),
-                        (_, false) => (wav_status, EMPTY),
-                    };
-                    (Ok(response(status, body, None)), Duration::from_millis(10))
+                    let status = if request.opus { 200 } else { wav_status };
+                    (Ok(response(status, EMPTY, None)), Duration::from_millis(10))
                 },
-            )
-            .unwrap();
-            assert_eq!(success.model, "grok::grok-voice-transcribe-2.0");
+            );
+            assert!(failure.is_err());
             assert_eq!(
                 sent,
-                [
-                    (Provider::Deepgram, true),
-                    (Provider::Deepgram, false),
-                    (Provider::Grok, true),
-                ]
+                [(Provider::Deepgram, true), (Provider::Deepgram, false)]
             );
             assert!(!opus_refused("deepgram::nova-3"));
             assert_eq!(opus_encodes(), 1);
@@ -3594,40 +3706,31 @@ mod tests {
     fn a_model_confirmed_on_opus_accepts_its_empty_answer_without_a_wav_resend() {
         const EMPTY: &str = r#"{"results":{"channels":[{"alternatives":[{"transcript":" "}]}]}}"#;
         use_encoder(true);
-        let config = config(&["deepgram::nova-3", "grok::grok-voice-transcribe-2.0"]);
-        // Unconfirmed: an empty Opus answer resends the WAV once, as before.
+        let single = config(&["deepgram::nova-3"]);
+        // Unconfirmed single model: an empty Opus answer resends the WAV once.
         assert!(!opus_confirmed("deepgram::nova-3"));
         let mut sent = Vec::new();
-        let _ = run_chain(
-            &config,
+        let failure = run_chain(
+            &single,
             &vocabulary(&[]),
             None,
             &mut Progress::default(),
             &mut |request, _| {
                 sent.push((request.provider, request.opus));
-                let body = match (request.provider, request.opus) {
-                    (Provider::Grok, _) => r#"{"text":"two"}"#,
-                    _ => EMPTY,
-                };
-                (Ok(response(200, body, None)), Duration::from_millis(10))
+                (Ok(response(200, EMPTY, None)), Duration::from_millis(10))
             },
-        )
-        .unwrap();
+        );
+        assert!(failure.is_err());
         assert_eq!(
             sent,
-            [
-                (Provider::Deepgram, true),
-                (Provider::Deepgram, false),
-                (Provider::Grok, true),
-            ]
+            [(Provider::Deepgram, true), (Provider::Deepgram, false)]
         );
         assert!(!opus_confirmed("deepgram::nova-3"));
-        assert!(opus_confirmed("grok::grok-voice-transcribe-2.0"));
 
         // An Opus upload that returns text confirms the model.
         let mut sent = Vec::new();
         let success = run_chain(
-            &config,
+            &single,
             &vocabulary(&[]),
             None,
             &mut Progress::default(),
@@ -3645,26 +3748,21 @@ mod tests {
         assert!(opus_confirmed("deepgram::nova-3"));
         assert!(!opus_refused("deepgram::nova-3"));
 
-        // Confirmed: a noisy clip heard as nothing is the real outcome. The
-        // chain falls through without billing the same clip as WAV.
+        // Confirmed: a noisy clip heard as nothing is the real outcome and
+        // does not bill the same clip again as WAV.
         let mut sent = Vec::new();
-        let success = run_chain(
-            &config,
+        let failure = run_chain(
+            &single,
             &vocabulary(&[]),
             None,
             &mut Progress::default(),
             &mut |request, _| {
                 sent.push((request.provider, request.opus));
-                let body = match request.provider {
-                    Provider::Grok => r#"{"text":"two"}"#,
-                    _ => EMPTY,
-                };
-                (Ok(response(200, body, None)), Duration::from_millis(10))
+                (Ok(response(200, EMPTY, None)), Duration::from_millis(10))
             },
-        )
-        .unwrap();
-        assert_eq!(success.model, "grok::grok-voice-transcribe-2.0");
-        assert_eq!(sent, [(Provider::Deepgram, true), (Provider::Grok, true)]);
+        );
+        assert!(failure.is_err());
+        assert_eq!(sent, [(Provider::Deepgram, true)]);
         assert!(!opus_refused("deepgram::nova-3"));
     }
 
@@ -4247,9 +4345,9 @@ mod tests {
             &mut |_, _| {
                 calls += 1;
                 (Ok(match calls {
-                    1 => response(429, r#"{"usage":{"cost":0.0001}}"#, Some(Duration::ZERO)),
-                    2 => response(503, r#"{"error":"PRIVATE_BODY","usage":{"cost":0.0002}}"#, None),
-                    3 => response(200, r#"{"transcript":" ","usage":{"cost":0.0003}}"#, None),
+                    1 => response(503, r#"{"error":"PRIVATE_BODY","usage":{"cost":0.0001}}"#, None),
+                    2 => response(200, r#"{"transcript":" ","usage":{"cost":0.0002}}"#, None),
+                    3 => response(429, r#"{"usage":{"cost":0.0003}}"#, Some(Duration::ZERO)),
                     4 => response(200, r#"{"results":{"channels":[{"alternatives":[{"transcript":"first"}]}]}}"#, None),
                     5 => response(200, r#"{"text":"second","usage":{"cost":0.004}}"#, None),
                     _ => panic!("unexpected request"),
@@ -4275,8 +4373,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 ("openrouter", "fixture/primary", "failed", Some(0.0001)),
-                ("openrouter", "fixture/primary", "failed", Some(0.0002)),
-                ("meta", "muse-voice-transcribe-1.0", "failed", Some(0.0003)),
+                ("meta", "muse-voice-transcribe-1.0", "failed", Some(0.0002)),
+                ("deepgram", "nova-3", "failed", Some(0.0003)),
                 ("deepgram", "nova-3", "success", None),
                 ("openrouter", "fixture/primary", "success", Some(0.004)),
             ]
@@ -4693,7 +4791,6 @@ mod tests {
                     calls,
                     [
                         (Provider::Meta, 1),
-                        (Provider::Meta, 0),
                         (Provider::Grok, 1),
                         (Provider::Google, 1)
                     ]
@@ -4702,7 +4799,7 @@ mod tests {
                     progress
                         .failures
                         .iter()
-                        .any(|failure| failure.kind == ErrorKind::InvalidResponse)
+                        .any(|failure| failure.kind == ErrorKind::Rejected)
                 );
             } else {
                 assert_eq!(calls, [(Provider::Grok, 1), (Provider::Google, 1)]);
@@ -5075,19 +5172,16 @@ mod tests {
                 let success = result.unwrap();
                 assert_eq!(success.model, "deepgram::nova-3");
                 assert_eq!(success.text, "done");
+                // Primary 429 moves straight to fallback without waiting or retrying.
                 assert_eq!(
                     calls,
-                    [
-                        Provider::OpenRouter,
-                        Provider::OpenRouter,
-                        Provider::Meta,
-                        Provider::Deepgram
-                    ]
+                    [Provider::OpenRouter, Provider::Meta, Provider::Deepgram]
                 );
-                assert_eq!(waits, [Duration::from_millis(100)]);
+                assert!(waits.is_empty());
                 assert_eq!(progress.failures.len(), 2);
+                assert_eq!(progress.failures[0].kind, ErrorKind::RateLimited);
                 assert_eq!(progress.failures[1].kind, ErrorKind::InvalidResponse);
-                assert_eq!(progress.executions.len(), 4);
+                assert_eq!(progress.executions.len(), 3);
             } else {
                 let Err(error) = result else {
                     panic!("empty responses must fail the chain")
@@ -5574,5 +5668,113 @@ mod tests {
         assert_eq!(providers, [Provider::OpenRouter, Provider::Deepgram]);
         let samples = take_samples();
         assert!(samples[0].telemetry.as_ref().unwrap().used_fallback);
+    }
+
+    #[test]
+    fn failed_or_timed_out_live_primary_goes_straight_to_fallback_without_retrying_primary() {
+        let mut timeout_error = streaming::fixture_error(None, false);
+        timeout_error
+            .downcast_mut::<streaming::LiveError>()
+            .unwrap()
+            .error_kind = ErrorKind::Timeout;
+        for failure in [
+            Err(streaming::fixture_error(Some(503), false)),
+            Err(timeout_error),
+            Ok(streaming::LiveResult {
+                text: "   ".into(),
+                model: "deepgram::nova-3".into(),
+                keyword_count: 0,
+                latency_ms: 40,
+            }),
+        ] {
+            take_samples();
+            let config = telemetry_config(&["deepgram::nova-3", "openai/whisper-large-v3-turbo"]);
+            let live =
+                streaming::PendingLive::fixture(config.clone(), Snapshot::default(), failure, 1600);
+            let mut providers = Vec::new();
+            let result = transcribe_configured(
+                &[0.1; 1600],
+                &Snapshot::default(),
+                Some(live),
+                &config,
+                &mut |request, _| {
+                    providers.push(request.provider);
+                    assert_eq!(
+                        request.provider,
+                        Provider::OpenRouter,
+                        "must skip retrying the primary model when a fallback is configured"
+                    );
+                    (
+                        Ok(response(200, r#"{"text":"from fallback"}"#, None)),
+                        Duration::from_millis(20),
+                    )
+                },
+                &mut |_, _, _, _| panic!("must not reopen primary websocket"),
+                &mut |_| panic!("must not sleep before fallback"),
+            )
+            .unwrap();
+            assert_eq!(result.text, "from fallback");
+            assert_eq!(providers, [Provider::OpenRouter]);
+            let report = result.report.unwrap();
+            assert_eq!(
+                report.model.as_deref(),
+                Some("openai/whisper-large-v3-turbo")
+            );
+            assert_eq!(report.executions.len(), 2);
+            assert_eq!(report.executions[0].provider, "deepgram");
+            assert!(report.executions[0].streaming);
+            assert_eq!(report.executions[0].outcome, "failed");
+            assert!(report.executions[0].error.is_some());
+            assert_eq!(report.executions[1].provider, "openrouter");
+            assert!(!report.executions[1].streaming);
+            assert_eq!(report.executions[1].outcome, "success");
+            let samples = take_samples();
+            let telemetry = samples[0].telemetry.as_ref().unwrap();
+            assert!(telemetry.used_fallback);
+            assert!(telemetry.live_recovered);
+            assert!(!telemetry.retried);
+        }
+    }
+
+    #[test]
+    fn post_cancellable_enforces_hard_timeout_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(2));
+        });
+        let request = Request {
+            provider: Provider::OpenRouter,
+            url: format!("http://{addr}/v1/audio/transcriptions"),
+            content_type: "application/json".into(),
+            body: b"{}".to_vec(),
+            keyword_count: 2,
+            opus: false,
+        };
+        let pool = HttpPool::new();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let started = Instant::now();
+        let error = post_cancellable(
+            &pool,
+            &request,
+            "Authorization",
+            "Bearer test",
+            Duration::from_millis(120),
+            Some(&cancelled),
+        )
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        let _ = done_tx.send(());
+        let _ = server.join();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "timed out too slowly: {elapsed:?}"
+        );
+        let failure = error
+            .downcast_ref::<TransportFailure>()
+            .expect("must classify as TransportFailure");
+        assert_eq!(failure.0, ErrorKind::Timeout);
     }
 }
