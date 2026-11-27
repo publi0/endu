@@ -2,7 +2,8 @@
 //! only copies bounded PCM blocks; credentials, codecs and sockets stay here.
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, mpsc};
 use std::time::{Duration, Instant};
@@ -24,6 +25,11 @@ const BLOCK: usize = 1_600; // 100 ms of mono 16 kHz audio.
 const QUEUE_BLOCKS: usize = 32;
 const MAX_TAIL: usize = BLOCK * QUEUE_BLOCKS;
 const POLL: Duration = Duration::from_millis(20);
+const MAX_CONNECT_ADDRESSES: usize = 8;
+/// RFC 8305 Connection Attempt Delay: give IPv6 a head start before launching
+/// the fallback family in parallel.
+const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_LIFETIME: Duration = Duration::from_secs(60 * 60);
 const GOOGLE_LIFETIME: Duration = Duration::from_secs(10 * 60);
 
@@ -1798,7 +1804,7 @@ impl Connection {
             let _ = tx.send(
                 (host.as_str(), port)
                     .to_socket_addrs()
-                    .map(|addresses| addresses.take(8).collect::<Vec<_>>()),
+                    .map(interleave_address_families),
             );
         });
         let addresses = loop {
@@ -1812,29 +1818,7 @@ impl Connection {
                 }
             }
         };
-        let addresses = interleave_address_families(addresses);
-        let mut connected = None;
-        let mut last_connect_error = ErrorKind::Network;
-        for address in addresses {
-            control.check(deadline)?;
-            match TcpStream::connect_timeout(
-                &address,
-                Duration::from_secs(2).min(deadline.saturating_duration_since(Instant::now())),
-            ) {
-                Ok(stream) => {
-                    connected = Some(stream);
-                    break;
-                }
-                Err(error) => last_connect_error = connect_error_kind(&error),
-            }
-        }
-        control.check(deadline)?;
-        let stream = connected.ok_or_else(|| {
-            failure_kind(
-                "Could not connect to streaming provider.",
-                last_connect_error,
-            )
-        })?;
+        let stream = connect_happy_eyeballs(&addresses, deadline, control, HAPPY_EYEBALLS_DELAY)?;
         let stream = SocketIo {
             tcp: stream,
             control: control.clone(),
@@ -2174,29 +2158,306 @@ impl Connection {
     }
 }
 
-/// Interleaves IPv4 and IPv6 addresses (starting with IPv4 when present) so a
-/// broken-IPv6 network does not burn multiple sequential 2-second timeouts
-/// before trying IPv4.
-fn interleave_address_families(addresses: Vec<std::net::SocketAddr>) -> Vec<std::net::SocketAddr> {
-    let mut v4 = std::collections::VecDeque::new();
+/// Interleaves IPv6 and IPv4 addresses, always preferring IPv6 first, before
+/// bounding the list to `MAX_CONNECT_ADDRESSES`. Collecting up to the cap per
+/// family prevents hosts with 8+ AAAA records (such as Google) from pushing
+/// every IPv4 fallback past the limit.
+fn interleave_address_families(addresses: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
     let mut v6 = std::collections::VecDeque::new();
+    let mut v4 = std::collections::VecDeque::new();
     for address in addresses {
-        if address.is_ipv4() {
+        if address.is_ipv6() {
+            if v6.len() < MAX_CONNECT_ADDRESSES {
+                v6.push_back(address);
+            }
+        } else if v4.len() < MAX_CONNECT_ADDRESSES {
             v4.push_back(address);
-        } else {
-            v6.push_back(address);
+        }
+        if v6.len() >= MAX_CONNECT_ADDRESSES && v4.len() >= MAX_CONNECT_ADDRESSES {
+            break;
         }
     }
-    let mut ordered = Vec::with_capacity(v4.len() + v6.len());
-    while !v4.is_empty() || !v6.is_empty() {
-        if let Some(addr) = v4.pop_front() {
+    let mut ordered = Vec::with_capacity((v6.len() + v4.len()).min(MAX_CONNECT_ADDRESSES));
+    while ordered.len() < MAX_CONNECT_ADDRESSES && (!v6.is_empty() || !v4.is_empty()) {
+        if let Some(addr) = v6.pop_front() {
             ordered.push(addr);
         }
-        if let Some(addr) = v6.pop_front() {
+        if ordered.len() < MAX_CONNECT_ADDRESSES
+            && let Some(addr) = v4.pop_front()
+        {
             ordered.push(addr);
         }
     }
     ordered
+}
+
+enum ConnectStart {
+    Connected(TcpStream),
+    Pending(OwnedFd),
+}
+
+struct PendingConnect {
+    fd: OwnedFd,
+    deadline: Instant,
+}
+
+fn start_connect(address: SocketAddr) -> io::Result<ConnectStart> {
+    let domain = match address {
+        SocketAddr::V4(_) => libc::AF_INET,
+        SocketAddr::V6(_) => libc::AF_INET6,
+    };
+    // SAFETY: Standard POSIX socket creation; the descriptor is immediately
+    // wrapped in OwnedFd so every error path closes it automatically.
+    let raw = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+
+    // Match std::net::TcpStream defaults on macOS: close-on-exec and no SIGPIPE.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let nosigpipe: libc::c_int = 1;
+    if unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_NOSIGPIPE,
+            (&raw const nosigpipe).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    let rc = match address {
+        SocketAddr::V4(v4) => {
+            let sockaddr = libc::sockaddr_in {
+                sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: v4.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            unsafe {
+                libc::connect(
+                    fd.as_raw_fd(),
+                    (&raw const sockaddr).cast(),
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+        }
+        SocketAddr::V6(v6) => {
+            let sockaddr = libc::sockaddr_in6 {
+                sin6_len: std::mem::size_of::<libc::sockaddr_in6>() as u8,
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: v6.port().to_be(),
+                sin6_flowinfo: v6.flowinfo().to_be(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: v6.ip().octets(),
+                },
+                sin6_scope_id: v6.scope_id(),
+            };
+            unsafe {
+                libc::connect(
+                    fd.as_raw_fd(),
+                    (&raw const sockaddr).cast(),
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        }
+    };
+
+    if rc == 0 {
+        let stream = TcpStream::from(fd);
+        stream.set_nonblocking(false)?;
+        return Ok(ConnectStart::Connected(stream));
+    }
+    let error = io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::EINPROGRESS) | Some(libc::EALREADY)
+    ) {
+        Ok(ConnectStart::Pending(fd))
+    } else {
+        Err(error)
+    }
+}
+
+fn socket_connect_error(fd: &OwnedFd) -> io::Result<Option<io::Error>> {
+    let mut code: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            (&raw mut code).cast(),
+            &raw mut len,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((code != 0).then(|| io::Error::from_raw_os_error(code)))
+}
+
+/// Connects using Happy Eyeballs (RFC 8305) over an already-interleaved
+/// IPv6-first address list: starts IPv6 immediately, races the next address in
+/// parallel after `stagger` (or right away on immediate refusal), and returns
+/// the first established socket while closing all others.
+fn connect_happy_eyeballs(
+    addresses: &[SocketAddr],
+    deadline: Instant,
+    control: &SessionControl,
+    stagger: Duration,
+) -> Result<TcpStream> {
+    let mut next_index = 0usize;
+    let mut next_start = Instant::now();
+    let mut in_flight: Vec<PendingConnect> = Vec::with_capacity(addresses.len());
+    let mut last_error = ErrorKind::Network;
+
+    loop {
+        control.check(deadline)?;
+        let now = Instant::now();
+
+        while next_index < addresses.len() && (in_flight.is_empty() || now >= next_start) {
+            let address = addresses[next_index];
+            next_index += 1;
+            match start_connect(address) {
+                Ok(ConnectStart::Connected(stream)) => return Ok(stream),
+                Ok(ConnectStart::Pending(fd)) => {
+                    let attempt_deadline = (now + CONNECT_ATTEMPT_TIMEOUT).min(deadline);
+                    in_flight.push(PendingConnect {
+                        fd,
+                        deadline: attempt_deadline,
+                    });
+                    next_start = now + stagger;
+                    break;
+                }
+                Err(error) => {
+                    last_error = connect_error_kind(&error);
+                    next_start = now;
+                }
+            }
+        }
+
+        if in_flight.is_empty() {
+            return Err(failure_kind(
+                "Could not connect to streaming provider.",
+                last_error,
+            ));
+        }
+
+        let mut wake_at = deadline.min(now + POLL);
+        if next_index < addresses.len() {
+            wake_at = wake_at.min(next_start);
+        }
+        for attempt in &in_flight {
+            wake_at = wake_at.min(attempt.deadline);
+        }
+        let remaining = wake_at.saturating_duration_since(Instant::now());
+        let wait_ms = if remaining.is_zero() {
+            0
+        } else {
+            remaining.as_millis().clamp(1, i32::MAX as u128) as libc::c_int
+        };
+
+        let mut pollfds: Vec<libc::pollfd> = in_flight
+            .iter()
+            .map(|attempt| libc::pollfd {
+                fd: attempt.fd.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            })
+            .collect();
+
+        // SAFETY: `pollfds` is a valid contiguous buffer of `pollfds.len()` descriptors.
+        let ready =
+            unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, wait_ms) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(failure_kind(
+                "Could not connect to streaming provider.",
+                connect_error_kind(&error),
+            ));
+        }
+
+        let after = Instant::now();
+        let mut failed_indices = Vec::new();
+        let mut failed_latest = false;
+        if ready > 0 {
+            // Check earlier (higher-priority, IPv6-first) attempts first so a
+            // simultaneous completion keeps the IPv6 preference.
+            for (index, pollfd) in pollfds.iter().enumerate() {
+                if pollfd.revents == 0 {
+                    continue;
+                }
+                let fd = &in_flight[index].fd;
+                let connect_result = if (pollfd.revents & libc::POLLNVAL) != 0 {
+                    Err(io::Error::from_raw_os_error(libc::EBADF))
+                } else {
+                    match socket_connect_error(fd) {
+                        Ok(Some(error)) => Err(error),
+                        Ok(None) if (pollfd.revents & libc::POLLOUT) != 0 => Ok(()),
+                        Ok(None) => Err(io::Error::new(
+                            io::ErrorKind::ConnectionRefused,
+                            "connection failed",
+                        )),
+                        Err(error) => Err(error),
+                    }
+                };
+                match connect_result {
+                    Ok(()) => {
+                        let winner = in_flight.swap_remove(index);
+                        let stream = TcpStream::from(winner.fd);
+                        stream
+                            .set_nonblocking(false)
+                            .map_err(|_| failure("Streaming socket configuration failed."))?;
+                        return Ok(stream);
+                    }
+                    Err(error) => {
+                        last_error = connect_error_kind(&error);
+                        if index + 1 == in_flight.len() {
+                            failed_latest = true;
+                        }
+                        failed_indices.push(index);
+                    }
+                }
+            }
+        }
+
+        for (index, attempt) in in_flight.iter().enumerate() {
+            if attempt.deadline <= after && !failed_indices.contains(&index) {
+                last_error = ErrorKind::Timeout;
+                if index + 1 == in_flight.len() {
+                    failed_latest = true;
+                }
+                failed_indices.push(index);
+            }
+        }
+
+        failed_indices.sort_unstable();
+        for index in failed_indices.into_iter().rev() {
+            in_flight.remove(index);
+        }
+        if failed_latest {
+            next_start = after;
+        }
+    }
 }
 
 /// Stateful 16 -> 24 kHz conversion for OpenAI; never restarts at packet edges.
@@ -3611,6 +3872,91 @@ mod tests {
         recorded.sent_samples.store(16_000, Ordering::Release);
         drop(recorded);
         assert!(take_discarded().is_empty());
+    }
+
+    #[test]
+    fn interleave_address_families_prefers_ipv6_and_preserves_ipv4_fallback_past_eight_records() {
+        let v6 = |last: u16| -> SocketAddr {
+            SocketAddr::from((
+                std::net::Ipv6Addr::new(0x2001, 0x4860, 0, 0, 0, 0, 0, last),
+                443,
+            ))
+        };
+        let v4 = |last: u8| -> SocketAddr {
+            SocketAddr::from((std::net::Ipv4Addr::new(172, 217, 112, last), 443))
+        };
+
+        // Regression: Google returns 8 AAAA records before 8 A records.
+        // Bounding before interleaving used to drop every IPv4 address.
+        let google_like: Vec<_> = (1..=8).map(v6).chain((1..=8).map(v4)).collect();
+        assert_eq!(
+            interleave_address_families(google_like),
+            vec![v6(1), v4(1), v6(2), v4(2), v6(3), v4(3), v6(4), v4(4)]
+        );
+
+        // Even when IPv4 records arrive first, IPv6 is always preferred first.
+        assert_eq!(
+            interleave_address_families([v4(1), v4(2), v6(1), v6(2)]),
+            vec![v6(1), v4(1), v6(2), v4(2)]
+        );
+
+        // Single-family inputs stay capped at MAX_CONNECT_ADDRESSES.
+        let only_v6: Vec<_> = (1..=12).map(v6).collect();
+        assert_eq!(
+            interleave_address_families(only_v6),
+            (1..=8).map(v6).collect::<Vec<_>>()
+        );
+        let only_v4: Vec<_> = (1..=12).map(v4).collect();
+        assert_eq!(
+            interleave_address_families(only_v4),
+            (1..=8).map(v4).collect::<Vec<_>>()
+        );
+        assert!(interleave_address_families(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn happy_eyeballs_prefers_ipv6_and_falls_back_to_ipv4_on_refusal() {
+        let v4_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let v4_addr = v4_listener.local_addr().unwrap();
+        v4_listener.set_nonblocking(true).unwrap();
+
+        let control = SessionControl::new(None, None);
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        // When IPv6 is reachable, IPv6 is chosen and IPv4 is never dialed.
+        if let Ok(v6_listener) = std::net::TcpListener::bind("[::1]:0") {
+            let v6_addr = v6_listener.local_addr().unwrap();
+            let ordered = interleave_address_families([v4_addr, v6_addr]);
+            assert_eq!(ordered, vec![v6_addr, v4_addr]);
+            let stream =
+                connect_happy_eyeballs(&ordered, deadline, &control, HAPPY_EYEBALLS_DELAY).unwrap();
+            assert_eq!(stream.peer_addr().unwrap(), v6_addr);
+            assert!(matches!(
+                v4_listener.accept(),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock
+            ));
+            drop(stream);
+            drop(v6_listener);
+
+            // Once the IPv6 listener is closed, immediate refusal falls back to
+            // IPv4 right away without waiting out a long stagger window.
+            let started = Instant::now();
+            let stream =
+                connect_happy_eyeballs(&ordered, deadline, &control, Duration::from_secs(5))
+                    .unwrap();
+            assert_eq!(stream.peer_addr().unwrap(), v4_addr);
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "immediate IPv6 refusal should not wait for the stagger timer"
+            );
+        }
+
+        // Empty list and pre-cancelled control fail cleanly without touching the network.
+        assert!(connect_happy_eyeballs(&[], deadline, &control, HAPPY_EYEBALLS_DELAY).is_err());
+        control.cancelled.store(true, Ordering::Release);
+        let err = connect_happy_eyeballs(&[v4_addr], deadline, &control, HAPPY_EYEBALLS_DELAY)
+            .unwrap_err();
+        assert!(err.to_string().contains("cancelled"));
     }
 
     #[test]
