@@ -38,6 +38,15 @@ impl std::fmt::Display for UnusableTranscript {
 
 impl std::error::Error for UnusableTranscript {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryCancel {
+    None,
+    /// Explicit Escape cancellation: discard temporary audio.
+    Discard,
+    /// User stopped processing from the HUD: keep saved audio for retry.
+    KeepForRetry,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryStatus {
@@ -141,6 +150,14 @@ impl PendingResolution {
             entry,
             t("Endu closed before transcription finished. Audio was kept for retry."),
         );
+    }
+
+    /// Preserves an accepted recording whose transcription was stopped by the
+    /// user from the HUD, keeping its audio ready for a manual Retry.
+    pub fn preserve_stopped(mut self) {
+        if let Some(entry) = self.entry.take() {
+            self.store.finish_stopped(entry);
+        }
     }
 
     /// Keeps a successful transcript that was not pasted (copied, deferred or
@@ -653,6 +670,27 @@ impl RecordingRecovery {
         self.record_failure(entry, message);
     }
 
+    fn finish_stopped(&self, mut entry: RecoveryEntry) {
+        let base = t("Transcription was stopped. The saved audio is ready to retry.");
+        let message = if entry.volatile {
+            format!(
+                "{base} Audio could not be saved to disk and is only in memory. Keep Endu open until recovery."
+            )
+        } else {
+            base.to_owned()
+        };
+        entry.status = RecoveryStatus::Pending;
+        entry.message = Some(message);
+        if !entry.volatile
+            && let Err(error) = self.save_metadata(&entry)
+        {
+            tracing::warn!(%error, "could not update stopped recording status");
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.entries.insert(entry.id.clone(), entry);
+        state.revision += 1;
+    }
+
     fn record_failure(&self, mut entry: RecoveryEntry, message: String) {
         entry.status = RecoveryStatus::Failed;
         entry.message = Some(message);
@@ -754,6 +792,32 @@ impl RecordingRecovery {
         user_cancelled: Option<&std::sync::atomic::AtomicBool>,
         transcribe: impl FnOnce(&[f32]) -> color_eyre::Result<Transcription>,
     ) -> (color_eyre::Result<Transcription>, Option<PendingResolution>) {
+        self.transcribe_original_with_cancel(
+            samples,
+            application,
+            preferences,
+            || {
+                if user_cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                    RecoveryCancel::Discard
+                } else {
+                    RecoveryCancel::None
+                }
+            },
+            transcribe,
+        )
+    }
+
+    /// Like [`Self::transcribe_original_cancellable`], distinguishing between
+    /// discarding a cancelled recording (Escape) and stopping transcription
+    /// while keeping the saved audio ready to retry in History.
+    pub fn transcribe_original_with_cancel(
+        &self,
+        samples: &[f32],
+        application: Option<&str>,
+        preferences: crate::post_processing::Preferences,
+        cancel_state: impl Fn() -> RecoveryCancel,
+        transcribe: impl FnOnce(&[f32]) -> color_eyre::Result<Transcription>,
+    ) -> (color_eyre::Result<Transcription>, Option<PendingResolution>) {
         let entry = self.begin(samples, application);
         let active = ActiveAttempt {
             store: self.clone(),
@@ -783,8 +847,12 @@ impl RecordingRecovery {
                 .downcast_ref::<crate::openrouter::transcribe::NoSpeech>()
                 .is_some()
         });
-        let cancelled =
-            user_cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+        let cancel = cancel_state();
+        if cancel == RecoveryCancel::KeepForRetry {
+            self.finish_stopped(entry);
+            drop(active);
+            return (result, None);
+        }
         match &result {
             Ok(_) => {
                 if entry.volatile {
@@ -803,7 +871,7 @@ impl RecordingRecovery {
                 }
             }
             // Silence and explicit user cancellation have nothing to recover.
-            Err(_) if no_speech || cancelled => {
+            Err(_) if no_speech || cancel == RecoveryCancel::Discard => {
                 self.resolve_entry(entry);
                 drop(active);
                 (result, None)
@@ -814,6 +882,18 @@ impl RecordingRecovery {
                 (result, None)
             }
         }
+    }
+
+    /// Keeps accepted audio whose transcription was stopped before it began,
+    /// ready for a manual Retry in History.
+    pub fn save_stopped(&self, samples: &[f32], application: Option<&str>) {
+        let entry = self.begin(samples, application);
+        let _active = ActiveAttempt {
+            store: self.clone(),
+            id: entry.id.clone(),
+            retry: false,
+        };
+        self.finish_stopped(entry);
     }
 
     /// Keeps accepted audio that can no longer be transcribed, such as a
@@ -1909,6 +1989,90 @@ mod tests {
         assert!(pending.is_none());
         assert!(store.entries("").is_empty());
         assert!(fs::read_dir(&fixture.0).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn stopped_transcription_is_kept_in_recovery_for_retry() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let (result, pending) = store.transcribe_original_with_cancel(
+            &[0.1; 160],
+            Some("Notes"),
+            crate::post_processing::Preferences::default(),
+            || {
+                if stopped.load(Ordering::Acquire) {
+                    RecoveryCancel::KeepForRetry
+                } else {
+                    RecoveryCancel::None
+                }
+            },
+            |_| {
+                stopped.store(true, Ordering::Release);
+                Err(color_eyre::eyre::eyre!("Transcription was cancelled."))
+            },
+        );
+        assert!(result.is_err());
+        assert!(pending.is_none());
+        let entries = store.entries("");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, RecoveryStatus::Pending);
+        assert!(!entries[0].busy);
+        assert_eq!(entries[0].application.as_deref(), Some("Notes"));
+        assert_eq!(entries[0].title(), "Interrupted transcription");
+        assert!(
+            entries[0]
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("stopped"))
+        );
+
+        // Retrying the stopped entry recovers the transcript and deletes audio.
+        let id = entries[0].id.clone();
+        store
+            .retry_with(&id, |_| {
+                Ok(Transcription {
+                    text: "retried after stop".into(),
+                    report: None,
+                })
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let entries = store.entries("");
+            if entries[0].status == RecoveryStatus::Recovered && !entries[0].busy {
+                assert_eq!(entries[0].text.as_deref(), Some("retried after stop"));
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "retry did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // `save_stopped` and `PendingResolution::preserve_stopped` keep audio too.
+        store.save_stopped(&[0.2; 320], Some("Slack"));
+        let (ok, pending) = store.transcribe_original_with_cancel(
+            &[0.3; 320],
+            Some("Mail"),
+            crate::post_processing::Preferences::default(),
+            || RecoveryCancel::None,
+            |_| {
+                Ok(Transcription {
+                    text: "late".into(),
+                    report: None,
+                })
+            },
+        );
+        assert!(ok.is_ok());
+        pending.unwrap().preserve_stopped();
+        let entries = store.entries("");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.status == RecoveryStatus::Pending && !entry.busy)
+                .count(),
+            2
+        );
     }
 
     #[test]

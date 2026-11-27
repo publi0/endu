@@ -327,6 +327,7 @@ fn recreate_panel(panel: &NSPanel) -> Option<Retained<NSPanel>> {
     replacement.setBackgroundColor(Some(&panel.backgroundColor()));
     replacement.setOpaque(panel.isOpaque());
     replacement.setIgnoresMouseEvents(panel.ignoresMouseEvents());
+    replacement.setBecomesKeyOnlyIfNeeded(panel.becomesKeyOnlyIfNeeded());
     replacement.setHasShadow(panel.hasShadow());
     replacement.setHidesOnDeactivate(panel.hidesOnDeactivate());
     replacement.setCanHide(panel.canHide());

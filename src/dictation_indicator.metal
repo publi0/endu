@@ -34,6 +34,13 @@ struct Uniforms {
     float light;
     // 1 hides the lines so a written notice can sit in the capsule.
     float silenced;
+    // 1 reveals the hover stop button on the right cap while transcribing.
+    float cancel_reveal;
+    // 1 highlights the stop button when the pointer is directly over it.
+    float cancel_hover;
+    // 1 depresses the stop button while pressed.
+    float cancel_pressed;
+    float _cancel_padding;
 };
 
 struct VertexOutput {
@@ -186,9 +193,13 @@ fragment float4 indicator_fragment(
     composite(result, rim_color, rim * rim_strength * detail_clarity);
     composite(result, recording_color, rim * recording_flash * 0.7 * detail_clarity);
 
+    float cancel_reveal = clamp(uniforms.cancel_reveal, 0.0, 1.0);
+    float cancel_hover = clamp(uniforms.cancel_hover, 0.0, 1.0);
+    float cancel_pressed = clamp(uniforms.cancel_pressed, 0.0, 1.0);
+
     float inset = radius * 0.9;
     float start = -half_size.x + inset;
-    float end = half_size.x - inset;
+    float end = half_size.x - inset - cancel_reveal * 12.0;
     float time = uniforms.time;
     float rest = 0.5 + 0.5 * sin(time * 4.0);
     float amplitude = mix(0.6 + 4.2 * level, 1.5, processing);
@@ -209,6 +220,27 @@ fragment float4 indicator_fragment(
     composite(result, line_color, line_glow * glow_strength * lines_visible * (1.0 - preparing));
     composite(result, line_color, coverage(secondary - 0.32, stroke_edge) * 0.55 * lines_visible);
     composite(result, line_color, coverage(primary - 0.45, stroke_edge) * lines_visible);
+
+    if (cancel_reveal > 0.001) {
+        float2 button_center = float2(half_size.x - radius, 0.0);
+        float button_scale = mix(0.72, 1.0, cancel_reveal) * mix(1.0, 0.88, cancel_pressed);
+        float2 local = (point - button_center) / max(button_scale, 0.01);
+        float disc = coverage(length(local) - 5.6, edge) * cancel_reveal * shape * detail_clarity;
+        float3 disc_rest = light_mode ? float3(0.11, 0.16, 0.23) : float3(1.0);
+        float3 disc_hot = light_mode ? float3(0.82, 0.20, 0.18) : float3(0.90, 0.28, 0.24);
+        float disc_alpha = mix(light_mode ? 0.10 : 0.14, light_mode ? 0.90 : 0.88, cancel_hover);
+        composite(result, mix(disc_rest, disc_hot, cancel_hover), disc * disc_alpha);
+
+        float2 d1a = float2(-2.0, -2.0);
+        float2 d1b = float2(2.0, 2.0);
+        float2 d2a = float2(-2.0, 2.0);
+        float2 d2b = float2(2.0, -2.0);
+        float cross = min(segment_distance(local, d1a, d1b), segment_distance(local, d2a, d2b));
+        float3 cross_rest = light_mode ? float3(0.18, 0.22, 0.28) : float3(0.86, 0.87, 0.90);
+        float3 cross_color = mix(cross_rest, float3(1.0), cancel_hover);
+        float cross_alpha = mix(0.84, 1.0, cancel_hover) * cancel_reveal * shape * detail_clarity;
+        composite(result, cross_color, coverage(cross - 0.55, stroke_edge) * cross_alpha);
+    }
 
     if (completion > 0.0) {
         float drawn = smoothstep(0.25, 0.75, completion);

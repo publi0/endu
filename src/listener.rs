@@ -75,6 +75,9 @@ impl ReleaseTail {
 #[derive(Debug)]
 pub enum ListenerControl {
     PasteLast,
+    /// Stop the active transcription from the HUD and keep its audio in
+    /// Recording Recovery for manual retry.
+    StopProcessing,
 }
 
 /// The sending half of the listener's control queue. It also wakes an idle
@@ -630,6 +633,16 @@ pub fn listen(
                         hotkey.suspend();
                         input_monitor.reset_submit_guard(false);
                         session.paste_last()?;
+                    }
+                    ListenerControl::StopProcessing => {
+                        if let Some(job_id) = worker.cancel_current_for_recovery() {
+                            feedback::play(Tone::Cancel);
+                            events.dictation(DictationPhase::Cancelled, "")?;
+                            session.indicate(DictationIndicatorEvent::JobCancelled {
+                                job_id: job_id.value(),
+                            });
+                            session.emit_state(hotkey.is_recording())?;
+                        }
                     }
                 }
             }

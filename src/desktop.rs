@@ -5,6 +5,7 @@ use crate::i18n::t;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::thread::{self, JoinHandle};
@@ -164,6 +165,7 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
         })
         .transpose()?;
     let (indicator_sender, indicator_receiver) = dictation_indicator::channel();
+    let preview_cancel = Arc::new(AtomicBool::new(false));
     if notice_preview {
         let sender = indicator_sender.clone();
         thread::spawn(move || {
@@ -175,7 +177,7 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
             }
         });
     } else if hud_preview {
-        spawn_hud_preview(indicator_sender.clone());
+        spawn_hud_preview(indicator_sender.clone(), preview_cancel.clone());
     }
     let (control_sender, control_receiver) = crate::listener::control_channel(8);
     let shutdown_wake = control_sender.clone();
@@ -299,8 +301,27 @@ pub fn run(shutdown: &'static AtomicBool, launch: Launch) -> Result<()> {
         })
         .detach();
         let indicator_enabled = hud_preview || ui.preview.is_none();
+        let on_cancel_processing: Arc<dyn Fn() + Send + Sync> = if hud_preview {
+            let flag = preview_cancel.clone();
+            Arc::new(move || {
+                flag.store(true, Ordering::Release);
+            })
+        } else {
+            let controls = ui.listener_controls.clone();
+            Arc::new(move || {
+                let _ = controls.try_send(ListenerControl::StopProcessing);
+            })
+        };
         cx.spawn(async move |cx| {
-            drive_ui(indicator_receiver, ui, shutdown, indicator_enabled, cx).await;
+            drive_ui(
+                indicator_receiver,
+                ui,
+                shutdown,
+                indicator_enabled,
+                on_cancel_processing,
+                cx,
+            )
+            .await;
         })
         .detach();
     });
@@ -466,9 +487,10 @@ async fn drive_ui(
     ui: Rc<Ui>,
     shutdown: &AtomicBool,
     indicator_enabled: bool,
+    on_cancel_processing: Arc<dyn Fn() + Send + Sync>,
     cx: &mut gpui::AsyncApp,
 ) {
-    let mut indicator = indicator_enabled.then(DictationIndicatorUi::new);
+    let mut indicator = indicator_enabled.then(|| DictationIndicatorUi::new(on_cancel_processing));
     let mut paste_notice: Option<crate::paste_notice::PasteNotice> = None;
     // The window also checks while open; this keeps the menu bar badge and
     // restart item current for people who only use the menu bar.
@@ -683,12 +705,16 @@ fn restart_to_update(ui: &Ui, cx: &mut App) {
     }
 }
 
-fn spawn_hud_preview(sender: crate::dictation_indicator::DictationIndicatorSender) {
+fn spawn_hud_preview(
+    sender: crate::dictation_indicator::DictationIndicatorSender,
+    cancel: Arc<AtomicBool>,
+) {
     thread::spawn(move || {
         // Cycles in turn: normal speech ending in a check; a muted microphone
         // ("No audio" while recording and at the end); quiet speech ("Low audio").
         for cycle in 0_u64.. {
             let job_id = cycle;
+            cancel.store(false, Ordering::Release);
             sender.send(DictationIndicatorEvent::Preparing);
             thread::sleep(Duration::from_millis(900));
             sender.send(DictationIndicatorEvent::Started);
@@ -712,8 +738,18 @@ fn spawn_hud_preview(sender: crate::dictation_indicator::DictationIndicatorSende
                 sender.send(DictationIndicatorEvent::JobQuiet { job_id });
             }
             sender.send(DictationIndicatorEvent::Transcribing { job_id });
-            thread::sleep(Duration::from_millis(900));
-            sender.send(if cycle % 3 == 1 {
+            let transcribing_started = Instant::now();
+            let mut stopped = false;
+            while transcribing_started.elapsed() < Duration::from_millis(2_500) {
+                if cancel.swap(false, Ordering::AcqRel) {
+                    stopped = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            sender.send(if stopped {
+                DictationIndicatorEvent::JobCancelled { job_id }
+            } else if cycle % 3 == 1 {
                 DictationIndicatorEvent::JobNoAudio { job_id }
             } else {
                 DictationIndicatorEvent::JobCompleted { job_id }

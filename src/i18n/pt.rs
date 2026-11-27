@@ -1597,10 +1597,18 @@ pub(super) const CATALOG: &[(&str, &str)] = &[
     ("Retry with", "Tentar novamente com"),
     ("Stop", "Parar"),
     (
+        "Stop transcribing and save audio to History",
+        "Parar transcrição e salvar áudio no Histórico",
+    ),
+    (
         "This recording has no audio to play.",
         "Esta gravação não tem áudio para reproduzir.",
     ),
     ("Timed out", "Tempo esgotado"),
+    (
+        "Transcription was stopped. The saved audio is ready to retry.",
+        "A transcrição foi interrompida. O áudio salvo está pronto para tentar novamente.",
+    ),
     ("Use at most {max} names.", "Use no máximo {max} nomes."),
     (
         "↑  Drag Endu into the {permission} list above",

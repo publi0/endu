@@ -6,7 +6,7 @@
 //! jobs keep their order, and a cancelled job never pastes.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -102,7 +102,7 @@ enum OutputJob {
         result: Box<Result<CompletedTranscript, String>>,
         /// Saved-audio cleanup, settled once the output outcome is known.
         /// Dropping it resolves the recording.
-        recovery: Option<crate::recording_recovery::PendingResolution>,
+        recovery: Option<Box<crate::recording_recovery::PendingResolution>>,
     },
     Cancelled {
         job_id: DictationJobId,
@@ -176,9 +176,14 @@ impl TranscriptionQueue {
     }
 }
 
+const CANCEL_NONE: u8 = 0;
+const CANCEL_DISCARD: u8 = 1;
+const CANCEL_KEEP_FOR_RETRY: u8 = 2;
+const CANCEL_SHUTDOWN: u8 = 3;
+
 struct JobControl {
     cancelled: AtomicBool,
-    user_cancelled: AtomicBool,
+    cancel_mode: AtomicU8,
     output_started: Mutex<bool>,
     cancel_flag: Arc<AtomicBool>,
 }
@@ -187,7 +192,7 @@ impl Default for JobControl {
     fn default() -> Self {
         Self {
             cancelled: AtomicBool::new(false),
-            user_cancelled: AtomicBool::new(false),
+            cancel_mode: AtomicU8::new(CANCEL_NONE),
             output_started: Mutex::new(false),
             cancel_flag: Arc::new(AtomicBool::new(false)),
         }
@@ -198,15 +203,13 @@ impl JobControl {
     fn with_cancel_flag(cancel_flag: Arc<AtomicBool>) -> Self {
         Self {
             cancelled: AtomicBool::new(false),
-            user_cancelled: AtomicBool::new(false),
+            cancel_mode: AtomicU8::new(CANCEL_NONE),
             output_started: Mutex::new(false),
             cancel_flag,
         }
     }
 
-    /// Cancel due to explicit user Escape unless output already began.
-    /// Returns whether this call cancelled.
-    fn cancel(&self) -> bool {
+    fn cancel_with_mode(&self, mode: u8) -> bool {
         let output_started = self
             .output_started
             .lock()
@@ -214,23 +217,34 @@ impl JobControl {
         if *output_started {
             return false;
         }
-        self.user_cancelled.store(true, Ordering::Release);
+        if self
+            .cancel_mode
+            .compare_exchange(CANCEL_NONE, mode, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
         self.cancel_flag.store(true, Ordering::Release);
-        !self.cancelled.swap(true, Ordering::AcqRel)
+        self.cancelled.store(true, Ordering::Release);
+        true
+    }
+
+    /// Cancel due to explicit user Escape unless output already began.
+    /// Returns whether this call cancelled.
+    fn cancel(&self) -> bool {
+        self.cancel_with_mode(CANCEL_DISCARD)
+    }
+
+    /// Stop processing from the HUD without discarding saved audio, keeping
+    /// the recording in History for manual retry.
+    fn cancel_for_recovery(&self) -> bool {
+        self.cancel_with_mode(CANCEL_KEEP_FOR_RETRY)
     }
 
     /// Cancel during app shutdown without marking the job as user-cancelled,
     /// so queued/in-flight audio is preserved in Recording Recovery.
     fn cancel_for_shutdown(&self) {
-        let output_started = self
-            .output_started
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if *output_started {
-            return;
-        }
-        self.cancel_flag.store(true, Ordering::Release);
-        self.cancelled.store(true, Ordering::Release);
+        let _ = self.cancel_with_mode(CANCEL_SHUTDOWN);
     }
 
     fn is_cancelled(&self) -> bool {
@@ -238,7 +252,19 @@ impl JobControl {
     }
 
     fn is_user_cancelled(&self) -> bool {
-        self.user_cancelled.load(Ordering::Acquire)
+        self.cancel_mode.load(Ordering::Acquire) == CANCEL_DISCARD
+    }
+
+    fn keep_for_recovery(&self) -> bool {
+        self.cancel_mode.load(Ordering::Acquire) == CANCEL_KEEP_FOR_RETRY
+    }
+
+    fn recovery_cancel(&self) -> crate::recording_recovery::RecoveryCancel {
+        match self.cancel_mode.load(Ordering::Acquire) {
+            CANCEL_DISCARD => crate::recording_recovery::RecoveryCancel::Discard,
+            CANCEL_KEEP_FOR_RETRY => crate::recording_recovery::RecoveryCancel::KeepForRetry,
+            _ => crate::recording_recovery::RecoveryCancel::None,
+        }
     }
 
     /// Commit to output; refused once cancelled.
@@ -265,6 +291,15 @@ struct OrderedOutputs {
 impl OrderedOutputs {
     fn push(&mut self, job: OutputJob) -> Vec<OutputJob> {
         if job.sequence() < self.next_sequence {
+            if let OutputJob::Completed {
+                control,
+                recovery: Some(pending),
+                ..
+            } = job
+                && control.keep_for_recovery()
+            {
+                pending.preserve_stopped();
+            }
             return Vec::new();
         }
         self.waiting.insert(job.sequence(), job);
@@ -313,6 +348,12 @@ impl WorkerState {
             .rev()
             .find_map(|(&job_id, control)| control.cancel().then_some(job_id))
     }
+
+    fn cancel_current_for_recovery(&self) -> Option<DictationJobId> {
+        self.jobs
+            .iter()
+            .find_map(|(&job_id, control)| control.cancel_for_recovery().then_some(job_id))
+    }
 }
 
 /// Worker events for the listener. Each send rings its doorbell: the output
@@ -346,11 +387,11 @@ impl DictationWorker {
             Some(shutdown_recovery),
             move |samples, context, vocabulary, live, preferences, control| {
                 let cancel_flag = control.cancel_flag.clone();
-                recovery.transcribe_original_cancellable(
+                recovery.transcribe_original_with_cancel(
                     samples,
                     context.application.as_deref(),
                     preferences,
-                    Some(&control.user_cancelled),
+                    || control.recovery_cancel(),
                     |samples| {
                         crate::providers::batch::transcribe_cancellable(
                             samples,
@@ -580,6 +621,19 @@ impl DictationWorker {
         Some(job_id)
     }
 
+    /// Stops the oldest active transcription job and keeps its saved audio in
+    /// Recording Recovery so the user can retry it from History later.
+    pub fn cancel_current_for_recovery(&self) -> Option<DictationJobId> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let job_id = state.cancel_current_for_recovery()?;
+        drop(state);
+        let _ = self
+            .output_jobs
+            .as_ref()?
+            .try_send(OutputJob::Cancelled { job_id });
+        Some(job_id)
+    }
+
     fn shutdown(&mut self) {
         {
             // Output commits take this same lock. A pending clipboard write can
@@ -595,7 +649,10 @@ impl DictationWorker {
         let queued = self.transcription_jobs.close_and_drain();
         if let Some(recovery) = &self.recovery {
             for job in queued {
-                if !job.control.is_user_cancelled() {
+                if job.control.keep_for_recovery() {
+                    let samples = job.clip.into_transcription_samples();
+                    recovery.save_stopped(&samples, job.context.application.as_deref());
+                } else if !job.control.is_user_cancelled() {
                     let samples = job.clip.into_transcription_samples();
                     recovery.save_untranscribed(&samples, job.context.application.as_deref());
                 }
@@ -682,13 +739,26 @@ fn run_transcription_queue(
     prioritize_transcription_thread();
     while let Some(mut job) = jobs.pop() {
         if is_shutting_down(state) {
-            if !job.control.is_user_cancelled()
+            if job.control.keep_for_recovery()
+                && let Some(recovery) = &recovery
+            {
+                let samples = job.clip.into_transcription_samples();
+                recovery.save_stopped(&samples, job.context.application.as_deref());
+            } else if !job.control.is_user_cancelled()
                 && let Some(recovery) = &recovery
             {
                 let samples = job.clip.into_transcription_samples();
                 recovery.save_untranscribed(&samples, job.context.application.as_deref());
             }
             break;
+        }
+        if job.control.keep_for_recovery() {
+            if let Some(recovery) = &recovery {
+                let samples = job.clip.into_transcription_samples();
+                recovery.save_stopped(&samples, job.context.application.as_deref());
+            }
+            let _ = output.send(OutputJob::Cancelled { job_id: job.job_id });
+            continue;
         }
         if job.control.is_user_cancelled() {
             let _ = output.send(OutputJob::Cancelled { job_id: job.job_id });
@@ -716,6 +786,8 @@ fn run_transcription_queue(
             if let Some(pending) = pending_cleanup {
                 if job.control.is_user_cancelled() {
                     pending.finish();
+                } else if job.control.keep_for_recovery() {
+                    pending.preserve_stopped();
                 } else {
                     let recovered_text = result.ok().and_then(|transcription| {
                         let restored = job.vocabulary.restore(transcription.text.trim());
@@ -726,6 +798,18 @@ fn run_transcription_queue(
                 }
             }
             break;
+        }
+        if job.control.keep_for_recovery() {
+            if let Some(pending) = pending_cleanup {
+                pending.preserve_stopped();
+            }
+            if output
+                .send(OutputJob::Cancelled { job_id: job.job_id })
+                .is_err()
+            {
+                break;
+            }
+            continue;
         }
         let timings = JobTimings {
             total_started: job.submitted_at,
@@ -755,7 +839,7 @@ fn run_transcription_queue(
             job_id: job.job_id,
             control: job.control,
             result: Box::new(result),
-            recovery: pending_cleanup,
+            recovery: pending_cleanup.map(Box::new),
         });
         if sent.is_err() {
             break;
@@ -961,9 +1045,20 @@ fn finish_output(
                 }
             }
         }
-        OutputJob::Completed { job_id, .. } | OutputJob::Cancelled { job_id } => {
+        OutputJob::Completed {
+            job_id,
+            control,
+            recovery,
+            ..
+        } => {
+            if control.keep_for_recovery()
+                && let Some(pending) = recovery
+            {
+                pending.preserve_stopped();
+            }
             WorkerEvent::Cancelled { job_id }
         }
+        OutputJob::Cancelled { job_id } => WorkerEvent::Cancelled { job_id },
         OutputJob::PasteLast { target, .. } => {
             let Some(last) = last_transcript else {
                 return WorkerEvent::Pasted {
@@ -1792,7 +1887,7 @@ mod tests {
             assert!(pending.is_some());
             let mut job = completed(0, &result.unwrap().text);
             if let OutputJob::Completed { recovery, .. } = &mut job {
-                *recovery = pending;
+                *recovery = pending.map(Box::new);
             }
             job
         };
@@ -2096,5 +2191,217 @@ mod tests {
             }
             assert_eq!(pastes.try_recv(), Err(mpsc::TryRecvError::Disconnected));
         }
+    }
+
+    #[test]
+    fn cancel_current_for_recovery_stops_active_job_keeps_audio_and_unblocks_queue() {
+        let directory = std::env::temp_dir().join(format!(
+            "hex-stop-recovery-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let recovery =
+            crate::recording_recovery::RecordingRecovery::open(directory.join("recovery")).unwrap();
+        let history = History::new(crate::history::HistoryStore::open(
+            directory.join("history.json"),
+            crate::history::HistoryRetention::Week,
+            crate::history::now_ms(),
+        ));
+        let (first_started_tx, first_started_rx) = mpsc::channel();
+        let (pasted_tx, pasted_rx) = mpsc::channel();
+        let worker_recovery = recovery.clone();
+        let worker = DictationWorker::start_with_recovery(
+            Arc::default(),
+            Some(history.clone()),
+            Some(worker_recovery.clone()),
+            move |samples, context, _, _, preferences, control| {
+                let cancel_flag = control.cancel_flag.clone();
+                let first_started_tx = first_started_tx.clone();
+                worker_recovery.transcribe_original_with_cancel(
+                    samples,
+                    context.application.as_deref(),
+                    preferences,
+                    || control.recovery_cancel(),
+                    |_| {
+                        if context.application.as_deref() == Some("SlowApp") {
+                            let _ = first_started_tx.send(());
+                            let deadline = Instant::now() + TEST_TIMEOUT;
+                            while !cancel_flag.load(Ordering::Acquire) {
+                                assert!(Instant::now() < deadline, "cancel flag never set");
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            return Err(color_eyre::eyre::eyre!("Transcription was cancelled."));
+                        }
+                        Ok(test_transcription("second job text"))
+                    },
+                )
+            },
+            move || {
+                Box::new(move |prepare_only, text, _, _, commit| {
+                    if !prepare_only {
+                        assert!(commit());
+                        pasted_tx.send(text.to_owned()).unwrap();
+                    }
+                    Ok(PasteOutcome::Pasted)
+                })
+            },
+        );
+        let first_id = worker
+            .transcribe(
+                DictationClip::from_samples(vec![0.1; 1_600]),
+                ContextSnapshot {
+                    application: Some("SlowApp".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        first_started_rx.recv_timeout(TEST_TIMEOUT).unwrap();
+        let _second_id = worker
+            .transcribe(
+                DictationClip::from_samples(vec![0.2; 1_600]),
+                ContextSnapshot {
+                    application: Some("FastApp".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(worker.cancel_current_for_recovery(), Some(first_id));
+        assert_eq!(
+            pasted_rx.recv_timeout(TEST_TIMEOUT).unwrap(),
+            "second job text"
+        );
+
+        let deadline = Instant::now() + TEST_TIMEOUT;
+        while worker.is_busy() {
+            while worker.try_recv().is_some() {}
+            assert!(Instant::now() < deadline, "worker did not settle");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // First job is kept in Recording Recovery ready to retry, never pasted.
+        let recovered = recovery.entries("");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].status,
+            crate::recording_recovery::RecoveryStatus::Pending
+        );
+        assert!(!recovered[0].busy);
+        assert_eq!(recovered[0].application.as_deref(), Some("SlowApp"));
+        // Only the second job entered normal pasted History.
+        let history_entries = history.search("");
+        assert_eq!(history_entries.len(), 1);
+        assert_eq!(history_entries[0].text, "second job text");
+
+        drop(worker);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cancel_for_recovery_preserves_audio_if_transcription_already_returned() {
+        let directory = std::env::temp_dir().join(format!(
+            "hex-stop-late-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let recovery =
+            crate::recording_recovery::RecordingRecovery::open(directory.join("recovery")).unwrap();
+
+        // Case 1: OutputJob::Completed cancelled for recovery inside finish_output.
+        let (result, pending) = recovery.transcribe_original_with_cancel(
+            &[0.1; 1_600],
+            Some("Editor"),
+            crate::post_processing::Preferences::default(),
+            || crate::recording_recovery::RecoveryCancel::None,
+            |_| Ok(test_transcription("finished just before stop")),
+        );
+        let control = Arc::new(JobControl::default());
+        assert!(control.cancel_for_recovery());
+        let state = Mutex::new(WorkerState::default());
+        let mut last = None;
+        let event = finish_output(
+            OutputJob::Completed {
+                job_id: DictationJobId(0),
+                control,
+                result: Box::new(Ok(CompletedTranscript {
+                    options: PasteOptions::default(),
+                    text: result.unwrap().text,
+                    context: ContextSnapshot::default(),
+                    timings: JobTimings {
+                        total_started: Instant::now(),
+                        queue_ms: 0,
+                        audio_ms: 100,
+                        inference_ms: 10,
+                    },
+                    report: None,
+                })),
+                recovery: pending.map(Box::new),
+            },
+            &mut |_, _, _, _| panic!("stopped job must not paste"),
+            &mut last,
+            None,
+            &state,
+        );
+        assert!(matches!(event, WorkerEvent::Cancelled { .. }));
+        assert!(last.is_none());
+
+        // Case 2: Late OutputJob::Completed dropped by OrderedOutputs after
+        // OutputJob::Cancelled already advanced next_sequence.
+        let (result2, pending2) = recovery.transcribe_original_with_cancel(
+            &[0.2; 1_600],
+            Some("Terminal"),
+            crate::post_processing::Preferences::default(),
+            || crate::recording_recovery::RecoveryCancel::None,
+            |_| Ok(test_transcription("late completed")),
+        );
+        let control2 = Arc::new(JobControl::default());
+        assert!(control2.cancel_for_recovery());
+        let mut ordered = OrderedOutputs::default();
+        assert_eq!(
+            ordered
+                .push(OutputJob::Cancelled {
+                    job_id: DictationJobId(0)
+                })
+                .len(),
+            1
+        );
+        assert!(
+            ordered
+                .push(OutputJob::Completed {
+                    job_id: DictationJobId(0),
+                    control: control2,
+                    result: Box::new(Ok(CompletedTranscript {
+                        options: PasteOptions::default(),
+                        text: result2.unwrap().text,
+                        context: ContextSnapshot::default(),
+                        timings: JobTimings {
+                            total_started: Instant::now(),
+                            queue_ms: 0,
+                            audio_ms: 100,
+                            inference_ms: 10,
+                        },
+                        report: None,
+                    })),
+                    recovery: pending2.map(Box::new),
+                })
+                .is_empty()
+        );
+
+        let entries = recovery.entries("");
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| {
+            entry.status == crate::recording_recovery::RecoveryStatus::Pending && !entry.busy
+        }));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

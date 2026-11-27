@@ -104,6 +104,7 @@ pub fn pcm16(samples: &[f32]) -> Vec<u8> {
 }
 
 /// A request without its key. Deliberately has no Debug implementation.
+#[derive(Clone)]
 struct Request {
     provider: Provider,
     url: String,
@@ -704,7 +705,12 @@ fn http_body_failure(error: &ureq::Error, keyword_count: usize) -> TransportFail
     TransportFailure(http_error_kind(error, true), keyword_count)
 }
 
-fn send(request: &Request, config: &Config, timeout: Duration) -> Result<Response> {
+fn send(
+    request: &Request,
+    config: &Config,
+    timeout: Duration,
+    cancelled: Option<&Arc<AtomicBool>>,
+) -> Result<Response> {
     crate::openrouter::http::validate_url(&request.url)
         .map_err(|_| TransportFailure(ErrorKind::Rejected, 0))?;
     if cfg!(test) {
@@ -716,7 +722,65 @@ fn send(request: &Request, config: &Config, timeout: Duration) -> Result<Respons
     let key = keys::api_key(request.provider, config)
         .map_err(|_| TransportFailure(ErrorKind::Auth, 0))?;
     let (header, authorization) = keys::authorization(request.provider, &key);
-    post(&AGENT, request, header, &authorization, timeout)
+    post_cancellable(&AGENT, request, header, &authorization, timeout, cancelled)
+}
+
+/// Like [`post`], but stops waiting promptly when `cancelled` flips, freeing
+/// the transcription worker and recovery entry while any slow socket finishes
+/// under its own `timeout_global` without returning to the pool.
+fn post_cancellable(
+    pool: &HttpPool,
+    request: &Request,
+    header: &str,
+    authorization: &str,
+    timeout: Duration,
+    cancelled: Option<&Arc<AtomicBool>>,
+) -> Result<Response> {
+    let Some(flag) = cancelled else {
+        return post(pool, request, header, authorization, timeout);
+    };
+    check_cancelled(Some(flag))?;
+    let origin = origin(&request.url);
+    let checkout = pool.checkout(origin.as_deref());
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let owned_request = request.clone();
+    let owned_header = header.to_owned();
+    let owned_auth = authorization.to_owned();
+    let spawned = std::thread::Builder::new()
+        .name("endu-http-send".into())
+        .spawn(move || {
+            let result = post_with_checkout(
+                checkout,
+                &owned_request,
+                &owned_header,
+                &owned_auth,
+                timeout,
+            );
+            let _ = tx.send(result);
+        });
+    if spawned.is_err() {
+        return post(pool, request, header, authorization, timeout);
+    }
+    loop {
+        match rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(Ok((response, checkout))) => {
+                check_cancelled(Some(flag))?;
+                pool.used(&checkout, origin.as_deref());
+                return Ok(response);
+            }
+            Ok(Err(error)) => {
+                check_cancelled(Some(flag))?;
+                return Err(error);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                check_cancelled(Some(flag))?;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                check_cancelled(Some(flag))?;
+                return Err(TransportFailure(ErrorKind::Network, 0).into());
+            }
+        }
+    }
 }
 
 /// The network half of `send`, after URL validation and key resolution; tests
@@ -734,9 +798,22 @@ fn post(
     authorization: &str,
     timeout: Duration,
 ) -> Result<Response> {
-    let started = Instant::now();
     let origin = origin(&request.url);
     let checkout = pool.checkout(origin.as_deref());
+    let (response, checkout) =
+        post_with_checkout(checkout, request, header, authorization, timeout)?;
+    pool.used(&checkout, origin.as_deref());
+    Ok(response)
+}
+
+fn post_with_checkout(
+    checkout: super::http_pool::Checkout,
+    request: &Request,
+    header: &str,
+    authorization: &str,
+    timeout: Duration,
+) -> Result<(Response, super::http_pool::Checkout)> {
+    let started = Instant::now();
     // A request to an origin this agent never pooled opens a new connection,
     // so a failure there is not a stale socket and is not repeated.
     let mut may_retry = checkout.pooled;
@@ -791,12 +868,14 @@ fn post(
         .limit(MAX_RESPONSE_BYTES)
         .read_to_vec()
         .map_err(|error| http_body_failure(&error, request.keyword_count))?;
-    pool.used(&checkout, origin.as_deref());
-    Ok(Response {
-        status,
-        retry_after,
-        body,
-    })
+    Ok((
+        Response {
+            status,
+            retry_after,
+            body,
+        },
+        checkout,
+    ))
 }
 
 /// A socket that failed under the request before the server could have read
@@ -1713,7 +1792,7 @@ fn transcribe_with_options(
         &config,
         &mut |request, timeout| {
             let at = Instant::now();
-            let result = send(request, &config, timeout);
+            let result = send(request, &config, timeout, cancelled.as_ref());
             (result, at.elapsed())
         },
         &mut |id, samples, vocabulary, timeout| {
@@ -2562,6 +2641,51 @@ mod tests {
         );
         let listener = server.join().unwrap();
         assert!(!connected(&listener));
+    }
+
+    #[test]
+    fn post_cancellable_stops_waiting_when_cancelled_mid_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let request = loopback(Provider::OpenRouter, &listener);
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_http_request(&mut stream).unwrap();
+            accepted_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            drop(stream);
+        });
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let trigger_cancel = cancelled.clone();
+        let canceller = std::thread::spawn(move || {
+            accepted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            trigger_cancel.store(true, Ordering::Release);
+        });
+        let pool = HttpPool::new();
+        let started = Instant::now();
+        let error = post_cancellable(
+            &pool,
+            &request,
+            "Authorization",
+            "Bearer test",
+            Duration::from_secs(10),
+            Some(&cancelled),
+        )
+        .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancelled request waited too long: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            error.to_string().contains("cancelled"),
+            "unexpected error: {error:#}"
+        );
+        assert!(!pool.checkout(origin(&request.url).as_deref()).pooled);
+        let _ = release_tx.send(());
+        canceller.join().unwrap();
+        server.join().unwrap();
     }
 
     #[test]
@@ -4659,7 +4783,7 @@ mod tests {
                 keyword_count: 0,
                 opus: false,
             };
-            let error = send(&request, &config, Duration::from_secs(1)).unwrap_err();
+            let error = send(&request, &config, Duration::from_secs(1), None).unwrap_err();
             assert_eq!(
                 error
                     .downcast_ref::<TransportFailure>()
@@ -4682,7 +4806,7 @@ mod tests {
                 keyword_count: 0,
                 opus: false,
             };
-            let error = send(&request, &config, Duration::from_secs(1)).unwrap_err();
+            let error = send(&request, &config, Duration::from_secs(1), None).unwrap_err();
             assert_eq!(
                 error.to_string(),
                 "HTTP transcription is disabled in unit tests; inject a transport."

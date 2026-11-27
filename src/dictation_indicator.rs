@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -14,11 +15,12 @@ use metal::{
     CommandQueue, Device, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType, MTLStoreAction,
     MetalLayer, RenderPassDescriptor, RenderPipelineDescriptor, RenderPipelineState,
 };
-use objc2::MainThreadMarker;
 use objc2::rc::Retained;
+use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, msg_send};
 use objc2_app_kit::{
-    NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSFont, NSFontWeightSemibold, NSPanel,
-    NSStatusWindowLevel, NSTextAlignment, NSTextField, NSView, NSWindowStyleMask,
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSCursor, NSEvent, NSFont,
+    NSFontWeightSemibold, NSPanel, NSStatusWindowLevel, NSTextAlignment, NSTextField, NSView,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use objc2_quartz_core::CALayer;
@@ -27,6 +29,15 @@ const WINDOW_WIDTH: f32 = 112.0;
 const WINDOW_HEIGHT: f32 = 64.0;
 const CAPSULE_WIDTH: f32 = 56.0;
 const CAPSULE_HEIGHT: f32 = 16.0;
+/// Capsule width while hovered during transcription, leaving room for the
+/// right-end stop button without shortening the waves.
+const HOVER_CAPSULE_WIDTH: f32 = 68.0;
+/// Center of the circular stop button inside the hovered capsule (concentric
+/// with the right endcap).
+const CANCEL_BUTTON_CENTER_X: f32 = HOVER_CAPSULE_WIDTH * 0.5 - CAPSULE_HEIGHT * 0.5;
+const CANCEL_BUTTON_HIT_LEFT: f32 = CANCEL_BUTTON_CENTER_X - 10.0;
+const CANCEL_BUTTON_HIT_RIGHT: f32 = HOVER_CAPSULE_WIDTH * 0.5 + 4.0;
+const CANCEL_BUTTON_HIT_HALF_Y: f32 = CAPSULE_HEIGHT * 0.5 + 4.0;
 const ENTRANCE_ANGULAR_FREQUENCY: f32 = 24.0;
 const EXIT_ANGULAR_FREQUENCY: f32 = 24.0;
 const GEOMETRY_ANGULAR_FREQUENCY: f32 = 24.0;
@@ -163,14 +174,155 @@ pub fn channel() -> (DictationIndicatorSender, Receiver<DictationIndicatorEvent>
     (DictationIndicatorSender(sender), receiver)
 }
 
+/// Converts a point in window or screen space relative to `frame` into the
+/// shader's centered base coordinates (`+x` right, `+y` down).
+fn pointer_in_capsule_space(frame: NSRect, pointer: NSPoint, size_factor: f32) -> (f32, f32) {
+    let scale = f64::from(size_factor.max(0.01));
+    let center_x = frame.origin.x + frame.size.width / 2.0;
+    let center_y = frame.origin.y + frame.size.height / 2.0;
+    let x = ((pointer.x - center_x) / scale) as f32;
+    let y = ((center_y - pointer.y) / scale) as f32;
+    (x, y)
+}
+
+/// Returns `(pill_hovered, cancel_button_hovered)` for a pointer in capsule
+/// coordinates while the HUD is in `Phase::Transcribing`. Hysteresis keeps the
+/// pill steady once it widens to reveal the stop button.
+fn hit_test_processing_pill(x: f32, y: f32, was_hovered: bool) -> (bool, bool) {
+    if !x.is_finite() || !y.is_finite() {
+        return (false, false);
+    }
+    let (half_x, half_y) = if was_hovered {
+        (HOVER_CAPSULE_WIDTH * 0.5 + 6.0, CAPSULE_HEIGHT * 0.5 + 6.0)
+    } else {
+        (CAPSULE_WIDTH * 0.5 + 4.0, CAPSULE_HEIGHT * 0.5 + 4.0)
+    };
+    let pill_hovered = x.abs() <= half_x && y.abs() <= half_y;
+    let button_hovered = pill_hovered
+        && (CANCEL_BUTTON_HIT_LEFT..=CANCEL_BUTTON_HIT_RIGHT).contains(&x)
+        && y.abs() <= CANCEL_BUTTON_HIT_HALF_Y;
+    (pill_hovered, button_hovered)
+}
+
+fn cancel_button_view_rect(bounds: NSRect, size_factor: f32) -> NSRect {
+    let scale = f64::from(size_factor.max(0.01));
+    let center_x = bounds.origin.x + bounds.size.width / 2.0;
+    let center_y = bounds.origin.y + bounds.size.height / 2.0;
+    let left = center_x + f64::from(CANCEL_BUTTON_HIT_LEFT) * scale;
+    let right = center_x + f64::from(CANCEL_BUTTON_HIT_RIGHT) * scale;
+    let half_y = f64::from(CANCEL_BUTTON_HIT_HALF_Y) * scale;
+    NSRect::new(
+        NSPoint::new(left, center_y - half_y),
+        NSSize::new((right - left).max(0.0), half_y * 2.0),
+    )
+}
+
+struct CancelOverlayIvars {
+    renderer: Arc<SharedRenderer>,
+    pressed: Cell<bool>,
+    on_cancel: Arc<dyn Fn() + Send + Sync>,
+}
+
+objc2::define_class!(
+    #[unsafe(super = NSView)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = CancelOverlayIvars]
+    struct CancelOverlayView;
+
+    impl CancelOverlayView {
+        #[unsafe(method(acceptsFirstMouse:))]
+        fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool {
+            true
+        }
+
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &NSEvent) {
+            let pressed = self.ivars().renderer.can_cancel() && self.point_in_cancel_button(event);
+            self.ivars().pressed.set(pressed);
+            if pressed {
+                self.ivars().renderer.set_hover_state(true, true, true);
+            }
+        }
+
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, event: &NSEvent) {
+            if !self.ivars().pressed.get() {
+                return;
+            }
+            let over = self.ivars().renderer.can_cancel() && self.point_in_cancel_button(event);
+            self.ivars().renderer.set_hover_state(true, over, over);
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, event: &NSEvent) {
+            let was_pressed = self.ivars().pressed.replace(false);
+            if !was_pressed {
+                return;
+            }
+            let should_cancel =
+                self.ivars().renderer.can_cancel() && self.point_in_cancel_button(event);
+            if should_cancel {
+                self.ivars().renderer.set_hover_state(false, false, false);
+                if let Some(window) = self.window() {
+                    window.setIgnoresMouseEvents(true);
+                }
+                (self.ivars().on_cancel)();
+            } else {
+                self.ivars().renderer.set_hover_state(true, false, false);
+            }
+        }
+
+        #[unsafe(method(resetCursorRects))]
+        fn reset_cursor_rects(&self) {
+            let bounds = self.bounds();
+            let size_factor = crate::hud_settings::current().size.scale();
+            let rect = cancel_button_view_rect(bounds, size_factor);
+            self.addCursorRect_cursor(rect, &NSCursor::pointingHandCursor());
+        }
+    }
+);
+
+impl CancelOverlayView {
+    fn new(
+        mtm: MainThreadMarker,
+        frame: NSRect,
+        renderer: Arc<SharedRenderer>,
+        on_cancel: Arc<dyn Fn() + Send + Sync>,
+    ) -> Retained<Self> {
+        let this = mtm.alloc::<Self>().set_ivars(CancelOverlayIvars {
+            renderer,
+            pressed: Cell::new(false),
+            on_cancel,
+        });
+        unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+
+    fn point_in_cancel_button(&self, event: &NSEvent) -> bool {
+        let location = self.convertPoint_fromView(event.locationInWindow(), None);
+        let bounds = self.bounds();
+        let size_factor = crate::hud_settings::current().size.scale();
+        let (x, y) = pointer_in_capsule_space(bounds, location, size_factor);
+        hit_test_processing_pill(x, y, true).1
+    }
+
+    fn is_pressed(&self) -> bool {
+        self.ivars().pressed.get()
+    }
+
+    fn clear_pressed(&self) {
+        self.ivars().pressed.set(false);
+    }
+}
+
 pub struct DictationIndicatorUi {
     indicator: Option<MetalIndicator>,
+    on_cancel_processing: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl DictationIndicatorUi {
-    pub fn new() -> Self {
+    pub fn new(on_cancel_processing: Arc<dyn Fn() + Send + Sync>) -> Self {
         let started = Instant::now();
-        let indicator = match MetalIndicator::new() {
+        let indicator = match MetalIndicator::new(on_cancel_processing.clone()) {
             Ok(indicator) => {
                 tracing::info!(
                     initialization_ms = started.elapsed().as_millis(),
@@ -183,7 +335,10 @@ impl DictationIndicatorUi {
                 None
             }
         };
-        Self { indicator }
+        Self {
+            indicator,
+            on_cancel_processing,
+        }
     }
 
     pub fn handle(&mut self, event: DictationIndicatorEvent, _cx: &mut App) {
@@ -193,7 +348,7 @@ impl DictationIndicatorUi {
                 DictationIndicatorEvent::Preparing | DictationIndicatorEvent::Started
             )
         {
-            match MetalIndicator::new() {
+            match MetalIndicator::new(self.on_cancel_processing.clone()) {
                 Ok(indicator) => self.indicator = Some(indicator),
                 Err(error) => {
                     tracing::error!(%error, "could not create Metal dictation indicator");
@@ -225,6 +380,11 @@ struct MetalIndicator {
     /// A written notice over the capsule, such as "No audio".
     notice: Retained<NSTextField>,
     notice_style: Option<(u32, bool, u32, crate::i18n::Language)>,
+    /// Transparent hit target for clicking the hover stop button while transcribing.
+    cancel_view: Retained<CancelOverlayView>,
+    tooltip_language: Option<crate::i18n::Language>,
+    hovered: bool,
+    over_cancel: bool,
     renderer: Arc<SharedRenderer>,
     display_link: CVDisplayLink,
     display_link_context: *const SharedRenderer,
@@ -232,7 +392,7 @@ struct MetalIndicator {
 }
 
 impl MetalIndicator {
-    fn new() -> Result<Self, String> {
+    fn new(on_cancel_processing: Arc<dyn Fn() + Send + Sync>) -> Result<Self, String> {
         let mtm = MainThreadMarker::new().ok_or("indicator must be created on the main thread")?;
         let renderer = Arc::new(SharedRenderer::new()?);
         let frame = NSRect::new(
@@ -255,8 +415,8 @@ impl MetalIndicator {
         let cocoa_layer = unsafe { &*metal_layer.cast::<CALayer>() };
         cocoa_layer.setOpaque(false);
         view.setLayer(Some(cocoa_layer));
-        // The Metal view hosts its layer, so the notice is its sibling in a
-        // plain container rather than its subview.
+        // The Metal view hosts its layer, so the notice and cancel hit view are
+        // its siblings in a plain container rather than its subviews.
         let resizing = NSAutoresizingMaskOptions::ViewWidthSizable
             | NSAutoresizingMaskOptions::ViewHeightSizable;
         view.setAutoresizingMask(resizing);
@@ -266,10 +426,15 @@ impl MetalIndicator {
         notice.setAlignment(NSTextAlignment::Center);
         notice.setAlphaValue(0.0);
         container.addSubview(&notice);
+        let cancel_view =
+            CancelOverlayView::new(mtm, frame, renderer.clone(), on_cancel_processing);
+        cancel_view.setAutoresizingMask(resizing);
+        container.addSubview(&cancel_view);
         window.setContentView(Some(&container));
         window.setBackgroundColor(Some(&NSColor::clearColor()));
         window.setOpaque(false);
         window.setIgnoresMouseEvents(true);
+        window.setBecomesKeyOnlyIfNeeded(true);
         window.setHasShadow(false);
         window.setHidesOnDeactivate(false);
         window.setCanHide(false);
@@ -294,6 +459,10 @@ impl MetalIndicator {
             window,
             notice,
             notice_style: None,
+            cancel_view,
+            tooltip_language: None,
+            hovered: false,
+            over_cancel: false,
             renderer,
             display_link,
             display_link_context,
@@ -314,11 +483,60 @@ impl MetalIndicator {
         }
         // Present first, then update pure CPU animation state (never waiting on GPU).
         self.renderer.handle(event);
+        if !self.renderer.can_cancel() {
+            self.clear_hover_interaction();
+        }
         if self.renderer.is_active()
             && !self.display_link.is_running()
             && let Err(status) = self.display_link.start()
         {
             tracing::error!(status, "could not start indicator display link");
+        }
+    }
+
+    fn clear_hover_interaction(&mut self) {
+        if self.hovered
+            || self.over_cancel
+            || self.cancel_view.is_pressed()
+            || !self.window.ignoresMouseEvents()
+        {
+            self.hovered = false;
+            self.over_cancel = false;
+            self.cancel_view.clear_pressed();
+            self.renderer.set_hover_state(false, false, false);
+            self.window.setIgnoresMouseEvents(true);
+        }
+    }
+
+    fn update_cancel_hover(&mut self) {
+        if !self.renderer.can_cancel() || !self.visibility.is_ordered() {
+            self.clear_hover_interaction();
+            return;
+        }
+        let language = crate::i18n::language();
+        if self.tooltip_language != Some(language) {
+            self.cancel_view
+                .setToolTip(Some(&NSString::from_str(crate::i18n::t(
+                    "Stop transcribing and save audio to History",
+                ))));
+            self.tooltip_language = Some(language);
+        }
+        let size_factor = crate::hud_settings::current().size.scale();
+        let (x, y) =
+            pointer_in_capsule_space(self.window.frame(), NSEvent::mouseLocation(), size_factor);
+        let (hovered, over_cancel) = hit_test_processing_pill(x, y, self.hovered);
+        let pressed = self.cancel_view.is_pressed();
+        let effective_hovered = hovered || pressed;
+        let effective_pressed = pressed && over_cancel;
+        if effective_hovered != self.hovered || over_cancel != self.over_cancel || pressed {
+            self.hovered = effective_hovered;
+            self.over_cancel = over_cancel;
+            self.renderer
+                .set_hover_state(effective_hovered, over_cancel, effective_pressed);
+        }
+        let ignores_mouse = !(over_cancel || pressed);
+        if self.window.ignoresMouseEvents() != ignores_mouse {
+            self.window.setIgnoresMouseEvents(ignores_mouse);
         }
     }
 
@@ -388,13 +606,17 @@ impl MetalIndicator {
     fn maintain(&mut self) {
         self.update_notice();
         if self.renderer.is_active() {
-            self.position_on_selected_screen();
+            if !self.hovered && !self.cancel_view.is_pressed() {
+                self.position_on_selected_screen();
+            }
             if self.renderer.has_live_work() {
                 self.visibility.update(&mut self.window, true);
             } else {
                 self.visibility.maintain_fading(&mut self.window);
             }
+            self.update_cancel_hover();
         } else {
+            self.clear_hover_interaction();
             if self.display_link.is_running() {
                 let _ = self.display_link.stop();
             }
@@ -417,6 +639,7 @@ impl MetalIndicator {
             self.window
                 .setContentSize(NSSize::new(window_width, window_height));
             self.layout_notice();
+            self.window.invalidateCursorRectsForView(&self.cancel_view);
         }
         self.renderer
             .set_viewport(screen.backing_scale, size_factor);
@@ -523,6 +746,7 @@ struct SharedRenderer {
     gpu: Mutex<MetalGpu>,
     active: AtomicBool,
     live_work: AtomicBool,
+    can_cancel: AtomicBool,
     /// The notice code and its opacity's bits, published after each frame
     /// so the UI thread never waits on the render lock.
     notice_code: AtomicU32,
@@ -546,6 +770,7 @@ impl SharedRenderer {
             gpu: Mutex::new(gpu),
             active: AtomicBool::new(false),
             live_work: AtomicBool::new(false),
+            can_cancel: AtomicBool::new(false),
             notice_code: AtomicU32::new(0),
             notice_alpha: AtomicU32::new(0),
         })
@@ -575,8 +800,16 @@ impl SharedRenderer {
         self.publish_notice(&renderer);
         let has_work = renderer.capture_phase.is_some() || !renderer.jobs.is_empty();
         self.live_work.store(has_work, Ordering::Release);
+        self.can_cancel
+            .store(renderer.can_cancel_processing(), Ordering::Release);
         if renderer.should_be_active() {
             self.active.store(true, Ordering::Release);
+        }
+    }
+
+    fn set_hover_state(&self, hovered: bool, cancel_hovered: bool, cancel_pressed: bool) {
+        if let Ok(mut renderer) = self.renderer.try_lock() {
+            renderer.set_hover_state(hovered, cancel_hovered, cancel_pressed);
         }
     }
 
@@ -600,6 +833,8 @@ impl SharedRenderer {
             let mut renderer = self.renderer.lock().unwrap();
             let step = renderer.step_frame(Instant::now());
             self.publish_notice(&renderer);
+            self.can_cancel
+                .store(renderer.can_cancel_processing(), Ordering::Release);
             (step, renderer.state_generation)
         };
         if let Ok(gpu) = self.gpu.lock() {
@@ -619,6 +854,10 @@ impl SharedRenderer {
 
     fn has_live_work(&self) -> bool {
         self.live_work.load(Ordering::Acquire)
+    }
+
+    fn can_cancel(&self) -> bool {
+        self.can_cancel.load(Ordering::Acquire)
     }
 }
 
@@ -725,9 +964,16 @@ struct Uniforms {
     light: f32,
     /// 1 hides the lines so a written notice can sit in the capsule.
     silenced: f32,
+    /// 1 reveals the hover stop button on the right cap while transcribing.
+    cancel_reveal: f32,
+    /// 1 highlights the stop button when the pointer is directly over it.
+    cancel_hover: f32,
+    /// 1 depresses the stop button while pressed.
+    cancel_pressed: f32,
+    _cancel_padding: f32,
 }
 
-const _: () = assert!(std::mem::size_of::<Uniforms>() == 128);
+const _: () = assert!(std::mem::size_of::<Uniforms>() == 144);
 
 fn recording_flash(elapsed: Duration) -> f32 {
     2.0_f32.powf(-elapsed.as_secs_f32() / RECORDING_FLASH_HALF_LIFE.as_secs_f32())
@@ -789,6 +1035,12 @@ struct MetalRenderer {
     visual_scale: Spring,
     softness: Spring,
     processing: Spring,
+    hovered: bool,
+    cancel_hovered: bool,
+    cancel_pressed: bool,
+    cancel_reveal: Spring,
+    cancel_hover: Spring,
+    cancel_press: Spring,
     tuning: HudTuning,
     /// The system appearance, sampled when the HUD opens so a System HUD
     /// matches macOS without querying defaults every frame.
@@ -878,6 +1130,12 @@ impl MetalRenderer {
             visual_scale: Spring::new(HIDDEN_SCALE),
             softness: Spring::new(HIDDEN_SOFTNESS),
             processing: Spring::new(0.0),
+            hovered: false,
+            cancel_hovered: false,
+            cancel_pressed: false,
+            cancel_reveal: Spring::new(0.0),
+            cancel_hover: Spring::new(0.0),
+            cancel_press: Spring::new(0.0),
             tuning: HudTuning::default(),
             system_dark: crate::appearance::system_is_dark(),
         })
@@ -925,6 +1183,12 @@ impl MetalRenderer {
                 self.visual_scale.reset(HIDDEN_SCALE);
                 self.softness.reset(HIDDEN_SOFTNESS);
                 self.processing.reset(0.0);
+                self.hovered = false;
+                self.cancel_hovered = false;
+                self.cancel_pressed = false;
+                self.cancel_reveal.reset(0.0);
+                self.cancel_hover.reset(0.0);
+                self.cancel_press.reset(0.0);
             }
             DictationIndicatorEvent::Meter { average, peak } => {
                 if self.capture_phase == Some(CapturePhase::Recording) {
@@ -1020,6 +1284,29 @@ impl MetalRenderer {
                     self.show_pipeline(now);
                 }
             }
+        }
+        if !self.can_cancel_processing() {
+            self.hovered = false;
+            self.cancel_hovered = false;
+            self.cancel_pressed = false;
+        }
+    }
+
+    fn can_cancel_processing(&self) -> bool {
+        matches!(self.phase, Phase::Transcribing)
+            && !self.completion_pending
+            && !self.jobs.is_empty()
+    }
+
+    fn set_hover_state(&mut self, hovered: bool, cancel_hovered: bool, cancel_pressed: bool) {
+        if self.can_cancel_processing() {
+            self.hovered = hovered;
+            self.cancel_hovered = hovered && cancel_hovered;
+            self.cancel_pressed = hovered && cancel_hovered && cancel_pressed;
+        } else {
+            self.hovered = false;
+            self.cancel_hovered = false;
+            self.cancel_pressed = false;
         }
     }
 
@@ -1202,11 +1489,23 @@ impl MetalRenderer {
             self.softness.velocity = 0.0;
             self.exiting = true;
         }
+        let can_cancel = self.can_cancel_processing();
+        if !can_cancel {
+            self.hovered = false;
+            self.cancel_hovered = false;
+            self.cancel_pressed = false;
+        }
         let target_width = match self.phase {
             Phase::Preparing => CAPSULE_WIDTH,
             Phase::Recording => recording_width(recording_average),
-            // The capsule keeps its width; its lines change color and pace.
-            Phase::Transcribing => CAPSULE_WIDTH,
+            // The capsule widens gently while hovered to make room for the stop button.
+            Phase::Transcribing => {
+                if can_cancel && self.hovered {
+                    HOVER_CAPSULE_WIDTH
+                } else {
+                    CAPSULE_WIDTH
+                }
+            }
             Phase::Hidden | Phase::Completed | Phase::Cancelled | Phase::Failed | Phase::Notice => {
                 self.width.value
             }
@@ -1231,6 +1530,29 @@ impl MetalRenderer {
             .step_critical(target_width, dt, GEOMETRY_ANGULAR_FREQUENCY);
         self.processing
             .step_critical(target_processing, dt, GEOMETRY_ANGULAR_FREQUENCY);
+        self.cancel_reveal.step_critical(
+            if can_cancel && self.hovered { 1.0 } else { 0.0 },
+            dt,
+            GEOMETRY_ANGULAR_FREQUENCY,
+        );
+        self.cancel_hover.step_critical(
+            if can_cancel && self.cancel_hovered {
+                1.0
+            } else {
+                0.0
+            },
+            dt,
+            GEOMETRY_ANGULAR_FREQUENCY,
+        );
+        self.cancel_press.step_critical(
+            if can_cancel && self.cancel_pressed {
+                1.0
+            } else {
+                0.0
+            },
+            dt,
+            GEOMETRY_ANGULAR_FREQUENCY,
+        );
         let visibility_frequency = if visible {
             ENTRANCE_ANGULAR_FREQUENCY
         } else {
@@ -1318,6 +1640,10 @@ impl MetalRenderer {
                 1.0
             },
             silenced: self.notice_ease(now).map_or(0.0, |(_, ease)| ease),
+            cancel_reveal: self.cancel_reveal.value.clamp(0.0, 1.0),
+            cancel_hover: self.cancel_hover.value.clamp(0.0, 1.0),
+            cancel_pressed: self.cancel_press.value.clamp(0.0, 1.0),
+            _cancel_padding: 0.0,
         };
         (uniforms, keep_rendering)
     }
@@ -1636,7 +1962,7 @@ mod tests {
 
     #[test]
     fn rust_uniform_layout_matches_metal() {
-        assert_eq!(std::mem::size_of::<Uniforms>(), 128);
+        assert_eq!(std::mem::size_of::<Uniforms>(), 144);
         assert_eq!(std::mem::align_of::<Uniforms>(), 8);
         assert_eq!(std::mem::offset_of!(Uniforms, sphere_outline), 92);
         assert_eq!(std::mem::offset_of!(Uniforms, recording_flash), 100);
@@ -1645,6 +1971,9 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Uniforms, transcription_hue_shift), 112);
         assert_eq!(std::mem::offset_of!(Uniforms, brightness), 116);
         assert_eq!(std::mem::offset_of!(Uniforms, light), 120);
+        assert_eq!(std::mem::offset_of!(Uniforms, cancel_reveal), 128);
+        assert_eq!(std::mem::offset_of!(Uniforms, cancel_hover), 132);
+        assert_eq!(std::mem::offset_of!(Uniforms, cancel_pressed), 136);
     }
 
     #[test]
@@ -1843,5 +2172,69 @@ mod tests {
         // A quiet mark for an unknown job is ignored.
         renderer.handle(DictationIndicatorEvent::JobQuiet { job_id: 99 });
         assert!(renderer.quiet_jobs.is_empty());
+    }
+
+    #[test]
+    fn hover_stop_button_hit_test_and_renderer_state_only_activate_while_transcribing() {
+        for scale in [1.0_f32, 1.5, 2.0] {
+            let frame = NSRect::new(
+                NSPoint::new(400.0, 700.0),
+                NSSize::new(
+                    f64::from(WINDOW_WIDTH * scale),
+                    f64::from(WINDOW_HEIGHT * scale),
+                ),
+            );
+            let center = NSPoint::new(
+                frame.origin.x + frame.size.width / 2.0,
+                frame.origin.y + frame.size.height / 2.0,
+            );
+            assert_eq!(pointer_in_capsule_space(frame, center, scale), (0.0, 0.0));
+            let button_point = NSPoint::new(
+                center.x + f64::from(CANCEL_BUTTON_CENTER_X * scale),
+                center.y,
+            );
+            let (x, y) = pointer_in_capsule_space(frame, button_point, scale);
+            assert!((x - CANCEL_BUTTON_CENTER_X).abs() < 0.01);
+            assert!(y.abs() < 0.01);
+            assert_eq!(hit_test_processing_pill(x, y, false), (true, true));
+            // Left wave area hovers the pill without capturing the stop button.
+            assert_eq!(hit_test_processing_pill(-10.0, 0.0, false), (true, false));
+            // Expanded cap stays hovered through hysteresis once revealed.
+            assert_eq!(hit_test_processing_pill(35.0, 0.0, false), (false, false));
+            assert_eq!(hit_test_processing_pill(35.0, 0.0, true), (true, true));
+            // Outside the capsule is never hovered.
+            assert_eq!(hit_test_processing_pill(0.0, 20.0, true), (false, false));
+            assert_eq!(
+                hit_test_processing_pill(f32::NAN, 0.0, true),
+                (false, false)
+            );
+        }
+
+        let mut renderer = MetalRenderer::new().expect("local macOS checks require Metal");
+        renderer.handle(DictationIndicatorEvent::Started);
+        assert!(!renderer.can_cancel_processing());
+        renderer.set_hover_state(true, true, true);
+        assert!(!renderer.hovered);
+
+        renderer.handle(DictationIndicatorEvent::Submitted { job_id: 1 });
+        renderer.handle(DictationIndicatorEvent::Transcribing { job_id: 1 });
+        assert!(renderer.can_cancel_processing());
+        renderer.set_hover_state(true, true, false);
+        let start = Instant::now();
+        let mut last_uniforms = None;
+        for frame in 1..=30 {
+            let (uniforms, _) = renderer.step_frame(start + Duration::from_millis(frame * 16));
+            last_uniforms = Some(uniforms);
+        }
+        let uniforms = last_uniforms.unwrap();
+        assert!(uniforms.width > HOVER_CAPSULE_WIDTH - 0.5);
+        assert!(uniforms.cancel_reveal > 0.95);
+        assert!(uniforms.cancel_hover > 0.95);
+
+        // Finishing or starting a new recording clears cancelability immediately.
+        renderer.handle(DictationIndicatorEvent::JobCompleted { job_id: 1 });
+        assert!(!renderer.can_cancel_processing());
+        assert!(!renderer.hovered);
+        assert!(!renderer.cancel_hovered);
     }
 }
